@@ -62,7 +62,6 @@ def test_real_mesh():
             assert mesh.read(positions, resampler=resampler, compensate=compensate).shape == positions.shape[:1]
 
 
-
 def test_resamplers():
     for shape in [(3,), (4, 3, 5)]:
         meshshape = np.array(shape)
@@ -75,8 +74,7 @@ def test_resamplers():
             assert np.allclose(mesh.sum(), weights.sum())
 
 
-
-def test_particle_field():
+def test_particle_field()les methodes de:
     boxsize = 100.
     positions = boxsize * random.uniform(random.key(42), shape=(10, 3))
     weights = 1. + random.uniform(random.key(42), shape=(10,))

@@ -5,7 +5,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import MeshFFTPower, generate_gaussian_random_field
+from jaxpower import MeshFFTPower, PowerSpectrumMultipoles, generate_gaussian_random_field
 
 
 dirname = Path('_tests')
@@ -17,7 +17,7 @@ def test_power(plot=False):
         kp = 0.15
         return k**3 * jnp.exp(-k / kp**2)
 
-    #@jax.jit
+    @jax.jit
     def mock(seed):
         mesh = generate_gaussian_random_field(pk, seed=seed, unitary_amplitude=True)
         return MeshFFTPower(mesh, edges={'step': 0.01})
@@ -26,7 +26,7 @@ def test_power(plot=False):
 
     fn = dirname / 'tmp.npy'
     power.save(fn)
-    power = MeshFFTPower.load(fn)
+    power = PowerSpectrumMultipoles.load(fn)
     if plot:
         from matplotlib import pyplot as plt
         ax = power.plot()

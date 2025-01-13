@@ -1,6 +1,6 @@
 import os
 from functools import partial
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Union
 
 import numpy as np
@@ -14,20 +14,80 @@ from .utils import mkdir
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['k', 'power_nonorm', 'nmodes', 'norm', 'shotnoise_nonorm'], meta_fields=['edges', 'ells'])
-@dataclass(init=False)
-class MeshFFTPower(object):
+@dataclass(frozen=True)
+class PowerSpectrumMultipoles(object):
 
-    """TODO: implement Legendre polynomials in JAX, mu-wedges and varying line-of-sight."""
+    """Class to store power spectrum multipoles."""
+
     k : np.ndarray
     power_nonorm: jax.Array
     nmodes: np.ndarray
-    norm: jax.Array
-    shotnoise_nonorm: jax.Array
     edges: np.ndarray
     ells: tuple
+    norm: jax.Array = 1.
+    shotnoise_nonorm: jax.Array = 0.
 
-    def __init__(self, *meshs: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField], edges: Union[np.ndarray, dict, None]=None,
-                 ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x', norm: Union[jax.Array, float]=1., shotnoise_nonorm: Union[jax.Array, float]=0.):
+    @property
+    def shotnoise(self):
+        return self.shotnoise_nonorm / self.norm
+
+    @property
+    def power(self):
+        return (self.power_nonorm - self.shotnoise_nonorm) / self.norm
+
+    def save(self, fn):
+        fn = str(fn)
+        mkdir(os.path.dirname(fn))
+        np.save(fn, asdict(self), allow_pickle=True)
+
+    @classmethod
+    def load(cls, fn):
+        fn = str(fn)
+        state = np.load(fn, allow_pickle=True)[()]
+        new = cls.__new__(cls)
+        new.__dict__.update(**state)
+        return new
+
+    def plot(self, ax=None, fn=None, kw_save=None, show=False):
+        r"""
+        Plot power spectrum.
+
+        Parameters
+        ----------
+        ax : matplotlib.axes.Axes, default=None
+            Axes where to plot samples. If ``None``, takes current axes.
+
+        fn : string, default=None
+            If not ``None``, file name where to save figure.
+
+        kw_save : dict, default=None
+            Optional arguments for :meth:`matplotlib.figure.Figure.savefig`.
+
+        show : bool, default=False
+            Whether to show figure.
+
+        Returns
+        -------
+        ax : matplotlib.axes.Axes
+        """
+        from matplotlib import pyplot as plt
+        fig = None
+        if ax is None: fig, ax = plt.subplots()
+        for ill, ell in enumerate(self.ells):
+            ax.plot(self.k, self.k * self.power[ill].real, label=r'$\ell = {:d}$'.format(ell))
+        ax.legend()
+        ax.grid(True)
+        ax.set_xlabel(r'$k$ [$h/\mathrm{Mpc}$]')
+        ax.set_ylabel(r'$k P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{2}$]')
+        if fn is not None:
+            utils.savefig(fn, fig=fig, **(kw_save or {}))
+        if show:
+            plt.show()
+        return ax
+
+
+def MeshFFTPower(*meshs: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField], edges: Union[np.ndarray, dict, None]=None,
+                   ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x'):
         meshs = list(meshs)
         assert 1 <= len(meshs) <= 2
         for imesh, mesh in enumerate(meshs):
@@ -91,70 +151,4 @@ class MeshFFTPower(object):
         nmodes = jnp.bincount(ibin, weights=nmodes, length=edges.size + 1)[1:-1]
         k /= nmodes
         power *= jnp.prod(boxsize / meshsize**2) / nmodes
-        self.k, self.power_nonorm, self.nmodes, self.edges = k, power, nmodes, edges
-        self.ells = ells
-        self.norm = jnp.asarray(norm, dtype=dtype)
-        self.shotnoise_nonorm = jnp.asarray(shotnoise_nonorm, dtype=dtype)
-
-    @property
-    def shotnoise(self):
-        return self.shotnoise_nonorm / self.norm
-
-    @property
-    def power(self):
-        return (self.power_nonorm - self.shotnoise_nonorm) / self.norm
-
-    def save(self, fn):
-        fn = str(fn)
-        mkdir(os.path.dirname(fn))
-        np.save(fn, asdict(self), allow_pickle=True)
-
-    @classmethod
-    def load(cls, fn):
-        fn = str(fn)
-        state = np.load(fn, allow_pickle=True)[()]
-        new = cls.__new__(cls)
-        new.__dict__.update(**state)
-        return new
-
-    def plot(self, ax=None, fn=None, kw_save=None, show=False):
-        r"""
-        Plot power spectrum.
-
-        Parameters
-        ----------
-        ax : matplotlib.axes.Axes, default=None
-            Axes where to plot samples. If ``None``, takes current axes.
-
-        fn : string, default=None
-            If not ``None``, file name where to save figure.
-
-        kw_save : dict, default=None
-            Optional arguments for :meth:`matplotlib.figure.Figure.savefig`.
-
-        show : bool, default=False
-            Whether to show figure.
-
-        Returns
-        -------
-        ax : matplotlib.axes.Axes
-        """
-        from matplotlib import pyplot as plt
-        fig = None
-        if ax is None: fig, ax = plt.subplots()
-        for ill, ell in enumerate(self.ells):
-            ax.plot(self.k, self.k * self.power[ill].real, label=r'$\ell = {:d}$'.format(ell))
-        ax.legend()
-        ax.grid(True)
-        ax.set_xlabel(r'$k$ [$h/\mathrm{Mpc}$]')
-        ax.set_ylabel(r'$k P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{2}$]')
-        if fn is not None:
-            utils.savefig(fn, fig=fig, **(kw_save or {}))
-        if show:
-            plt.show()
-        return ax
-
-
-class ParticleFFTPower(MeshFFTPower):
-
-    """TODO."""
+        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells)
