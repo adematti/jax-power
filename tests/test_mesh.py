@@ -19,8 +19,8 @@ def test_static_array():
 
 
 def test_base_mesh():
-    mesh = BaseMeshField(jnp.zeros((4, 3)))
-    mesh2 = BaseMeshField(jnp.zeros((4, 3)), boxsize=(4., 3.))
+    mesh = BaseMeshField(jnp.ones((4, 3)))
+    mesh2 = BaseMeshField(jnp.fill((4, 3), 3.), boxsize=(4., 3.))
 
     @jax.jit
     def test(mesh, mesh2):
@@ -32,16 +32,19 @@ def test_base_mesh():
 
     bak = mesh
     mesh += 2
-    assert np.allclose(mesh, bak.value + 2)
+    assert isinstance(mesh, BaseMeshField) and np.allclose(mesh, bak.value + 2)
     bak = mesh
     mesh /= 3
-    assert np.allclose(mesh, bak.value / 3.)
+    assert isinstance(mesh, BaseMeshField) and np.allclose(mesh, bak.value / 3.)
     bak = mesh
     mesh = mesh.conj()
-    assert np.allclose(mesh, bak.value.conj())
-
-    mesh2 = mesh.at[1, 2].set(100.)
-    assert np.allclose(mesh2[1, 2], 100)
+    assert isinstance(mesh, BaseMeshField) and np.allclose(mesh, bak.value.conj())
+    bak = mesh
+    mesh = mesh + mesh
+    assert np.allclose(mesh, bak.value * 2)
+    bak = mesh
+    mesh = mesh.at[1, 2].set(100.)
+    assert isinstance(mesh, BaseMeshField) and np.allclose(mesh[1, 2], 100)
 
 
 def test_real_mesh():
