@@ -227,7 +227,7 @@ class FKPField(object):
         return tuple(other.clone(**attrs) for other in others)
 
 
-def compute_normalization(*particles, resampler='cic', **kwargs):
+def compute_normalization(*inputs: Union[RealMeshField, ParticleField], resampler='cic', **kwargs) -> jax.Array:
     """
     Return normalization, in 1 / volume unit.
 
@@ -235,10 +235,20 @@ def compute_normalization(*particles, resampler='cic', **kwargs):
     -------
     Input particles are considered uncorrelated.
     """
-    particles = ParticleField.same_mesh(*particles, **kwargs)
+    meshs, particles = [], []
+    attrs = {}
+    for inp in inputs:
+        if isinstance(inp, RealMeshField):
+            meshs.append(inp)
+            attrs = {name: getattr(inp, name) for name in ['boxsize', 'boxcenter', 'meshsize']}
+        else:
+            particles.append(inp)
+    if particles: particles = ParticleField.same_mesh(*particles, **attrs)
     normalization = 1
-    for p in particles:
-        normalization *= p.paint(resampler=resampler, interlacing=1, compensate=False)
+    for mesh in meshs:
+        normalization *= mesh
+    for particle in particles:
+        normalization *= particle.paint(resampler=resampler, interlacing=1, compensate=False)
     return normalization.sum() / normalization.cellsize.prod()
 
 
