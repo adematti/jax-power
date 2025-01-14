@@ -10,7 +10,7 @@ from scipy import special
 
 from . import utils
 from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField
-from .utils import mkdir
+from .utils import legendre, mkdir
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['k', 'power_nonorm', 'nmodes', 'norm', 'shotnoise_nonorm'], meta_fields=['edges', 'ells'])
@@ -29,26 +29,30 @@ class PowerSpectrumMultipoles(object):
 
     @property
     def shotnoise(self):
+        """Shot noise."""
         return self.shotnoise_nonorm / self.norm
 
     @property
-    def power(self):
+    def power(self) -> jax.Array:
+        """Power spectrum estimate."""
         return (self.power_nonorm - self.shotnoise_nonorm) / self.norm
 
     def save(self, fn):
+        """Save power spectrum multipoles to file."""
         fn = str(fn)
         mkdir(os.path.dirname(fn))
         np.save(fn, asdict(self), allow_pickle=True)
 
     @classmethod
     def load(cls, fn):
+        """Load power spectrum from file."""
         fn = str(fn)
         state = np.load(fn, allow_pickle=True)[()]
         new = cls.__new__(cls)
         new.__dict__.update(**state)
         return new
 
-    def plot(self, ax=None, fn=None, kw_save=None, show=False):
+    def plot(self, ax=None, fn: str=None, kw_save: dict=None, show: bool=False):
         r"""
         Plot power spectrum.
 
@@ -86,69 +90,95 @@ class PowerSpectrumMultipoles(object):
         return ax
 
 
-def MeshFFTPower(*meshs: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField], edges: Union[np.ndarray, dict, None]=None,
-                   ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x'):
-        meshs = list(meshs)
-        assert 1 <= len(meshs) <= 2
-        for imesh, mesh in enumerate(meshs):
-            if not isinstance(mesh, (ComplexMeshField, HermitianComplexMeshField)):
-                meshs[imesh] = mesh.r2c()
-        kfun, knyq = np.min(meshs[0].kfun), np.min(meshs[0].knyq)
-        if edges is None:
-            edges = {}
-        if isinstance(edges, dict):
-            kmin = edges.get('min', 0.)
-            kmax = edges.get('max', knyq)
-            kstep = edges.get('step', kfun)
-            edges = np.arange(kmin, kmax, kstep)
+def compute_mesh_power(*meshs: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField], edges: Union[np.ndarray, dict, None]=None,
+                       ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x') -> PowerSpectrumMultipoles:
+    """
+    Compute power spectrum from mesh.
+
+    Parameters
+    ----------
+    meshs : RealMeshField, ComplexMeshField, HermitianComplexMeshField
+        Input meshs.
+
+    edges : np.ndarray, dict, default=None
+        ``kedges`` may be:
+        - a numpy array containing the :math:`k`-edges.
+        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
+            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
+        - ``None``, defaults to empty dictionary.
+
+    ells : tuple, default=0
+        Multiple orders to compute.
+
+    los : str, default='x'
+        Line-of-sight direction.
+
+    Returns
+    -------
+    power : PowerSpectrumMultipoles
+    """
+    meshs = list(meshs)
+    assert 1 <= len(meshs) <= 2
+    for imesh, mesh in enumerate(meshs):
+        if not isinstance(mesh, (ComplexMeshField, HermitianComplexMeshField)):
+            meshs[imesh] = mesh.r2c()
+    kfun, knyq = np.min(meshs[0].kfun), np.min(meshs[0].knyq)
+    if edges is None:
+        edges = {}
+    if isinstance(edges, dict):
+        kmin = edges.get('min', 0.)
+        kmax = edges.get('max', knyq)
+        kstep = edges.get('step', kfun)
+        edges = np.arange(kmin, kmax, kstep)
+    else:
+        edges = np.asarray(edges)
+
+    if len(meshs) == 1:
+        power = meshs[0] * meshs[0].conj()
+    else:
+        power = meshs[0] * meshs[1].conj()
+
+    boxsize, meshsize = power.boxsize, power.meshsize
+    hermitian = isinstance(power, HermitianComplexMeshField)
+    nmodes = jnp.full_like(power.value, 1 + hermitian, dtype='i4')
+    if hermitian:
+        nmodes = nmodes.at[..., 0].set(1)
+        if power.shape[-1] % 2 == 0:
+            nmodes = nmodes.at[..., -1].set(1)
+
+    kvec = power.coords(kind='wavenumber', sparse=True)
+    k = sum(kk**2 for kk in kvec)**0.5
+    k = k.ravel()
+    power = power.ravel()
+    nmodes = nmodes.ravel()
+    ibin = jnp.digitize(k, edges, right=False)
+    power = (power * nmodes).astype(power.dtype)
+
+    vlos = los
+    ndim = len(boxsize)
+    if isinstance(los, str):
+        vlos = [0.] * ndim
+        vlos['xyz'.index(los)] = 1.
+    vlos = np.array(vlos)
+    isscalar = np.ndim(ells) == 0
+    if isscalar: ells = (ells,)
+    mu = None
+    poles = []
+    for ell in ells:
+        if ell == 0:
+            leg = 1.
         else:
-            edges = np.asarray(edges)
-
-        if len(meshs) == 1:
-            power = meshs[0] * meshs[0].conj()
-        else:
-            power = meshs[0] * meshs[1].conj()
-
-        boxsize, meshsize = power.boxsize, power.meshsize
-        hermitian = isinstance(power, HermitianComplexMeshField)
-        nmodes = jnp.full_like(power.value, 1 + hermitian, dtype='i4')
-        if hermitian:
-            nmodes = nmodes.at[..., 0].set(1)
-            if power.shape[-1] % 2 == 0:
-                nmodes = nmodes.at[..., -1].set(1)
-
-        kvec = power.coords(kind='wavenumber', sparse=True)
-        k = sum(kk**2 for kk in kvec)**0.5
-        k = k.ravel()
-        power = power.ravel()
-        nmodes = nmodes.ravel()
-        ibin = jnp.digitize(k, edges, right=False)
-        power = (power * nmodes).astype(power.dtype)
-
-        vlos = los
-        ndim = len(boxsize)
-        if isinstance(los, str):
-            vlos = [0.] * ndim
-            vlos['xyz'.index(los)] = 1.
-        vlos = np.array(vlos)
-        isscalar = np.ndim(ells) == 0
-        if isscalar: ells = (ells,)
-        mu = None
-        poles = []
-        for ell in ells:
-            if ell == 0:
-                leg = 1.
-            else:
-                if mu is None:
-                    mu = np.where(k == 0., 0., sum(kk * ll for kk, ll in zip(kvec, vlos)) / k)
-                leg = special.legendre(ell)(mu)
-            poles.append(jnp.bincount(ibin, weights=power * leg, length=edges.size + 1)[1:-1])
-        ells = tuple(ells)
-        power = jnp.array(poles)
-        dtype = power.real.dtype
-        k = (k * nmodes).astype(dtype)
-        k = jnp.bincount(ibin, weights=k, length=edges.size + 1)[1:-1]
-        nmodes = jnp.bincount(ibin, weights=nmodes, length=edges.size + 1)[1:-1]
-        k /= nmodes
-        power *= jnp.prod(boxsize / meshsize**2) / nmodes
-        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells)
+            if mu is None:
+                knonzero = jnp.where(k == 0., 1., k)
+                mu = sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel() / knonzero
+            leg = (2 * ell + 1) * legendre(ell)(mu)
+        poles.append(jnp.bincount(ibin, weights=power * leg, length=edges.size + 1)[1:-1])
+    ells = tuple(ells)
+    power = jnp.array(poles)
+    dtype = power.real.dtype
+    k = (k * nmodes).astype(dtype)
+    k = jnp.bincount(ibin, weights=k, length=edges.size + 1)[1:-1]
+    nmodes = jnp.bincount(ibin, weights=nmodes, length=edges.size + 1)[1:-1]
+    k /= nmodes
+    power *= jnp.prod(boxsize / meshsize**2) / nmodes
+    return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells)

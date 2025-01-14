@@ -18,8 +18,7 @@ def generate_gaussian_random_field(power, seed=42, boxsize=1000., meshsize=128, 
     mesh = mesh.r2c()
 
     def kernel(value, kvec):
-        k = sum(kk**2 for kk in kvec)**0.5
-        ker = jnp.sqrt(power(k.ravel()).reshape(k.shape) / mesh.cellsize.prod())
+        ker = jnp.sqrt(power(kvec) / mesh.cellsize.prod())
         if unitary_amplitude:
             ker *= mesh.meshsize.prod()**0.5 / jnp.abs(value)
         return value * ker
