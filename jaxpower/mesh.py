@@ -284,13 +284,13 @@ class RealMeshField(BaseMeshField):
             fft = partial(HermitianComplexMeshField, jnp.fft.rfftn(self.value), meshsize=self.meshsize)
         return fft(boxsize=self.boxsize, boxcenter=self.boxcenter, attrs=self.attrs)
 
-    def apply(self, fn: callable, kind: str=Ellipsis, sparse: Union[bool, None]=False):
+    def apply(self, fn: Callable, kind: str=Ellipsis, sparse: Union[bool, None]=False):
         """
         Apply input kernel ``fn`` to mesh.
 
         Parameters
         ----------
-        fn : callable
+        fn : Callable
             Callable that takes the mesh value as input, and return a new mesh value.
 
         kind : str, default=Ellipsis
@@ -318,7 +318,7 @@ class RealMeshField(BaseMeshField):
         value = fn(*args)
         return self.clone(value=value)
 
-    def read(self, positions: jax.Array, resampler: Union[str, callable]='cic', compensate: bool=False):
+    def read(self, positions: jax.Array, resampler: Union[str, Callable]='cic', compensate: bool=False):
         """
         Read mesh, at input ``positions``.
 
@@ -327,7 +327,7 @@ class RealMeshField(BaseMeshField):
         positions : jax.Array
             Array of positions.
 
-        resampler : str, callable
+        resampler : str, Callable
             Resampler to read particule weights from mesh.
             One of ['ngp', 'cic', 'tsc', 'pcs'].
 
@@ -440,7 +440,7 @@ class ComplexMeshField(BaseMeshField):
 
         Parameters
         ----------
-        fn : callable
+        fn : Callable
             Callable that takes the mesh value as input, and return a new mesh value.
 
         kind : str, default=Ellipsis
@@ -503,8 +503,8 @@ class HermitianComplexMeshField(ComplexMeshField):
         return RealMeshField(jnp.fft.irfftn(self.value, s=self.meshsize), boxsize=self.boxsize, boxcenter=self.boxcenter, attrs=self.attrs)
 
 
-def get_mesh_cache_attrs(*positions: np.ndarray, meshsize: Union[np.ndarray, int]=None,
-                         boxsize: Union[np.ndarray, float]=None, boxcenter: Union[np.ndarray, float]=None,
+def get_mesh_attrs(*positions: np.ndarray, meshsize: Union[np.ndarray, int]=None,
+                   boxsize: Union[np.ndarray, float]=None, boxcenter: Union[np.ndarray, float]=None,
                          cellsize: Union[np.ndarray, float]=None, boxpad: Union[np.ndarray, float]=2.,
                          check: bool=False, dtype=None):
     """
@@ -591,7 +591,22 @@ def get_mesh_cache_attrs(*positions: np.ndarray, meshsize: Union[np.ndarray, int
     return {name: staticarray(value) for name, value in toret.items()}
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['positions', 'weights'], meta_fields=['boxsize', 'boxcenter', 'meshsize', '_cache_attrs'])
+def _get_common_mesh_cache_attrs(*attrs, **kwargs):
+    gather = attrs[0]
+    for a in attrs:
+         if a != gather:
+            raise RuntimeError("Not same attrs, {} vs {}".format(a, gather))
+    return gather | kwargs
+
+
+def get_common_mesh_attrs(*particles, **kwargs):
+    """Get common mesh attributes for multiple :class:`ParticleField`."""
+    attrs = _get_common_mesh_cache_attrs(*[p._cache_attrs for p in particles], **kwargs)
+    return get_mesh_attrs(*[p.positions for p in particles], **attrs)
+
+
+# Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
+@jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class ParticleField(object):
     """
@@ -604,46 +619,70 @@ class ParticleField(object):
     Note sure it's worth the complexity.
     """
 
-    positions: jax.Array
-    weights: jax.Array = None
-    boxsize: staticarray = None
-    boxcenter: staticarray = 0.
-    meshsize: staticarray = None
-    _cache_attrs: dict = None
+    positions: jax.Array = field(repr=False)
+    weights: jax.Array = field(repr=False)
+    _attrs: dict = field(init=False, repr=False)
+    _cache_attrs: dict = field(init=True, repr=False)
 
     def __init__(self, positions: jax.Array, weights: Union[jax.Array, None]=None, **kwargs):
         weights = jnp.ones_like(positions, shape=positions.shape[0]) if weights is None else weights
-        attrs = get_mesh_cache_attrs(positions, **kwargs)
-        self.__dict__.update(positions=positions, weights=weights, _cache_attrs=kwargs, **attrs)
-
-    @property
-    def cellsize(self):
-        return self.boxsize / self.meshsize
+        if '_cache_attrs' in kwargs:
+            raise ValueError
+        kwargs = {name: staticarray(value) if value is not None else value for name, value in kwargs.items()}
+        self.__dict__.update(positions=positions, weights=weights, _attrs=dict(), _cache_attrs=kwargs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        return self.__class__(self.positions, weights=self.weights, **(self._cache_attrs | kwargs))
+        state = asdict(self)
+        for name in ['positions', 'weights']:
+            if name in kwargs:
+                state[name] = kwargs.pop(name)
+        state.pop('_attrs')
+        attrs = state.pop('_cache_attrs')
+        attrs.update(kwargs)
+        state.update(attrs)
+        return self.__class__(**state)
+
+    def tree_flatten(self):
+        return tuple(getattr(self, name) for name in ['positions', 'weights']), {name: getattr(self, name) for name in ['_attrs', '_cache_attrs']}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(positions=children[0], weights=children[1], **aux_data)
+        return new
+
+    def __getitem__(self, name):
+        """Array-like slicing."""
+        return self.clone(positions=self.positions[name], weights=self.weights[name])
+
+    @property
+    def size(self):
+        return self.weights.size
 
     def sum(self, *args, **kwargs):
         """Sum of :attr:`weights`."""
         return self.weights.sum(*args, **kwargs)
 
+    @staticmethod
+    def same_mesh(*others, **kwargs):
+        attrs = get_common_mesh_attrs(*others, **kwargs)
+        return tuple(other.clone(**attrs) for other in others)
+
     @classmethod
-    def concatenate(cls, others, weights=None):
+    def concatenate(cls, others, weights=None, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
             weights = [1] * len(weights)
         else:
             assert len(weights) == len(others)
         gather = {name: [] for name in ['positions', 'weights']}
-        cache_attrs = others[0]._cache_attrs
         for other, factor in zip(others, weights):
             if not isinstance(other, ParticleField):
                 raise RuntimeError("Type of `other` not understood.")
-            if set(other._cache_attrs) != set(cache_attrs) or not all(np.all(cache_attrs[name] == other._cache_attrs[name]) for name in cache_attrs):
-                raise RuntimeError("Not same _cache_attrs, {} vs {}".format(other._cache_attrs, cache_attrs))
             gather['positions'].append(other.positions)
             gather['weights'].append(factor * other.weights)
+        cache_attrs = _get_common_mesh_cache_attrs(*[other._cache_attrs for other in others], **kwargs)
         for name, value in gather.items():
             gather[name] = jnp.concatenate(value, axis=0)
         return cls(**gather, **cache_attrs)
@@ -672,14 +711,14 @@ class ParticleField(object):
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
 
-    def paint(self, resampler: Union[str, callable]='cic', interlacing: int=1,
+    def paint(self, resampler: Union[str, Callable]='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real'):
         r"""
         Paint particles to mesh.
 
         Parameters
         ----------
-        resampler : str, callable
+        resampler : str, Callable
             Resampler to read particule weights from mesh.
             One of ['ngp', 'cic', 'tsc', 'pcs'].
 
@@ -741,6 +780,27 @@ class ParticleField(object):
         else:
             if out != 'real': toret = toret.r2c()
         return toret
+
+
+def _set_property(base, name):
+
+    def fn(self):
+        if name not in self._attrs:
+            self._attrs.update(get_mesh_attrs(self.positions, **self._cache_attrs))
+            if 'cellsize' not in self._attrs:
+                self._attrs['cellsize'] = self._attrs['boxsize'] / self._attrs['meshsize']
+        return self._attrs[name]
+
+    fn.__name__ = name
+    fn.__qualname__ = base.__qualname__ + "." + name
+    setattr(base, name, property(fn))
+
+
+for name in ['boxsize',
+             'boxcenter',
+             'meshsize',
+             'cellsize']:
+    _set_property(ParticleField, name)
 
 
 # For functional programming interface

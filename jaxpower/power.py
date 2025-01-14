@@ -1,6 +1,6 @@
 import os
 from functools import partial
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from typing import Any, Union
 
 import numpy as np
@@ -9,7 +9,7 @@ from jax import numpy as jnp
 from scipy import special
 
 from . import utils
-from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, ParticleField
+from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, ParticleField, get_common_mesh_attrs
 from .utils import legendre, mkdir
 
 
@@ -27,6 +27,12 @@ class PowerSpectrumMultipoles(object):
     norm: jax.Array = 1.
     shotnoise_nonorm: jax.Array = 0.
 
+    def clone(self, **kwargs):
+        """Create a new instance, updating some attributes."""
+        state = asdict(self)
+        state.update(kwargs)
+        return self.__class__(**state)
+
     @property
     def shotnoise(self):
         """Shot noise."""
@@ -35,7 +41,10 @@ class PowerSpectrumMultipoles(object):
     @property
     def power(self) -> jax.Array:
         """Power spectrum estimate."""
-        return (self.power_nonorm - self.shotnoise_nonorm) / self.norm
+        power_nonorm = self.power_nonorm
+        if 0 in self.ells:
+            power_nonorm = power_nonorm.at[self.ells.index(0)].add(- self.shotnoise_nonorm)
+        return power_nonorm / self.norm
 
     def save(self, fn):
         """Save power spectrum multipoles to file."""
@@ -61,7 +70,7 @@ class PowerSpectrumMultipoles(object):
         ax : matplotlib.axes.Axes, default=None
             Axes where to plot samples. If ``None``, takes current axes.
 
-        fn : string, default=None
+        fn : str, default=None
             If not ``None``, file name where to save figure.
 
         kw_save : dict, default=None
@@ -92,7 +101,7 @@ class PowerSpectrumMultipoles(object):
 
 def compute_mesh_power(*meshs: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField], edges: Union[np.ndarray, dict, None]=None,
                        ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x') -> PowerSpectrumMultipoles:
-    """
+    r"""
     Compute power spectrum from mesh.
 
     Parameters
@@ -180,5 +189,107 @@ def compute_mesh_power(*meshs: Union[RealMeshField, ComplexMeshField, HermitianC
     k = jnp.bincount(ibin, weights=k, length=edges.size + 1)[1:-1]
     nmodes = jnp.bincount(ibin, weights=nmodes, length=edges.size + 1)[1:-1]
     k /= nmodes
-    power *= jnp.prod(boxsize / meshsize**2) / nmodes
-    return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells)
+    power /= nmodes
+    norm = meshsize.prod() / jnp.prod(boxsize / meshsize)
+    return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm)
+
+
+@partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
+@dataclass(frozen=True, init=False)
+class FKPField(object):
+    """
+    Class defining the FKP field, data - randoms.
+
+    References
+    ----------
+    https://arxiv.org/abs/astro-ph/9304022
+    """
+    data: ParticleField
+    randoms: ParticleField
+
+    def __init__(self, data, randoms, **kwargs):
+        data, randoms = ParticleField.same_mesh(data, randoms, **kwargs)
+        self.__dict__.update(data=data, randoms=randoms)
+
+    def clone(self, **kwargs):
+        """Create a new instance, updating some attributes."""
+        state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
+        return self.__class__(**state)
+
+    def paint(self, resampler: Union[str, callable]='cic', interlacing: int=1,
+              compensate: bool=False, dtype=None, out: str='real'):
+        fkp = self.data - self.data.sum() / self.randoms.sum() * self.randoms
+        return fkp.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out)
+
+    @staticmethod
+    def same_mesh(*others, **kwargs):
+        attrs = get_common_mesh_attrs(*([other.data for other in others] + [other.randoms for other in others]), **kwargs)
+        return tuple(other.clone(**attrs) for other in others)
+
+
+def compute_normalization(*particles, resampler='cic', **kwargs):
+    """
+    Return normalization, in 1 / volume unit.
+
+    Warning
+    -------
+    Input particles are considered uncorrelated.
+    """
+    particles = ParticleField.same_mesh(*particles, **kwargs)
+    normalization = 1
+    for p in particles:
+        normalization *= p.paint(resampler=resampler, interlacing=1, compensate=False)
+    return normalization.sum() / normalization.cellsize.prod()
+
+
+def compute_fkp_power(*fkps: FKPField, edges: Union[np.ndarray, dict, None]=None,
+                      resampler='tsc', interlacing=3, ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x') -> PowerSpectrumMultipoles:
+    r"""
+    Compute power spectrum from FKP field.
+
+    Parameters
+    ----------
+    meshs : FKPField
+        Input FKP fields.
+
+    edges : np.ndarray, dict, default=None
+        ``kedges`` may be:
+        - a numpy array containing the :math:`k`-edges.
+        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
+            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
+        - ``None``, defaults to empty dictionary.
+
+    resampler : str, callable
+        Resampler to read particule weights from mesh.
+        One of ['ngp', 'cic', 'tsc', 'pcs'].
+
+    interlacing : int, default=1
+        If 1, no interlacing correction.
+        If > 1, order of interlacing correction.
+        Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
+
+    ells : tuple, default=0
+        Multiple orders to compute.
+
+    los : str, default='x'
+        Line-of-sight direction.
+
+    Returns
+    -------
+    power : PowerSpectrumMultipoles
+    """
+    fkps = FKPField.same_mesh(*fkps)
+    meshs = [fkp.paint(resampler=resampler, interlacing=interlacing, compensate=True, out='complex') for fkp in fkps]
+    # TODO: generalize to N fkp fields
+    if len(fkps) > 1:
+        shotnoise = 0.
+        randoms = [fkp.randoms for fkp in fkps]
+        alpha2 = jnp.array([fkp.data.sum() / fkp.randoms.sum() for fkp in fkps]).prod()
+    else:
+        fkp = fkps[0]
+        alpha = fkp.data.sum() / fkp.randoms.sum()
+        shotnoise = jnp.sum(fkp.data.weights**2) + alpha**2 * jnp.sum(fkp.randoms.weights**2)
+        randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
+        alpha2 = jnp.array([fkp.data.sum() / randoms.sum() for randoms in randoms]).prod()
+    norm = alpha2 * compute_normalization(*randoms, cellsize=10.)
+    return compute_mesh_power(*meshs, edges=edges, ells=ells, los=los).clone(norm=norm, shotnoise_nonorm=shotnoise)

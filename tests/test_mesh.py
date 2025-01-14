@@ -80,6 +80,10 @@ def test_particle_field():
     weights = 1. + random.uniform(random.key(42), shape=(10,))
     particle = ParticleField(positions, weights=weights, cellsize=10)
     particle = particle + particle
+    assert np.allclose(particle.cellsize, 10.)
+    particle2 = jax.tree.map(lambda x, y: x + y, particle, particle)
+    assert np.allclose(particle2.positions, 2 * particle.positions)
+    assert np.allclose(particle2.cellsize, particle.cellsize)
     assert particle.positions.shape[0] == positions.shape[0] * 2
     assert np.all(particle.boxsize > 40)
     assert particle.meshsize.shape == positions.shape[1:]
