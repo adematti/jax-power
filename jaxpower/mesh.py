@@ -591,7 +591,7 @@ def get_mesh_cache_attrs(*positions: np.ndarray, meshsize: Union[np.ndarray, int
     return {name: staticarray(value) for name, value in toret.items()}
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['positions', 'weights'], meta_fields=['_cache_attrs'])
+@partial(jax.tree_util.register_dataclass, data_fields=['positions', 'weights'], meta_fields=['boxsize', 'boxcenter', 'meshsize', '_cache_attrs'])
 @dataclass(init=False, frozen=True)
 class ParticleField(object):
     """
@@ -606,12 +606,19 @@ class ParticleField(object):
 
     positions: jax.Array
     weights: jax.Array = None
-    _attrs: dict = None
+    boxsize: staticarray = None
+    boxcenter: staticarray = 0.
+    meshsize: staticarray = None
     _cache_attrs: dict = None
 
     def __init__(self, positions: jax.Array, weights: Union[jax.Array, None]=None, **kwargs):
         weights = jnp.ones_like(positions, shape=positions.shape[0]) if weights is None else weights
-        self.__dict__.update(positions=positions, weights=weights, _attrs={}, _cache_attrs=kwargs)
+        attrs = get_mesh_cache_attrs(positions, **kwargs)
+        self.__dict__.update(positions=positions, weights=weights, _cache_attrs=kwargs, **attrs)
+
+    @property
+    def cellsize(self):
+        return self.boxsize / self.meshsize
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -638,7 +645,7 @@ class ParticleField(object):
             gather['positions'].append(other.positions)
             gather['weights'].append(factor * other.weights)
         for name, value in gather.items():
-            gather[name] = jnp.concatenate(gather[name], axis=0)
+            gather[name] = jnp.concatenate(value, axis=0)
         return cls(**gather, **cache_attrs)
 
     def __add__(self, other):
@@ -684,7 +691,7 @@ class ParticleField(object):
         compensate : bool, default=False
             If ``True``, applies compensation to the mesh after painting.
 
-        dtype : defaulat=None
+        dtype : default=None
             Mesh array type.
 
         out : str, default='real'
@@ -734,27 +741,6 @@ class ParticleField(object):
         else:
             if out != 'real': toret = toret.r2c()
         return toret
-
-
-def _set_property(base, name):
-
-    def fn(self):
-        if name not in self._attrs:
-            self._attrs.update(get_mesh_cache_attrs(self.positions, **self._cache_attrs))
-            if 'cellsize' not in self._attrs:
-                self._attrs['cellsize'] = self._attrs['boxsize'] / self._attrs['meshsize']
-        return self._attrs[name]
-
-    fn.__name__ = name
-    fn.__qualname__ = base.__qualname__ + "." + name
-    setattr(base, name, property(fn))
-
-
-for name in ['boxsize',
-             'boxcenter',
-             'meshsize',
-             'cellsize']:
-    _set_property(ParticleField, name)
 
 
 # For functional programming interface

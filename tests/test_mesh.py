@@ -20,7 +20,7 @@ def test_static_array():
 
 def test_base_mesh():
     mesh = BaseMeshField(jnp.ones((4, 3)))
-    mesh2 = BaseMeshField(jnp.fill((4, 3), 3.), boxsize=(4., 3.))
+    mesh2 = BaseMeshField(jnp.full((4, 3), 3.), boxsize=(4., 3.))
 
     @jax.jit
     def test(mesh, mesh2):
@@ -74,7 +74,7 @@ def test_resamplers():
             assert np.allclose(mesh.sum(), weights.sum())
 
 
-def test_particle_field()les methodes de:
+def test_particle_field():
     boxsize = 100.
     positions = boxsize * random.uniform(random.key(42), shape=(10, 3))
     weights = 1. + random.uniform(random.key(42), shape=(10,))

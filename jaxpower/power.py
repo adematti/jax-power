@@ -9,7 +9,7 @@ from jax import numpy as jnp
 from scipy import special
 
 from . import utils
-from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField
+from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, ParticleField
 from .utils import legendre, mkdir
 
 
