@@ -248,6 +248,11 @@ class RealMeshField(BaseMeshField):
 
     """A :class:`BaseMeshField` containing the values of a real (or complex) field."""
 
+    @property
+    def spacing(self):
+        """Spacing between two mesh nodes."""
+        return self.cellsize
+
     def coords(self, kind: str='position', sparse: Union[bool, None]=None):
         """
         Return mesh spatial coordinates.
@@ -399,6 +404,11 @@ def fftfreq(shape: tuple, kind: str='wavenumber', sparse: Union[bool, None]=None
 class ComplexMeshField(BaseMeshField):
 
     """A :class:`BaseMeshField` containing the values of a field in Fourier space."""
+
+    @property
+    def spacing(self):
+        """Spacing between two mesh nodes."""
+        return self.kfun
 
     @property
     def kfun(self):
@@ -711,7 +721,7 @@ class ParticleField(object):
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
 
-    def paint(self, resampler: Union[str, Callable]='cic', interlacing: int=1,
+    def paint(self, resampler: Union[str, Callable]='cic', interlacing: int=0,
               compensate: bool=False, dtype=None, out: str='real'):
         r"""
         Paint particles to mesh.
@@ -722,8 +732,8 @@ class ParticleField(object):
             Resampler to read particule weights from mesh.
             One of ['ngp', 'cic', 'tsc', 'pcs'].
 
-        interlacing : int, default=1
-            If 1, no interlacing correction.
+        interlacing : int, default=0
+            If 0 or 1, no interlacing correction.
             If > 1, order of interlacing correction.
             Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
 
@@ -742,6 +752,7 @@ class ParticleField(object):
         mesh : Output mesh.
         """
         resampler = getattr(resamplers, resampler, resampler)
+        interlacing = max(interlacing, 1)
         shifts = np.arange(interlacing) * 1. / interlacing
         positions = (self.positions - self.boxsize / 2. - self.boxcenter) / self.cellsize
 
