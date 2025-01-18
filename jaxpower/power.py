@@ -13,7 +13,7 @@ from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, Pa
 from .utils import legendre, mkdir
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['k', 'power_nonorm', 'nmodes', 'norm', 'shotnoise_nonorm'], meta_fields=['edges', 'ells', 'attrs'])
+@partial(jax.tree_util.register_dataclass, data_fields=['k', 'power_nonorm', 'nmodes', 'norm', 'shotnoise_nonorm', 'power_zero_nonorm'], meta_fields=['edges', 'ells', 'attrs'])
 @dataclass(frozen=True)
 class PowerSpectrumMultipoles(object):
 
