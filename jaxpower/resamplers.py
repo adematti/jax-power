@@ -8,6 +8,7 @@ https://arxiv.org/pdf/1512.07295
 
 import itertools
 from typing import Any, Union
+from collections.abc import Callable
 
 import numpy as np
 import jax
@@ -92,7 +93,7 @@ def _kernel_pcs(shape: tuple, positions: jax.Array):
         yield tuple(wrap(idx + ishift).T), jnp.prod(kernel, axis=-1)
 
 
-def _get_painter(kernel: callable):
+def _get_painter(kernel: Callable):
     def fn(mesh, positions, weights):
         for idx, ker in kernel(mesh.shape, positions):
             mesh = mesh.at[idx].add(weights * ker)
@@ -100,7 +101,7 @@ def _get_painter(kernel: callable):
     return jax.jit(fn)
 
 
-def _get_reader(kernel: callable):
+def _get_reader(kernel: Callable):
     def fn(mesh, positions):
         toret = 0.
         for idx, ker in kernel(mesh.shape, positions):

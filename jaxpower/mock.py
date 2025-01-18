@@ -1,10 +1,11 @@
+from typing import Union
+from collections.abc import Callable
+
 import numpy as np
 from jax import random
 from jax import numpy as jnp
 
 from .mesh import RealMeshField, ParticleField, staticarray
-from collections.abc import Callable
-from typing import Union
 
 
 def _get_ndim(*args):

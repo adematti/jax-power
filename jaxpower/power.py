@@ -317,7 +317,7 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
     musum = jnp.zeros(xsize, dtype=xdtype)
     xsum = jnp.zeros(xsize, dtype=xdtype)
     ysum = jnp.zeros((nell, xsize), dtype=dtype)  # extra dimension for multipoles
-    nsum = jnp.zeros(xsize, dtype=xdtype if mode_oversampling else 'i4')
+    nsum = jnp.zeros(xsize, dtype=xdtype if mode_oversampling else int)
     # If input array is Hermitian symmetric, only half of the last axis is stored in `mesh`
 
     spacing = mesh.spacing
