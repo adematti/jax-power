@@ -99,14 +99,17 @@ class BaseMeshField(object):
         """Save mesh to file."""
         fn = str(fn)
         mkdir(os.path.dirname(fn))
-        np.save(fn, asdict(self), allow_pickle=True)
+        np.savez(fn, **asdict(self))
 
     @classmethod
     def load(cls, fn):
         """Load mesh from file."""
         fn = str(fn)
-        state = np.load(fn, allow_pickle=True)[()]
+        state = np.load(fn, allow_pickle=True)
         new = cls.__new__(cls)
+        state = dict(state)
+        for name in ['boxsize', 'boxcenter', 'meshsize']:
+            state[name] = staticarray(state[name])
         new.__dict__.update(**state)
         return new
 
@@ -288,7 +291,7 @@ class RealMeshField(BaseMeshField):
         -------
         coords : tuple
         """
-        toret = [np.arange(s) for s in self.shape]
+        toret = [jnp.arange(s) for s in self.shape]
         if kind != 'index':
             toret = [idx * box + center - box / 2. for idx, box, center in zip(toret, self.boxsize, self.boxcenter)]
         if sparse is None:
@@ -405,16 +408,16 @@ def fftfreq(shape: tuple, kind: str='wavenumber', sparse: Union[bool, None]=None
         toret = [np.arange(s) for s in shape]
     else:
         if kind == 'circular':
-            period = (2 * np.pi,) * ndim
+            period = (2 * jnp.pi,) * ndim
         else:  # wavenumber
-            period = 2 * np.pi / spacing
+            period = 2 * jnp.pi / spacing
         toret = []
         for axis, s in enumerate(shape):
-            k = (np.fft.rfftfreq if axis == ndim - 1 and hermitian else np.fft.fftfreq)(s) * period[axis]
+            k = (jnp.fft.rfftfreq if axis == ndim - 1 and hermitian else jnp.fft.fftfreq)(s) * period[axis]
             toret.append(k)
     if sparse is None:
         return tuple(toret)
-    return np.meshgrid(*toret, sparse=sparse, indexing='ij')
+    return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['value'], meta_fields=['boxsize', 'boxcenter', 'attrs'])

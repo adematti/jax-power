@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from functools import partial
 
@@ -20,15 +21,30 @@ def test_mesh_power(plot=False):
 
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
-    #@jax.jit
-    def mock(seed):
-        mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=256, unitary_amplitude=True)
-        return compute_mesh_power(mesh, ells=(0, 2, 4), edges={'step': 0.01})
+    def get_fn(los='x'):
+        return dirname / 'tmp_{}.npy'.format(los)
 
-    power = mock(random.key(43))
-    fn = dirname / 'tmp.npy'
-    power.save(fn)
-    power = PowerSpectrumMultipoles.load(fn)
+    list_los = ['x', 'endpoint']
+
+    for los in list_los:
+        @partial(jax.jit, static_argnames=['los'])
+        def mock(seed, los='x'):
+            mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=128, unitary_amplitude=True)
+            return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+
+        power = mock(random.key(43))
+
+        nmock = 5
+        t0 = time.time()
+        power = mock(random.key(43), los=los)
+        print(f'time for jit {time.time() - t0:.2f}')
+        t0 = time.time()
+        for i in range(nmock):
+            mock(random.key(i + 42), los=los)
+        print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
+        power.save(get_fn(los))
+
+    power = PowerSpectrumMultipoles.load(get_fn(los='x'))
     if plot:
         from matplotlib import pyplot as plt
         ax = power.plot()
@@ -64,7 +80,14 @@ def test_fkp_power(plot=False):
             fkp = FKPField(data, randoms)
             return compute_fkp_power(fkp, ells=(0, 2, 4), los=los, edges={'step': 0.01})
 
+        nmock = 5
+        t0 = time.time()
         power = mock(random.key(43), los=los)
+        print(f'time for jit {time.time() - t0:.2f}')
+        t0 = time.time()
+        for i in range(nmock):
+            mock(random.key(i + 42), los=los)
+        print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         power.save(get_fn(los))
 
     if plot:
@@ -79,5 +102,5 @@ def test_fkp_power(plot=False):
 
 if __name__ == '__main__':
 
-    #test_mesh_power(plot=True)
+    test_mesh_power(plot=False)
     test_fkp_power(plot=True)

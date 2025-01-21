@@ -46,6 +46,11 @@ def test_base_mesh():
     mesh = mesh.at[1, 2].set(100.)
     assert isinstance(mesh, BaseMeshField) and np.allclose(mesh[1, 2], 100)
 
+    fn = dirname / 'mesh.npz'
+    mesh.save(fn)
+    mesh2 = RealMeshField.load(fn)
+    assert np.allclose(mesh2.value, mesh.value)
+
 
 def test_real_mesh():
     mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)), boxsize=(1000., 102., 2320.))

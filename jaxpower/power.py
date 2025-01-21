@@ -1,5 +1,5 @@
 import os
-from functools import partial
+from functools import partial, lru_cache
 from dataclasses import dataclass, asdict, field, fields
 from typing import Any, Union
 
@@ -49,7 +49,7 @@ class PowerSpectrumMultipoles(object):
         dig_zero = np.digitize(0., self.edges, right=False) - 1
         if 0 <= dig_zero < self.power_nonorm.shape[1]:
             with np.errstate(divide='ignore', invalid='ignore'):
-                toret.at[..., dig_zero].add(- self.power_zero_nonorm / self.nmodes[dig_zero])
+                toret = toret.at[..., dig_zero].add(- self.power_zero_nonorm / self.nmodes[dig_zero])
         return toret / self.norm
 
     def save(self, fn):
@@ -105,6 +105,7 @@ class PowerSpectrumMultipoles(object):
         return ax
 
 
+@lru_cache(maxsize=32, typed=False)
 def get_real_Ylm(ell, m):
     """
     Return a function that computes the real spherical harmonic of order (ell, m).
@@ -199,6 +200,9 @@ def get_real_Ylm(ell, m):
     Ylm.l = ell
     Ylm.m = m
     return Ylm
+
+
+[[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
 
 
 def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMeshField, xedges: np.ndarray,
@@ -327,9 +331,9 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
     mincell = np.min(spacing)
 
     if hermitian_symmetric:
-        nonsingular = np.ones(shape, dtype='?')
+        nonsingular = jnp.ones(shape, dtype='i4')
         # Get the indices that have positive freq along symmetry axis = -1
-        nonsingular[...] = coords[-1] > 0.
+        nonsingular = nonsingular.at[...].set(coords[-1] > 0.)
         nonsingular = nonsingular.ravel()
 
     import itertools
@@ -339,20 +343,20 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
     for shift in shifts:
         shift = spacing * shift / (2 * mode_oversampling + 1)
         xvec = coords
-        mask_zero_noshift = np.ravel(sum(xx**2 for xx in xvec) < (mincell / 2.)**2)  # mask_zero defined *before* shift
+        mask_zero_noshift = jnp.ravel(sum(xx**2 for xx in xvec) < (mincell / 2.)**2)  # mask_zero defined *before* shift
         xvec = tuple(xx + ss for xx, ss in zip(xvec, shift))
-        xnorm = np.ravel(sum(xx**2 for xx in xvec)**0.5)
+        xnorm = jnp.ravel(sum(xx**2 for xx in xvec)**0.5)
 
         # Get the bin indices for x on the slab
         dig_x = jnp.digitize(xnorm, xedges, right=False)
-        dig_x = dig_x.at[mask_zero_noshift].set(nx + 2)
+        dig_x = jnp.where(mask_zero_noshift, nx + 2, dig_x)
 
         # Get the bin indices for mu on the slab
         mu = None
         if muedges is not None or unique_ells:
-            mu = np.ravel(sum(xx * ll for xx, ll in zip(xvec, los)))
-            mask_zero = xnorm < (mincell / (2 * mode_oversampling + 1) / 2.)
-            mu[~mask_zero] /= xnorm[~mask_zero]
+            mu = jnp.ravel(sum(xx * ll for xx, ll in zip(xvec, los)))
+            with np.errstate(divide='ignore', invalid='ignore'):
+                mu = jnp.where(xnorm >= (mincell / (2 * mode_oversampling + 1) / 2.), mu / xnorm, 0.)
 
         if hermitian_symmetric == 0:
             mus = [mu]
@@ -364,33 +368,32 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
             if muedges is not None:
                 # Make the multi-index
                 dig_mu = jnp.digitize(mu, muedges, right=False)  # this is bins[i-1] <= x < bins[i]
-                dig_mu = dig_mu.at[mu == muedges[-1]].set(nmu)  # last mu inclusive
-                dig_mu = dig_mu.at[mask_zero_noshift].set(nmu + 2)
+                dig_mu = jnp.where(mu == muedges[-1], nmu, dig_mu) # last mu inclusive
+                dig_mu = jnp.where(mask_zero_noshift, nmu + 2, dig_mu)
             else:
                 dig_mu = nmu
 
             multi_index = jnp.ravel_multi_index([dig_x, dig_mu], (nx + 3, nmu + 3), mode='clip')
 
+            mode_weight = None
             if hermitian_symmetric and imu:
-                multi_index = multi_index[nonsingular]
-                xnorm = xnorm[nonsingular]  # it will be recomputed
-                if mu is not None: mu = mu[nonsingular]
+                mode_weight = nonsingular
 
             # Count number of modes in each bin
-            nsum = nsum.at[...].add(jnp.bincount(multi_index, length=nsum.size))
+            nsum = nsum.at[...].add(jnp.bincount(multi_index, weights=mode_weight, length=nsum.size))
             # Sum up x in each bin
-            xsum = xsum.at[...].add(jnp.bincount(multi_index, weights=xnorm, length=nsum.size))
+            xsum = xsum.at[...].add(jnp.bincount(multi_index, weights=xnorm * mode_weight if mode_weight is not None else xnorm, length=nsum.size))
             # Sum up mu in each bin
-            if muedges is not None: musum = musum.at[...].add(jnp.bincount(multi_index, weights=mu, length=nsum.size))
+            if muedges is not None: musum = musum.at[...].add(jnp.bincount(multi_index, weights=mu * mode_weight if mode_weight is not None else xnorm, length=nsum.size))
 
             # Compute multipoles by weighting by Legendre(ell, mu)
             for ill, ell in enumerate(unique_ells):
 
                 weightedmesh = 1. if ell == 0 else (2. * ell + 1.) * legpoly[ill](mu)
 
-                if hermitian_symmetric and imu:
+                if mode_weight is not None:
                     # Weight the input 3D array by the appropriate Legendre polynomial
-                    weightedmesh = hermitian_symmetric * weightedmesh * mesh[nonsingular].conj()  # hermitian_symmetric is 1 or -1
+                    weightedmesh = hermitian_symmetric * weightedmesh * mesh.conj() * mode_weight  # hermitian_symmetric is 1 or -1
                 else:
                     weightedmesh = weightedmesh * mesh
 
@@ -561,9 +564,9 @@ def compute_mesh_power(*meshs: Union[RealMeshField, ComplexMeshField, HermitianC
             for ill, ell in enumerate(nonzeroells):
                 Aell = sum(_2c(rmesh1 * Ylm(*xhat)) * Ylm(*khat) for Ylm in Ylms[ill])
                 Aell = Aell.conj() * A0
-                # Project on to 1d k-basis (averaging over mu=[-1,1])
+                # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, antisymmetric=bool(ell % 2), exclude_zero=False, mode_oversampling=mode_oversampling)
-                result.append((4 * np.pi * power, 4 * np.pi * power_zero))
+                result.append((4 * jnp.pi * power, 4 * jnp.pi * power_zero))
 
         # pmesh convention is F(k) = 1/N^3 \sum_{r} e^{-ikr} F(r); let us correct it here
         power, power_zero = (jnp.array([result[ells.index(ell)][ii] for ell in ells]) for ii in range(2))
