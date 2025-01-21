@@ -9,8 +9,8 @@ from jax import numpy as jnp
 from scipy import special
 
 from . import utils
-from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, ParticleField, staticarray, get_common_mesh_attrs
 from .utils import legendre, mkdir
+from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, ParticleField, staticarray, get_common_mesh_attrs
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['k', 'power_nonorm', 'nmodes', 'norm', 'shotnoise_nonorm', 'power_zero_nonorm'], meta_fields=['edges', 'ells', 'attrs'])
@@ -443,7 +443,6 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
     return (xmean2d, mumean2d, y2d, n2d, zero2d)
 
 
-
 def _get_los_vector(los: str | np.ndarray, ndim=3):
     vlos = None
     if isinstance(los, str):
@@ -582,8 +581,7 @@ def compute_mesh_power(*meshs: Union[RealMeshField, ComplexMeshField, HermitianC
 
         power = meshs[0] * meshs[1].conj()
         k, _, power, nmodes, power_zero = project_to_basis(power, edges, ells=ells, los=vlos, exclude_zero=False, mode_oversampling=mode_oversampling)
-        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm,
-                                       power_zero_nonorm=power_zero, attrs=attrs)
+        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=attrs)
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])

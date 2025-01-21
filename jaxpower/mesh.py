@@ -1,3 +1,4 @@
+import os
 import operator
 from functools import partial
 from collections.abc import Callable
@@ -8,6 +9,7 @@ import jax
 from jax import numpy as jnp
 from dataclasses import dataclass, field, asdict
 from . import resamplers
+from .utils import mkdir
 
 
 class staticarray(np.ndarray):
@@ -92,6 +94,21 @@ class BaseMeshField(object):
     @property
     def cellsize(self):
         return self.boxsize / self.meshsize
+
+    def save(self, fn):
+        """Save mesh to file."""
+        fn = str(fn)
+        mkdir(os.path.dirname(fn))
+        np.save(fn, asdict(self), allow_pickle=True)
+
+    @classmethod
+    def load(cls, fn):
+        """Load mesh from file."""
+        fn = str(fn)
+        state = np.load(fn, allow_pickle=True)[()]
+        new = cls.__new__(cls)
+        new.__dict__.update(**state)
+        return new
 
 
 def _set_property(base, name: str):
@@ -757,7 +774,7 @@ class ParticleField(object):
         positions = (self.positions - self.boxsize / 2. - self.boxcenter) / self.cellsize
 
         def _paint(positions):
-            return RealMeshField(resampler.paint(jnp.zeros(tuple(self.meshsize), dtype=dtype), positions, self.weights), boxsize=self.boxsize, boxcenter=self.boxcenter)
+            return RealMeshField(resampler.paint(jnp.zeros(self.meshsize, dtype=dtype), positions, self.weights), boxsize=self.boxsize, boxcenter=self.boxcenter)
 
         if isinstance(compensate, bool):
             if compensate:
