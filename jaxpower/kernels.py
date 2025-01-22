@@ -1,11 +1,9 @@
-from typing import Any, Union
-
 import numpy as np
 from jax import numpy as jnp
 
 
 
-def gradient(axis: Union[int, tuple, list] = 0, order: Union[str, None] = None):
+def gradient(axis: int | tuple | list=0, order: str | None=None):
     """
     Return the gradient kernel in the requested direction.
 
@@ -43,7 +41,7 @@ def gradient(axis: Union[int, tuple, list] = 0, order: Union[str, None] = None):
     return fn
 
 
-def invlaplace(order: Union[str, None] = None):
+def invlaplace(order: str | None=None):
     """
     Return the inverse Laplace kernel.
 

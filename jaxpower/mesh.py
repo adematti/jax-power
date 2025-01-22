@@ -1,13 +1,14 @@
 import os
 import operator
 from functools import partial
+from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Union
+from typing import Any
 
 import numpy as np
 import jax
 from jax import numpy as jnp
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from . import resamplers
 from .utils import mkdir
 
@@ -38,7 +39,7 @@ class staticarray(np.ndarray):
         return other.shape == self.shape and np.all(self.view(np.ndarray) == np.asarray(other))
 
     @classmethod
-    def fill(cls, fill: Union[float, np.ndarray], shape: Union[int, tuple], **kwargs):
+    def fill(cls, fill: float | np.ndarray, shape: int | tuple, **kwargs):
         """
         Create a :class:`staticarray` of shape ``shape``, filled with ``fill``,
         which can be a numpy array, as long as its shape is brodcastable with ``shape``.
@@ -49,36 +50,206 @@ class staticarray(np.ndarray):
         return cls(toret)
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['value'], meta_fields=['boxsize', 'boxcenter', 'attrs'])
-@dataclass(frozen=True)
+def _get_ndim(*args):
+    ndim = 3
+    for value in args:
+        try: ndim = len(value)
+        except: pass
+    return ndim
+
+
+
+def fftfreq(shape: tuple, kind: str='wavenumber', sparse: bool | None=None,
+            hermitian: bool=False, spacing: np.ndarray | float=1.):
+    r"""
+    Return mesh frequencies.
+
+    Parameters
+    ----------
+    kind : str, default='wavenumber'
+        Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units).
+
+    sparse : bool, default=None
+        If ``None``, return a tuple of 1D-arrays.
+        If ``False``, return a tuple of broadcastable arrays.
+        If ``True``, return a tuple of broadcastable arrays of same shape.
+
+    hermitian : bool, default=False
+        If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
+
+    spacing : float, default=1.
+        Sampling spacing, typically ``cellsize``.
+
+    Returns
+    -------
+    freqs : tuple
+    """
+    ndim = len(shape)
+    spacing = staticarray.fill(spacing, ndim)
+    if kind is None:
+        toret = [jnp.arange(s) for s in shape]
+    else:
+        if kind == 'circular':
+            period = (2 * jnp.pi,) * ndim
+        else:  # wavenumber
+            period = 2 * jnp.pi / spacing
+        toret = []
+        for axis, s in enumerate(shape):
+            k = (jnp.fft.rfftfreq if axis == ndim - 1 and hermitian else jnp.fft.fftfreq)(s) * period[axis]
+            toret.append(k)
+    if sparse is None:
+        return tuple(toret)
+    return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
+class MeshAttrs(object):
+
+    meshsize: staticarray = None
+    boxsize: staticarray = None
+    boxcenter: staticarray = 0.
+
+    def __init__(self, meshsize=None, boxsize=None, boxcenter=0.):
+        state = dict(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter)
+        ndim = _get_ndim(*[meshsize, boxsize, boxcenter])
+        if meshsize is not None:  # meshsize may not be provided (e.g. for particles) and it is fine
+            meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
+            if boxsize is None: boxsize = 1. * meshsize
+        if boxsize is not None: boxsize = staticarray.fill(boxsize, ndim, dtype=float)
+        if boxcenter is not None: boxcenter = staticarray.fill(boxcenter, ndim, dtype=float)
+        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter)
+
+    def tree_flatten(self):
+        return tuple(), asdict(self)
+
+    # For mapping
+    def __getitem__(self, key):
+            return getattr(self, key)
+
+    def keys(self):
+        return self.__annotations__.keys()
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(aux_data)
+        return new
+
+    def clone(self, **kwargs):
+        """Create a new instance, updating some attributes."""
+        state = asdict(self)
+        state.update(kwargs)
+        return self.__class__(**state)
+
+    @property
+    def cellsize(self):
+        return self.boxsize / self.meshsize
+
+    @property
+    def kfun(self):
+        """Fundamental wavenumber."""
+        return 2. * np.pi / self.boxsize
+
+    @property
+    def knyq(self):
+        """Nyquist wavenumber."""
+        return np.pi * self.meshsize / self.boxsize
+
+    def xcoords(self, kind: str='position', sparse: bool | None=None):
+        """
+        Return mesh spatial coordinates.
+
+        Parameters
+        ----------
+        kind : str, default='position'.
+            Either 'index' (index on mesh) or 'position' (spatial coordinates).
+
+        sparse : bool, default=None
+            If ``None``, return a tuple of 1D-arrays.
+            If ``False``, return a tuple of broadcastable arrays.
+            If ``True``, return a tuple of broadcastable arrays of same shape, :attr:`shape`.
+
+        Returns
+        -------
+        coords : tuple
+        """
+        toret = [jnp.arange(s) for s in self.meshsize]
+        if kind != 'index':
+            toret = [idx * box + center - box / 2. for idx, box, center in zip(toret, self.boxsize, self.boxcenter)]
+        if sparse is None:
+            return tuple(toret)
+        return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
+
+    def kcoords(self, kind: str='wavenumber', sparse: bool | None=None, hermitian: bool=False):
+        r"""
+        Return mesh Fourier coordinates.
+
+        Parameters
+        ----------
+        kind : str, default='wavenumber'
+            Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units).
+
+        sparse : bool, default=None
+            If ``None``, return a tuple of 1D-arrays.
+            If ``False``, return a tuple of broadcastable arrays.
+            If ``True``, return a tuple of broadcastable arrays of same shape.
+
+        hermitian : bool, default=False
+        If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
+
+        Returns
+        -------
+        coords : tuple
+        """
+        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=hermitian, spacing=self.boxsize / self.meshsize)
+
+
+
+# Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
 class BaseMeshField(object):
 
     """Representation of a N-dim field as a N-dim array."""
 
     value: jax.Array = field(repr=False)
-    boxsize: staticarray = None
-    boxcenter: staticarray = 0.
-    meshsize: staticarray = field(default=None, init=False, hash=None)
-    attrs: dict = field(default_factory=lambda: dict())
+    attrs: MeshAttrs = None
 
-    def __post_init__(self):
-        state = asdict(self)
-        state['value'] = jnp.asarray(state['value'])
+    def __init__(self, value, *args, **kwargs):
+        state = dict(value=jnp.asarray(value))
         shape = state['value'].shape
-        dtype = state['value'].real.dtype
-        if state['meshsize'] is None: state['meshsize'] = shape
-        if state['boxsize'] is None: state['boxsize'] = tuple(1. * s for s in self.shape)
-        for name, dt in zip(['meshsize', 'boxsize', 'boxcenter'], ['i4', dtype, dtype]):
-            state[name] = staticarray.fill(state[name], len(shape), dtype=dt)
+        if 'attrs' in kwargs:
+            args = args + (kwargs.pop('attrs'),)
+        if len(args):  # attrs is provided directly
+            assert len(args) == 1, f"Do not understand args {args}"
+            state['attrs'] = args[0].clone(**kwargs)
+        else:
+            meshsize = kwargs.get('meshsize', None)
+            if meshsize is None: meshsize = shape
+            meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
+            state['attrs'] = MeshAttrs(meshsize=meshsize, **kwargs)
         self.__dict__.update(state)
+
+    def tree_flatten(self):
+        return tuple(getattr(self, name) for name in ['value']), {name: getattr(self, name) for name in ['attrs']}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(value=children[0], attrs=aux_data['attrs'])
+        return new
 
     def __getitem__(self, item):
         return self.value.__getitem__(item)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        state = asdict(self)
-        state.update(kwargs)
+        state = {name: getattr(self, name) for name in ['value', 'attrs']}
+        for name in list(kwargs):
+            if name in state:
+                state[name] = kwargs.pop(name)
+        state['attrs'] = state['attrs'].clone(**kwargs)
         new = self.__class__.__new__(self.__class__)
         new.__dict__.update(state)
         return new
@@ -91,15 +262,11 @@ class BaseMeshField(object):
         # for numpy
         return np.array(self.value)
 
-    @property
-    def cellsize(self):
-        return self.boxsize / self.meshsize
-
     def save(self, fn):
         """Save mesh to file."""
         fn = str(fn)
         mkdir(os.path.dirname(fn))
-        np.savez(fn, **asdict(self))
+        np.savez(fn, **{name: getattr(self, name) for name in ['value', 'attrs']})
 
     @classmethod
     def load(cls, fn):
@@ -107,9 +274,6 @@ class BaseMeshField(object):
         fn = str(fn)
         state = np.load(fn, allow_pickle=True)
         new = cls.__new__(cls)
-        state = dict(state)
-        for name in ['boxsize', 'boxcenter', 'meshsize']:
-            state[name] = staticarray(state[name])
         new.__dict__.update(**state)
         return new
 
@@ -124,6 +288,14 @@ for name in ['ndim',
              'dtype',
              'real',
              'imag']:
+    _set_property(BaseMeshField, name)
+
+
+def _set_property(base, name: str):
+    setattr(base, name, property(lambda self: getattr(self.attrs, name)))
+
+
+for name in [field.name for field in fields(MeshAttrs)] + ['cellsize']:
     _set_property(BaseMeshField, name)
 
 
@@ -263,7 +435,8 @@ for name in ['set',
     _set_binary_at(_UpdateRef, name)
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['value'], meta_fields=['boxsize', 'boxcenter', 'attrs'])
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
 class RealMeshField(BaseMeshField):
 
     """A :class:`BaseMeshField` containing the values of a real (or complex) field."""
@@ -273,7 +446,7 @@ class RealMeshField(BaseMeshField):
         """Spacing between two mesh nodes."""
         return self.cellsize
 
-    def coords(self, kind: str='position', sparse: Union[bool, None]=None):
+    def coords(self, kind: str='position', sparse: bool | None=None):
         """
         Return mesh spatial coordinates.
 
@@ -291,12 +464,7 @@ class RealMeshField(BaseMeshField):
         -------
         coords : tuple
         """
-        toret = [jnp.arange(s) for s in self.shape]
-        if kind != 'index':
-            toret = [idx * box + center - box / 2. for idx, box, center in zip(toret, self.boxsize, self.boxcenter)]
-        if sparse is None:
-            return tuple(toret)
-        return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
+        return self.attrs.xcoords(kind=kind, sparse=sparse)
 
     def r2c(self):
         """
@@ -306,10 +474,10 @@ class RealMeshField(BaseMeshField):
         if jnp.iscomplexobj(self.value):
             fft = partial(ComplexMeshField, jnp.fft.fftn(self.value))
         else:
-            fft = partial(HermitianComplexMeshField, jnp.fft.rfftn(self.value), meshsize=self.meshsize)
-        return fft(boxsize=self.boxsize, boxcenter=self.boxcenter, attrs=self.attrs)
+            fft = partial(HermitianComplexMeshField, jnp.fft.rfftn(self.value))
+        return fft(self.attrs)
 
-    def apply(self, fn: Callable, kind: str=Ellipsis, sparse: Union[bool, None]=False):
+    def apply(self, fn: Callable, kind: str=Ellipsis, sparse: bool | None=False):
         """
         Apply input kernel ``fn`` to mesh.
 
@@ -343,7 +511,7 @@ class RealMeshField(BaseMeshField):
         value = fn(*args)
         return self.clone(value=value)
 
-    def read(self, positions: jax.Array, resampler: Union[str, Callable]='cic', compensate: bool=False):
+    def read(self, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False):
         """
         Read mesh, at input ``positions``.
 
@@ -377,50 +545,8 @@ class RealMeshField(BaseMeshField):
         return resampler.read(mesh.value, (positions - self.boxsize / 2. - self.boxcenter) / self.cellsize)
 
 
-def fftfreq(shape: tuple, kind: str='wavenumber', sparse: Union[bool, None]=None,
-            hermitian: bool=False, spacing: Union[np.ndarray, float]=1.):
-    r"""
-    Return mesh frequencies.
-
-    Parameters
-    ----------
-    kind : str, default='wavenumber'
-        Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units).
-
-    sparse : bool, default=None
-        If ``None``, return a tuple of 1D-arrays.
-        If ``False``, return a tuple of broadcastable arrays.
-        If ``True``, return a tuple of broadcastable arrays of same shape.
-
-    hermitian : bool, default=False
-        If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
-
-    spacing : float, default=1.
-        Sampling spacing, typically ``cellsize``.
-
-    Returns
-    -------
-    freqs : tuple
-    """
-    ndim = len(shape)
-    spacing = staticarray.fill(spacing, ndim)
-    if kind is None:
-        toret = [np.arange(s) for s in shape]
-    else:
-        if kind == 'circular':
-            period = (2 * jnp.pi,) * ndim
-        else:  # wavenumber
-            period = 2 * jnp.pi / spacing
-        toret = []
-        for axis, s in enumerate(shape):
-            k = (jnp.fft.rfftfreq if axis == ndim - 1 and hermitian else jnp.fft.fftfreq)(s) * period[axis]
-            toret.append(k)
-    if sparse is None:
-        return tuple(toret)
-    return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
-
-
-@partial(jax.tree_util.register_dataclass, data_fields=['value'], meta_fields=['boxsize', 'boxcenter', 'attrs'])
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
 class ComplexMeshField(BaseMeshField):
 
     """A :class:`BaseMeshField` containing the values of a field in Fourier space."""
@@ -433,14 +559,14 @@ class ComplexMeshField(BaseMeshField):
     @property
     def kfun(self):
         """Fundamental wavenumber."""
-        return 2. * np.pi / self.boxsize
+        return self.attrs.kfun
 
     @property
     def knyq(self):
         """Nyquist wavenumber."""
-        return np.pi * self.meshsize / self.boxsize
+        return self.attrs.knyq
 
-    def coords(self, kind: str='wavenumber', sparse: Union[bool, None]=None):
+    def coords(self, kind: str='wavenumber', sparse: bool | None=None):
         r"""
         Return mesh Fourier coordinates.
 
@@ -458,11 +584,11 @@ class ComplexMeshField(BaseMeshField):
         -------
         coords : tuple
         """
-        return fftfreq(self.shape, kind=kind, sparse=sparse, hermitian=False, spacing=self.boxsize / self.meshsize)
+        return self.attrs.kcoords(kind=kind, sparse=sparse, hermitian=False)
 
     def c2r(self):
         """FFT, from complex to real. Return :class:`RealMeshField`."""
-        return RealMeshField(jnp.fft.ifftn(self.value), boxsize=self.boxsize, boxcenter=self.boxcenter, attrs=self.attrs)
+        return RealMeshField(jnp.fft.ifftn(self.value), attrs=self.attrs)
 
     def apply(self, fn, sparse=False, kind=Ellipsis):
         """
@@ -499,15 +625,13 @@ class ComplexMeshField(BaseMeshField):
         return self.clone(value=value)
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['value'], meta_fields=['boxsize', 'boxcenter', 'meshsize', 'attrs'])
-@dataclass(frozen=True)
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
 class HermitianComplexMeshField(ComplexMeshField):
 
     """Same as :class:`ComplexMeshField`, but with Hermitian symmetry."""
 
-    meshsize: staticarray = field(default=None)
-
-    def coords(self, kind: str='wavenumber', sparse: Union[bool, None]=None):
+    def coords(self, kind: str='wavenumber', sparse: bool | None=None):
         r"""
         Return mesh Fourier coordinates.
 
@@ -525,18 +649,18 @@ class HermitianComplexMeshField(ComplexMeshField):
         -------
         coords : tuple
         """
-        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=True, spacing=self.boxsize / self.meshsize)
+        return self.attrs.kcoords(kind=kind, sparse=sparse, hermitian=True)
 
     def c2r(self):
         """FFT, from complex to real. Return :class:`RealMeshField`."""
         # shape must be provided in case meshsize is odd
-        return RealMeshField(jnp.fft.irfftn(self.value, s=self.meshsize), boxsize=self.boxsize, boxcenter=self.boxcenter, attrs=self.attrs)
+        return RealMeshField(jnp.fft.irfftn(self.value, s=self.meshsize), attrs=self.attrs)
 
 
-def get_mesh_attrs(*positions: np.ndarray, meshsize: Union[np.ndarray, int]=None,
-                   boxsize: Union[np.ndarray, float]=None, boxcenter: Union[np.ndarray, float]=None,
-                         cellsize: Union[np.ndarray, float]=None, boxpad: Union[np.ndarray, float]=2.,
-                         check: bool=False, dtype=None):
+def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
+                   boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
+                   cellsize: np.ndarray | float=None, boxpad: np.ndarray | float=2.,
+                   check: bool=False, dtype=None):
     """
     Compute enclosing box.
     Differentiable if ``meshsize`` is provided.
@@ -618,7 +742,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: Union[np.ndarray, int]=None
         toret['meshsize'] = meshsize
     boxcenter = staticarray.fill(boxcenter, ndim, dtype=dtype)
     toret = dict(boxsize=boxsize, boxcenter=boxcenter) | toret
-    return {name: staticarray(value) for name, value in toret.items()}
+    return MeshAttrs(**{name: staticarray(value) for name, value in toret.items()})
 
 
 def _get_common_mesh_cache_attrs(*attrs, **kwargs):
@@ -651,15 +775,14 @@ class ParticleField(object):
 
     positions: jax.Array = field(repr=False)
     weights: jax.Array = field(repr=False)
-    _attrs: dict = field(init=False, repr=False)
+    _attrs: MeshAttrs | None = field(init=False, repr=False)
     _cache_attrs: dict = field(init=True, repr=False)
 
-    def __init__(self, positions: jax.Array, weights: Union[jax.Array, None]=None, **kwargs):
+    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, **kwargs):
         weights = jnp.ones_like(positions, shape=positions.shape[0]) if weights is None else weights
-        if '_cache_attrs' in kwargs:
-            raise ValueError
+        assert '_cache_attrs' not in kwargs
         kwargs = {name: staticarray(value) if value is not None else value for name, value in kwargs.items()}
-        self.__dict__.update(positions=positions, weights=weights, _attrs=dict(), _cache_attrs=kwargs)
+        self.__dict__.update(positions=positions, weights=weights, _attrs=None, _cache_attrs=kwargs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -672,6 +795,12 @@ class ParticleField(object):
         attrs.update(kwargs)
         state.update(attrs)
         return self.__class__(**state)
+
+    @property
+    def attrs(self):
+        if self._attrs is None:
+            self.__dict__.update(_attrs=get_mesh_attrs(self.positions, **self._cache_attrs))
+        return self._attrs
 
     def tree_flatten(self):
         return tuple(getattr(self, name) for name in ['positions', 'weights']), {name: getattr(self, name) for name in ['_attrs', '_cache_attrs']}
@@ -741,7 +870,7 @@ class ParticleField(object):
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
 
-    def paint(self, resampler: Union[str, Callable]='cic', interlacing: int=0,
+    def paint(self, resampler: str | Callable='cic', interlacing: int=0,
               compensate: bool=False, dtype=None, out: str='real'):
         r"""
         Paint particles to mesh.
@@ -813,39 +942,26 @@ class ParticleField(object):
         return toret
 
 
-def _set_property(base, name):
-
-    def fn(self):
-        if name not in self._attrs:
-            self._attrs.update(get_mesh_attrs(self.positions, **self._cache_attrs))
-            if 'cellsize' not in self._attrs:
-                self._attrs['cellsize'] = self._attrs['boxsize'] / self._attrs['meshsize']
-        return self._attrs[name]
-
-    fn.__name__ = name
-    fn.__qualname__ = base.__qualname__ + "." + name
-    setattr(base, name, property(fn))
+def _set_property(base, name: str):
+    setattr(base, name, property(lambda self: getattr(self.attrs, name)))
 
 
-for name in ['boxsize',
-             'boxcenter',
-             'meshsize',
-             'cellsize']:
+for name in [field.name for field in fields(MeshAttrs)] + ['cellsize']:
     _set_property(ParticleField, name)
 
 
 # For functional programming interface
 
-def c2r(mesh: Union[ComplexMeshField, HermitianComplexMeshField]) -> RealMeshField:
+def c2r(mesh: ComplexMeshField | HermitianComplexMeshField) -> RealMeshField:
     return mesh.c2r()
 
 
-def r2c(mesh: RealMeshField) -> Union[ComplexMeshField, HermitianComplexMeshField]:
+def r2c(mesh: RealMeshField) -> ComplexMeshField | HermitianComplexMeshField:
     return mesh.r2c()
 
 
-def apply(mesh: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField],
-          fn: Callable, sparse=False, **kwargs) -> Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField]:
+def apply(mesh: RealMeshField | ComplexMeshField | HermitianComplexMeshField,
+          fn: Callable, sparse=False, **kwargs) -> RealMeshField | ComplexMeshField | HermitianComplexMeshField:
     return mesh.apply(fn, sparse=sparse, **kwargs)
 
 
@@ -853,5 +969,5 @@ def read(mesh: RealMeshField, positions: jax.Array, *args, **kwargs) -> jax.Arra
     return mesh.read(positions, *args, **kwargs)
 
 
-def paint(mesh: ParticleField, *args, **kwargs) -> Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField]:
+def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField | HermitianComplexMeshField:
     return mesh.paint(*args, **kwargs)

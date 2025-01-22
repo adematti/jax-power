@@ -1,7 +1,7 @@
 import os
 from functools import partial, lru_cache
-from dataclasses import dataclass, asdict, field, fields
-from typing import Any, Union
+from dataclasses import dataclass, asdict, field
+from collections.abc import Callable
 
 import numpy as np
 import jax
@@ -470,8 +470,8 @@ def _get_edges(edges, kfun=None, knyq=None):
 
 
 
-def compute_mesh_power(*meshs: Union[RealMeshField, ComplexMeshField, HermitianComplexMeshField], edges: Union[np.ndarray, dict, None]=None,
-                       ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
+def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField, edges: np.ndarray | dict | None=None,
+                       ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
     r"""
     Compute power spectrum from mesh.
 
@@ -609,7 +609,7 @@ class FKPField(object):
         state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
         return self.__class__(**state)
 
-    def paint(self, resampler: Union[str, callable]='cic', interlacing: int=1,
+    def paint(self, resampler: str | Callable='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real'):
         fkp = self.data - self.data.sum() / self.randoms.sum() * self.randoms
         return fkp.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out)
@@ -620,7 +620,7 @@ class FKPField(object):
         return tuple(other.clone(**attrs) for other in others)
 
 
-def compute_normalization(*inputs: Union[RealMeshField, ParticleField], resampler='cic', **kwargs) -> jax.Array:
+def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic', **kwargs) -> jax.Array:
     """
     Return normalization, in 1 / volume unit.
 
@@ -645,8 +645,8 @@ def compute_normalization(*inputs: Union[RealMeshField, ParticleField], resample
     return normalization.sum() / normalization.cellsize.prod()
 
 
-def compute_fkp_power(*fkps: FKPField, edges: Union[np.ndarray, dict, None]=None,
-                      resampler='tsc', interlacing=3, ells: Union[int, tuple]=0, los: Union[str, np.ndarray]='x') -> PowerSpectrumMultipoles:
+def compute_fkp_power(*fkps: FKPField, edges: np.ndarray | dict | None=None,
+                      resampler='tsc', interlacing=3, ells: int | tuple=0, los: str | np.ndarray='x') -> PowerSpectrumMultipoles:
     r"""
     Compute power spectrum from FKP field.
 

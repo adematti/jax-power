@@ -7,7 +7,6 @@ https://arxiv.org/pdf/1512.07295
 """
 
 import itertools
-from typing import Any, Union
 from collections.abc import Callable
 
 import numpy as np

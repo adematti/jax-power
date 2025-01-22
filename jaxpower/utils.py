@@ -3,7 +3,6 @@ import sys
 import time
 import logging
 import traceback
-from typing import Union
 
 import numpy as np
 import jax
@@ -75,7 +74,7 @@ def setup_logging(level=logging.INFO, stream=sys.stdout, filename=None, filemode
 
     Parameters
     ----------
-    level : string, int, default=logging.INFO
+    level : str, int, default=logging.INFO
         Logging level.
 
     stream : _io.TextIOWrapper, default=sys.stdout
@@ -161,7 +160,7 @@ class MemoryMonitor(object):
         self()
 
 
-def rebin(array: Union[np.ndarray, jax.Array], factor: Union[int, tuple], axis: Union[int, tuple]=None, reduction: callable=jnp.sum):
+def rebin(array: np.ndarray | jax.Array, factor: int | tuple, axis: int | tuple=None, reduction: callable=jnp.sum):
     """
     Rebin input ``array`` by factors ``factor`` along axes ``axis``,
     with reduction operation ``reduction``.

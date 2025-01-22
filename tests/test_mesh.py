@@ -6,7 +6,7 @@ from jax import numpy as jnp
 from jax import random
 
 from jaxpower import resamplers
-from jaxpower.mesh import staticarray, BaseMeshField, RealMeshField, ParticleField
+from jaxpower.mesh import staticarray, MeshAttrs, BaseMeshField, RealMeshField, ParticleField
 
 
 dirname = Path('_tests')
@@ -16,6 +16,11 @@ def test_static_array():
     array = staticarray.fill(3., 4)
     assert np.allclose(array, 3.) and array.shape == (4,)
     assert jnp.zeros(shape=staticarray.fill(3, 4)).shape == (3, 3, 3, 3)
+
+
+def test_mesh_attrs():
+    attrs = MeshAttrs(meshsize=100, boxsize=100.)
+    dict(**attrs)
 
 
 def test_base_mesh():
@@ -105,6 +110,7 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    test_mesh_attrs()
     test_resamplers()
     test_static_array()
     test_base_mesh()
