@@ -371,7 +371,7 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
                 dig_mu = jnp.where(mu == muedges[-1], nmu, dig_mu) # last mu inclusive
                 dig_mu = jnp.where(mask_zero_noshift, nmu + 2, dig_mu)
             else:
-                dig_mu = nmu
+                dig_mu = jnp.where(mask_zero_noshift, nmu + 2, nmu)
 
             multi_index = jnp.ravel_multi_index([dig_x, dig_mu], (nx + 3, nmu + 3), mode='clip')
 

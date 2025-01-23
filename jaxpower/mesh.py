@@ -176,7 +176,7 @@ class MeshAttrs(object):
         """
         toret = [jnp.arange(s) for s in self.meshsize]
         if kind != 'index':
-            toret = [idx * box + center - box / 2. for idx, box, center in zip(toret, self.boxsize, self.boxcenter)]
+            toret = [idx * cell + offset for idx, cell, offset in zip(toret, self.cellsize, self.boxcenter - self.boxsize / 2.)]
         if sparse is None:
             return tuple(toret)
         return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
