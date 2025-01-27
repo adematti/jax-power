@@ -222,7 +222,7 @@ class BaseMeshField(object):
             assert len(args) == 1, f"Do not understand args {args}"
             state['attrs'] = args[0].clone(**kwargs)
         else:
-            meshsize = kwargs.get('meshsize', None)
+            meshsize = kwargs.pop('meshsize', None)
             if meshsize is None: meshsize = shape
             meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
             state['attrs'] = MeshAttrs(meshsize=meshsize, **kwargs)
@@ -446,8 +446,7 @@ class RealMeshField(BaseMeshField):
     def rebin(self, factor: int | tuple, axis: int | tuple=None, reduce: Callable=jnp.sum):
         """Rebin mesh by factors ``factor`` along axes ``axis``, with reduction operation ``reduce``."""
         value = utils.rebin(self.value, factor, axis=axis, reduce=reduce)
-        boxsize = staticarray(value.shape) / self.meshsize * self.boxsize
-        return self.clone(value=value, boxsize=boxsize)
+        return self.clone(value=value)
 
     @property
     def spacing(self):
