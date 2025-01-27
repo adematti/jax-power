@@ -519,6 +519,7 @@ class RealMeshField(BaseMeshField):
         value = fn(*args)
         return self.clone(value=value)
 
+    @partial(jax.jit, static_argnames=['resampler', 'compensate'])
     def read(self, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False):
         """
         Read mesh, at input ``positions``.
@@ -880,6 +881,7 @@ class ParticleField(object):
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
 
+    @partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'dtype', 'out'])
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
               compensate: bool=False, dtype=None, out: str='real'):
         r"""

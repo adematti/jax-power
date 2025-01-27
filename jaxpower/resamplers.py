@@ -97,7 +97,7 @@ def _get_painter(kernel: Callable):
         for idx, ker in kernel(mesh.shape, positions):
             mesh = mesh.at[idx].add(ker if weights is None else weights * ker)
         return mesh
-    return jax.jit(fn)
+    return fn
 
 
 def _get_reader(kernel: Callable):
@@ -106,7 +106,7 @@ def _get_reader(kernel: Callable):
         for idx, ker in kernel(mesh.shape, positions):
             toret += mesh[idx] * ker
         return toret
-    return jax.jit(fn)
+    return fn
 
 
 # Define namespaces
