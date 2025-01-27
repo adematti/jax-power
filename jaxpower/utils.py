@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import traceback
+from collections.abc import Callable
 
 import numpy as np
 import jax
@@ -160,16 +161,16 @@ class MemoryMonitor(object):
         self()
 
 
-def rebin(array: np.ndarray | jax.Array, factor: int | tuple, axis: int | tuple=None, reduction: callable=jnp.sum):
+def rebin(array: np.ndarray | jax.Array, factor: int | tuple, axis: int | tuple=None, reduce: Callable=jnp.sum):
     """
     Rebin input ``array`` by factors ``factor`` along axes ``axis``,
-    with reduction operation ``reduction``.
+    with reduction operation ``reduce``.
     """
     if axis is None:
         axis = list(range(array.ndim))
-    if not np.ndim(axis) == 0:
+    if np.ndim(axis) == 0:
         axis = [axis]
-    if not np.ndim(factor) == 0:
+    if np.ndim(factor) == 0:
         factor = [factor] * len(axis)
     factors = [1] * array.ndim
     for a, f in zip(axis, factor):
@@ -183,7 +184,7 @@ def rebin(array: np.ndarray | jax.Array, factor: int | tuple, axis: int | tuple=
     array = array.reshape(flattened)
 
     for i in range(len(factors)):
-        array = reduction(array, axis=-1 * (i + 1))
+        array = reduce(array, axis=-1 * (i + 1))
 
     return array
 

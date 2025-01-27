@@ -54,11 +54,14 @@ def test_base_mesh():
     fn = dirname / 'mesh.npz'
     mesh.save(fn)
     mesh2 = RealMeshField.load(fn)
+    mesh3.attrs.boxsize
     assert np.allclose(mesh2.value, mesh.value)
 
 
 def test_real_mesh():
     mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)), boxsize=(1000., 102., 2320.))
+    mesh2 = mesh.rebin(factor=(2, 1, 1))
+    assert mesh2.shape == (5, 21, 13)
     mesh2 = mesh.r2c()
     assert mesh2.shape != mesh.shape
     assert np.allclose(mesh2.c2r(), mesh)

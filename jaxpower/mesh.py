@@ -1,7 +1,6 @@
 import os
 import operator
 from functools import partial
-from collections import namedtuple
 from collections.abc import Callable
 from typing import Any
 
@@ -9,8 +8,7 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 from dataclasses import dataclass, field, fields, asdict
-from . import resamplers
-from .utils import mkdir
+from . import resamplers, utils
 
 
 class staticarray(np.ndarray):
@@ -205,7 +203,6 @@ class MeshAttrs(object):
         return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=hermitian, spacing=self.boxsize / self.meshsize)
 
 
-
 # Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
@@ -246,6 +243,10 @@ class BaseMeshField(object):
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
         state = {name: getattr(self, name) for name in ['value', 'attrs']}
+        name = 'value'
+        # value is provided, set meshsize to value.shape as a default
+        if kwargs.get(name, state[name]).shape != state[name].shape and 'attrs' not in kwargs:
+            kwargs.setdefault('meshsize', kwargs[name].shape)
         for name in list(kwargs):
             if name in state:
                 state[name] = kwargs.pop(name)
@@ -265,15 +266,16 @@ class BaseMeshField(object):
     def save(self, fn):
         """Save mesh to file."""
         fn = str(fn)
-        mkdir(os.path.dirname(fn))
+        utils.mkdir(os.path.dirname(fn))
         np.savez(fn, **{name: getattr(self, name) for name in ['value', 'attrs']})
 
     @classmethod
     def load(cls, fn):
         """Load mesh from file."""
         fn = str(fn)
-        state = np.load(fn, allow_pickle=True)
+        state = dict(np.load(fn, allow_pickle=True))
         new = cls.__new__(cls)
+        state['attrs'] = state['attrs'][()]
         new.__dict__.update(**state)
         return new
 
@@ -441,6 +443,12 @@ class RealMeshField(BaseMeshField):
 
     """A :class:`BaseMeshField` containing the values of a real (or complex) field."""
 
+    def rebin(self, factor: int | tuple, axis: int | tuple=None, reduce: Callable=jnp.sum):
+        """Rebin mesh by factors ``factor`` along axes ``axis``, with reduction operation ``reduce``."""
+        value = utils.rebin(self.value, factor, axis=axis, reduce=reduce)
+        boxsize = staticarray(value.shape) / self.meshsize * self.boxsize
+        return self.clone(value=value, boxsize=boxsize)
+
     @property
     def spacing(self):
         """Spacing between two mesh nodes."""
@@ -542,7 +550,9 @@ class RealMeshField(BaseMeshField):
         mesh = self
         if kernel_compensate is not None:
             mesh = mesh.r2c().apply(kernel_compensate).c2r()
-        return resampler.read(mesh.value, (positions - self.boxsize / 2. - self.boxcenter) / self.cellsize)
+        if isinstance(positions, ParticleField):
+            positions = positions.positions
+        return resampler.read(mesh.value, (positions + self.boxsize / 2. - self.boxcenter) / self.cellsize)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -903,10 +913,10 @@ class ParticleField(object):
         resampler = getattr(resamplers, resampler, resampler)
         interlacing = max(interlacing, 1)
         shifts = np.arange(interlacing) * 1. / interlacing
-        positions = (self.positions - self.boxsize / 2. - self.boxcenter) / self.cellsize
+        positions = (self.positions + self.boxsize / 2. - self.boxcenter) / self.cellsize
 
         def _paint(positions):
-            return RealMeshField(resampler.paint(jnp.zeros(self.meshsize, dtype=dtype), positions, self.weights), boxsize=self.boxsize, boxcenter=self.boxcenter)
+            return RealMeshField(resampler.paint(jnp.zeros(self.meshsize, dtype=dtype), positions, self.weights.astype(dtype) if dtype is not None else self.weights), boxsize=self.boxsize, boxcenter=self.boxcenter)
 
         if isinstance(compensate, bool):
             if compensate:

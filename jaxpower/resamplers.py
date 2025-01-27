@@ -93,9 +93,9 @@ def _kernel_pcs(shape: tuple, positions: jax.Array):
 
 
 def _get_painter(kernel: Callable):
-    def fn(mesh, positions, weights):
+    def fn(mesh, positions, weights=None):
         for idx, ker in kernel(mesh.shape, positions):
-            mesh = mesh.at[idx].add(weights * ker)
+            mesh = mesh.at[idx].add(ker if weights is None else weights * ker)
         return mesh
     return jax.jit(fn)
 
