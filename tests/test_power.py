@@ -7,10 +7,50 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_fkp_power
+from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_uniform_particles, FKPField,
+                      compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, compute_mean_mesh_power)
 
 
 dirname = Path('_tests')
+
+
+def test_binned_statistic():
+
+    x = [np.linspace(0.01, 0.2, 10), np.linspace(0.01, 0.2, 10)]
+    v = x
+    observable = BinnedStatistic(x=x, value=v, projs=[0, 2])
+    assert np.allclose(observable.view(projs=2), v[0])
+    assert np.allclose(observable.view(xlim=(0., 0.1), projs=0), v[0][v[0] <= 0.1])
+    assert np.allclose(observable.select(rebin=2).view(projs=0), (v[0][::2] + v[0][1::2]) / 2.)
+    fn = dirname / 'tmp.npy'
+    observable.save(fn)
+    observable2 = BinnedStatistic.load(fn)
+    assert np.allclose(observable2.view(), observable.view())
+
+    xt = [np.linspace(0.01, 0.2, 20), np.linspace(0.01, 0.2, 20)]
+    vt = xt
+    theory = BinnedStatistic(x=xt, value=vt, projs=[0, 2])
+    wmat = WindowMatrix(observable=observable, theory=theory, value=np.ones((observable.size, theory.size)))
+    assert np.allclose(wmat.select(xlim=(0., 0.15), axis='o').observable.x(projs=0), v[0][v[0] <= 0.15])
+    assert np.allclose(wmat.select(axis='t', projs=0, select_projs=True).theory.view(), vt[0])
+
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    def mock(seed, los='x'):
+        mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=64, unitary_amplitude=True)
+        return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+
+    power = mock(random.key(43), los='x')
+    power.save(fn)
+    observable2 = BinnedStatistic.load(fn)
+    assert np.allclose(observable2.view(), power.view())
+    observable2.plot(show=True)
+    assert power.clone(norm=0.1).norm == 0.1
 
 
 def test_mesh_power(plot=False):
@@ -26,13 +66,12 @@ def test_mesh_power(plot=False):
 
     list_los = ['x', 'endpoint']
 
-    for los in list_los:
-        @partial(jax.jit, static_argnames=['los'])
-        def mock(seed, los='x'):
-            mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=128, unitary_amplitude=True)
-            return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+    @partial(jax.jit, static_argnames=['los'])
+    def mock(seed, los='x'):
+        mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=128, unitary_amplitude=True)
+        return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
 
-        power = mock(random.key(43))
+    for los in list_los:
 
         nmock = 5
         t0 = time.time()
@@ -45,13 +84,14 @@ def test_mesh_power(plot=False):
         power.save(get_fn(los))
 
     power = PowerSpectrumMultipoles.load(get_fn(los='x'))
+    k = power.x(projs=0)
     if plot:
         from matplotlib import pyplot as plt
         ax = power.plot()
-        ax.plot(power.k, power.k * pk(power.k))
+        ax.plot(k, k * pk(k))
         plt.show()
     # remove first few bins because of binning effects
-    assert np.allclose(power.power[0, 2:], pk(power.k)[2:], rtol=1e-2)
+    assert np.allclose(power.view(projs=0)[2:], pk(k)[2:], rtol=1e-2)
 
 
 def test_fkp_power(plot=False):
@@ -94,13 +134,60 @@ def test_fkp_power(plot=False):
         from matplotlib import pyplot as plt
 
         for los in list_los:
-            ax = power.plot()
-            ax.plot(power.k, power.k * pk(power.k))
+            ax = power.plot().axes[0]
+            k = power.x(projs=0)
+            ax.plot(k, k * pk(k))
+            ax.set_title(los)
+            plt.show()
+
+
+def test_mean_power(plot=False):
+
+    def pk(k):
+        kp = 0.01
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    f, b = 0.8, 1.5
+    beta = f / b
+    poles = {0: lambda k: (1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(k),
+             2: lambda k: 0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(k),
+             4: lambda k: 8. / 35 * beta ** 2 * pk(k)}
+
+    list_los = [('x', None), ('endpoint', None), ('endpoint', 'kaiser')]
+    attrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
+
+    @partial(jax.jit, static_argnames=['los', 'thlos'])
+    def mean(los='x', thlos=None):
+        theory = poles
+        if thlos is not None:
+            theory = (poles, thlos)
+        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+
+    for los, thlos in list_los:
+
+        #power_mock = mock(random.key(43), los=los)
+        t0 = time.time()
+        power_mean = mean(los=los, thlos=thlos)
+        print(f'time for jit {time.time() - t0:.2f}')
+        nmock = 5
+        t0 = time.time()
+        for i in range(nmock):
+            jax.block_until_ready(mean(los=los, thlos=thlos))
+        print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
+
+        if plot:
+            from matplotlib import pyplot as plt
+            ax = power_mean.plot().axes[0]
+            for ell in power_mean.ells:
+                k = power_mean.x(projs=ell)
+                ax.plot(k, k * poles[ell](k), color='k', linestyle='--')
             ax.set_title(los)
             plt.show()
 
 
 if __name__ == '__main__':
 
+    test_binned_statistic()
     test_mesh_power(plot=False)
-    test_fkp_power(plot=True)
+    test_fkp_power(plot=False)
+    test_mean_power(plot=True)

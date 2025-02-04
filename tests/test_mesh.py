@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ def test_static_array():
 def test_mesh_attrs():
     attrs = MeshAttrs(meshsize=100, boxsize=100.)
     dict(**attrs)
+    attrs.create()
 
 
 def test_base_mesh():
@@ -85,6 +87,35 @@ def test_resamplers():
             mesh = jnp.zeros(meshshape)
             mesh = getattr(resamplers, resampler).paint(mesh, positions, weights)
             assert np.allclose(mesh.sum(), weights.sum())
+
+
+def test_jit():
+
+    from jaxpower.resamplers import tsc
+    mesh = jnp.zeros((32,) * 3)
+    positions = random.uniform(random.key(64), shape=(100000, 3))
+    t0 = time.time()
+    paint = jax.jit(tsc.paint)
+    mesh = paint(mesh, positions)
+    #values = tsc.read(mesh, positions)
+    print(f'time for jit {time.time() - t0:.2f}')
+    t0 = time.time()
+    nmock = 10
+    for i in range(nmock):
+        mesh = paint(mesh, positions)
+        jax.block_until_ready(mesh)
+    print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
+
+    positions = ParticleField(positions, meshsize=mesh.shape, boxsize=1., boxcenter=0.5)
+    t0 = time.time()
+    positions.paint(resampler='tsc')
+    print(f'time for jit {time.time() - t0:.2f}')
+    t0 = time.time()
+    nmock = 10
+    for i in range(nmock):
+        mesh = positions.paint(resampler='tsc')
+        jax.block_until_ready(mesh)
+    print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
 
 
 def test_particle_field():

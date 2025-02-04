@@ -121,18 +121,18 @@ class MeshAttrs(object):
     def tree_flatten(self):
         return tuple(), asdict(self)
 
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(aux_data)
+        return new
+
     # For mapping
     def __getitem__(self, key):
             return getattr(self, key)
 
     def keys(self):
         return self.__annotations__.keys()
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        new = cls.__new__(cls)
-        new.__dict__.update(aux_data)
-        return new
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -201,6 +201,39 @@ class MeshAttrs(object):
         coords : tuple
         """
         return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=hermitian, spacing=self.boxsize / self.meshsize)
+
+    def create(self, kind: str='real', fill: float=None, dtype=None):
+        """
+        Create mesh with these given attributes.
+
+        Parameters
+        ----------
+        kind : str, default='real'
+            Type of mesh to return, 'real', 'complex', or 'hermitian_complex'.
+
+        fill : float, complex, default=None
+            Optionally, value to fill mesh with.
+            Empty as a default.
+
+        dtype : DTypeLike, default=None
+            Data type, float or complex.
+
+        Returns
+        -------
+        mesh : New mesh.
+        """
+        kind = {'real': RealMeshField, 'complex': ComplexMeshField, 'hermitian_complex': HermitianComplexMeshField}.get(kind, kind)
+        name = kind.__name__.lower()
+        shape = tuple(self.meshsize)
+        if 'hermitian' in name:
+            shape = shape[:-1] + (shape[-1] // 2 + 1,)
+        if dtype is None:
+            dtype = complex if 'complex' in name else float
+        if fill is None:
+            value = jnp.empty(shape, dtype=dtype)
+        else:
+            value = jnp.full(shape, fill, dtype=dtype)
+        return kind(value, **self)
 
 
 # Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
@@ -516,6 +549,7 @@ class RealMeshField(BaseMeshField):
         else:
             raise ValueError('do not recognize kind = {}'.format(kind))
         value = fn(*args)
+        assert value.shape == self.shape, f'kernel does not return correct shape: {value.shape} vs expected {self.shape}'
         return self.clone(value=value)
 
     @partial(jax.jit, static_argnames=['resampler', 'compensate'])
@@ -632,6 +666,7 @@ class ComplexMeshField(BaseMeshField):
         else:
             raise ValueError('do not recognize kind = {}'.format(kind))
         value = fn(*args)
+        assert value.shape == self.shape, f'kernel does not return correct shape: {value.shape} vs expected {self.shape}'
         return self.clone(value=value)
 
 
