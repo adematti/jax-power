@@ -917,12 +917,14 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                         for Yl1m1 in Ylms[ell1]:
 
                             def kernel(value, kvec):
-                                return poles[ell1, wa1](jnp.sqrt(sum(kk**2 for kk in kvec))) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*khat)
+                                knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+                                khat = [_safe_divide(kk, knorm) for kk in kvec]
+                                return poles[ell1, wa1](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*khat)
 
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r() * snorm**wa1
                             Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
 
-                elif theory_los == 'kaiser':
+                elif theory_los == 'local':
                     coeff2 = {(0, 0): lambda k: poles[0, 0](k) - 7. / 18. * poles[4, 0](k),
                               (0, 2): lambda k: 1. / 2. * poles[2, 0](k) - 5. / 18. * poles[4, 0](k),
                               (2, 2): lambda k: 35. / 18. * poles[4, 0](k)}
@@ -931,8 +933,11 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                         for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
 
                             def kernel(value, kvec):
-                                return coeff2[ell1, ell2](jnp.sqrt(sum(kk**2 for kk in kvec))) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*khat) * Yl2m2(*khat)
+                                knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+                                khat = [_safe_divide(kk, knorm) for kk in kvec]
+                                return coeff2[ell1, ell2](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])
 
+                            #xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r().real
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
                             Q += (4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * xi * _2r(_2c(rmesh1 * Ylm(*xhat) * Yl1m1(*xhat)).conj() * _2c(rmesh2 * Yl2m2(*xhat)))
 

@@ -58,13 +58,14 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
         meshsize, cellsize = attrs.meshsize, attrs.cellsize
         if unitary_amplitude:
             for imesh, mesh in enumerate(meshs):
-                meshs[imesh] *= meshsize.prod(dtype=rdtype)**0.5 / jnp.abs(mesh.value)
+                meshs[imesh] *= jnp.sqrt(meshsize.prod(dtype=rdtype)) / jnp.abs(mesh.value)
 
         kvec = meshs[0].coords(sparse=True)
+        shape = meshs[0].shape
         knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
 
-        a11 = 35. / 18. * poles[4](knorm) / cellsize.prod()
-        a00 = poles[0](knorm) / cellsize.prod() - 1. / 5. * a11
+        a11 = 35. / 18. * poles[4](knorm).reshape(shape) / cellsize.prod()
+        a00 = poles[0](knorm).reshape(shape) / cellsize.prod() - 1. / 5. * a11
         # Cholesky decomposition
         l00 = jnp.sqrt(a00)
         del a00
@@ -72,14 +73,15 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
         mesh = meshs[0] * l00
         mesh = mesh.c2r()
 
-        a10 = 1. / 2. * poles[2](knorm) / cellsize.prod() - 1. / 7. * a11
-        l10 = a10 / l00
+        a10 = 1. / 2. * poles[2](knorm).reshape(shape) / cellsize.prod() - 1. / 7. * a11
+        l10 = a10 / jnp.where(knorm.reshape(shape) == 0., 1., l00)
         del a10, l00
         # The mesh for ell = 2
         mesh2 = meshs[0] * l10 + meshs[1] * jnp.sqrt(a11 - l10**2)
         del a11, l10, meshs
 
         # The Fourier-space grid
+        knorm = knorm.reshape(shape)
         khat = [_safe_divide(kk, knorm) for kk in kvec]
         del knorm, kvec
 

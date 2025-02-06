@@ -686,7 +686,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             oneslice = slice(start, stop, 1)
             ww = self._weights[iproj][oneslice]
             if not weighted:
-                ww = np.ones_like(ww)
+                ww = np.ones(ww.shape)
             if len(ww) % step != 0:
                 raise IndexError('slicing step = {:d} does not divide length {:d}'.format(step, len(ww)))
             tmp_lim = np.zeros((len(ww), len(self._weights[iproj])), dtype=float)

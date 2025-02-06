@@ -153,7 +153,7 @@ def test_mean_power(plot=False):
              2: lambda k: 0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(k),
              4: lambda k: 8. / 35 * beta ** 2 * pk(k)}
 
-    list_los = [('x', None), ('endpoint', None), ('endpoint', 'kaiser')]
+    list_los = [('x', None), ('endpoint', None), ('endpoint', 'local')]
     attrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
 
     @partial(jax.jit, static_argnames=['los', 'thlos'])
