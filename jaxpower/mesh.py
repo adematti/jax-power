@@ -915,7 +915,6 @@ class ParticleField(object):
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
 
-    @partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'dtype', 'out'])
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
               compensate: bool=False, dtype=None, out: str='real'):
         r"""
@@ -946,46 +945,52 @@ class ParticleField(object):
         -------
         mesh : Output mesh.
         """
-        resampler = getattr(resamplers, resampler, resampler)
-        interlacing = max(interlacing, 1)
-        shifts = np.arange(interlacing) * 1. / interlacing
-        positions = (self.positions + self.boxsize / 2. - self.boxcenter) / self.cellsize
+        return _paint(self.attrs, self.positions, weights=self.weights, resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out)
 
-        def _paint(positions):
-            return RealMeshField(resampler.paint(jnp.zeros(self.meshsize, dtype=dtype), positions, self.weights.astype(dtype) if dtype is not None else self.weights), boxsize=self.boxsize, boxcenter=self.boxcenter)
+@partial(jax.jit, static_argnames=['attrs', 'resampler',  'interlacing', 'compensate', 'dtype', 'out'])
+def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, dtype=None, out: str='real'):
 
-        if isinstance(compensate, bool):
-            if compensate:
-                kernel_compensate = resampler.compensate
-            else:
-                kernel_compensate = None
+    resampler = getattr(resamplers, resampler, resampler)
+    interlacing = max(interlacing, 1)
+    shifts = np.arange(interlacing) * 1. / interlacing
+    positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
+
+    if isinstance(compensate, bool):
+        if compensate:
+            kernel_compensate = resampler.compensate
         else:
-            kernel_compensate = compensate
-        toret = _paint(positions)
-        if interlacing > 1:
-            toret = toret.r2c()
-            for shift in shifts[1:]: # remove 0 shift, already computed
+            kernel_compensate = None
+    else:
+        kernel_compensate = compensate
 
-                # convention is F(k) = \sum_{r} e^{-ikr} F(r)
-                # shifting by "shift * cellsize" we compute F(k) = \sum_{r} e^{-ikr} F(r - shift * cellsize)
-                # i.e. F(k) = e^{- i shift * kc} e^{-ikr} F(r)
-                # Hence compensation below
+    def ppaint(positions):
+        return RealMeshField(resampler.paint(jnp.zeros(attrs.meshsize, dtype=dtype), positions, weights.astype(dtype) if dtype is not None else weights), boxsize=attrs.boxsize, boxcenter=attrs.boxcenter)
 
-                def kernel_shift(value, kvec):
-                    kvec = sum(kvec)
-                    return value * jnp.exp(shift * 1j * kvec)
+    toret = ppaint(positions)
+    if interlacing > 1:
+        toret = toret.r2c()
+        for shift in shifts[1:]: # remove 0 shift, already computed
 
-                toret += _paint(positions + shift).r2c().apply(kernel_shift, kind='circular')
-            if kernel_compensate is not None:
-                toret = toret.apply(kernel_compensate)
-            toret /= interlacing
-            if out == 'real': toret = toret.c2r()
-        elif kernel_compensate is not None:
-            toret = toret.r2c().apply(kernel_compensate)
-            if out == 'real': toret = toret.c2r()
-        else:
-            if out != 'real': toret = toret.r2c()
-        return toret
+            # convention is F(k) = \sum_{r} e^{-ikr} F(r)
+            # shifting by "shift * cellsize" we compute F(k) = \sum_{r} e^{-ikr} F(r - shift * cellsize)
+            # i.e. F(k) = e^{- i shift * kc} e^{-ikr} F(r)
+            # Hence compensation below
+
+            def kernel_shift(value, kvec):
+                kvec = sum(kvec)
+                return value * jnp.exp(shift * 1j * kvec)
+
+            toret += ppaint(positions + shift).r2c().apply(kernel_shift, kind='circular')
+        if kernel_compensate is not None:
+            toret = toret.apply(kernel_compensate)
+        toret /= interlacing
+        if out == 'real': toret = toret.c2r()
+    elif kernel_compensate is not None:
+        toret = toret.r2c().apply(kernel_compensate)
+        if out == 'real': toret = toret.c2r()
+    else:
+        if out != 'real': toret = toret.r2c()
+    return toret
 
 
 def _set_property(base, name: str):

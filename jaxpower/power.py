@@ -7,6 +7,7 @@ import itertools
 import numpy as np
 import jax
 from jax import numpy as jnp
+from jax import random
 from scipy import special
 
 from . import utils
@@ -716,6 +717,8 @@ def compute_fkp_power(*fkps: FKPField, edges: np.ndarray | dict | None=None,
         fkp = fkps[0]
         alpha = fkp.data.sum() / fkp.randoms.sum()
         shotnoise = jnp.sum(fkp.data.weights**2) + alpha**2 * jnp.sum(fkp.randoms.weights**2)
+        #mask = random.uniform(random.key(42), shape=fkp.randoms.size) < 0.5
+        #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
         randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
         alpha2 = jnp.array([fkp.data.sum() / randoms.sum() for randoms in randoms]).prod()
     norm = alpha2 * compute_normalization(*randoms, cellsize=10.)
