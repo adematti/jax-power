@@ -449,6 +449,8 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         if value is None:
             state['_value'] = [jnp.full(len(xx), np.nan) for xx in state['_x']]
         else:
+            if getattr(value, 'ndim', 0) == 1:
+                value = jnp.array_split(value, np.cumsum(shape)[:-1])
             state['_value'] = [jnp.atleast_1d(vv) for vv in value]
             vshape = tuple(len(vv) for vv in state['_value'])
             if vshape != shape:
@@ -458,9 +460,23 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
                 state[name] = tuple(value)
         self.__dict__.update(state)
 
+    def _clone_as_binned_statistic(self, **kwargs):
+        state = {'x': self.x(), 'value': self.value, 'weights': self.weights(), 'edges': self.edges()}
+        state |= {name: getattr(self, name) for name in ['projs', 'name', 'attrs']}
+        state.update(kwargs)
+        return BinnedStatistic(**state)
+
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        state = {self._rename_fields.get(name, name): getattr(self, name) for name in self._data_fields + self._meta_fields}  # remove front _
+        fields = self._data_fields + self._meta_fields
+        renames = [self._rename_fields.get(name, name) for name in fields]
+        not_in_fields = [name for name in kwargs if name not in renames]
+        if not_in_fields:
+            if type(self) == BinnedStatistic:
+                raise ValueError('arguments {} not known'.format(not_in_fields))
+            else:
+                return self._clone_as_binned_statistic(**kwargs)  # try preceding clone
+        state = {rename: getattr(self, name) for name, rename in zip(fields, renames)}  # remove front _
         state.update(kwargs)
         return self.__class__(**state)
 
@@ -763,10 +779,20 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         -------
         new : array, ObservableArray
         """
+        if (xlim, return_type) == (None, 'nparray'):  # fast way
+            iprojs = self._index_projs(projs=projs)
+            isscalar = not isinstance(iprojs, list)
+            value = self.value
+            if isscalar: return value[iprojs].copy()
+            return jnp.concatenate([value[iproj] for iproj in iprojs], axis=0)
         toret = self.select(xlim=xlim, projs=projs, select_projs=True, method=method)
         if return_type is None:
             return toret
         return jnp.concatenate(toret.value, axis=0)
+
+    @property
+    def projs(self):
+        return self._projs
 
     def x(self, projs=Ellipsis):
         """x-coordinates (optionally restricted to input projs)."""
@@ -1150,6 +1176,12 @@ class WindowMatrix(object):
     def shape(self):
         """Return window matrix shape."""
         return self._value.shape
+
+    def dot(self, theory, zpt=True):
+        theory = jnp.ravel(theory)
+        if zpt:
+            return self.observable.view() + self._value.dot(theory - self.theory.view())
+        return self._value.dot(theory - self.theory.view())
 
     @plotter
     def plot(self, split_projs=True, **kwargs):

@@ -35,7 +35,7 @@ class PowerSpectrumMultipoles(BinnedStatistic):
             return tuple(item)
 
         self.__dict__.update(_norm=norm, _shotnoise_nonorm=shotnoise_nonorm, _power_zero_nonorm=tuple(power_zero_nonorm))
-        super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=tuple(power_nonorm),
+        super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=power_nonorm,
                          weights=_tuple(nmodes), name=name, attrs=attrs)
 
     @property

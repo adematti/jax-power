@@ -47,10 +47,14 @@ def test_binned_statistic():
 
     power = mock(random.key(43), los='x')
     power.save(fn)
-    observable2 = BinnedStatistic.load(fn)
-    assert np.allclose(observable2.view(), power.view())
-    observable2.plot(show=True)
+    power2 = BinnedStatistic.load(fn)
+    assert np.allclose(power2.view(), power.view())
+    assert type(power2) == PowerSpectrumMultipoles
+    power2.plot(show=True)
     assert power.clone(norm=0.1).norm == 0.1
+    power3 = power.clone(value=power.view())
+    assert np.allclose(power3.view(), power.view())
+    assert type(power3) == BinnedStatistic
 
 
 def test_mesh_power(plot=False):
@@ -178,7 +182,7 @@ def test_mean_power(plot=False):
         if plot:
             from matplotlib import pyplot as plt
             ax = power_mean.plot().axes[0]
-            for ell in power_mean.ells:
+            for ell in power_mean.projs:
                 k = power_mean.x(projs=ell)
                 ax.plot(k, k * poles[ell](k), color='k', linestyle='--')
             ax.set_title(los)
