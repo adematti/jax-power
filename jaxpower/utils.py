@@ -253,7 +253,6 @@ class FakeFigure(object):
             axes = [axes]
         self.axes = list(axes)
 
-
 def plotter(*args, **kwargs):
 
     from functools import wraps
@@ -311,6 +310,50 @@ def plotter(*args, **kwargs):
         raise ValueError('unexpected args: {}'.format(args))
 
     return get_wrapper(args[0])
+
+class MemoryMonitor(object):
+    """
+    Class that monitors memory usage and clock, useful to check for memory leaks.
+
+    >>> with MemoryMonitor() as mem:
+            '''do something'''
+            mem()
+            '''do something else'''
+    """
+    def __init__(self, pid=None):
+        """
+        Initalize :class:`MemoryMonitor` and register current memory usage.
+
+        Parameters
+        ----------
+        pid : int, default=None
+            Process identifier. If ``None``, use the identifier of the current process.
+        """
+        import psutil
+        self.proc = psutil.Process(os.getpid() if pid is None else pid)
+        self.mem = self.proc.memory_info().rss / 1e6
+        self.time = time.time()
+        msg = 'using {:.3f} [Mb]'.format(self.mem)
+        print(msg, flush=True)
+
+    def __enter__(self):
+        """Enter context."""
+        return self
+
+    def __call__(self, log=None):
+        """Update memory usage."""
+        mem = self.proc.memory_info().rss / 1e6
+        t = time.time()
+        msg = 'using {:.3f} [Mb] (increase of {:.3f} [Mb]) after {:.3f} [s]'.format(mem, mem - self.mem, t - self.time)
+        if log:
+            msg = '[{}] {}'.format(log, msg)
+        print(msg, flush=True)
+        self.mem = mem
+        self.time = t
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        """Exit context."""
+        self()
 
 
 
@@ -957,14 +1000,14 @@ class WindowMatrix(object):
             return 1, 'theory', self._theory
         raise ValueError('axis must be in {} or {}'.format(observable_names, theory_names))
 
-    def _slice_matrix(self, slice, axis='o', projs=Ellipsis):
+    def _slice_matrix(self, slice, axis='o', projs=Ellipsis, normalize=False):
         # Return, for a given slice, the corresponding matrix to apply to the data arrays.
         axis, _, observable = self._axis_index(axis=axis)
         if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
         proj_indices = observable._index_projs(projs)
         matrix = []
         for iproj, proj in enumerate(observable._projs):
-            matrix.append(observable._slice_matrix(slice if iproj in proj_indices else None, projs=proj))
+            matrix.append(observable._slice_matrix(slice if iproj in proj_indices else None, projs=proj, normalize=normalize))
         import scipy
         return scipy.linalg.block_diag(*matrix)
 
@@ -991,8 +1034,8 @@ class WindowMatrix(object):
         """
         axis, name, observable = self._axis_index(axis=axis)
         observable = observable.slice(slice, projs=projs)
-        matrix = self._slice_matrix(slice, axis=axis, projs=projs)
-        value = matrix.dot(self._value) if axis == 0 else self._value.dot(matrix)
+        matrix = self._slice_matrix(slice, axis=axis, projs=projs, normalize=axis == 0)
+        value = matrix.dot(self._value) if axis == 0 else self._value.dot(matrix.T)
         if select_projs:
             observable = observable.select(projs=projs, select_projs=True)
             index = self._index(projs=projs, concatenate=True)
@@ -1177,11 +1220,15 @@ class WindowMatrix(object):
         """Return window matrix shape."""
         return self._value.shape
 
-    def dot(self, theory, zpt=True):
+    def dot(self, theory, zpt=True, return_type='nparray'):
         theory = jnp.ravel(theory)
         if zpt:
-            return self.observable.view() + self._value.dot(theory - self.theory.view())
-        return self._value.dot(theory - self.theory.view())
+            toret = self.observable.view() + self._value.dot(theory - self.theory.view())
+        else:
+            toret = self._value.dot(theory)
+        if return_type == 'nparray':
+            return toret
+        return self.observable.clone(value=toret)
 
     @plotter
     def plot(self, split_projs=True, **kwargs):
@@ -1214,8 +1261,8 @@ class WindowMatrix(object):
             xlabels, plabels, x, indices = [], [], [], []
             axis, _, observable = self._axis_index(axis=axis)
             for proj in observable._projs:
-                indices[-1].append(self._index(projs=proj, axis=axis, concatenate=True))
-                x[-1].append(observable.x(projs=proj))
+                indices.append(self._index(projs=proj, axis=axis, concatenate=True))
+                x.append(observable.x(projs=proj))
                 xlabels.append(observable._label_x)
                 plabels.append(observable._get_label_proj(proj))
             return xlabels, plabels, x, indices

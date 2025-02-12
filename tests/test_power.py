@@ -32,8 +32,13 @@ def test_binned_statistic():
     theory = BinnedStatistic(x=xt, value=vt, projs=[0, 2])
     wmat = WindowMatrix(observable=observable, theory=theory, value=np.ones((observable.size, theory.size)))
     assert np.allclose(wmat.select(xlim=(0., 0.15), axis='o').observable.x(projs=0), v[0][v[0] <= 0.15])
+    tmp = wmat.dot(theory.view(), zpt=False)
+    tmp2 = wmat.slice(slice(0, None, 2), axis='t').dot(theory.slice(slice(0, None, 2)).view(), zpt=False)
+    assert np.allclose(tmp.sum(), tmp2.sum())
+    wmat.slice(slice(0, None, 2), axis='o')
+    wmat.slice(slice(0, None, 2), axis='o')
     assert np.allclose(wmat.select(axis='t', projs=0, select_projs=True).theory.view(), vt[0])
-
+    wmat.plot()
 
     def pk(k):
         kp = 0.03
