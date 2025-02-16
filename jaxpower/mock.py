@@ -51,67 +51,59 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
         with np.errstate(divide='ignore', invalid='ignore'):
             return jnp.where(denom == 0., 0., num / denom)
 
+    def generate_normal(seed):
+        mesh = RealMeshField(random.normal(seed, attrs.meshsize), attrs=attrs).r2c()
+        if unitary_amplitude:
+            mesh *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
+        return mesh
+
     if los == 'local':
         seeds = random.split(seed)
-        meshs = [RealMeshField(random.normal(seed, attrs.meshsize), attrs=attrs).r2c() for seed in seeds]
-        rdtype = meshs[0].real.dtype
-        meshsize, cellsize = attrs.meshsize, attrs.cellsize
-        if unitary_amplitude:
-            for imesh, mesh in enumerate(meshs):
-                meshs[imesh] *= jnp.sqrt(meshsize.prod(dtype=rdtype)) / jnp.abs(mesh.value)
 
-        kvec = meshs[0].coords(sparse=True)
-        shape = meshs[0].shape
-        knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
+        kvec = attrs.kcoords(sparse=True, hermitian=True)
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+        shape = knorm.shape
+        knorm = knorm.ravel()
 
-        a11 = 35. / 18. * poles[4](knorm).reshape(shape) / cellsize.prod()
-        a00 = poles[0](knorm).reshape(shape) / cellsize.prod() - 1. / 5. * a11
+        a11 = 35. / 18. * poles[4](knorm).reshape(shape) / attrs.cellsize.prod()
+        a00 = poles[0](knorm).reshape(shape) / attrs.cellsize.prod() - 1. / 5. * a11
         # Cholesky decomposition
         l00 = jnp.sqrt(a00)
         del a00
-        # The mesh for ell = 0
-        mesh = meshs[0] * l00
-        mesh = mesh.c2r()
 
-        a10 = 1. / 2. * poles[2](knorm).reshape(shape) / cellsize.prod() - 1. / 7. * a11
+        a10 = 1. / 2. * poles[2](knorm).reshape(shape) / attrs.cellsize.prod() - 1. / 7. * a11
         l10 = a10 / jnp.where(knorm.reshape(shape) == 0., 1., l00)
-        del a10, l00
+        del a10
+
+        # The mesh for ell = 0
+        normal = generate_normal(seeds[0])
+        mesh = (normal * l00).c2r()
+        del l00
+        mesh2 = normal * l10
+        del normal
         # The mesh for ell = 2
-        mesh2 = meshs[0] * l10 + meshs[1] * jnp.sqrt(a11 - l10**2)
-        del a11, l10, meshs
+        mesh2 += generate_normal(seeds[1]) * jnp.sqrt(a11 - l10**2)
+        del a11, l10
 
-        # The Fourier-space grid
-        knorm = knorm.reshape(shape)
-        khat = [_safe_divide(kk, knorm) for kk in kvec]
-        del knorm, kvec
-
-        # The real-space grid
-        xhat = mesh.coords(sparse=True)
-        xnorm = jnp.sqrt(sum(xx**2 for xx in xhat))
-        xhat = [_safe_divide(xx, xnorm) for xx in xhat]
-        del xnorm
-
+        xvec = mesh.coords()
         ell = 2
-        Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
-        mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*khat)).c2r() * Ylm(*xhat) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
+        Ylms = [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)]
+        mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*kvec)).c2r() * Ylm(*xvec) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
 
         return mesh
 
     else:
         vlos = _get_los_vector(los, ndim=len(attrs.meshsize))
         mesh = RealMeshField(random.normal(seed, attrs.meshsize), attrs=attrs).r2c()
-        rdtype = mesh.real.dtype
-        meshsize, cellsize = attrs.meshsize, attrs.cellsize
-
         def kernel(value, kvec):
             knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
             mu = _safe_divide(sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel(), knorm)
             ker = 0.
             for ell in ells:
-                ker += poles[ell](knorm) / cellsize.prod() * legendre(ell)(mu)
+                ker += poles[ell](knorm) / attrs.cellsize.prod() * legendre(ell)(mu)
             ker = jnp.sqrt(ker).reshape(value.shape)
             if unitary_amplitude:
-                ker *= jnp.sqrt(meshsize.prod(dtype=rdtype)) / jnp.abs(value)
+                ker *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(value)
             return value * ker
 
         mesh = mesh.apply(kernel, kind='wavenumber')

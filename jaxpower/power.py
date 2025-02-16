@@ -113,8 +113,35 @@ class PowerSpectrumMultipoles(BinnedStatistic):
         return fig
 
 
+def _get_batch_Ylm(Ylm):
+
+    if Ylm.ell == 0:
+        return lambda *coords: 1. / np.sqrt(4. * np.pi)
+
+    def _safe_divide(num, denom):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return jnp.where(denom == 0., 0., num / denom)
+
+    def func(*coords):
+        if coords[0].ndim < len(coords):
+            coords = jnp.meshgrid(*coords, indexing='ij', sparse=True)
+        coords = tuple(coords)
+        def f(x):
+            x = (x,) + coords[1:]
+            xnorm = jnp.sqrt(sum(xx**2 for xx in x))
+            xhat = tuple(_safe_divide(xx, xnorm) for xx in x)
+            return Ylm(*xhat)#[0]
+        nbatch = 4
+        total_size = len(coords[0])
+        batch_size = total_size // nbatch
+        return jnp.concatenate([f(coords[0][i * total_size // nbatch:(i + 1) * total_size // nbatch]) for i in range(nbatch)])
+        #return jax.lax.map(f, coords[0].ravel(), batch_size=batch_size)
+
+    return func
+
+
 @lru_cache(maxsize=32, typed=False)
-def get_real_Ylm(ell, m):
+def get_real_Ylm(ell, m, batch=True):
     """
     Return a function that computes the real spherical harmonic of order (ell, m).
     Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/convpower/fkp.py.
@@ -175,42 +202,44 @@ def get_real_Ylm(ell, m):
             return toret
 
         # Attach some meta-data
-        Ylm.l = ell
+        Ylm.ell = ell
         Ylm.m = m
-        return Ylm
 
-    # The relevant cartesian and spherical symbols
-    # Using intermediate variable r helps sympy simplify expressions
-    x, y, z, r = sp.symbols('x y z r', real=True, positive=True)
-    xhat, yhat, zhat = sp.symbols('xhat yhat zhat', real=True, positive=True)
-    phi, theta = sp.symbols('phi theta')
-    defs = [(sp.sin(phi), y / sp.sqrt(x**2 + y**2)),
-            (sp.cos(phi), x / sp.sqrt(x**2 + y**2)),
-            (sp.cos(theta), z / sp.sqrt(x**2 + y**2 + z**2))]
+    else:
+        # The relevant cartesian and spherical symbols
+        # Using intermediate variable r helps sympy simplify expressions
+        x, y, z, r = sp.symbols('x y z r', real=True, positive=True)
+        xhat, yhat, zhat = sp.symbols('xhat yhat zhat', real=True, positive=True)
+        phi, theta = sp.symbols('phi theta')
+        defs = [(sp.sin(phi), y / sp.sqrt(x**2 + y**2)),
+                (sp.cos(phi), x / sp.sqrt(x**2 + y**2)),
+                (sp.cos(theta), z / sp.sqrt(x**2 + y**2 + z**2))]
 
-    # The cos(theta) dependence encoded by the associated Legendre polynomial
-    expr = (-1)**m * sp.assoc_legendre(ell, abs(m), sp.cos(theta))
+        # The cos(theta) dependence encoded by the associated Legendre polynomial
+        expr = (-1)**m * sp.assoc_legendre(ell, abs(m), sp.cos(theta))
 
-    # The phi dependence
-    if m < 0:
-        expr *= sp.expand_trig(sp.sin(abs(m) * phi))
-    elif m > 0:
-        expr *= sp.expand_trig(sp.cos(m * phi))
+        # The phi dependence
+        if m < 0:
+            expr *= sp.expand_trig(sp.sin(abs(m) * phi))
+        elif m > 0:
+            expr *= sp.expand_trig(sp.cos(m * phi))
 
-    # Simplify
-    expr = sp.together(expr.subs(defs)).subs(x**2 + y**2 + z**2, r**2)
-    expr = amp * expr.expand().subs([(x / r, xhat), (y / r, yhat), (z / r, zhat)])
+        # Simplify
+        expr = sp.together(expr.subs(defs)).subs(x**2 + y**2 + z**2, r**2)
+        expr = amp * expr.expand().subs([(x / r, xhat), (y / r, yhat), (z / r, zhat)])
+        Ylm = sp.lambdify((xhat, yhat, zhat), expr, modules='jax')
 
-    Ylm = sp.lambdify((xhat, yhat, zhat), expr, modules='jax')
+        # Attach some meta-data
+        Ylm.expr = expr
+        Ylm.ell = ell
+        Ylm.m = m
 
-    # Attach some meta-data
-    Ylm.expr = expr
-    Ylm.l = ell
-    Ylm.m = m
+    if batch:
+        return _get_batch_Ylm(Ylm)
     return Ylm
 
 
-[[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
+[[get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
 
 
 def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMeshField, xedges: np.ndarray,
@@ -347,6 +376,7 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
     import itertools
     shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(spacing)
     shifts = list(itertools.product(*shifts))
+    compute_mu = muedges is not None or unique_ells != (0,)
 
     for shift in shifts:
         shift = spacing * shift / (2 * mode_oversampling + 1)
@@ -360,8 +390,8 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
         dig_x = jnp.where(mask_zero_noshift, nx + 2, dig_x)
 
         # Get the bin indices for mu on the slab
-        mu = None
-        if muedges is not None or unique_ells:
+        mu = 0
+        if compute_mu:
             mu = jnp.ravel(sum(xx * ll for xx, ll in zip(xvec, los)))
             with np.errstate(divide='ignore', invalid='ignore'):
                 mu = jnp.where(xnorm >= (mincell / (2 * mode_oversampling + 1) / 2.), mu / xnorm, 0.)
@@ -373,7 +403,7 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
 
         # Accounting for negative frequencies
         for imu, mu in enumerate(mus):
-            if muedges is not None:
+            if compute_mu and muedges is not None:
                 # Make the multi-index
                 dig_mu = jnp.digitize(mu, muedges, right=False)  # this is bins[i-1] <= x < bins[i]
                 dig_mu = jnp.where(mu == muedges[-1], nmu, dig_mu) # last mu inclusive
@@ -559,27 +589,15 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
 
         if nonzeroells:
 
-            def _safe_divide(num, denom):
-                with np.errstate(divide='ignore', invalid='ignore'):
-                    return jnp.where(denom == 0., 0., num / denom)
-
             rmesh1 = _2r(meshs[0])
             # The real-space grid
-            xhat = rmesh1.coords(sparse=True)
-            xnorm = jnp.sqrt(sum(xx**2 for xx in xhat))
-            xhat = [_safe_divide(xx, xnorm) for xx in xhat]
-            del xnorm
-
+            xvec = rmesh1.coords(sparse=True)
             # The Fourier-space grid
-            khat = A0.coords(sparse=True)
-            knorm = jnp.sqrt(sum(kk**2 for kk in khat))
-            khat = [_safe_divide(kk, knorm) for kk in khat]
-            del knorm
-
-            Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in nonzeroells}
+            kvec = A0.coords(sparse=True)
+            Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in nonzeroells}
 
             for ell in nonzeroells:
-                Aell = sum(_2c(rmesh1 * Ylm(*xhat)) * Ylm(*khat) for Ylm in Ylms[ell])
+                Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell])
                 Aell = Aell.conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, antisymmetric=bool(ell % 2), exclude_zero=False, mode_oversampling=mode_oversampling)
@@ -600,6 +618,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
             meshs.append(meshs[0])
 
         power = meshs[0] * meshs[1].conj()
+        del meshs
         k, _, power, nmodes, power_zero = project_to_basis(power, edges, ells=ells, los=vlos, exclude_zero=False, mode_oversampling=mode_oversampling)
         return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=attrs)
 
@@ -760,8 +779,8 @@ def compute_wide_angle_poles(poles: dict[Callable]):
     return toret
 
 
-def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, theory: Callable | dict[Callable], edges: np.ndarray | dict | None=None,
-                            ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
+
+def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, theory: Callable | dict[Callable], edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
     r"""
     Compute mean power spectrum from mesh.
 
@@ -894,22 +913,18 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         # The real-space grid
         xhat = mattrs.xcoords(sparse=True)
         xnorm = jnp.sqrt(sum(xx**2 for xx in xhat))
-        xhat = [_safe_divide(xx, xnorm) for xx in xhat]
 
         def _wrap_rslab(rslab):
             return tuple(jnp.where(rr > mattrs.boxsize[ii] / 2., rr - mattrs.boxsize[ii], rr) for ii, rr in enumerate(rslab))
 
         shat = _wrap_rslab(mattrs.clone(boxcenter=mattrs.boxsize / 2.).xcoords(sparse=True))
         snorm = jnp.sqrt(sum(xx**2 for xx in shat))
-        #shat = [_safe_divide(xx, snorm) for xx in shat]
 
         # The Fourier-space grid
         khat = A0.coords(sparse=True)
-        knorm = jnp.sqrt(sum(kk**2 for kk in khat))
-        khat = [_safe_divide(kk, knorm) for kk in khat]
-        del knorm
+        knorm = jnp.sqrt(sum(xx**2 for xx in khat))
 
-        Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
+        Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
 
         for ell in ells:
             Aell = 0.
@@ -917,12 +932,11 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                 Q = 0.
                 if theory_los == 'firstpoint':
                     for ell1, wa1 in poles:
+                        kernel_ell1 = poles[ell1, wa1](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype)
                         for Yl1m1 in Ylms[ell1]:
 
-                            def kernel(value, kvec):
-                                knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-                                khat = [_safe_divide(kk, knorm) for kk in kvec]
-                                return poles[ell1, wa1](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*khat)
+                            def kernel(value, _):
+                                return kernel_ell1 * Yl1m1(*khat)
 
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r() * snorm**wa1
                             Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
@@ -933,12 +947,11 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                               (2, 2): lambda k: 35. / 18. * poles[4, 0](k)}
                     coeff2[2, 0] = coeff2[0, 2]
                     for ell1, ell2 in itertools.product((0, 2), (0, 2)):
+                        kernel_ell2 = coeff2[ell1, ell2](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype)
                         for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
 
-                            def kernel(value, kvec):
-                                knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-                                khat = [_safe_divide(kk, knorm) for kk in kvec]
-                                return coeff2[ell1, ell2](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])
+                            def kernel(value, _):
+                                return kernel_ell2 * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])
 
                             #xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r().real
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
