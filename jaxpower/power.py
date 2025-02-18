@@ -862,7 +862,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         theories = theory
         isscalar = not isinstance(theory, list)
         if isscalar: theories = [theory]
-        else: theories = list(theories)
+        else: theories = list(theory)
 
         if not periodic:
 
@@ -907,7 +907,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
             theory, theory_los = theory
         isscalar = not isinstance(theory, list)
         if isscalar: theories = [theory]
-        else: theories = list(theories)
+        else: theories = list(theory)
         for ith, theory in enumerate(theories):
             assert isinstance(theory, dict)
             th = {}
