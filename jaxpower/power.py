@@ -383,7 +383,7 @@ def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMe
         xvec = coords
         mask_zero_noshift = jnp.ravel(sum(xx**2 for xx in xvec) < (mincell / 2.)**2)  # mask_zero defined *before* shift
         xvec = tuple(xx + ss for xx, ss in zip(xvec, shift))
-        xnorm = jnp.ravel(sum(xx**2 for xx in xvec)**0.5)
+        xnorm = jnp.ravel(jnp.sqrt(sum(xx**2 for xx in xvec)))
 
         # Get the bin indices for x on the slab
         dig_x = jnp.digitize(xnorm, xedges, right=False)
@@ -583,9 +583,9 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
         A0 = _2c(meshs[0] if autocorr else meshs[1])
         if 0 in ells:
             Aell = A0 if autocorr else _2c(meshs[1])
-        Aell = Aell.conj() * A0
-        k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, exclude_zero=False, mode_oversampling=mode_oversampling)
-        result.append((power, power_zero))
+            Aell = Aell.conj() * A0
+            k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, exclude_zero=False, mode_oversampling=mode_oversampling)
+            result.append((power, power_zero))
 
         if nonzeroells:
 
@@ -604,8 +604,8 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
                 result.append((4 * jnp.pi * power, 4 * jnp.pi * power_zero))
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        power, power_zero = (jnp.array([result[ells.index(ell)][ii] for ell in ells]) for ii in range(2))
-        if swap: power, power_zero = (tmp.conj() for tmp in (power, power_zero))
+        power, power_zero = (jnp.array([result[ill][ii] for ill, _ in enumerate(ells)]) for ii in range(2))
+        if swap: power, power_zero = power.conj(), power_zero.conj()
         # Format the power results into :class:`PowerSpectrumMultipoles` instance
         return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm,
                                        power_zero_nonorm=power_zero, attrs=attrs)
@@ -779,8 +779,8 @@ def compute_wide_angle_poles(poles: dict[Callable]):
     return toret
 
 
-
-def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, theory: Callable | dict[Callable], edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
+def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, theory: list | Callable | dict[Callable],
+                            edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0, pbar=False) -> PowerSpectrumMultipoles:
     r"""
     Compute mean power spectrum from mesh.
 
@@ -790,10 +790,11 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         Input mesh(s).
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
 
-    theory : Callable, dict[Callable]
+    theory : list, Callable, dict[Callable]
         Mean theory power spectrum. Either a callable (if ``los`` is an axis),
         or a dictionary of callables, with keys the multipole orders :math:`\ell`.
         Also possible to add wide-angle order :math:`n`, such that they key is the tuple :math:`(\ell, n)`.
+        Can provide a list of callables.
 
     edges : np.ndarray, dict, default=None
         ``kedges`` may be:
@@ -818,7 +819,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
 
     Returns
     -------
-    power : PowerSpectrumMultipoles
+    power : (list of) PowerSpectrumMultipoles
     """
     meshs = list(meshs)
     assert 1 <= len(meshs) <= 2
@@ -858,17 +859,10 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
     autocorr = len(meshs) == 1
 
     if vlos is not None:
-
-        pkvec = theory
-
-        if isinstance(theory, dict):
-            def pkvec(kvec):
-                knorm = sum(kk**2 for kk in kvec)**0.5
-                mu = sum(kk * ll for kk, ll in zip(kvec, vlos))
-                mu = jnp.where(knorm == 0., 0., mu / knorm)
-                return sum(theory[ell](knorm) * legendre(ell)(mu) for ell in theory)
-
-        power = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * norm, kind='wavenumber')
+        theories = theory
+        isscalar = not isinstance(theory, list)
+        if isscalar: theories = [theory]
+        else: theories = list(theories)
 
         if not periodic:
 
@@ -877,26 +871,55 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
             if autocorr:
                 meshs.append(meshs[0])
 
-            power = _2c(_2r(meshs[0] * meshs[1].conj()) * _2r(power))
+            Q = _2r(meshs[0] * meshs[1].conj())
+        else:
+            Q = None
 
-        k, _, power, nmodes, power_zero = project_to_basis(power, edges, ells=ells, los=vlos, exclude_zero=False, mode_oversampling=mode_oversampling)
-        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=mattrs)
+        results = [None for _ in theories]
+        project = jax.jit(partial(project_to_basis, xedges=edges, ells=ells, los=vlos, exclude_zero=False, mode_oversampling=mode_oversampling))
+
+        if pbar:
+            from tqdm import tqdm
+            t = tqdm(total=len(theories))
+
+        for ith, theory in enumerate(theories):
+
+            pkvec = theory
+
+            if isinstance(theory, dict):
+                def pkvec(kvec):
+                    knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+                    mu = sum(kk * ll for kk, ll in zip(kvec, vlos))
+                    mu = jnp.where(knorm == 0., 0., mu / knorm)
+                    return sum(theory[ell](knorm) * legendre(ell)(mu) for ell in theory)
+
+            power = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * norm, kind='wavenumber')
+            if Q is not None: power = (Q * power.c2r()).r2c()
+
+            k, _, power, nmodes, power_zero = project(power)
+            results[ith] = PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=mattrs)
+            if pbar: t.update(n=1)
 
     else:
+
         theory_los = 'firstpoint'
         if isinstance(theory, tuple):
             theory, theory_los = theory
-        assert isinstance(theory, dict)
-        poles = {}
-        for mode, p in theory.items():
-            if isinstance(mode, tuple):
-                poles[mode] = p
-            else:
-                poles[(mode, 0)] = p  # wide-angle = 0 as a default
-        ellsin = [mode[0] for mode in poles]
+        isscalar = not isinstance(theory, list)
+        if isscalar: theories = [theory]
+        else: theories = list(theories)
+        for ith, theory in enumerate(theories):
+            assert isinstance(theory, dict)
+            th = {}
+            for mode, p in theory.items():
+                if isinstance(mode, tuple):
+                    th[mode] = p
+                else:
+                    th[(mode, 0)] = p  # wide-angle = 0 as a default
+            theories[ith] = th
+        ellsin = [mode[0] for mode in theories[0]]
 
         # In this case, theory must be a dictionary of (multipole, wide_angle_order)
-        result = []
         if swap: meshs = meshs[::-1]
 
         if periodic:
@@ -911,63 +934,85 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         A0 = _2c(meshs[0] if autocorr else meshs[1])
         del meshs
         # The real-space grid
-        xhat = mattrs.xcoords(sparse=True)
-        xnorm = jnp.sqrt(sum(xx**2 for xx in xhat))
+        xvec = mattrs.xcoords(sparse=True)
 
         def _wrap_rslab(rslab):
             return tuple(jnp.where(rr > mattrs.boxsize[ii] / 2., rr - mattrs.boxsize[ii], rr) for ii, rr in enumerate(rslab))
 
-        shat = _wrap_rslab(mattrs.clone(boxcenter=mattrs.boxsize / 2.).xcoords(sparse=True))
-        snorm = jnp.sqrt(sum(xx**2 for xx in shat))
+        svec = _wrap_rslab(mattrs.clone(boxcenter=mattrs.boxsize / 2.).xcoords(sparse=True))
 
         # The Fourier-space grid
-        khat = A0.coords(sparse=True)
-        knorm = jnp.sqrt(sum(xx**2 for xx in khat))
+        kvec = A0.coords(sparse=True)
 
         Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
 
-        for ell in ells:
-            Aell = 0.
-            for Ylm in Ylms[ell]:
-                Q = 0.
-                if theory_los == 'firstpoint':
-                    for ell1, wa1 in poles:
-                        kernel_ell1 = poles[ell1, wa1](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype)
-                        for Yl1m1 in Ylms[ell1]:
+        powers = [[0.] * len(ells) for _ in theories]
+        powers_zero = [[0.] * len(ells) for _ in theories]
+        project = jax.jit(partial(project_to_basis, xedges=edges, exclude_zero=False, mode_oversampling=mode_oversampling), static_argnames=['antisymmetric'])
 
-                            def kernel(value, _):
-                                return kernel_ell1 * Yl1m1(*khat)
+        if pbar:
+            from tqdm import tqdm
+            t = tqdm(total=len(theories), bar_format='{l_bar}{bar}| {n:.3f}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]')
 
-                            xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r() * snorm**wa1
-                            Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
+        if theory_los == 'firstpoint':
+            n = 1. / (sum(len(Ylms[ell1]) for ell1, wa in theories[0]) * len(ells))
+            n = int(n * 1e6) / 1e6
+            for ell1, wa1 in theories[0]:
+                for Yl1m1 in Ylms[ell1]:
+                    for ill, ell in enumerate(ells):
+                        xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
+                        snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                        Qs = [(4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1 for Ylm in Ylms[ell]]
+                        del xnorm, snorm
+                        knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
 
-                elif theory_los == 'local':
-                    coeff2 = {(0, 0): lambda k: poles[0, 0](k) - 7. / 18. * poles[4, 0](k),
-                              (0, 2): lambda k: 1. / 2. * poles[2, 0](k) - 5. / 18. * poles[4, 0](k),
-                              (2, 2): lambda k: 35. / 18. * poles[4, 0](k)}
-                    coeff2[2, 0] = coeff2[0, 2]
-                    for ell1, ell2 in itertools.product((0, 2), (0, 2)):
-                        kernel_ell2 = coeff2[ell1, ell2](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype)
-                        for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
+                        for ith, theory in enumerate(theories):
 
-                            def kernel(value, _):
-                                return kernel_ell2 * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])
+                            def kernel(*args):
+                                return theory[ell1, wa1](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*kvec)
 
-                            #xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r().real
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
-                            Q += (4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * xi * _2r(_2c(rmesh1 * Ylm(*xhat) * Yl1m1(*xhat)).conj() * _2c(rmesh2 * Yl2m2(*xhat)))
 
-                else:
-                    raise NotImplementedError(f'theory los {theory_los} not implemented')
+                            k, _, power, nmodes, power_zero = project(sum((xi * Q).r2c() * Ylm(*kvec) for Q, Ylm in zip(Qs, Ylms[ell])), antisymmetric=bool(ell % 2))
+                            if swap: power, power_zero = power.conj(), power_zero.conj()
+                            powers[ith][ill] += 4 * jnp.pi * power
+                            powers_zero[ith][ill] += 4 * jnp.pi * power_zero
+                            if pbar: t.update(n=n)
 
-                Aell += _2c(Q) * Ylm(*khat)
-            # Project on to 1d k-basis (averaging over mu=[-1, 1])
-            k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, antisymmetric=bool(ell % 2), exclude_zero=False, mode_oversampling=mode_oversampling)
-            result.append((4 * jnp.pi * power, 4 * jnp.pi * power_zero))
+        elif theory_los == 'local':
+            ells12 = list(itertools.product((0, 2), (0, 2)))
+            n = 1. / (sum(len(Ylms[ell1]) * len(Ylms[ell2]) for ell1, ell2 in ells12) * len(ells))
+            n = int(n * 1e6) / 1e6
+            for ell1, ell2 in ells12:
+                for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
+                    for ill, ell in enumerate(ells):
+                        Qs = [(4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * _2r(_2c(rmesh1 * Ylm(*xvec) * Yl1m1(*xvec)).conj() * _2c(rmesh2 * Yl2m2(*xvec))) for Ylm in Ylms[ell]]
+                        knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
+                        for ith, theory in enumerate(theories):
+                            coeff2 = {(0, 0): lambda k: theory[0, 0](k) - 7. / 18. * theory[4, 0](k),
+                                      (0, 2): lambda k: 1. / 2. * theory[2, 0](k) - 5. / 18. * theory[4, 0](k),
+                                      (2, 2): lambda k: 35. / 18. * theory[4, 0](k)}
+                            coeff2[2, 0] = coeff2[0, 2]
 
-        # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        power, power_zero = (jnp.array([result[ells.index(ell)][ii] for ell in ells]) for ii in range(2))
-        if swap: power, power_zero = (tmp.conj() for tmp in (power, power_zero))
-        # Format the power results into :class:`PowerSpectrumMultipoles` instance
-        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm,
-                                       power_zero_nonorm=power_zero, attrs=attrs)
+                            def kernel(*args):
+                                return coeff2[ell1, ell2](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
+
+                            xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                            Aell = sum((xi * Q).r2c() * Ylm(*kvec) for Q, Ylm in zip(Qs, Ylms[ell]))
+                            del xi
+                            k, _, power, nmodes, power_zero = project(Aell, antisymmetric=bool(ell % 2))
+                            if swap: power, power_zero = power.conj(), power_zero.conj()
+                            powers[ith][ill] += 4 * jnp.pi * power
+                            powers_zero[ith][ill] += 4 * jnp.pi * power_zero
+                            if pbar: t.update(n=n)
+
+        else:
+            raise NotImplementedError(f'theory los {theory_los} not implemented')
+
+        results = []
+        for power, power_zero in zip(powers, powers_zero):
+            results.append(PowerSpectrumMultipoles(k, power_nonorm=jnp.array(power), nmodes=nmodes, edges=edges, ells=ells, norm=norm,
+                                                   power_zero_nonorm=jnp.array(power_zero), attrs=attrs))
+    if isscalar:
+        results = results[0]
+    return results

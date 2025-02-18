@@ -19,7 +19,6 @@ def generate_gaussian_mesh(power: Callable, seed: int=42,
 
     attrs = MeshAttrs(boxsize=boxsize, meshsize=meshsize, boxcenter=boxcenter)
     mesh = RealMeshField(random.normal(seed, attrs.meshsize), boxsize=boxsize, boxcenter=boxcenter).r2c()
-    rdtype = mesh.real.dtype
 
     def kernel(value, kvec):
         ker = jnp.sqrt(power(kvec) / mesh.cellsize.prod())

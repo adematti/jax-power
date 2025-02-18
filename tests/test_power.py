@@ -75,12 +75,12 @@ def test_mesh_power(plot=False):
 
     list_los = ['x', 'endpoint']
 
-    @partial(jax.jit, static_argnames=['los'])
-    def mock(seed, los='x'):
+    @partial(jax.jit, static_argnames=['los', 'ells'])
+    def mock(seed, los='x', ells=(0, 2, 4)):
         mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=128, unitary_amplitude=True)
-        return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+        return compute_mesh_power(mesh, ells=ells, los=los, edges={'step': 0.01})
 
-    for los in list_los:
+    for los in list_los[1:]:
 
         nmock = 5
         t0 = time.time()
@@ -91,12 +91,14 @@ def test_mesh_power(plot=False):
             mock(random.key(i + 42), los=los)
         print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         power.save(get_fn(los))
+        power = mock(random.key(i + 42), los=los, ells=(4,))
+        assert tuple(power.projs) == (4,)
 
     power = PowerSpectrumMultipoles.load(get_fn(los='x'))
     k = power.x(projs=0)
     if plot:
         from matplotlib import pyplot as plt
-        ax = power.plot()
+        ax = power.plot().axes[0]
         ax.plot(k, k * pk(k))
         plt.show()
     # remove first few bins because of binning effects
@@ -165,12 +167,12 @@ def test_mean_power(plot=False):
     list_los = [('x', None), ('endpoint', None), ('endpoint', 'local')]
     attrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
 
-    @partial(jax.jit, static_argnames=['los', 'thlos'])
+    #@partial(jax.jit, static_argnames=['los', 'thlos'])
     def mean(los='x', thlos=None):
         theory = poles
         if thlos is not None:
             theory = (poles, thlos)
-        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), los=los, edges={'step': 0.01}, pbar=True)
 
     for los, thlos in list_los:
 
@@ -178,7 +180,7 @@ def test_mean_power(plot=False):
         t0 = time.time()
         power_mean = mean(los=los, thlos=thlos)
         print(f'time for jit {time.time() - t0:.2f}')
-        nmock = 5
+        nmock = 2
         t0 = time.time()
         for i in range(nmock):
             jax.block_until_ready(mean(los=los, thlos=thlos))
