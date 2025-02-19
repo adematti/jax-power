@@ -80,7 +80,7 @@ def test_mesh_power(plot=False):
         mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=128, unitary_amplitude=True)
         return compute_mesh_power(mesh, ells=ells, los=los, edges={'step': 0.01})
 
-    for los in list_los[1:]:
+    for los in list_los:
 
         nmock = 5
         t0 = time.time()
@@ -88,21 +88,24 @@ def test_mesh_power(plot=False):
         print(f'time for jit {time.time() - t0:.2f}')
         t0 = time.time()
         for i in range(nmock):
-            mock(random.key(i + 42), los=los)
+            jax.block_until_ready(mock(random.key(i + 42), los=los))
         print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         power.save(get_fn(los))
+        # remove first few bins because of binning effects
+        assert np.allclose(power.view(projs=0)[2:], pk(power.x(projs=0))[2:], rtol=1e-2)
         power = mock(random.key(i + 42), los=los, ells=(4,))
         assert tuple(power.projs) == (4,)
 
-    power = PowerSpectrumMultipoles.load(get_fn(los='x'))
-    k = power.x(projs=0)
     if plot:
         from matplotlib import pyplot as plt
-        ax = power.plot().axes[0]
-        ax.plot(k, k * pk(k))
-        plt.show()
-    # remove first few bins because of binning effects
-    assert np.allclose(power.view(projs=0)[2:], pk(k)[2:], rtol=1e-2)
+
+        for los in list_los:
+            power = PowerSpectrumMultipoles.load(get_fn(los=los))
+            ax = power.plot().axes[0]
+            k = power.x(projs=0)
+            ax.plot(k, k * pk(k))
+            ax.set_title(los)
+            plt.show()
 
 
 def test_fkp_power(plot=False):
@@ -137,7 +140,7 @@ def test_fkp_power(plot=False):
         print(f'time for jit {time.time() - t0:.2f}')
         t0 = time.time()
         for i in range(nmock):
-            mock(random.key(i + 42), los=los)
+            jax.block_until_ready(mock(random.key(i + 42), los=los))
         print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         power.save(get_fn(los))
 
@@ -145,6 +148,7 @@ def test_fkp_power(plot=False):
         from matplotlib import pyplot as plt
 
         for los in list_los:
+            power = PowerSpectrumMultipoles.load(get_fn(los=los))
             ax = power.plot().axes[0]
             k = power.x(projs=0)
             ax.plot(k, k * pk(k))

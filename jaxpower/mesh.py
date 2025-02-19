@@ -100,6 +100,7 @@ def fftfreq(shape: tuple, kind: str='wavenumber', sparse: bool | None=None,
     return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
 
 
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class MeshAttrs(object):

@@ -242,248 +242,6 @@ def get_real_Ylm(ell, m, batch=True):
 [[get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
 
 
-def project_to_basis(mesh: RealMeshField | ComplexMeshField | HermitianComplexMeshField, xedges: np.ndarray,
-                     los: str | np.ndarray='x', muedges: None | np.ndarray=None, ells: None | tuple | list=None,
-                     antisymmetric: bool=False, exclude_zero: bool=False, mode_oversampling: int=0):
-    r"""
-    Project a 3D statistic on to the specified basis. The basis will be one of:
-
-        - 2D :math:`(x, \mu)` bins: :math:`\mu` is the cosine of the angle to the line-of-sight
-        - 2D :math:`(x, \ell)` bins: :math:`\ell` is the multipole number, which specifies
-          the Legendre polynomial when weighting different :math:`\mu` bins.
-
-    Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/fftpower.py.
-
-    Notes
-    -----
-    In single precision (float32/complex64) nbodykit's implementation is fairly imprecise
-    due to incorrect binning of :math:`x` and :math:`\mu` modes.
-    Here we cast mesh coordinates to the maximum precision of input ``edges``,
-    which makes computation much more accurate in single precision.
-
-    Notes
-    -----
-    We deliberately set to 0 the number of modes beyond Nyquist, as it is unclear whether to count Nyquist as :math:`\mu` or :math:`-\mu`
-    (it should probably be half weight for both).
-    Our safe choice ensures consistent results between hermitian compressed and their associated uncompressed fields.
-
-    Notes
-    -----
-    The 2D :math:`(x, \ell)` bins will be computed only if ``ells`` is specified.
-    See return types for further details.
-    For both :math:`x` and :math:`\mu`, binning is inclusive on the low end and exclusive on the high end,
-    i.e. mode `mode` falls in bin `i` if ``edges[i] <= mode < edges[i+1]``.
-    However, last :math:`\mu`-bin is inclusive on both ends: ``edges[-2] <= mu <= edges[-1]``.
-    Therefore, with e.g. :math:`\mu`-edges ``[0.2, 0.4, 1.0]``, the last :math:`\mu`-bin includes modes at :math:`\mu = 1.0`.
-    Similarly, with :math:`\mu`-edges ``[0.2, 0.4, 0.8]``, the last :math:`\mu`-bin includes modes at :math:`\mu = 0.8`.
-
-    Warning
-    -------
-    Integration over Legendre polynomials for multipoles is performed between the first and last :math:`\mu`-edges,
-    e.g. with :math:`\mu`-edges ``[0.2, 0.4, 0.8]``, integration is performed between :math:`\mu = 0.2` and :math:`\mu = 0.8`.
-
-    Parameters
-    ----------
-    mesh : RealMeshField or ComplexMeshField
-        The 3D array holding the statistic to be projected to the specified basis.
-
-    xedges : array
-        List of arrays specifying the edges of the desired :math:`x` bins; assumed sorted.
-
-    muedges : array, default=None
-        List of arrays specifying the edges of the desired :math:`\mu` bins; assumed sorted.
-
-    los : array_like, default=(0, 0, 1)
-        The line-of-sight direction to use, which :math:`\mu` is defined with respect to.
-
-    ells : tuple of ints, default=None
-        If provided, a list of integers specifying multipole numbers to project the 2D :math:`(x, \mu)` bins on to.
-
-    antisymmetric : bool, default=False
-        If mesh is compressed, whether mesh is hermitian-antisymmetric (in which case negative modes are added with weight -1).
-
-    exclude_zero : bool, default=0
-        Whether to exclude zero mode from the sum.
-
-    mode_oversampling : int, default=0
-        If > 0, artificially increase the resolution of the input mesh by a factor ``2 * mode_oversampling + 1``.
-        In practice, shift the coordinates of the coordinates of the input grid by ``np.arange(-mode_oversampling, mode_oversampling + 1)``
-        along each of x, y, z axes.
-        This reduces "discrete grid binning effects".
-
-    Returns
-    -------
-    - xmean2d : array_like, (nx, nmu)
-        The mean :math:`x` value in each 2D bin
-    - mumean2d : array_like, (nx, nmu)
-        The mean :math:`\mu` value in each 2D bin
-    - y2d : array_like, (nell, nx, nmu)
-        The mean ``mesh`` value in each 2D bin, for each multipole
-    - n2d : array_like, (nx, nmu)
-        The number of values averaged in each 2D bin
-    - zero2d : array_like, (nmu, )
-        Value of the power spectrum at k = 0
-    """
-    hermitian_symmetric = isinstance(mesh, HermitianComplexMeshField)
-    if antisymmetric: hermitian_symmetric *= -1
-
-    shape = mesh.shape
-    ndim = mesh.ndim
-    dtype = mesh.dtype
-    xedges = np.asarray(xedges)
-    #xdtype = xedges.dtype
-    nx = len(xedges) - 1
-
-    # Setup the bin edges and number of bins
-    nmu = 1
-    if muedges is not None:
-        muedges = np.asarray(muedges)
-        #xdtype = max(xdtype, muedges.dtype)
-        nmu = len(muedges) - 1
-    xdtype = mesh.real.dtype
-    los = _get_los_vector(los, ndim=ndim)
-
-    # Always make sure first ell value is monopole, which is just (x, mu) projection since legendre of ell = 0 is 1
-    unique_ells = sorted(set([0]) | set(ells or []))
-    legpoly = {ell: legendre(ell) for ell in unique_ells}
-    nell = len(unique_ells)
-
-    # valid ell values
-    if any(ell < 0 for ell in unique_ells):
-        raise ValueError('Multipole numbers must be non-negative integers')
-
-    # Initialize the binning arrays
-    xshape = (nx + 3, nmu + 3)
-    xsize = xshape[0] * xshape[1]
-    musum = jnp.zeros(xsize, dtype=xdtype)
-    xsum = jnp.zeros(xsize, dtype=xdtype)
-    ysum = jnp.zeros((nell, xsize), dtype=dtype)  # extra dimension for multipoles
-    nsum = jnp.zeros(xsize, dtype=xdtype if mode_oversampling else int)
-    # If input array is Hermitian symmetric, only half of the last axis is stored in `mesh`
-
-    spacing = mesh.spacing
-    meshsize = mesh.meshsize
-    coords = mesh.coords(sparse=False)
-    mesh = mesh.ravel()
-    mincell = np.min(spacing)
-
-    if hermitian_symmetric:
-        nonsingular = jnp.ones(shape, dtype='i4')
-        # Get the indices that have positive freq along symmetry axis = -1
-        nonsingular = nonsingular.at[...].set(coords[-1] > 0.)
-        nonsingular = nonsingular.ravel()
-
-    import itertools
-    shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(spacing)
-    shifts = list(itertools.product(*shifts))
-    compute_mu = muedges is not None or unique_ells != (0,)
-
-    for shift in shifts:
-        shift = spacing * shift / (2 * mode_oversampling + 1)
-        xvec = coords
-        mask_zero_noshift = jnp.ravel(sum(xx**2 for xx in xvec) < (mincell / 2.)**2)  # mask_zero defined *before* shift
-        xvec = tuple(xx + ss for xx, ss in zip(xvec, shift))
-        xnorm = jnp.ravel(jnp.sqrt(sum(xx**2 for xx in xvec)))
-
-        # Get the bin indices for x on the slab
-        dig_x = jnp.digitize(xnorm, xedges, right=False)
-        dig_x = jnp.where(mask_zero_noshift, nx + 2, dig_x)
-
-        # Get the bin indices for mu on the slab
-        mu = 0
-        if compute_mu:
-            mu = jnp.ravel(sum(xx * ll for xx, ll in zip(xvec, los)))
-            with np.errstate(divide='ignore', invalid='ignore'):
-                mu = jnp.where(xnorm >= (mincell / (2 * mode_oversampling + 1) / 2.), mu / xnorm, 0.)
-
-        if hermitian_symmetric == 0:
-            mus = [mu]
-        else:
-            mus = [mu, -mu]
-
-        # Accounting for negative frequencies
-        for imu, mu in enumerate(mus):
-            if compute_mu and muedges is not None:
-                # Make the multi-index
-                dig_mu = jnp.digitize(mu, muedges, right=False)  # this is bins[i-1] <= x < bins[i]
-                dig_mu = jnp.where(mu == muedges[-1], nmu, dig_mu) # last mu inclusive
-                dig_mu = jnp.where(mask_zero_noshift, nmu + 2, dig_mu)
-            else:
-                dig_mu = jnp.where(mask_zero_noshift, nmu + 2, nmu)
-
-            multi_index = jnp.ravel_multi_index([dig_x, dig_mu], (nx + 3, nmu + 3), mode='clip')
-
-            mode_weight = None
-            if hermitian_symmetric and imu:
-                mode_weight = nonsingular
-
-            # Count number of modes in each bin
-            nsum = nsum.at[...].add(jnp.bincount(multi_index, weights=mode_weight, length=nsum.size))
-            # Sum up x in each bin
-            xsum = xsum.at[...].add(jnp.bincount(multi_index, weights=xnorm * mode_weight if mode_weight is not None else xnorm, length=nsum.size))
-            # Sum up mu in each bin
-            if muedges is not None: musum = musum.at[...].add(jnp.bincount(multi_index, weights=mu * mode_weight if mode_weight is not None else xnorm, length=nsum.size))
-
-            # Compute multipoles by weighting by Legendre(ell, mu)
-            for ill, ell in enumerate(unique_ells):
-
-                weightedmesh = 1. if ell == 0 else (2. * ell + 1.) * legpoly[ell](mu)
-
-                if mode_weight is not None:
-                    # Weight the input 3D array by the appropriate Legendre polynomial
-                    weightedmesh = hermitian_symmetric * weightedmesh * mesh.conj() * mode_weight  # hermitian_symmetric is 1 or -1
-                else:
-                    weightedmesh = weightedmesh * mesh
-
-                # Sum up the weighted y in each bin
-                tmp = jnp.bincount(multi_index, weights=weightedmesh.real, length=nsum.size)
-                if jnp.iscomplexobj(ysum):
-                    tmp += jnp.bincount(multi_index, weights=weightedmesh.imag, length=nsum.size)
-                ysum = ysum.at[ill, ...].add(tmp)
-
-    # It is not clear how to proceed with beyond Nyquist frequencies
-    # At Nyquist, kN = - pi * N / L (appears once in mesh.x) is the same as pi * N / L, so corresponds to mu and -mu
-    # Our treatment of hermitian symmetric field would sum this frequency twice (mu and -mu)
-    # But this would appear only once in the uncompressed field
-    # As a default, set frequencies beyond Nyquist to NaN
-    # Margin for oversampling factor
-    xmax = (meshsize // 2 - mode_oversampling) * spacing
-    mask_beyond_nyq = np.flatnonzero(xedges >= np.min(xmax))
-    xsum = xsum.reshape(xshape).at[mask_beyond_nyq].set(np.nan)
-    musum = musum.reshape(xshape).at[mask_beyond_nyq].set(np.nan)
-    ysum = ysum.reshape((nell,) + xshape).at[:, mask_beyond_nyq].set(np.nan)
-    nsum = nsum.reshape(xshape).at[mask_beyond_nyq].set(0)
-
-    # Reshape and slice to remove out of bounds points
-    slx = slmu = slice(1, -2)
-    if not exclude_zero:
-        dig_zero = tuple(np.digitize(0., edges, right=False) for edges in [xedges, muedges if muedges is not None else [-1., 1.]])
-        xsum = xsum.at[dig_zero].add(xsum[nx + 2, nmu + 2])
-        if muedges is not None: musum = musum.at[dig_zero].add(musum[nx + 2, nmu + 2])
-        ysum = ysum.at[(Ellipsis,) + dig_zero].add(ysum[:, nx + 2, nmu + 2])
-        nsum = nsum.at[dig_zero].add(nsum[nx + 2, nmu + 2])
-
-    with np.errstate(invalid='ignore', divide='ignore'):
-
-        # 2D binned results
-        if ells is None:
-            ills = 0
-        else:
-            ills = tuple(unique_ells.index(ell) for ell in ells)
-        if muedges is None:
-            mumean2d = None
-            slmu = nmu
-        else:
-            mumean2d = (musum / nsum)[slx, slmu]
-        y2d = (ysum / nsum)[ills, slx, slmu]  # ell=0 is first index
-        xmean2d = (xsum / nsum)[slx, slmu]
-        n2d = nsum[slx, slmu]
-        zero2d = ysum[ills, nx + 2, nmu + 2] / nsum[nx + 2, nmu + 2]
-        if mode_oversampling: n2d = n2d / len(shifts)  # int => float
-
-    return (xmean2d, mumean2d, y2d, n2d, zero2d)
-
-
 def _get_los_vector(los: str | np.ndarray, ndim=3):
     vlos = None
     if isinstance(los, str):
@@ -507,6 +265,74 @@ def _get_edges(edges, boxsize=1., meshsize=1., **kw):
         edges = np.asarray(edges)
     return edges
 
+
+def _get_bin_attrs(coords: jax.Array, edges: np.ndarray, weights: None | jax.Array=None):
+    r"""Return bin index, binned number of modes and coordinate."""
+    ibin = jnp.digitize(coords, edges, right=False)
+    nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+    x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+    return ibin, nmodes, x
+
+from collections import namedtuple
+
+BinAttrs = namedtuple('BinAttrs', ['nmodes', 'xavg', 'ibin', 'weights'])
+
+
+def get_bin_attrs(attrs, edges: staticarray, kind='complex_hermitian', mode_oversampling=0, **kwargs):
+    r"""Return Fourier bin index, weight, binned number of modes and coordinate."""
+    if isinstance(attrs, MeshAttrs):
+        hermitian = False
+        if kind == 'real':
+            vec = attrs.xcoords(sparse=True, **kwargs)
+        else:
+            hermitian = 'hermitian' in kind
+            vec = attrs.kcoords(sparse=True, hermitian=hermitian, **kwargs)
+    else:  # attrs is a mesh
+        hermitian = attrs.shape[-1] < attrs.meshsize[-1]
+        vec = attrs.coords(sparse=True)
+        attrs = attrs.attrs
+    nonsingular = None
+    if hermitian:
+        shape = np.broadcast_shapes(*[xx.shape for xx in vec])
+        nonsingular = jnp.ones(shape, dtype='i4')
+        # Get the indices that have positive freq along symmetry axis = -1
+        nonsingular += vec[-1] > 0.
+        nonsingular = nonsingular.ravel()
+    import itertools
+    shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(attrs.meshsize)
+    shifts = list(itertools.product(*shifts))
+    ibin, nmodes, xsum = [], 0, 0
+    for shift in shifts:
+        bin = _get_bin_attrs(jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift))).ravel(), edges=edges, weights=nonsingular)
+        ibin.append(bin[0])
+        nmodes += bin[1]
+        xsum += bin[2]
+    return BinAttrs(nmodes / len(shifts), xsum / nmodes, ibin, nonsingular)
+
+
+def bin(mesh, bin_attrs=None, antisymmetric=False, *args, **kwargs):
+    """Bin input mesh."""
+    if bin_attrs is None:
+        nmodes, xavg, ibin, weights = get_bin_attrs(mesh.attrs, *args, **kwargs)
+    else:
+        nmodes, xavg, ibin, weights = bin_attrs
+    value = mesh.ravel()
+    if weights is not None:
+        if antisymmetric: value = value.imag
+        else: value = value.real
+        value *= weights
+    value = sum(jnp.bincount(ibin, weights=value, length=len(xavg) + 2) for ibin in ibin)
+    value = value[1:-1] / len(ibin) / nmodes
+    if bin_attrs is None:
+        return value, nmodes, xavg
+    return value
+
+
+def _get_power_zero(mesh):
+    toret = mesh[(0,) * mesh.ndim]
+    if isinstance(mesh, HermitianComplexMeshField):
+        return toret.real
+    return toret
 
 
 def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField, edges: np.ndarray | dict | None=None,
@@ -575,17 +401,18 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
 
     autocorr = len(meshs) == 1
     if vlos is None:  # local, varying line-of-sight
-        result = []
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
         if swap: meshs = meshs[::-1]
 
         A0 = _2c(meshs[0] if autocorr else meshs[1])
+        battrs = get_bin_attrs(A0, edges=edges, mode_oversampling=mode_oversampling)
+        power, power_zero = [], []
         if 0 in ells:
             Aell = A0 if autocorr else _2c(meshs[1])
             Aell = Aell.conj() * A0
-            k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, exclude_zero=False, mode_oversampling=mode_oversampling)
-            result.append((power, power_zero))
+            power.append(bin(Aell, battrs))
+            power_zero.append(_get_power_zero(Aell))
 
         if nonzeroells:
 
@@ -600,14 +427,14 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
                 Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell])
                 Aell = Aell.conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
-                k, _, power, nmodes, power_zero = project_to_basis(Aell, edges, antisymmetric=bool(ell % 2), exclude_zero=False, mode_oversampling=mode_oversampling)
-                result.append((4 * jnp.pi * power, 4 * jnp.pi * power_zero))
+                power.append(4. * jnp.pi * bin(Aell, battrs, antisymmetric=bool(ell % 2)))
+                power_zero.append(4. * jnp.pi * 0.)
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        power, power_zero = (jnp.array([result[ill][ii] for ill, _ in enumerate(ells)]) for ii in range(2))
+        power, power_zero = jnp.array(power), jnp.array(power_zero)
         if swap: power, power_zero = power.conj(), power_zero.conj()
         # Format the power results into :class:`PowerSpectrumMultipoles` instance
-        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm,
+        return PowerSpectrumMultipoles(battrs.xavg, power_nonorm=power, nmodes=battrs.nmodes, edges=edges, ells=ells, norm=norm,
                                        power_zero_nonorm=power_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
@@ -617,10 +444,25 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
         if autocorr:
             meshs.append(meshs[0])
 
-        power = meshs[0] * meshs[1].conj()
+        Aell = meshs[0] * meshs[1].conj()
         del meshs
-        k, _, power, nmodes, power_zero = project_to_basis(power, edges, ells=ells, los=vlos, exclude_zero=False, mode_oversampling=mode_oversampling)
-        return PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=attrs)
+        battrs = get_bin_attrs(Aell, edges=edges, mode_oversampling=mode_oversampling)
+        kvec = Aell.coords(sparse=True)
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * kvec[0].ndim].set(1.)
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / knorm
+        del knorm
+        power, power_zero = [], []
+        for ell in ells:
+            leg = legendre(ell)(mu)
+            odd = ell % 2
+            if odd: leg += legendre(ell)(-mu)
+            power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, battrs))
+            power_zero.append(0.)
+            if ell == 0:
+                power_zero[-1] += _get_power_zero(Aell)
+        power, power_zero = jnp.array(power), jnp.array(power_zero)
+        return PowerSpectrumMultipoles(battrs.xavg, power_nonorm=power, nmodes=battrs.nmodes, edges=edges, ells=ells, norm=norm,
+                                       power_zero_nonorm=power_zero, attrs=attrs)
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
@@ -864,6 +706,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         if isscalar: theories = [theory]
         else: theories = list(theory)
 
+        hermitian = True
         if not periodic:
 
             for imesh, mesh in enumerate(meshs):
@@ -871,12 +714,17 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
             if autocorr:
                 meshs.append(meshs[0])
 
+            hermitian = any(isinstance(mesh, HermitianComplexMeshField) for mesh in meshs)
             Q = _2r(meshs[0] * meshs[1].conj())
         else:
             Q = None
 
+        battrs = get_bin_attrs(mattrs, edges=edges, kind='complex' + ('_hermitian' * hermitian), mode_oversampling=mode_oversampling)
+        kvec = mattrs.kcoords(sparse=True, hermitian=hermitian)
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * kvec[0].ndim].set(1.)
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / knorm
+
         results = [None for _ in theories]
-        project = jax.jit(partial(project_to_basis, xedges=edges, ells=ells, los=vlos, exclude_zero=False, mode_oversampling=mode_oversampling))
 
         if pbar:
             from tqdm import tqdm
@@ -887,17 +735,23 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
             pkvec = theory
 
             if isinstance(theory, dict):
-                def pkvec(kvec):
-                    knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-                    mu = sum(kk * ll for kk, ll in zip(kvec, vlos))
-                    mu = jnp.where(knorm == 0., 0., mu / knorm)
+                def pkvec(*args):
                     return sum(theory[ell](knorm) * legendre(ell)(mu) for ell in theory)
 
-            power = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * norm, kind='wavenumber')
-            if Q is not None: power = (Q * power.c2r()).r2c()
+            Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * norm, kind='wavenumber')
+            if Q is not None: Aell = (Q * Aell.c2r()).r2c()
 
-            k, _, power, nmodes, power_zero = project(power)
-            results[ith] = PowerSpectrumMultipoles(k, power_nonorm=power, nmodes=nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=mattrs)
+            power, power_zero = [], []
+            for ell in ells:
+                leg = legendre(ell)(mu)
+                odd = ell % 2
+                if odd: leg += legendre(ell)(-mu)
+                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, battrs))
+                power_zero.append(0.)
+                if ell == 0:
+                    power_zero[-1] += _get_power_zero(Aell)
+
+            results[ith] = PowerSpectrumMultipoles(battrs.xavg, power_nonorm=power, nmodes=battrs.nmodes, edges=edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=mattrs)
             if pbar: t.update(n=1)
 
     else:
@@ -933,6 +787,9 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         rmesh2 = rmesh1 if autocorr else _2r(meshs[1])
         A0 = _2c(meshs[0] if autocorr else meshs[1])
         del meshs
+
+        battrs = get_bin_attrs(A0, edges=edges, mode_oversampling=mode_oversampling)
+
         # The real-space grid
         xvec = mattrs.xcoords(sparse=True)
 
@@ -948,7 +805,6 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
 
         powers = [[0.] * len(ells) for _ in theories]
         powers_zero = [[0.] * len(ells) for _ in theories]
-        project = jax.jit(partial(project_to_basis, xedges=edges, exclude_zero=False, mode_oversampling=mode_oversampling), static_argnames=['antisymmetric'])
 
         if pbar:
             from tqdm import tqdm
@@ -972,9 +828,11 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                                 return theory[ell1, wa1](knorm) * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*kvec)
 
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
-
-                            k, _, power, nmodes, power_zero = project(sum((xi * Q).r2c() * Ylm(*kvec) for Q, Ylm in zip(Qs, Ylms[ell])), antisymmetric=bool(ell % 2))
-                            if swap: power, power_zero = power.conj(), power_zero.conj()
+                            Aell = sum((xi * Q).r2c() * Ylm(*kvec) for Q, Ylm in zip(Qs, Ylms[ell]))
+                            del xi
+                            power = bin(Aell, battrs, antisymmetric=bool(ell % 2))
+                            power_zero = 0.
+                            if ell == 0: power_zero += _get_power_zero(Aell)
                             powers[ith][ill] += 4 * jnp.pi * power
                             powers_zero[ith][ill] += 4 * jnp.pi * power_zero
                             if pbar: t.update(n=n)
@@ -1000,8 +858,9 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                             xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
                             Aell = sum((xi * Q).r2c() * Ylm(*kvec) for Q, Ylm in zip(Qs, Ylms[ell]))
                             del xi
-                            k, _, power, nmodes, power_zero = project(Aell, antisymmetric=bool(ell % 2))
-                            if swap: power, power_zero = power.conj(), power_zero.conj()
+                            power = bin(Aell, battrs, antisymmetric=bool(ell % 2))
+                            power_zero = 0.
+                            if ell == 0: power_zero += _get_power_zero(Aell)
                             powers[ith][ill] += 4 * jnp.pi * power
                             powers_zero[ith][ill] += 4 * jnp.pi * power_zero
                             if pbar: t.update(n=n)
@@ -1011,8 +870,10 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
 
         results = []
         for power, power_zero in zip(powers, powers_zero):
-            results.append(PowerSpectrumMultipoles(k, power_nonorm=jnp.array(power), nmodes=nmodes, edges=edges, ells=ells, norm=norm,
-                                                   power_zero_nonorm=jnp.array(power_zero), attrs=attrs))
+            power, power_zero = jnp.array(power), jnp.array(power_zero)
+            if swap: power, power_zero = power.conj(), power_zero.conj()
+            results.append(PowerSpectrumMultipoles(battrs.xavg, power_nonorm=power, nmodes=battrs.nmodes, edges=edges, ells=ells, norm=norm,
+                                                   power_zero_nonorm=power_zero, attrs=attrs))
     if isscalar:
         results = results[0]
     return results
