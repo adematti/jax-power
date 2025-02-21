@@ -7,7 +7,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_uniform_particles, FKPField,
+from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, FKPField,
                       compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, compute_mean_mesh_power)
 
 
@@ -168,15 +168,16 @@ def test_mean_power(plot=False):
              2: lambda k: 0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(k),
              4: lambda k: 8. / 35 * beta ** 2 * pk(k)}
 
-    list_los = [('x', None), ('endpoint', None), ('endpoint', 'local')]
+    list_los = [('x', None), ('endpoint', None), ('endpoint', 'local')][1:2]
     attrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
 
-    #@partial(jax.jit, static_argnames=['los', 'thlos'])
+    from jaxpower import compute_mean_mesh_power_list
+    @partial(jax.jit, static_argnames=['los', 'thlos'])
     def mean(los='x', thlos=None):
         theory = poles
         if thlos is not None:
             theory = (poles, thlos)
-        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), los=los, edges={'step': 0.01}, pbar=True)
+        return compute_mean_mesh_power_list(attrs, theory=theory, ells=(0, 2, 4), los=los, edges={'step': 0.01})
 
     for los, thlos in list_los:
 
@@ -200,8 +201,103 @@ def test_mean_power(plot=False):
             plt.show()
 
 
+
+class Interpolator1D(object):
+
+    def __init__(self, x: jax.Array, xeval: jax.Array, order: int=0):
+        self.x = x
+        self.eval_shape = xeval.shape
+        self.order = order
+        if self.order == 0:  # simple bins
+            edges = jnp.concatenate([x[:1], (x[1:] + x[:-1]) / 2., x[-1:]], axis=0)
+            self.idx = jnp.digitize(xeval.ravel(), edges, right=False) - 1
+            self.idx = jnp.clip(self.idx, 0, len(self.x) - 1)
+        elif self.order == 1:
+            self.idx = jnp.digitize(xeval.ravel(), x, right=False) - 1
+            self.idx = jnp.clip(self.idx, 0, len(self.x) - 2)
+            self.fidx = jnp.clip(xeval.ravel() - self.x[self.idx], 0., 1.)
+        else:
+            raise NotImplementedError
+
+    def __call__(self, fun: jax.Array):
+        if self.order == 0:
+            return fun[self.idx].reshape(self.eval_shape)
+        if self.order == 1:
+            return (1. - self.fidx) * fun[self.idx] + self.fidx * fun[self.idx + 1]
+
+
+
+def test_checkpoint():
+
+    def pk(k):
+        kp = 0.01
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    f, b = 0.8, 1.5
+    beta = f / b
+    kin = np.linspace(0.001, 0.7, 100)
+    ells = (0, 2, 4)
+    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
+                        8. / 35 * beta ** 2 * pk(kin)])
+
+    attrs = MeshAttrs(boxsize=2000., meshsize=512, boxcenter=1000.)
+
+    def make_callable(poles):
+        def get_fun(ill):
+            return lambda k: 1. * k * np.mean(poles[ill]) #jnp.interp(k, kin, poles[ill], left=0., right=0.)
+        return {ell: get_fun(ill) for ill, ell in enumerate(ells)}
+
+    def make_callable(poles):
+        knorm = jnp.sqrt(sum(kk**2 for kk in attrs.kcoords(sparse=True, hermitian=True))).ravel()
+        interp = Interpolator1D(kin, knorm)
+        del knorm
+        def get_fun(ill):
+            return lambda k: interp(poles[ill])
+        return {ell: get_fun(ill) for ill, ell in enumerate(ells)}
+
+    def mean(poles, los='local'):
+        theory = make_callable(poles)
+        if los == 'local':
+            theory = (theory, los)
+            los = 'firstpoint'
+        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), edges={'step': 0.01}, los=los)
+
+    #print(jax.grad(lambda poles: mean(poles).view()[2])(poles))
+    from jax.ad_checkpoint import checkpoint_name
+
+    def mock(poles, los='local', seed=42):
+        mesh = generate_anisotropic_gaussian_mesh(make_callable(poles), los=los, seed=seed, **attrs)
+        #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(make_callable(poles), los='x', seed=seed, **attrs))(poles)
+        return compute_mesh_power(mesh, ells=(0, 2, 4), edges={'step': 0.01}, los={'local': 'firstpoint'}.get(los, los)).view()[3]
+
+    def mock_vmap(poles, los='local'):
+        seeds = random.split(random.key(42), 4)
+        def func(seed):
+            mesh = generate_anisotropic_gaussian_mesh(make_callable(poles), los=los, seed=seed, **attrs)
+            #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(make_callable(poles), los='x', seed=seed, **attrs))(poles)
+            return compute_mesh_power(mesh, ells=(0, 2, 4), edges={'step': 0.01}, los={'local': 'firstpoint'}.get(los, los)).view()
+        return jnp.mean(jax.vmap(func)(seeds), axis=0)
+
+    func = lambda poles: mock(poles)
+    #func = jax.checkpoint(func, policy=jax.checkpoint_policies.save_only_these_names('mock'))
+    from jax.ad_checkpoint import print_saved_residuals
+    #print_saved_residuals(func, poles)
+    #func = jax.grad(func)
+    #func = jax.jacrev(func)
+    func = jax.jit(func)
+    for i in range(4):
+        t0 = time.time()
+        tmp = func(poles + i * 1e-6)
+        #jax.block_until_ready(tmp)
+        print(tmp)
+        print(time.time() - t0)
+
+
 if __name__ == '__main__':
 
+    test_checkpoint()
+    exit()
     test_binned_statistic()
     test_mesh_power(plot=False)
     test_fkp_power(plot=False)

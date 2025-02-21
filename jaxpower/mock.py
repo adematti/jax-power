@@ -1,6 +1,7 @@
 from collections.abc import Callable
 
 import numpy as np
+import jax
 from jax import random
 from jax import numpy as jnp
 
@@ -86,9 +87,27 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
 
         xvec = mesh.coords()
         ell = 2
-        Ylms = [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)]
-        mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*kvec)).c2r() * Ylm(*xvec) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
 
+        if True:
+            Ylms = [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)]
+
+            def f(carry, im):
+                carry += 4. * jnp.pi / (2 * ell + 1) * (mesh2 * jax.lax.switch(im, Ylms, *kvec)).c2r() * jax.lax.switch(im, Ylms, *xvec)
+                return carry, im
+
+            mesh, _ = jax.lax.scan(f, init=mesh, xs=np.arange(len(Ylms)))
+        else:
+            Ylms = [get_real_Ylm(ell, m, batch=False) for m in range(-ell, ell + 1)]
+            knorm = knorm.reshape(mesh2.shape)
+            kvec = tuple(_safe_divide(xx, knorm) for xx in kvec)
+            del knorm
+            xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
+            xvec = tuple(_safe_divide(xx, xnorm) for xx in xvec)
+            del xnorm
+
+            mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*kvec)).c2r() * Ylm(*xvec) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
+
+        del mesh2
         return mesh
 
     else:
@@ -97,16 +116,24 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
         def kernel(value, kvec):
             knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
             mu = _safe_divide(sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel(), knorm)
-            ker = 0.
-            for ell in ells:
-                ker += poles[ell](knorm) / attrs.cellsize.prod() * legendre(ell)(mu)
+
+            if False:
+                pole = [poles.get(ell, lambda x: x) for ell in range(max(ells) + 1)]
+                def f(carry, ell):
+                    carry += jax.lax.switch(ell, pole, knorm) / attrs.cellsize.prod() * legendre(ell)(mu)
+                    return carry, ell
+                ker, _ = jax.lax.scan(f, init=jnp.zeros(value.size, dtype=value.dtype), xs=jnp.array(ells))
+            else:
+                ker = 0.
+                for ell in ells:
+                    ker += poles[ell](knorm) / attrs.cellsize.prod() * legendre(ell)(mu)
             ker = jnp.sqrt(ker).reshape(value.shape)
             if unitary_amplitude:
                 ker *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(value)
             return value * ker
 
-        mesh = mesh.apply(kernel, kind='wavenumber')
-        return mesh.c2r()
+        mesh = mesh.apply(kernel, kind='wavenumber').c2r()
+        return mesh
 
 
 

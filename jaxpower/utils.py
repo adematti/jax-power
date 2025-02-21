@@ -224,9 +224,16 @@ def _legendre_9(x):
 def _legendre_10(x):
     return (46189*x**10 - 109395*x**8 + 90090*x**6 - 30030*x**4 + 3465*x**2 - 63) / 256
 
+_ells = np.arange(11)
+_legendres = [globals()['_legendre_{:d}'.format(ell)] for ill, ell in enumerate(_ells)]
+
 
 def legendre(ell):
-    return globals()['_legendre_{:d}'.format(ell)]
+
+    def f(mu):
+        return jax.lax.switch(ell, _legendres, mu)
+
+    return f
 
 
 def _nan_to_zero(array):
