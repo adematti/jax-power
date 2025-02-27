@@ -10,6 +10,7 @@ doc/_build/
 **/.wget*
 **/_tests
 **/_runs
+**/_tmp
 **/dist
 **/eggs
 **/build

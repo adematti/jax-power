@@ -7,6 +7,7 @@ from jax import numpy as jnp
 
 from .mesh import RealMeshField, ParticleField, MeshAttrs
 from .power import _get_los_vector, legendre, get_real_Ylm
+from .utils import BinnedStatistic
 
 
 def generate_gaussian_mesh(power: Callable, seed: int=42,
@@ -38,8 +39,13 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
     """Generate :class:`RealMeshField` with input power spectrum multipoles."""
 
     ells = (0, 2, 4)
+    kin = None
+    if isinstance(poles, tuple):
+        kin, poles = poles
+    if isinstance(poles, BinnedStatistic):
+        kin, poles = poles._edges[0], {proj: poles.view(projs=proj) for proj in poles.projs}
     if isinstance(poles, list):
-        poles = {ell: p for ell, p in zip(ells, poles)}
+        poles = {ell: pole for ell, pole in zip(ells, poles)}
     ells = list(poles)
 
     if isinstance(seed, int):
@@ -57,76 +63,84 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
             mesh *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
         return mesh
 
+    kvec = attrs.kcoords(sparse=True, hermitian=True)
+    knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
+    kshape = np.broadcast_shapes(*(kk.shape for kk in kvec))
+
+    is_callable = all(callable(pole) for pole in poles.values())
+    if not is_callable:
+        from .utils import Interpolator1D
+        interp = Interpolator1D(kin, knorm, edges=len(kin) == len(poles[0]) + 1)
+
+    def get_theory(ell=None, pole=None):
+        if pole is None:
+            pole = poles[ell]
+        if is_callable:
+            return pole(knorm)
+        else:
+            return interp(pole)
+
+
     if los == 'local':
-        seeds = random.split(seed)
 
-        kvec = attrs.kcoords(sparse=True, hermitian=True)
-        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-        shape = knorm.shape
-        knorm = knorm.ravel()
+        @jax.checkpoint
+        def get_meshs(seeds):
 
-        a11 = 35. / 18. * poles[4](knorm).reshape(shape) / attrs.cellsize.prod()
-        a00 = poles[0](knorm).reshape(shape) / attrs.cellsize.prod() - 1. / 5. * a11
-        # Cholesky decomposition
-        l00 = jnp.sqrt(a00)
-        del a00
+            if is_callable:
+                p0, p2, p4 = (get_theory(ell) for ell in ells)
+            else:
+                p0, p2, p4 = (poles[ell] for ell in ells)
 
-        a10 = 1. / 2. * poles[2](knorm).reshape(shape) / attrs.cellsize.prod() - 1. / 7. * a11
-        l10 = a10 / jnp.where(knorm.reshape(shape) == 0., 1., l00)
-        del a10
+            a11 = 35. / 18. * p4 / attrs.cellsize.prod()
+            a00 = p0 / attrs.cellsize.prod() - 1. / 5. * a11
+            # Cholesky decomposition
+            l00 = jnp.sqrt(a00)
+            del a00
 
-        # The mesh for ell = 0
-        normal = generate_normal(seeds[0])
-        mesh = (normal * l00).c2r()
-        del l00
-        mesh2 = normal * l10
-        del normal
-        # The mesh for ell = 2
-        mesh2 += generate_normal(seeds[1]) * jnp.sqrt(a11 - l10**2)
-        del a11, l10
+            a10 = 1. / 2. * p2 / attrs.cellsize.prod() - 1. / 7. * a11
+            l10 = jnp.where(l00 == 0., 0., a10 / l00)
+            del a10
 
+            def _interp(pole):
+                if is_callable:
+                    return pole.reshape(kshape)
+                else:
+                    return get_theory(pole=pole).reshape(kshape)
+
+            # The mesh for ell = 0
+            normal = generate_normal(seeds[0])
+            mesh = (normal * _interp(l00)).c2r()
+            del l00
+            mesh2 = normal * _interp(l10)
+            del normal
+            # The mesh for ell = 2
+            mesh2 += generate_normal(seeds[1]) * _interp(jnp.sqrt(a11 - l10**2))
+            del a11, l10
+            return mesh, mesh2
+
+        mesh, mesh2 = get_meshs(random.split(seed))
         xvec = mesh.coords()
         ell = 2
+        Ylms = [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)]
 
-        if True:
-            Ylms = [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)]
+        @jax.checkpoint
+        def f(carry, im):
+            carry += 4. * jnp.pi / (2 * ell + 1) * (mesh2 * jax.lax.switch(im, Ylms, *kvec)).c2r() * jax.lax.switch(im, Ylms, *xvec)
+            return carry, im
 
-            def f(carry, im):
-                carry += 4. * jnp.pi / (2 * ell + 1) * (mesh2 * jax.lax.switch(im, Ylms, *kvec)).c2r() * jax.lax.switch(im, Ylms, *xvec)
-                return carry, im
-
-            mesh, _ = jax.lax.scan(f, init=mesh, xs=np.arange(len(Ylms)))
-        else:
-            Ylms = [get_real_Ylm(ell, m, batch=False) for m in range(-ell, ell + 1)]
-            knorm = knorm.reshape(mesh2.shape)
-            kvec = tuple(_safe_divide(xx, knorm) for xx in kvec)
-            del knorm
-            xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
-            xvec = tuple(_safe_divide(xx, xnorm) for xx in xvec)
-            del xnorm
-
-            mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*kvec)).c2r() * Ylm(*xvec) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
+        mesh = jax.lax.scan(f, init=mesh, xs=np.arange(len(Ylms)))[0]
+        #mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*kvec)).c2r() * Ylm(*xvec) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
 
         del mesh2
         return mesh
 
     else:
         vlos = _get_los_vector(los, ndim=len(attrs.meshsize))
-        mesh = RealMeshField(random.normal(seed, attrs.meshsize), attrs=attrs).r2c()
-        def kernel(value, kvec):
-            knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
-            mu = _safe_divide(sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel(), knorm)
+        mesh = generate_normal(seed)
 
-            if False:
-                pole = [poles.get(ell, lambda x: x) for ell in range(max(ells) + 1)]
-                def f(carry, ell):
-                    carry += jax.lax.switch(ell, pole, knorm) / attrs.cellsize.prod() * legendre(ell)(mu)
-                    return carry, ell
-                ker, _ = jax.lax.scan(f, init=jnp.zeros(value.size, dtype=value.dtype), xs=jnp.array(ells))
-            else:
-                ker = 0.
-                for ell in ells:
-                    ker += poles[ell](knorm) / attrs.cellsize.prod() * legendre(ell)(mu)
+        def kernel(value, kvec):
+            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel() / jnp.where(knorm == 0., 1., knorm)
+            ker = sum(get_theory(ell) / attrs.cellsize.prod() * legendre(ell)(mu) for ell in ells)
             ker = jnp.sqrt(ker).reshape(value.shape)
             if unitary_amplitude:
                 ker *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(value)

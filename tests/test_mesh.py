@@ -56,7 +56,7 @@ def test_base_mesh():
     fn = dirname / 'mesh.npz'
     mesh.save(fn)
     mesh2 = RealMeshField.load(fn)
-    mesh3.attrs.boxsize
+    mesh2.attrs.boxsize
     assert np.allclose(mesh2.value, mesh.value)
 
 
@@ -144,6 +144,8 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    test_base_mesh()
+    exit()
     test_mesh_attrs()
     test_resamplers()
     test_static_array()

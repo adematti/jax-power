@@ -101,6 +101,14 @@ def fftfreq(shape: tuple, kind: str='wavenumber', sparse: bool | None=None,
 
 
 
+def _get_bin_attrs(coords: jax.Array, edges: np.ndarray, weights: None | jax.Array=None):
+    r"""Return bin index, binned number of modes and coordinates."""
+    ibin = jnp.digitize(coords, edges, right=False)
+    nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+    x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+    return ibin, nmodes, x
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class MeshAttrs(object):
@@ -176,6 +184,8 @@ class MeshAttrs(object):
         toret = [jnp.arange(s) for s in self.meshsize]
         if kind != 'index':
             toret = [idx * cell + offset for idx, cell, offset in zip(toret, self.cellsize, self.boxcenter - self.boxsize / 2.)]
+        if kind == 'separation':
+            toret = fftfreq(self.meshsize, spacing=self.kfun)
         if sparse is None:
             return tuple(toret)
         return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
@@ -201,7 +211,8 @@ class MeshAttrs(object):
         -------
         coords : tuple
         """
-        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=hermitian, spacing=self.boxsize / self.meshsize)
+        if kind == 'separation': kind = 'wavenumber'
+        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=hermitian, spacing=self.cellsize)
 
     def create(self, kind: str='real', fill: float=None, dtype=None):
         """
@@ -1002,6 +1013,68 @@ for name in [field.name for field in fields(MeshAttrs)] + ['cellsize']:
     _set_property(ParticleField, name)
 
 
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
+class BinAttrs(object):
+
+    nmodes: jax.Array = None
+    xavg: jax.Array = None
+    ibin: jax.Array = None
+    ibin_zero: jax.Array = None
+    wmodes: jax.Array = None
+
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray, kind='complex_hermitian', mode_oversampling: int=0, **kwargs):
+        if isinstance(mattrs, MeshAttrs):
+            hermitian = False
+            if kind == 'real':
+                vec = mattrs.xcoords(sparse=True, **kwargs)
+            else:
+                hermitian = 'hermitian' in kind
+                vec = mattrs.kcoords(sparse=True, hermitian=hermitian, **kwargs)
+        else:  # attrs is a mesh
+            hermitian = mattrs.shape[-1] < mattrs.meshsize[-1]
+            vec = mattrs.coords(kind='separation', sparse=True)
+            mattrs = mattrs.attrs
+        nonsingular = None
+        if hermitian:
+            shape = np.broadcast_shapes(*[xx.shape for xx in vec])
+            nonsingular = jnp.ones(shape, dtype='i4')
+            # Get the indices that have positive freq along symmetry axis = -1
+            nonsingular += vec[-1] > 0.
+            nonsingular = nonsingular.ravel()
+        import itertools
+        shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
+        shifts = list(itertools.product(*shifts))
+        ibin, nmodes, xsum = [], 0, 0
+        for shift in shifts:
+            bin = _get_bin_attrs(jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift))).ravel(), edges=edges, weights=nonsingular)
+            ibin.append(bin[0])
+            nmodes += bin[1]
+            xsum += bin[2]
+        self.__dict__.update(nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=nonsingular)
+
+    def __call__(self, mesh, antisymmetric=False, remove_zero=False):
+        value = mesh.ravel()
+        weights = self.wmodes
+        if weights is not None:
+            if antisymmetric: value = value.imag
+            else: value = value.real
+            value *= weights
+        if remove_zero:
+            value = value.at[0].set(0.)
+        value = sum(jnp.bincount(ib, weights=value, length=len(self.xavg) + 2) for ib in self.ibin)
+        return value[1:-1] / len(self.ibin) / self.nmodes
+
+    def tree_flatten(self):
+        return (asdict(self),), {}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(aux_data)
+        return new
+
+
 # For functional programming interface
 
 def c2r(mesh: ComplexMeshField | HermitianComplexMeshField) -> RealMeshField:
@@ -1023,3 +1096,14 @@ def read(mesh: RealMeshField, positions: jax.Array, *args, **kwargs) -> jax.Arra
 
 def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField | HermitianComplexMeshField:
     return mesh.paint(*args, **kwargs)
+
+
+def bin(mesh, battrs=None, antisymmetric=False, remove_zero=False, *args, **kwargs):
+    """Bin input mesh."""
+    input_battrs = battrs is not None
+    if not input_battrs:
+        battrs = BinAttrs(mesh, *args, **kwargs)
+    value = battrs(mesh, antisymmetric=antisymmetric, remove_zero=remove_zero)
+    if not input_battrs:
+        return battrs
+    return value

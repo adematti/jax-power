@@ -225,15 +225,100 @@ def _legendre_10(x):
     return (46189*x**10 - 109395*x**8 + 90090*x**6 - 30030*x**4 + 3465*x**2 - 63) / 256
 
 _ells = np.arange(11)
-_legendres = [globals()['_legendre_{:d}'.format(ell)] for ill, ell in enumerate(_ells)]
+_registered_legendres = [globals()['_legendre_{:d}'.format(ell)] for ill, ell in enumerate(_ells)]
 
 
 def legendre(ell):
 
     def f(mu):
-        return jax.lax.switch(ell, _legendres, mu)
+        return jax.lax.switch(ell, _registered_legendres, mu)
 
     return f
+
+
+from scipy import special
+
+def Si(x):
+    return special.sici(x)[0]
+
+# Derivative of correlation function w.r.t. k-bins, precomputed with sympy; full, low-s or low-a limit
+_registered_correlation_function_tophat_derivatives = {}
+_registered_correlation_function_tophat_derivatives[0] = (lambda s, a: (-a * np.cos(a * s) / s + np.sin(a * s) / s**2) / (2 * np.pi**2 * s),
+                                                          lambda s, a: -a**9 * s**6 / (90720 * np.pi**2) + a**7 * s**4 / (1680 * np.pi**2) - a**5 * s**2 / (60 * np.pi**2) + a**3 / (6 * np.pi**2))
+_registered_correlation_function_tophat_derivatives[1] = (lambda s, a: ((-a * np.sin(a * s) - 2 * np.cos(a * s) / s) / s**2 + 2 / s**3) / (2 * np.pi**2),
+                                                          lambda s, a: -a**10 * s**7 / (907200 * np.pi**2) + a**8 * s**5 / (13440 * np.pi**2) - a**6 * s**3 / (360 * np.pi**2) + a**4 * s / (24 * np.pi**2))
+_registered_correlation_function_tophat_derivatives[2] = (lambda s, a: -(a * s * np.cos(a * s) - 4 * np.sin(a * s) + 3 * Si(a * s)) / (2 * np.pi**2 * s**3),
+                                                          lambda s, a: -a**9 * s**6 / (136080 * np.pi**2) + a**7 * s**4 / (2940 * np.pi**2) - a**5 * s**2 / (150 * np.pi**2))
+_registered_correlation_function_tophat_derivatives[3] = (lambda s, a: -(8 / s**3 + (a * s**2 * np.sin(a * s) + 7 * s * np.cos(a * s) - 15 * np.sin(a * s) / a) / s**4) / (2 * np.pi**2),
+                                                          lambda s, a: -a**10 * s**7 / (1663200 * np.pi**2) + a**8 * s**5 / (30240 * np.pi**2) - a**6 * s**3 / (1260 * np.pi**2))
+_registered_correlation_function_tophat_derivatives[4] = (lambda s, a: (-a * s**3 * np.cos(a * s) + 11 * s**2 * np.sin(a * s) + 15 * s**2 * Si(a * s) / 2 + 105 * s * np.cos(a * s) / (2 * a) - 105 * np.sin(a * s) / (2 * a**2)) / (2 * np.pi**2 * s**5),
+                                                          lambda s, a: -a**9 * s**6 / (374220 * np.pi**2) + a**7 * s**4 / (13230 * np.pi**2))
+_registered_correlation_function_tophat_derivatives[5] = (lambda s, a: (16 / s**3 + (-a * s**4 * np.sin(a * s) - 16 * s**3 * np.cos(a * s) + 105 * s**2 * np.sin(a * s) / a + 315 * s * np.cos(a * s) / a**2 - 315 * np.sin(a * s) / a**3) / s**6) / (2 * np.pi**2),
+                                                          lambda s, a: -a**10 * s**7 / (5405400 * np.pi**2) + a**8 * s**5 / (166320 * np.pi**2))
+
+
+
+def weights_trapz(x):
+    """Return weights for trapezoidal integration."""
+    return np.concatenate([[x[1] - x[0]], x[2:] - x[:-2], [x[-1] - x[-2]]]) / 2.
+
+
+class TophatPowerToCorrelation(object):
+
+    def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False):
+        if edges: edges = k
+        else: edges = np.concatenate([k[:1], (k[1:] + k[:-1]) / 2., k[-1:]], axis=0)
+        tophat = _registered_correlation_function_tophat_derivatives[ell]
+        self.w = np.zeros(seval.shape + (len(edges) - 1,))
+        mask = seval > 0.1
+        self.w[mask] = np.diff(tophat[0](seval[mask, None], edges), axis=-1)
+        self.w[~mask] = np.diff(tophat[1](seval[~mask, None], edges), axis=-1)
+
+    def __call__(self, fun: jax.Array):
+        return jnp.sum(self.w * fun, axis=-1)
+
+
+class BesselPowerToCorrelation(object):
+
+    def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False, volume=None):
+        if edges:
+            edges = k
+            if volume is None: volume = 4. / 3. * np.pi * (edges[1:]**3 - edges[:-1]**3)
+            k = (edges[:-1] + edges[1:]) / 2.
+        else:
+            if volume is None: volume = 4. / 3. * np.pi * weights_trapz(k**3)
+        self.w = (-1)**(ell // 2) / (2. * np.pi)**3 * volume * special.spherical_jn(ell, seval[..., None] * k)
+
+    def __call__(self, fun: jax.Array):
+        return jnp.sum(self.w * fun, axis=-1)
+
+
+class Interpolator1D(object):
+
+    def __init__(self, x: jax.Array, xeval: jax.Array, order: int=0, edges=False):
+        self.eval_shape = xeval.shape
+        self.order = order
+        if self.order == 0:  # simple bins
+            if edges:
+                edges = x
+            else:
+                tmp = (x[:-1] + x[1:]) / 2.
+                edges = np.concatenate([[tmp[0] - (x[1] - x[0])], tmp, [tmp[-1] + (x[-1] - x[-2])]])
+            self.idx = jnp.digitize(xeval.ravel(), edges, right=False) - 1
+            self.idx = jnp.clip(self.idx, 0, len(edges) - 2)
+        elif self.order == 1:
+            self.idx = jnp.digitize(xeval.ravel(), x, right=False) - 1
+            self.idx = jnp.clip(self.idx, 0, len(x) - 2)
+            self.fidx = jnp.clip(xeval.ravel() - x[self.idx], 0., 1.)
+        else:
+            raise NotImplementedError
+
+    def __call__(self, fun: jax.Array):
+        if self.order == 0:
+            toret = fun[self.idx]
+        if self.order == 1:
+            toret = (1. - self.fidx) * fun[self.idx] + self.fidx * fun[self.idx + 1]
+        return toret.reshape(self.eval_shape)
 
 
 def _nan_to_zero(array):
@@ -317,6 +402,7 @@ def plotter(*args, **kwargs):
         raise ValueError('unexpected args: {}'.format(args))
 
     return get_wrapper(args[0])
+
 
 class MemoryMonitor(object):
     """
@@ -488,7 +574,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         shape = tuple(len(xx) for xx in state['_x'])
         eshape = tuple(len(edges) - 1 for edges in state['_edges'])
         if eshape != shape:
-            raise ValueError('edges should be of length(x) - 1, found = {}'.format(shape, eshape))
+            raise ValueError('edges should be of length(x) + 1 = {}, found = {}'.format(shape, eshape))
         if weights is None:
             weights = [None] * len(state['_x'])
         state['_weights'] = [jnp.atleast_1d(ww) if ww is not None else jnp.ones(len(xx), dtype=float) for xx, ww in zip(state['_x'], weights)]
