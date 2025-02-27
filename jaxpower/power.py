@@ -317,7 +317,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
     assert 1 <= len(meshs) <= 2
     rdtype = meshs[0].real.dtype
     mattrs = meshs[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.boxsize / mattrs.meshsize, dtype=rdtype)
+    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
     edges = _get_edges(edges, **mattrs)
 
     ndim = len(mattrs.boxsize)
@@ -367,14 +367,14 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
             kvec = A0.coords(sparse=True)
             Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in nonzeroells}
 
-            @jax.checkpoint
-            def f(carry, im):
+            @partial(jax.checkpoint, static_argnums=0)
+            def f(Ylm, carry, im):
                 carry += _2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
                 return carry, im
 
             for ell in nonzeroells:
                 Ylm = Ylms[ell]
-                Aell = jax.lax.scan(f, init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0].conj() * A0
+                Aell = jax.lax.scan(partial(f, Ylm), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0].conj() * A0
                 #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell]).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 power.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
@@ -573,7 +573,7 @@ def compute_wide_angle_poles(poles: dict[Callable]):
 
 def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
                         edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0,
-                        buffer=None, batch_size=None, pbar=False, norm=None) -> jax.Array:
+                        buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> jax.Array:
     r"""
     Compute mean power spectrum from mesh.
 
@@ -618,8 +618,10 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
     else:
         rdtype = meshs[0].real.dtype
         mattrs = meshs[0].attrs
-    if norm is None:
-        norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.boxsize / mattrs.meshsize, dtype=rdtype)
+
+    _norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
+    if norm is None: norm = _norm
+    rnorm = _norm / norm / mattrs.meshsize.prod(dtype=rdtype)
     edges = _get_edges(edges, **mattrs)
 
     ndim = len(mattrs.boxsize)
@@ -649,6 +651,9 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
     else:
         kin = jnp.array([edgesin[:-1], edgesin[1:]]).T
 
+    def np_map(f, xs):
+        return jnp.array(list(map(f, xs)))
+
     if vlos is not None:
 
         if np.ndim(ellsin) == 0: ellsin = (ellsin,)
@@ -667,11 +672,11 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
         bin = BinAttrs(mattrs, edges=edges, kind='complex_hermitian', mode_oversampling=mode_oversampling)
         kvec = mattrs.kcoords(sparse=True, hermitian=True)
-        knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * kvec[0].ndim].set(1.)
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
 
         wmat = []
         for ellin in ellsin:
-            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / knorm
+            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
             legin = legendre(ellin)(mu)
 
             def f(kin):
@@ -680,8 +685,9 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                     kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                     return kmask * legin
 
-                Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * norm, kind='wavenumber')
+                Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
                 if Q is not None: Aell = _2c(Q * _2r(Aell))
+                else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
 
                 power = []
                 for ell in ells:
@@ -691,12 +697,14 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                     power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=ell == 0))
                 return jnp.concatenate(power)
 
-            wmat.append(jax.lax.map(f, xs=kin, batch_size=batch_size))
+            if pbar: _map = np_map
+            else: _map = partial(jax.lax.map, batch_size=batch_size)
+            wmat.append(_map(f, kin))
         wmat = jnp.concatenate(wmat, axis=0).T
 
     else:
         theory_los = 'firstpoint'
-        if ellsin[1] == 'local':
+        if len(ellsin) == 2 and ellsin[1] == 'local':
             theory_los = 'local'
             ellsin = ellsin[0]
         if np.ndim(ellsin) == 0: ellsin = (ellsin,)
@@ -707,10 +715,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
         if periodic:
             meshs = [mattrs.create(kind='real', fill=1.)]
-
-        def _safe_divide(num, denom):
-            with np.errstate(divide='ignore', invalid='ignore'):
-                return jnp.where(denom == 0., 0., num / denom)
 
         rmesh1 = _2r(meshs[0])
         rmesh2 = rmesh1 if autocorr else _2r(meshs[1])
@@ -740,12 +744,9 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
             has_buffer = True
 
         def my_map(f, xs):
-            if has_buffer:
-                return jnp.array(list(map(f, xs)))
+            if has_buffer or pbar:
+                return np_map(f, xs)
             return jax.lax.map(f, xs=xs, batch_size=batch_size)
-
-        if not has_buffer:
-            pbar = False
 
         def dump_to_buffer(mesh, key):
             toret = None
@@ -770,7 +771,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
         if pbar:
             from tqdm import tqdm
-            t = tqdm(total=len(kin), bar_format='{l_bar}{bar}| {n:.3f}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]')
+            t = tqdm(total=len(kin), bar_format='{l_bar}{bar}| {n:.0f}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]')
 
             def round(n):
                 return int(n * 1e6) / 1e6
@@ -778,91 +779,131 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
         if theory_los == 'firstpoint':
 
             ellsin = [ellin if isinstance(ellin, tuple) else (ellin, 0) for ellin in ellsin]
-            nellsin = sum(len(Ylms[ell]) for ell, _ in ellsin)
-            wmat = []
+            wmat_tmp = {}
             for ell1, wa1 in ellsin:
-                xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
-                snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                wmat_tmp[ell1, wa1] = 0
                 Qs = {}
-                for ill, ell in enumerate(ells):
-                    for im, Ylm in enumerate(Ylms[ell]):
-                        for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                    for ill, ell in enumerate(ells):
+                        if 'recompute' in flags: Qs = {}
+                        xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
+                        snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                        for im, Ylm in enumerate(Ylms[ell]):
                             key = ell, im, im1
                             tmp = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
                             Qs[key] = dump_to_buffer(tmp, key)
+                        del xnorm, snorm
+                        if 'recompute' in flags:
+                            def f(kin):
+                                Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
+                                knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
 
-                del xnorm, snorm
-                knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
+                                def kernel(*args):
+                                    kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
+                                    return kmask * rnorm * Yl1m1(*kvec)
 
-                wmat = []
+                                xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                                for im in Aell[ell]:
+                                    Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
-                def f(kin):
-                    Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
-                    for im1, Yl1m1 in enumerate(Ylms[ell1]):
-                        def kernel(*args):
-                            kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                            return kmask * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*kvec)
+                                Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
+                                power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                del Aell[ell]
+                                if pbar:
+                                    t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell in ells)) / sum(len(Ylms[ell]) for ell, _ in ellsin))
+                                tmp = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
+                                return tmp.ravel()
+                            wmat_tmp[ell1, wa1] += my_map(f, kin)
+                if 'recompute' not in flags:
+                    def f(kin):
+                        Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
+                        knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
+                        for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                            def kernel(*args):
+                                kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
+                                return kmask * rnorm * Yl1m1(*kvec)
 
-                        xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
-                        for ell in Aell:
-                            for im in Aell[ell]:
-                                Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
+                            xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                            for ell in Aell:
+                                for im in Aell[ell]:
+                                    Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
-                    power = []
-                    for ill, ell in enumerate(ells):
-                        Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                        power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0))
-                        del Aell[ell]
-                    if pbar:
-                        t.update(n=round((im1 + 1) / nellsin))
-                    return jnp.concatenate(power)
+                        power = []
+                        for ill, ell in enumerate(ells):
+                            Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
+                            power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0))
+                            del Aell[ell]
+                        if pbar:
+                            t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell, _ in ellsin)))
+                        return jnp.concatenate(power)
 
-                wmat.append(my_map(f, kin))
+                wmat_tmp[ell1, wa1] = my_map(f, kin)
 
-            wmat = jnp.concatenate(wmat, axis=0).T
+            wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
 
         elif theory_los == 'local':
 
             wmat_tmp = {}
-            for ell1, ell2 in list(itertools.product((0, 2), (0, 2))):
+            for ell1, ell2 in itertools.product((2, 0), (2, 0)):
+                wmat_tmp[ell1, ell2] = 0
                 Qs = {}
                 for im12, (Yl1m1, Yl2m2) in enumerate(itertools.product(Ylms[ell1], Ylms[ell2])):
                     for ill, ell in enumerate(ells):
+                        if 'recompute' in flags: Qs = {}
                         for im, Ylm in enumerate(Ylms[ell]):
                             key = ell, im, im12
                             tmp = (4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * _2r(_2c(rmesh1 * Ylm(*xvec) * Yl1m1(*xvec)).conj() * _2c(rmesh2 * Yl2m2(*xvec)))
                             Qs[key] = dump_to_buffer(tmp, key)
+                        if 'recompute' in flags:
+                            def f(kin):
+                                knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
+                                Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
+                                def kernel(*args):
+                                    kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
+                                    return kmask * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
 
-                def f(kin):
-                    Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
-                    for im12, (Yl1m1, Yl2m2) in enumerate(itertools.product(Ylms[ell1], Ylms[ell2])):
-                        knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
+                                xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                                for im in Aell[ell]:
+                                    Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
+                                Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
+                                power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                if pbar:
+                                    t.update(n=round((im + 1) / sum(len(Ylms[ell]) for ell in ells) / 36))
+                                tmp = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
+                                return tmp.ravel()
+                            wmat_tmp[ell1, ell2] += my_map(f, kin)
 
-                        def kernel(*args):
-                            kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                            return kmask * norm / mattrs.meshsize.prod(dtype=rdtype) * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
+                if 'recompute' not in flags:
+                    knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
 
-                        xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
-                        # Typically takes ~ 2x the time to load all Qs than the above FFT
-                        # Not great, but... recomputing 15 FFTs would have taken more time
-                        for ell in Aell:
-                            for im in Aell[ell]:
-                                Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
+                    def f(kin):
+                        Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
+                        for im12, (Yl1m1, Yl2m2) in enumerate(itertools.product(Ylms[ell1], Ylms[ell2])):
 
-                    power = []
-                    for ill, ell in enumerate(ells):
-                        Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                        power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0))
-                        del Aell[ell]
-                    if pbar:
-                        t.update(n=round((im12 + 1) / 36))
-                    return jnp.concatenate(power)
+                            def kernel(*args):
+                                kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
+                                return kmask * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
 
-                wmat_tmp[ell1, ell2] = my_map(f, kin)
+                            xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                            # Typically takes ~ 2x the time to load all Qs than the above FFT
+                            # Not great, but... recomputing 15 FFTs would have taken more time
+                            for ell in Aell:
+                                for im in Aell[ell]:
+                                    Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
+                        power = []
+                        for ill, ell in enumerate(ells):
+                            Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
+                            power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0))
+                            del Aell[ell]
+                        if pbar:
+                            t.update(n=round((im12 + 1) / 36))
+                        return jnp.concatenate(power)
+
+                    wmat_tmp[ell1, ell2] = my_map(f, kin)
 
             wmat = jnp.zeros((len(ellsin),) + wmat_tmp[0, 0].shape)
-            coeff2 = {(0, 0): [(0, 1), (- 7. / 18., 4)],
-                      (0, 2): [(2, 1. / 2.), (4, - 5. / 18.)],
+            coeff2 = {(0, 0): [(0, 1), (4, -7. / 18.)],
+                      (0, 2): [(2, 1. / 2.), (4, -5. / 18.)],
                       (2, 2): [(4, 35. / 18.)]}
             coeff2[2, 0] = coeff2[0, 2]
             for illin, ellin in enumerate(ellsin):
@@ -932,7 +973,8 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
     else:
         rdtype = meshs[0].real.dtype
         mattrs = meshs[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.boxsize / mattrs.meshsize, dtype=rdtype)
+    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
+    rnorm = norm / mattrs.meshsize.prod(dtype=rdtype)
     edges = _get_edges(edges, **mattrs)
 
     ndim = len(mattrs.boxsize)
@@ -1009,12 +1051,14 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
 
         if is_poles:
             def pkvec(*args):
-                return sum(get_theory(ell) * legendre(ell)(mu) for ell in theory)
+                return sum(get_theory(ell) * legendre(ell)(mu) for ell in poles)
 
-        Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec).reshape(kshape) * norm, kind='wavenumber')
+        Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec).reshape(kshape) * rnorm, kind='wavenumber')
         if Q is not None: Aell = _2c(Q * _2r(Aell))
+        else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
 
         power, power_zero = [], []
+        mu = mu.reshape(kshape)
         for ell in ells:
             leg = legendre(ell)(mu)
             odd = ell % 2
@@ -1065,7 +1109,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                 if theory_los == 'firstpoint':
                     for ell1, wa1 in poles:
                         kernel_ell1 = get_theory((ell1, wa1))
-                        kernel_ell1 = kernel_ell1.reshape(kshape) * norm / mattrs.meshsize.prod(dtype=rdtype)
+                        kernel_ell1 = kernel_ell1.reshape(kshape) * rnorm
                         for Yl1m1 in Ylms[ell1]:
 
                             def kernel(*args):
@@ -1075,8 +1119,8 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                             Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
 
                 elif theory_los == 'local':
-                    coeff2 = {(0, 0): [(0, 1), (- 7. / 18., 4)],
-                              (0, 2): [(2, 1. / 2.), (4, - 5. / 18.)],
+                    coeff2 = {(0, 0): [(0, 1), (4, -7. / 18.)],
+                              (0, 2): [(2, 1. / 2.), (4, -5. / 18.)],
                               (2, 2): [(4, 35. / 18.)]}
                     coeff2[2, 0] = coeff2[0, 2]
                     for ell1, ell2 in itertools.product((0, 2), (0, 2)):
@@ -1085,7 +1129,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                         else:
                             pole = sum(coeff * poles[ell, 0] for ell, coeff in coeff2[ell1, ell2])
                             kernel_ell2 = get_theory(pole=pole)
-                        kernel_ell2 = kernel_ell2.reshape(kshape) * norm / mattrs.meshsize.prod(dtype=rdtype)
+                        kernel_ell2 = kernel_ell2.reshape(kshape) * rnorm
                         for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
 
                             def kernel(*args):
@@ -1101,7 +1145,9 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                 Aell += _2c(Q) * Ylm(*khat)
             # Project on to 1d k-basis (averaging over mu=[-1, 1])
             power.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
-            power_zero.append(4. * jnp.pi * 0.)
+            power_zero.append(0.)
+            if ell == 0:
+                power_zero[-1] += 4. * jnp.pi * _get_power_zero(Aell)
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
         power, power_zero = jnp.array(power), jnp.array(power_zero)

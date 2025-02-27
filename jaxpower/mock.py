@@ -87,17 +87,17 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
         def get_meshs(seeds):
 
             if is_callable:
-                p0, p2, p4 = (get_theory(ell) for ell in ells)
+                p0, p2, p4 = (get_theory(ell) / attrs.cellsize.prod() for ell in ells)
             else:
-                p0, p2, p4 = (poles[ell] for ell in ells)
+                p0, p2, p4 = (poles[ell] / attrs.cellsize.prod() for ell in ells)
 
-            a11 = 35. / 18. * p4 / attrs.cellsize.prod()
-            a00 = p0 / attrs.cellsize.prod() - 1. / 5. * a11
+            a11 = 35. / 18. * p4
+            a00 = p0 - 1. / 5. * a11
             # Cholesky decomposition
             l00 = jnp.sqrt(a00)
             del a00
 
-            a10 = 1. / 2. * p2 / attrs.cellsize.prod() - 1. / 7. * a11
+            a10 = 1. / 2. * p2 - 1. / 7. * a11
             l10 = jnp.where(l00 == 0., 0., a10 / l00)
             del a10
 
