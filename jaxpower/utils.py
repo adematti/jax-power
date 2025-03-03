@@ -4,6 +4,7 @@ import time
 import logging
 import traceback
 from collections.abc import Callable
+from functools import partial
 
 import numpy as np
 import jax
@@ -239,43 +240,59 @@ def legendre(ell):
 from scipy import special
 
 def Si(x):
-    return special.sici(x)[0]
+    return jax.pure_callback(lambda x: special.sici(x)[0], x, x, vmap_method="expand_dims")
 
 # Derivative of correlation function w.r.t. k-bins, precomputed with sympy; full, low-s or low-a limit
 _registered_correlation_function_tophat_derivatives = {}
-_registered_correlation_function_tophat_derivatives[0] = (lambda s, a: (-a * np.cos(a * s) / s + np.sin(a * s) / s**2) / (2 * np.pi**2 * s),
-                                                          lambda s, a: -a**9 * s**6 / (90720 * np.pi**2) + a**7 * s**4 / (1680 * np.pi**2) - a**5 * s**2 / (60 * np.pi**2) + a**3 / (6 * np.pi**2))
-_registered_correlation_function_tophat_derivatives[1] = (lambda s, a: ((-a * np.sin(a * s) - 2 * np.cos(a * s) / s) / s**2 + 2 / s**3) / (2 * np.pi**2),
-                                                          lambda s, a: -a**10 * s**7 / (907200 * np.pi**2) + a**8 * s**5 / (13440 * np.pi**2) - a**6 * s**3 / (360 * np.pi**2) + a**4 * s / (24 * np.pi**2))
-_registered_correlation_function_tophat_derivatives[2] = (lambda s, a: -(a * s * np.cos(a * s) - 4 * np.sin(a * s) + 3 * Si(a * s)) / (2 * np.pi**2 * s**3),
-                                                          lambda s, a: -a**9 * s**6 / (136080 * np.pi**2) + a**7 * s**4 / (2940 * np.pi**2) - a**5 * s**2 / (150 * np.pi**2))
-_registered_correlation_function_tophat_derivatives[3] = (lambda s, a: -(8 / s**3 + (a * s**2 * np.sin(a * s) + 7 * s * np.cos(a * s) - 15 * np.sin(a * s) / a) / s**4) / (2 * np.pi**2),
-                                                          lambda s, a: -a**10 * s**7 / (1663200 * np.pi**2) + a**8 * s**5 / (30240 * np.pi**2) - a**6 * s**3 / (1260 * np.pi**2))
-_registered_correlation_function_tophat_derivatives[4] = (lambda s, a: (-a * s**3 * np.cos(a * s) + 11 * s**2 * np.sin(a * s) + 15 * s**2 * Si(a * s) / 2 + 105 * s * np.cos(a * s) / (2 * a) - 105 * np.sin(a * s) / (2 * a**2)) / (2 * np.pi**2 * s**5),
-                                                          lambda s, a: -a**9 * s**6 / (374220 * np.pi**2) + a**7 * s**4 / (13230 * np.pi**2))
-_registered_correlation_function_tophat_derivatives[5] = (lambda s, a: (16 / s**3 + (-a * s**4 * np.sin(a * s) - 16 * s**3 * np.cos(a * s) + 105 * s**2 * np.sin(a * s) / a + 315 * s * np.cos(a * s) / a**2 - 315 * np.sin(a * s) / a**3) / s**6) / (2 * np.pi**2),
-                                                          lambda s, a: -a**10 * s**7 / (5405400 * np.pi**2) + a**8 * s**5 / (166320 * np.pi**2))
-
+_registered_correlation_function_tophat_derivatives[0] = (lambda s, a: (-a * jnp.cos(a * s) / s + jnp.sin(a * s) / s**2) / (2 * jnp.pi**2 * s),
+                                                          lambda s, a: -a**9 * s**6 / (90720 * jnp.pi**2) + a**7 * s**4 / (1680 * jnp.pi**2) - a**5 * s**2 / (60 * jnp.pi**2) + a**3 / (6 * jnp.pi**2))
+_registered_correlation_function_tophat_derivatives[1] = (lambda s, a: ((-a * jnp.sin(a * s) - 2 * jnp.cos(a * s) / s) / s**2 + 2 / s**3) / (2 * jnp.pi**2),
+                                                          lambda s, a: -a**10 * s**7 / (907200 * jnp.pi**2) + a**8 * s**5 / (13440 * jnp.pi**2) - a**6 * s**3 / (360 * jnp.pi**2) + a**4 * s / (24 * jnp.pi**2))
+_registered_correlation_function_tophat_derivatives[2] = (lambda s, a: -(a * s * jnp.cos(a * s) - 4 * jnp.sin(a * s) + 3 * Si(a * s)) / (2 * jnp.pi**2 * s**3),
+                                                          lambda s, a: -a**9 * s**6 / (136080 * jnp.pi**2) + a**7 * s**4 / (2940 * jnp.pi**2) - a**5 * s**2 / (150 * jnp.pi**2))
+_registered_correlation_function_tophat_derivatives[3] = (lambda s, a: -(8 / s**3 + (a * s**2 * jnp.sin(a * s) + 7 * s * jnp.cos(a * s) - 15 * jnp.sin(a * s) / a) / s**4) / (2 * jnp.pi**2),
+                                                          lambda s, a: -a**10 * s**7 / (1663200 * jnp.pi**2) + a**8 * s**5 / (30240 * jnp.pi**2) - a**6 * s**3 / (1260 * jnp.pi**2))
+_registered_correlation_function_tophat_derivatives[4] = (lambda s, a: (-a * s**3 * jnp.cos(a * s) + 11 * s**2 * jnp.sin(a * s) + 15 * s**2 * Si(a * s) / 2 + 105 * s * jnp.cos(a * s) / (2 * a) - 105 * jnp.sin(a * s) / (2 * a**2)) / (2 * jnp.pi**2 * s**5),
+                                                          lambda s, a: -a**9 * s**6 / (374220 * jnp.pi**2) + a**7 * s**4 / (13230 * jnp.pi**2))
+_registered_correlation_function_tophat_derivatives[5] = (lambda s, a: (16 / s**3 + (-a * s**4 * jnp.sin(a * s) - 16 * s**3 * jnp.cos(a * s) + 105 * s**2 * jnp.sin(a * s) / a + 315 * s * jnp.cos(a * s) / a**2 - 315 * jnp.sin(a * s) / a**3) / s**6) / (2 * jnp.pi**2),
+                                                          lambda s, a: -a**10 * s**7 / (5405400 * jnp.pi**2) + a**8 * s**5 / (166320 * jnp.pi**2))
 
 
 def weights_trapz(x):
     """Return weights for trapezoidal integration."""
-    return np.concatenate([[x[1] - x[0]], x[2:] - x[:-2], [x[-1] - x[-2]]]) / 2.
+    return jnp.concatenate([[x[1] - x[0]], x[2:] - x[:-2], [x[-1] - x[-2]]]) / 2.
 
 
 class TophatPowerToCorrelation(object):
 
     def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False):
         if edges: edges = k
-        else: edges = np.concatenate([k[:1], (k[1:] + k[:-1]) / 2., k[-1:]], axis=0)
+        else: edges = jnp.concatenate([k[:1], (k[1:] + k[:-1]) / 2., k[-1:]], axis=0)
         tophat = _registered_correlation_function_tophat_derivatives[ell]
-        self.w = np.zeros(seval.shape + (len(edges) - 1,))
-        mask = seval > 0.1
-        self.w[mask] = np.diff(tophat[0](seval[mask, None], edges), axis=-1)
-        self.w[~mask] = np.diff(tophat[1](seval[~mask, None], edges), axis=-1)
+        seval = seval[..., None]
+        mask = seval * edges > 0.01
+        self.w = jnp.diff(jnp.where(mask, tophat[0](seval, edges), tophat[1](seval, edges)), axis=-1)
 
     def __call__(self, fun: jax.Array):
         return jnp.sum(self.w * fun, axis=-1)
+
+
+class TophatCorrelationToPower(object):
+
+    def __init__(self, s: np.ndarray, keval: np.ndarray, ell=0, edges=False):
+        if edges: edges = s
+        else: edges = jnp.concatenate([s[:1], (s[1:] + s[:-1]) / 2., s[-1:]], axis=0)
+        tophat = _registered_correlation_function_tophat_derivatives[ell]
+        keval = keval[..., None]
+        mask = keval * edges > 0.01
+        self.w = (-1)**(ell // 2) * (2. * jnp.pi)**3 * jnp.diff(jnp.where(mask, tophat[0](keval, edges), tophat[1](keval, edges)), axis=-1)
+
+    def __call__(self, fun: jax.Array):
+        return jnp.sum(self.w * fun, axis=-1)
+
+
+def spherical_jn(ell):
+    return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x, vmap_method="expand_dims")
 
 
 class BesselPowerToCorrelation(object):
@@ -287,7 +304,7 @@ class BesselPowerToCorrelation(object):
             k = (edges[:-1] + edges[1:]) / 2.
         else:
             if volume is None: volume = 4. / 3. * np.pi * weights_trapz(k**3)
-        self.w = (-1)**(ell // 2) / (2. * np.pi)**3 * volume * special.spherical_jn(ell, seval[..., None] * k)
+        self.w = (-1)**(ell // 2) / (2. * np.pi)**3 * volume * spherical_jn(ell)(seval[..., None] * k)
 
     def __call__(self, fun: jax.Array):
         return jnp.sum(self.w * fun, axis=-1)
@@ -321,10 +338,6 @@ class Interpolator1D(object):
         return toret.reshape(self.eval_shape)
 
 
-def _nan_to_zero(array):
-    return jnp.where(jnp.isnan(array), 0., array)
-
-
 def _format_slice(sl, size):
     if sl is None: sl = slice(None)
     start, stop, step = sl.start, sl.stop, sl.step
@@ -336,6 +349,44 @@ def _format_slice(sl, size):
     if step < 0:
         raise IndexError('positive slicing step only supported')
     return slice(start, stop, step)
+
+
+def compute_real_gaunt(*ellms):
+    import sympy as sp
+    phi, theta = sp.symbols('phi theta', real=True)
+
+    def _Ylm(ell, m):
+        # Normalization of Ylms
+        amp = sp.sqrt((2 * ell + 1) / (4 * sp.pi))
+        if m != 0:
+            fac = 1
+            for n in range(ell - abs(m) + 1, ell + abs(m) + 1): fac *= n  # (ell + |m|)!/(ell - |m|)!
+            amp *= sp.sqrt(2) / sp.sqrt(fac)
+        expr = (-1)**m * sp.assoc_legendre(ell, abs(m), sp.cos(theta))
+        # The phi dependence
+        if m < 0:
+            expr *= sp.sin(abs(m) * phi)
+        elif m > 0:
+            expr *= sp.cos(m * phi)
+        return amp * expr
+
+    Ylm123 = 1
+    for ell, m in ellms:
+        Ylm123 *= _Ylm(ell, m)
+    expr = sp.integrate(Ylm123 * sp.sin(theta), (phi, 0, 2 * sp.pi), (theta, 0, sp.pi))
+    return expr
+
+
+def export_real_gaunt():
+    import itertools
+    gaunt = {}
+    for ells in itertools.product((0, 2, 4), (0, 2), (0, 2)):
+        for ms in itertools.product(*(list(range(-ell, ell + 1)) for ell in ells)):
+            ellms = tuple(zip(ells, ms))
+            tmp = float(compute_real_gaunt(*ellms))
+            if tmp != 0.:
+                gaunt[ellms] = tmp
+    return gaunt
 
 
 class FakeFigure(object):

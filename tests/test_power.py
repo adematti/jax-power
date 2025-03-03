@@ -8,7 +8,7 @@ from jax import random
 from jax import numpy as jnp
 
 from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
-                      compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, compute_mean_mesh_power, utils)
+                      compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, BinAttrs, compute_mean_mesh_power, compute_mesh_window, compute_normalization, utils)
 
 
 dirname = Path('_tests')
@@ -323,15 +323,61 @@ def test_checkpoint():
         print(time.time() - t0)
 
 
+
 def test_gaunt():
     import itertools
-    from sympy.physics.wigner import gaunt
+    import sympy as sp
+    from sympy.physics.wigner import real_gaunt
+    from jaxpower.utils import compute_real_gaunt
+    from jaxpower.power import get_real_Ylm
+
+    if False:
+        for ell1, ell2, ell3 in itertools.product((0, 2, 4), (0, 2), (0, 2)):
+            ms = list(itertools.product(list(range(-ell1, ell1 + 1)),
+                                        list(range(-ell2, ell2 + 1)),
+                                        list(range(-ell3, ell3 + 1))))
+            for m1, m2, m3 in ms:
+                g = compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))
+                print(g)
+
+    if False:
+        for ell in (0, 2, 4):
+            for m in range(-ell, ell + 1):
+                theta = sp.Symbol("theta")
+                phi = sp.Symbol("phi")
+                expr = sp.Znm(ell, m, theta, phi)
+                print(ell, m, expr)
+                #expr = sp.simplify(sp.Znm(ell, m, theta, phi).expand(func=True))
+
+    if False:
+        rng = np.random.RandomState(seed=42)
+        xyz = rng.uniform(-1., 1., (100, 3))
+        xyz /= np.sqrt(np.sum(xyz**2, axis=-1))[..., None]
+        for ell in (0, 2, 4):
+            for m in range(-ell, ell + 1):
+                tmp = get_real_Ylm(ell, m, modules=('scipy',), batch=False)(*xyz.T)
+                tmp2 = get_real_Ylm(ell, m, batch=False)(*xyz.T)
+                assert np.allclose(tmp2, tmp, rtol=1e-6, atol=1e-6)
 
     for ell1, ell2, ell3 in itertools.product((0, 2, 4), (0, 2), (0, 2)):
-        if any(gaunt(ell1, ell2, ell3, m1, m2, m3) for m1, m2, m3 in itertools.product(list(range(-ell1, ell1 + 1)),
-                                                                                       list(range(-ell2, ell2 + 1)),
-                                                                                       list(range(-ell3, ell3 + 1)))):
-            print(ell1, ell2, ell3)
+        ms = list(itertools.product(list(range(-ell1, ell1 + 1)),
+                                    list(range(-ell2, ell2 + 1)),
+                                    list(range(-ell3, ell3 + 1))))
+        if any(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3)) for m1, m2, m3 in ms):
+
+            for m1, m2, m3 in ms:
+                mattrs = MeshAttrs(boxsize=500, meshsize=64)
+                mesh = mattrs.create(kind='hermitian_complex')
+                kvec = mesh.coords(sparse=True)
+                knorm = sum(kk**2 for kk in kvec)**0.5
+                kedges = jnp.array([0.8 * mesh.knyq.min(), 0.9 * mesh.knyq.min()])
+                kmask = (knorm >= kedges[0]) & (knorm <= kedges[-1])
+                bin = BinAttrs(mesh, edges=kedges)
+                mesh = mesh.clone(value=kmask * get_real_Ylm(ell1, m1)(*kvec) * get_real_Ylm(ell2, m2)(*kvec) * get_real_Ylm(ell3, m3)(*kvec))
+                value = bin(mesh)[0]
+                g = float(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))) / (4 * np.pi)
+                if not np.allclose(value, g, rtol=1e-2, atol=1e-3):
+                     print(ell1, ell2, ell3, m1, m2, m3, value, g)
 
 
 def test_power_to_correlation():
@@ -406,29 +452,34 @@ def test_power_to_correlation():
         #return toret
         return toret.at[0, 0, 0].set(0.)
 
-    ax = plt.gca()
-    s = np.linspace(0.1, mattrs.boxsize[0] / 2, 1000)
-    xi = pk.to_xi()(s)
-    ax.plot(s, s**2 * xi, color='k')
+    if False:
+        ax = plt.gca()
+        s = np.linspace(0.1, mattrs.boxsize[0] / 2, 1000)
+        xi = pk.to_xi()(s)
+        ax.plot(s, s**2 * xi, color='k')
 
-    xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
-    sedges = np.linspace(0.1, mattrs.boxsize[0] / 2, 1000)
-    bin = BinAttrs(xi, edges=sedges)
-    xi = bin(xi).real
-    ax.plot(bin.xavg, bin.xavg**2 * xi)
+        xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
+        sedges = np.linspace(0.1, mattrs.boxsize[0] / 2, 1000)
+        bin = BinAttrs(xi, edges=sedges)
+        xi = bin(xi).real
+        ax.plot(bin.xavg, bin.xavg**2 * xi)
+
+    ell = 2
+
+    ax = plt.gca()
 
     if True:
         s = bin.xavg
-        tophat = TophatPowerToCorrelation(kinedges, s, edges=True)
+        tophat = TophatPowerToCorrelation(kinedges, s, edges=True, ell=ell)
         #tophat = BesselPowerToCorrelation(kinedges, s, edges=True)
-        xi = tophat(pkin * damping(kin))
+        xi = tophat(pkin) # * damping(kin))
         ax.plot(s, s**2 * xi)
 
     if False:
         s = bin.xavg
         mk, nk = find_unique(mattrs.kcoords(sparse=True), mattrs.kfun.min())
         interp = Interpolator1D(kinedges, mk, order=0, edges=True)
-        tophat = BesselPowerToCorrelation(mk, s) #, volume=mattrs.kfun.prod() * nk)
+        tophat = BesselPowerToCorrelation(mk, s, ell=ell) #, volume=mattrs.kfun.prod() * nk)
         xi = tophat(interp(pkin).at[0].set(0.) * damping(mk))
         ax.plot(s, s**2 * xi)
 
@@ -436,7 +487,6 @@ def test_power_to_correlation():
         mk, nk = find_unique(mattrs.kcoords(sparse=True), mattrs.kfun.min())
         interp = Interpolator1D(kinedges, mk, order=0, edges=True)
         volume = mattrs.kfun.prod() * nk
-        ell = 0
         #s = seval = np.linspace(0.1, mattrs.boxsize[0], 1000)
         s = seval = bin.xavg
         from scipy import special
@@ -623,11 +673,120 @@ def test_window():
     print(time.time() - t0)
 
 
+def test_smooth_window():
+    from matplotlib import pyplot as plt
+    from cosmoprimo.fiducial import DESI
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+
+    attrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
+    edges = {'step': 0.005}
+    edgesin = np.arange(0., 1.1 * attrs.knyq.max(), 0.002)
+    kin = (edgesin[:-1] + edgesin[1:]) / 2.
+    ellsin = (0, 2, 4)
+    f, b = 0.8, 1.5
+    beta = f / b
+    ells = (0, 2, 4)
+    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
+                        8. / 35 * beta ** 2 * pk(kin)])[:len(ellsin)]
+    #poles = poles.at[2:].set(0.)
+    #klim = (0.1, 0.106)
+    #poles = poles.at[..., (kin < klim[0]) | (kin > klim[1])].set(0.)
+
+    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
+        # Generate Gaussian-distributed positions
+        positions = scale * random.normal(seed, shape=(size, 3))
+        bscale = 2. * scale  # cut at 2 sigmas
+        mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+        positions = positions * boxsize + boxcenter
+        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
+        return toret
+
+    if False:
+        selection = gaussian_survey(meshsize=128, size=int(1e7), paint=True)
+        norm = compute_normalization(selection, selection)
+        selection = selection.r2c()
+        selection = (selection * selection.conj()).c2r()
+        edges = np.arange(0., selection.boxsize.max(), selection.cellsize.min())
+        bin = BinAttrs(selection, edges=edges)
+        pole = bin(selection) / norm / selection.cellsize.prod()
+        print(pole)
+
+        from matplotlib import pyplot as plt
+        ax = plt.gca()
+        ax.plot(bin.xavg, pole)
+        ax.set_xscale('log')
+        plt.show()
+
+    selection = gaussian_survey(**attrs, paint=True)
+    norm = compute_normalization(selection, selection)
+
+    for thlos in ['firstpoint', 'local'][1:]:
+        mean = compute_mean_mesh_power(selection, theory=(edgesin, list(poles), thlos),
+                                       ells=ells, edges=edges, los='firstpoint').clone(norm=norm)
+        wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos),
+                                      edges=edges, ells=ells, los='firstpoint', norm=norm, flags=('smooth',), pbar=True)
+        wpoles = wmatrix.dot(poles, return_type=None)
+        ax = plt.gca()
+        for iproj, proj in enumerate(mean.projs):
+            ax.plot(kin, kin * poles[iproj], color='k')
+            k = mean.x(projs=proj)
+            ax.plot(k, k * mean.view(projs=proj), color='C0')
+            ax.plot(k, k * wpoles.view(projs=proj), color='C1')
+        plt.show()
+
+
+def tophat_bessel():
+
+    from matplotlib import pyplot as plt
+    from jaxpower.utils import TophatPowerToCorrelation, TophatCorrelationToPower, BesselPowerToCorrelation
+
+    from cosmoprimo.fiducial import DESI
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+    xi = pk.to_xi()
+
+    #attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=800.)
+    kedgesin = np.arange(0., 1., 0.01)
+    kin = (kedgesin[:-1] + kedgesin[1:]) / 2.
+    f, b = 0.8, 1.5
+    beta = f / b
+    ells = (0, 2, 4)[:1]
+    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
+                        8. / 35 * beta ** 2 * pk(kin)])
+    sedges = jnp.linspace(0., 300, 1000)
+    s = (sedges[:-1] + sedges[1:]) / 2.
+    s = 3. / 4. * (sedges[1:]**4 - sedges[:-1]**4) / (sedges[1:]**3 - sedges[:-1]**3)
+    ax = plt.gca()
+    for ill, ell in enumerate(ells):
+        tophat1 = TophatPowerToCorrelation(kedgesin, s, ell=ell, edges=True)
+        tmp = tophat1(poles[ill])
+        tophat2 = TophatCorrelationToPower(sedges, kin, ell=ell, edges=True)
+        #poles2 = tophat2(xi(s))
+        poles2 = tophat2(tmp)
+        if False:
+            smask = s < 200
+            ax.plot(s[smask], s[smask]**2 * xi(s[smask]), color='k')
+            ax.plot(s[smask], s[smask]**2 * tmp[smask], color='C0')
+        else:
+            ax.plot(kin, kin * poles[ill], color='k')
+            ax.plot(kin, kin * poles2, color='C0')
+            #ax.plot(kin, poles2 / poles[ill], color='C0')
+    plt.show()
+
 
 if __name__ == '__main__':
 
     #test_gaunt()
+    test_smooth_window()
+    #tophat_bessel()
+    exit()
     #test_checkpoint()
+    #test_power_to_correlation()
     #test_power_to_correlation2()
     test_binned_statistic()
     test_mesh_power(plot=False)

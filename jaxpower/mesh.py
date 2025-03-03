@@ -959,6 +959,7 @@ class ParticleField(object):
         """
         return _paint(self.attrs, self.positions, weights=self.weights, resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out)
 
+
 @partial(jax.jit, static_argnames=['attrs', 'resampler',  'interlacing', 'compensate', 'dtype', 'out'])
 def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, dtype=None, out: str='real'):
 
@@ -1013,27 +1014,41 @@ for name in [field.name for field in fields(MeshAttrs)] + ['cellsize']:
     _set_property(ParticleField, name)
 
 
+def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf):
+    x2 = sum(xx**2 for xx in xvec).ravel()
+    x2 = x2[(x2 >= xmin**2) & (x2 <= xmax**2)]
+    _, index, counts = jnp.unique(np.int64(x2 / (0.5 * x0)**2 + 0.5), return_index=True, return_counts=True)
+    x = jnp.sqrt(x2[index])
+    tmp = (x[:-1] + x[1:]) / 2.
+    edges = jnp.insert(tmp, jnp.array([0, len(tmp)]), jnp.array([tmp[0] - (x[1] - x[0]), tmp[-1] + (x[-1] - x[-2])]))
+    return edges, counts
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class BinAttrs(object):
 
+    edges: jax.Array = None
     nmodes: jax.Array = None
     xavg: jax.Array = None
     ibin: jax.Array = None
     ibin_zero: jax.Array = None
     wmodes: jax.Array = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray, kind='complex_hermitian', mode_oversampling: int=0, **kwargs):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, kind='complex_hermitian', mode_oversampling: int=0, **kwargs):
         if isinstance(mattrs, MeshAttrs):
             hermitian = False
             if kind == 'real':
                 vec = mattrs.xcoords(sparse=True, **kwargs)
+                vec0 = mattrs.cellsize.min()
             else:
                 hermitian = 'hermitian' in kind
                 vec = mattrs.kcoords(sparse=True, hermitian=hermitian, **kwargs)
+                vec0 = mattrs.kfun.min()
         else:  # attrs is a mesh
             hermitian = mattrs.shape[-1] < mattrs.meshsize[-1]
             vec = mattrs.coords(kind='separation', sparse=True)
+            vec0 = mattrs.spacing.min()
             mattrs = mattrs.attrs
         nonsingular = None
         if hermitian:
@@ -1042,6 +1057,14 @@ class BinAttrs(object):
             # Get the indices that have positive freq along symmetry axis = -1
             nonsingular += vec[-1] > 0.
             nonsingular = nonsingular.ravel()
+        if edges is None:
+            edges = {}
+        if isinstance(edges, dict):
+            step = edges.get('step', None)
+            if step is None:
+                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
+            else:
+                edges = jnp.arange(edges.get('min', 0.), edges.get('max', vec0 * mattrs.meshsize / 2.), step)
         import itertools
         shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
         shifts = list(itertools.product(*shifts))
@@ -1051,7 +1074,7 @@ class BinAttrs(object):
             ibin.append(bin[0])
             nmodes += bin[1]
             xsum += bin[2]
-        self.__dict__.update(nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=nonsingular)
+        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=nonsingular)
 
     def __call__(self, mesh, antisymmetric=False, remove_zero=False):
         value = mesh.ravel()
