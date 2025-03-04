@@ -240,7 +240,7 @@ def legendre(ell):
 from scipy import special
 
 def Si(x):
-    return jax.pure_callback(lambda x: special.sici(x)[0], x, x, vmap_method="expand_dims")
+    return jax.pure_callback(lambda x: special.sici(x)[0], x, x)
 
 # Derivative of correlation function w.r.t. k-bins, precomputed with sympy; full, low-s or low-a limit
 _registered_correlation_function_tophat_derivatives = {}
@@ -292,7 +292,7 @@ class TophatCorrelationToPower(object):
 
 
 def spherical_jn(ell):
-    return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x, vmap_method="expand_dims")
+    return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x)
 
 
 class BesselPowerToCorrelation(object):
@@ -312,9 +312,10 @@ class BesselPowerToCorrelation(object):
 
 class Interpolator1D(object):
 
-    def __init__(self, x: jax.Array, xeval: jax.Array, order: int=0, edges=False):
+    def __init__(self, x: jax.Array, xeval: jax.Array, order: int=0, edges=False, extrap=False):
         self.eval_shape = xeval.shape
         self.order = order
+        self.mask = 1
         if self.order == 0:  # simple bins
             if edges:
                 edges = x
@@ -322,9 +323,11 @@ class Interpolator1D(object):
                 tmp = (x[:-1] + x[1:]) / 2.
                 edges = np.concatenate([[tmp[0] - (x[1] - x[0])], tmp, [tmp[-1] + (x[-1] - x[-2])]])
             self.idx = jnp.digitize(xeval.ravel(), edges, right=False) - 1
-            self.idx = jnp.clip(self.idx, 0, len(edges) - 2)
+            if not extrap: self.mask = (self.idx >= 0) & (self.idx <= len(edges) - 2)
+            self.idx = jnp.where(self.mask, self.idx, 0)
         elif self.order == 1:
             self.idx = jnp.digitize(xeval.ravel(), x, right=False) - 1
+            if not extrap: self.mask = (self.idx >= 0) & (self.idx <= len(x) - 1)
             self.idx = jnp.clip(self.idx, 0, len(x) - 2)
             self.fidx = jnp.clip(xeval.ravel() - x[self.idx], 0., 1.)
         else:
@@ -335,6 +338,7 @@ class Interpolator1D(object):
             toret = fun[self.idx]
         if self.order == 1:
             toret = (1. - self.fidx) * fun[self.idx] + self.fidx * fun[self.idx + 1]
+        toret *= self.mask
         return toret.reshape(self.eval_shape)
 
 

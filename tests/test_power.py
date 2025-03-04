@@ -498,7 +498,6 @@ def test_power_to_correlation():
     plt.show()
 
 
-
 def test_power_to_correlation2():
 
     from matplotlib import pyplot as plt
@@ -593,7 +592,6 @@ def test_power_to_correlation2():
             plt.show()
             exit()
 
-
     mesh2 = mattrs.create(kind='hermitian_complex')
     knorm = jnp.sqrt(sum(xx**2 for xx in mattrs.kcoords(kind='separation', hermitian=True, sparse=True)))
     interp = Interpolator1D(kinedges, knorm, order=0, edges=True)
@@ -611,6 +609,88 @@ def test_power_to_correlation2():
     #ax.plot(kin, kin * pk2)
     plt.show()
 
+
+def test_power_to_correlation3():
+
+    from matplotlib import pyplot as plt
+    from jaxpower.utils import TophatPowerToCorrelation, BesselPowerToCorrelation, Interpolator1D
+    from jaxpower import BinAttrs
+
+    from cosmoprimo.fiducial import DESI
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+    mattrs = MeshAttrs(boxsize=1500, meshsize=64)
+    kinedges = np.linspace(0., 1.01 * np.sqrt(3) * mattrs.knyq[0], 200)
+    #kinedges = np.linspace(0., mattrs.knyq[0], 200)
+    kin = (kinedges[:-1] + kinedges[1:]) / 2.
+    klim = (0.1, 0.102)
+    mask = (kin > klim[0]) & (kin < klim[1])
+    pkin = jnp.array(pk(kin)) * mask
+
+    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e7), seed=random.key(42), scale=0.2, paint=False):
+        # Generate Gaussian-distributed positions
+        positions = scale * random.normal(seed, shape=(size, 3))
+        bscale = scale  # cut at 1 sigmas
+        mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+        positions = positions * boxsize + boxcenter
+        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
+        return toret
+
+    selection = gaussian_survey(**mattrs, paint=True)
+    norm = compute_normalization(selection, selection)
+    selection = selection.r2c()
+    selection = (selection * selection.conj()).c2r()
+    selection /= norm
+
+    def kernel(value, kvec):
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+        interp = Interpolator1D(kinedges, knorm, order=0, edges=True)
+        toret = interp(pkin) / mattrs.cellsize.prod()
+        #return toret
+        return toret.at[0, 0, 0].set(0.)
+
+    pk = mattrs.create(kind='complex').apply(kernel, kind='wavenumber')
+    kbin = BinAttrs(pk, edges=kinedges)
+    xi = pk.c2r() * selection
+    bin = BinAttrs(xi)
+    bxi = bin(xi)
+    bpk = kbin(xi.r2c())
+    print(xi.coords(kind='separation'), bin.edges)
+    snorm = jnp.sqrt(sum(xx**2 for xx in xi.coords(kind='separation', sparse=True)))
+    interp = Interpolator1D(bin.edges, snorm, order=0, edges=True)
+    xi = xi.clone(value=interp(bxi))
+    bxi2 = bin(xi)
+    bpk2 = kbin(xi.r2c())
+
+    if True:
+        kbin2 = BinAttrs(pk) #, edges=dict(max=mattrs.knyq[0]))
+        kinterp = Interpolator1D(kinedges, kbin2.xavg, order=0, edges=True)
+        bessel = BesselPowerToCorrelation(kbin2.xavg, bin.xavg, ell=0, volume=mattrs.kfun.prod() * kbin2.nmodes)
+        bxi3 = bessel(kinterp(pkin))
+    else:
+        tophat = TophatPowerToCorrelation(kinedges, bin.xavg, edges=True)
+        bxi3 = tophat(pkin)
+    xi = xi.clone(value=interp(bxi3).astype(xi.dtype) * selection.value)
+    bxi3 = bin(xi)
+    bpk3 = kbin(xi.r2c())
+
+    if True:
+        ax = plt.gca()
+        ax.plot(bin.xavg, bin.xavg**2 * bxi, color='C0')
+        ax.plot(bin.xavg, bin.xavg**2 * bxi2, color='C1')
+        ax.plot(bin.xavg, bin.xavg**2 * bxi3, color='C2')
+        plt.show()
+
+    if True:
+        ax = plt.gca()
+        mask = kin < mattrs.knyq[0]
+        ax.plot(kin[mask], kin[mask] * pkin[mask], color='k')
+        mask = kbin.xavg < mattrs.knyq[0]
+        ax.plot(kbin.xavg[mask], kbin.xavg[mask] * bpk[mask], color='C0')
+        ax.plot(kbin.xavg[mask], kbin.xavg[mask] * bpk2[mask], color='C1')
+        ax.plot(kbin.xavg[mask], kbin.xavg[mask] * bpk3[mask], color='C2')
+        plt.show()
 
 
 def test_window():
@@ -633,10 +713,13 @@ def test_window():
     attrs = MeshAttrs(boxsize=2000., meshsize=128, boxcenter=1000.)
     edges = {'step': 0.01}
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
+    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
         # Generate Gaussian-distributed positions
-        positions = scale * boxsize * random.normal(seed, shape=(size, 3))
-        toret = ParticleField(positions + boxcenter, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        positions = scale * random.normal(seed, shape=(size, 3))
+        bscale = 2. * scale  # cut at 2 sigmas
+        mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+        positions = positions * boxsize + boxcenter
+        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
@@ -682,7 +765,8 @@ def test_smooth_window():
 
     attrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
     edges = {'step': 0.005}
-    edgesin = np.arange(0., 1.1 * attrs.knyq.max(), 0.002)
+    #edgesin = np.arange(0., 1.1 * attrs.knyq.max(), 0.002)
+    edgesin = np.arange(0., attrs.knyq.max(), 0.002)
     kin = (edgesin[:-1] + edgesin[1:]) / 2.
     ellsin = (0, 2, 4)
     f, b = 0.8, 1.5
@@ -724,7 +808,7 @@ def test_smooth_window():
     selection = gaussian_survey(**attrs, paint=True)
     norm = compute_normalization(selection, selection)
 
-    for thlos in ['firstpoint', 'local'][1:]:
+    for thlos in ['firstpoint', 'local'][:1]:
         mean = compute_mean_mesh_power(selection, theory=(edgesin, list(poles), thlos),
                                        ells=ells, edges=edges, los='firstpoint').clone(norm=norm)
         wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos),
@@ -782,8 +866,9 @@ def tophat_bessel():
 if __name__ == '__main__':
 
     #test_gaunt()
-    test_smooth_window()
+    #test_smooth_window()
     #tophat_bessel()
+    test_power_to_correlation3()
     exit()
     #test_checkpoint()
     #test_power_to_correlation()
