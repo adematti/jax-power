@@ -627,7 +627,7 @@ def test_power_to_correlation3():
     mask = (kin > klim[0]) & (kin < klim[1])
     pkin = jnp.array(pk(kin)) * mask
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e7), seed=random.key(42), scale=0.2, paint=False):
+    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e7), seed=random.key(42), scale=0.24, paint=False):
         # Generate Gaussian-distributed positions
         positions = scale * random.normal(seed, shape=(size, 3))
         bscale = scale  # cut at 1 sigmas
@@ -656,7 +656,6 @@ def test_power_to_correlation3():
     bin = BinAttrs(xi)
     bxi = bin(xi)
     bpk = kbin(xi.r2c())
-    print(xi.coords(kind='separation'), bin.edges)
     snorm = jnp.sqrt(sum(xx**2 for xx in xi.coords(kind='separation', sparse=True)))
     interp = Interpolator1D(bin.edges, snorm, order=0, edges=True)
     xi = xi.clone(value=interp(bxi))
@@ -863,13 +862,38 @@ def tophat_bessel():
     plt.show()
 
 
+def test_wmatrix():
+    xo = np.linspace(0., 0.2, 21)
+    xt = np.linspace(0., 0.2, 41)
+    ellsin = (0, 2)
+    ells = (0, 2)
+    theory = BinnedStatistic(x=[xt] * len(ellsin), projs=ellsin)
+    observable = BinnedStatistic(x=[xo] * len(ells), projs=ells)
+    theory2 = BinnedStatistic(x=[np.linspace(0., 0.3, 61)] * len(ellsin), projs=ellsin)
+    observable2 = BinnedStatistic(x=[np.linspace(0., 0.3, 61)] * len(ells), projs=ells)
+
+    def f(xo, xt):
+        sigma = 0.02
+        delta = (xo - xt) / sigma
+        return np.exp(-delta**2)
+
+    value = np.bmat([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
+    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
+    wmatrix.plot(show=True)
+    wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
+    wmatrix2.plot(show=True)
+    wmatrix3 = wmatrix.interp(observable2, axis='o', extrap=True)
+    wmatrix3.plot(show=True)
+
+
 if __name__ == '__main__':
 
+    test_wmatrix()
+    exit()
     #test_gaunt()
     #test_smooth_window()
     #tophat_bessel()
-    test_power_to_correlation3()
-    exit()
+    #test_power_to_correlation3()
     #test_checkpoint()
     #test_power_to_correlation()
     #test_power_to_correlation2()
@@ -878,3 +902,4 @@ if __name__ == '__main__':
     test_fkp_power(plot=False)
     test_mean_power(plot=True)
     test_window()
+    test_wmatrix()

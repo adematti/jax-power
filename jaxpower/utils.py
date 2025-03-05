@@ -782,7 +782,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             new = new.slice(projs=projs, select_projs=True)
         return new
 
-    def _index(self, xlim, projs=Ellipsis, method='mid', concatenate=True):
+    def _index(self, xlim=None, projs=Ellipsis, method='mid', concatenate=True):
         """
         Return indices for given input x-limits and projs.
 
@@ -1369,6 +1369,7 @@ class WindowMatrix(object):
         return self._value.shape
 
     def dot(self, theory, zpt=True, return_type='nparray'):
+        """Apply window matrix to input theory."""
         theory = jnp.ravel(theory)
         if zpt:
             toret = self.observable.view() + self._value.dot(theory - self.theory.view())
@@ -1428,6 +1429,69 @@ class WindowMatrix(object):
             kwargs.setdefault(f'label{ilabel + 1:d}', label)
         mat = [[self._value[np.ix_(index1, index2)] for index2 in indices[1]] for index1 in indices[0]]
         return plot_matrix(mat, x1=x[0], x2=x[1], **kwargs)
+
+    def interp(self, new, axis='o', extrap=False):
+        """
+        Interpolate window matrix.
+
+        Parameters
+        ----------
+        new : BinnedStatistic
+            New observable (axis='o') or theory (axis='t') vector.
+
+        axis : str
+            Axis to apply the selection to.
+            One of ('o', 'observable') or ('t', 'theory').
+
+        Returns
+        -------
+        new : WindowMatrix
+        """
+        axis, name, observable = self._axis_index(axis=axis)
+        from scipy import interpolate
+        shape = list(self._value.shape)
+        shape[axis] = new.size
+        value = np.zeros_like(self._value, shape=shape)
+        for po in self.observable.projs:
+            for pt in self.theory.projs:
+                xo, xt = self.observable.x(projs=po), self.theory.x(projs=pt)
+                ixo, ixt = self.observable._index(projs=po, concatenate=True), self.theory._index(projs=pt, concatenate=True)
+                xxo, xxt = np.meshgrid(xo, xt, indexing='ij')
+                # x is observable.x, y is theory.x - x, z is wmat
+                x = [xxo, xxt][axis]
+                p = [po, pt][axis]
+                y = xxt - xxo
+                v = self._value[np.ix_(ixo, ixt)]
+                x, y, z = x.ravel(), y.ravel(), v.ravel()
+                del xxo, xxt
+                ixnew = new._index(projs=p, concatenate=True)
+                xnew = new.x(projs=p)
+                if extrap:
+                    xold = [xo, xt][axis]
+                    idxs = []
+                    if xnew[0] < xold[0]:
+                        idxs.append(0)
+                    if xnew[-1] > xold[-1]:
+                        idxs.append(-1)
+                    for idx in idxs:
+                        if axis == 0:  # observable
+                            x = np.append(x, np.full_like(xt, fill_value=xnew[idx]))
+                            y = np.append(y, xt - xo[idx])
+                            z = np.append(z, v[idx, :])
+                        else:  # theory
+                            x = np.append(x, np.full_like(xo, fill_value=xnew[idx]))
+                            y = np.append(y, xt[idx] - xo)
+                            z = np.append(z, v[:, idx])
+                interp = interpolate.LinearNDInterpolator(np.column_stack([x, y]), z, fill_value=0., rescale=False)
+                for ix, x in zip(ixnew, xnew):
+                    if axis == 0:  # observable
+                        xo = x
+                        idx = (ix, ixt)
+                    else:  # theory
+                        xt = x
+                        idx = (ixo, ix)
+                    value[idx] += interp(x, xt - xo)
+        return self.clone(**{name: new, 'value': value})
 
 
 @plotter

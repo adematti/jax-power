@@ -1021,7 +1021,7 @@ def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf):
     x = jnp.sqrt(x2[index])
     tmp = (x[:-1] + x[1:]) / 2.
     edges = jnp.insert(tmp, jnp.array([0, len(tmp)]), jnp.array([tmp[0] - (x[1] - x[0]), tmp[-1] + (x[-1] - x[-2])]))
-    return edges, counts
+    return edges, x, counts
 
 
 @jax.tree_util.register_pytree_node_class
