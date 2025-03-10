@@ -697,25 +697,18 @@ def test_window():
     from jaxpower import compute_mesh_window
     from jaxpower.utils import Interpolator1D
 
-    def pk(k):
-        kp = 0.01
-        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+    ellsin = (0, 2, 4)
+    edgesin = np.array([0.1, 0.11])
+    xin = (edgesin[:-1] + edgesin[1:]) / 2.
+    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[edgesin] * len(ellsin), value=[np.ones(1)] + [np.zeros(1)] * (len(ellsin) - 1), projs=ellsin)
 
-    f, b = 0.8, 1.5
-    beta = f / b
-    kin = np.linspace(0.001, 0.7, 100)
-    ells = (0, 2, 4)
-    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
-                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
-                        8. / 35 * beta ** 2 * pk(kin)])
-
-    attrs = MeshAttrs(boxsize=2000., meshsize=128, boxcenter=1000.)
+    attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
     edges = {'step': 0.01}
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
+    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
-        positions = scale * random.normal(seed, shape=(size, 3))
-        bscale = 2. * scale  # cut at 2 sigmas
+        positions = jnp.array([1., 0.2, 0.2]) * scale * random.normal(seed, shape=(size, 3))
+        bscale = scale
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
         positions = positions * boxsize + boxcenter
         toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
@@ -723,36 +716,22 @@ def test_window():
         return toret
 
     selection = gaussian_survey(**attrs, paint=True)
-    edgesin = np.linspace(0., 0.2, 100)
-    ellsin = (0, 2, 4)
+    norm = compute_normalization(selection, selection)
+    ells = (0, 2, 4)
 
-    def make_callable(poles):
-        knorm = jnp.sqrt(sum(kk**2 for kk in attrs.kcoords(sparse=True, hermitian=True))).ravel()
-        interp = Interpolator1D(kin, knorm)
-        del knorm
-        def get_fun(ill):
-            return lambda k: interp(poles[ill])
-        return {ell: get_fun(ill) for ill, ell in enumerate(ells)}
-
-    def mean(poles, selection):
-        return compute_mean_mesh_power(selection, theory=(make_callable(poles), 'local'), ells=(0, 2, 4), edges=edges, los='firstpoint').view()[-3]
-
-    if False:
-        mean = jax.grad(mean)
-        mean = jax.jit(mean)
-        tmp = mean(poles, selection)
-        jax.block_until_ready(tmp)
-
-        t0 = time.time()
-        tmp = mean(poles + 1e-9, selection)
-        jax.block_until_ready(tmp)
-        print(time.time() - t0)
-        exit()
-
-    t0 = time.time()
-    tmp = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, 'local'), edges=edges, los='firstpoint', buffer='_tmp', pbar=True)
-    jax.block_until_ready(tmp)
-    print(time.time() - t0)
+    for flag in ['smooth', 'infinite']:
+        for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')]:
+            print(flag, los, thlos)
+            mean = compute_mean_mesh_power(selection, theory=(theory, thlos) if thlos is not None else theory, ells=ells, edges=edges, los=los).clone(norm=norm)
+            wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, edges=edges, los=los, pbar=True, norm=norm, flags=(flag,))
+            from matplotlib import pyplot as plt
+            ax = plt.gca()
+            for iproj, proj in enumerate(mean.projs):
+                color = 'C{:d}'.format(iproj)
+                ax.plot(mean.x(projs=proj), mean.view(projs=proj), color=color, linestyle='-')
+                projin = (0, 0) if thlos == 'firstpoint' else 0
+                ax.plot(mean.x(projs=proj), wmatrix.select(projs=proj, select_projs=True, axis='o').select(projs=projin, select_projs=True, axis='t').view(), color=color, linestyle='--')
+            plt.show()
 
 
 def test_smooth_window():
@@ -888,8 +867,9 @@ def test_wmatrix():
 
 if __name__ == '__main__':
 
-    test_wmatrix()
+    test_window()
     exit()
+    #test_wmatrix()
     #test_gaunt()
     #test_smooth_window()
     #tophat_bessel()

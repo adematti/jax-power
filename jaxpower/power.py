@@ -118,7 +118,7 @@ class PowerSpectrumMultipoles(BinnedStatistic):
 def _get_batch_Ylm(Ylm):
 
     if Ylm.ell == 0:
-        return lambda *coords: 1. / np.sqrt(4. * np.pi)
+        return lambda *coords: 1. / jnp.sqrt(4. * jnp.pi)
 
     def _safe_divide(num, denom):
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -586,8 +586,6 @@ def compute_wide_angle_poles(poles: dict[Callable]):
     return toret
 
 
-from matplotlib import pyplot as plt
-
 def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
                         edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0,
                         buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
@@ -625,6 +623,8 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
     -------
     wmat : WindowMatrix
     """
+    from .utils import TophatPowerToCorrelation, TophatCorrelationToPower
+
     meshs = list(meshs)
     assert 1 <= len(meshs) <= 2
     periodic = isinstance(meshs[0], MeshAttrs)
@@ -671,6 +671,18 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
     def np_map(f, xs):
         return jnp.array(list(map(f, xs)))
 
+    svec = mattrs.xcoords(kind='separation', sparse=True)
+
+    def oversample(edges, factor=5):
+        return jnp.interp(jnp.linspace(0., 1., (edges.size - 1) * factor + 1), jnp.linspace(0., 1., edges.size), edges)
+
+    if pbar:
+        from tqdm import tqdm
+        t = tqdm(total=len(kin), bar_format='{l_bar}{bar}| {n:.0f}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]')
+
+        def round(n):
+            return int(n * 1e6) / 1e6
+
     if vlos is not None:
 
         if np.ndim(ellsin) == 0: ellsin = (ellsin,)
@@ -690,33 +702,109 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
         bin = BinAttrs(mattrs, edges=edges, kind='complex_hermitian', mode_oversampling=mode_oversampling)
         kvec = mattrs.kcoords(sparse=True, hermitian=True)
         knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
+
+        def _bin(Aell):
+            power = []
+            for ell in ells:
+                leg = legendre(ell)(mu)
+                odd = ell % 2
+                if odd: leg += legendre(ell)(-mu)
+                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=ell == 0))
+            return jnp.concatenate(power)
+
+        def my_map(f, xs):
+            if pbar:
+                return np_map(f, xs)
+            return jax.lax.map(f, xs=xs, batch_size=batch_size)
 
         wmat = []
-        for ellin in ellsin:
-            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
-            legin = legendre(ellin)(mu)
 
-            def f(kin):
+        if 'smooth' in flags:
 
-                def pkvec(*args):
-                    kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                    return kmask * legin
+            from .utils import spherical_jn
+            spherical_jn = {ell: spherical_jn(ell) for ell in set(ells)}
+            sedges = None
+            #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
+            sbin = BinAttrs(mattrs, edges=sedges, kind='real')
+            koversampling = 5
+            kbin = BinAttrs(mattrs, edges=oversample(edges, koversampling), kind='complex_hermitian', mode_oversampling=mode_oversampling)
+            kout, koutnmodes = kbin.xavg.reshape(-1, koversampling), kbin.nmodes.reshape(-1, koversampling)
+            koutnmodes /= koutnmodes.sum(axis=-1)[..., None]
+            kout = jnp.where(koutnmodes == 0, 0., kout)
+            del kbin
 
-                Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
-                if Q is not None: Aell = _2c(Q * _2r(Aell))
-                else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
+            for ellin in ellsin:
 
-                power = []
-                for ell in ells:
-                    leg = legendre(ell)(mu)
-                    odd = ell % 2
-                    if odd: leg += legendre(ell)(-mu)
-                    power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=ell == 0))
-                return jnp.concatenate(power)
+                wmat_tmp = []
+                for ill, ell in enumerate(ells):
+                    snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                    smu = sum(xx * ll for xx, ll in zip(svec, vlos)) / jnp.where(snorm == 0., 1., snorm)
 
-            if pbar: _map = np_map
-            else: _map = partial(jax.lax.map, batch_size=batch_size)
-            wmat.append(_map(f, kin))
+                    Qs = sbin((Q if Q is not None else 1.) * legendre(ell)(smu) * legendre(ellin)(smu))
+                    if ell != 0: Qs = Qs.at[0].set(0.)
+                    Qs = jnp.where(sbin.nmodes == 0, 0., Qs)
+                    savg = jnp.where(sbin.nmodes == 0, 0., sbin.xavg)
+                    snmodes = sbin.nmodes
+
+                    del snorm
+
+                    def f(kin):
+                        tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ellin, edges=True).w[..., 0] * rnorm * mattrs.cellsize.prod() * Qs
+
+                        def f2(args):
+                            kout, nout = args
+                            return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat_Qs)
+
+                        batch_size = min(max(Qs.size // (koversampling * savg.size), 1), kout.shape[0])
+                        power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
+
+                        if pbar:
+                            t.update(n=round(1 / len(ells) / len(ellsin)))
+                        return power
+
+                    wmat_tmp.append(my_map(f, kin))
+                wmat.append(jnp.concatenate(wmat_tmp, axis=-1))
+
+        elif 'infinite' in flags:
+
+            snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+            smu = sum(xx * ll for xx, ll in zip(svec, vlos)) / jnp.where(snorm == 0., 1., snorm)
+
+            for ellin in ellsin:
+                legin = legendre(ellin)(smu)
+
+                def f(kin):
+                    Aell = TophatPowerToCorrelation(kin, seval=snorm, ell=ellin, edges=True).w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
+                    if Q is not None: Aell *= Q
+                    power = _bin(_2c(Aell))
+                    if pbar:
+                        t.update(n=round(1 / len(ellsin)))
+                    return power
+
+                wmat.append(my_map(f, kin))
+
+        else:
+
+            for ellin in ellsin:
+                legin = legendre(ellin)(mu)
+
+                def f(kin):
+
+                    def pkvec(*args):
+                        kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
+                        return kmask * legin
+
+                    Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
+                    if Q is not None: Aell = _2c(Q * _2r(Aell))
+                    else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
+                    power = _bin(Aell)
+                    if pbar:
+                        t.update(n=round(1 / len(ellsin)))
+                    return power
+
+                wmat.append(my_map(f, kin))
+
         wmat = jnp.concatenate(wmat, axis=0).T
 
     else:
@@ -741,11 +829,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
         # The real-space grid
         xvec = mattrs.xcoords(sparse=True)
-
-        def _wrap_rslab(rslab):
-            return tuple(jnp.where(rr > mattrs.boxsize[ii] / 2., rr - mattrs.boxsize[ii], rr) for ii, rr in enumerate(rslab))
-
-        svec = _wrap_rslab(mattrs.clone(boxcenter=mattrs.boxsize / 2.).xcoords(sparse=True))
 
         # The Fourier-space grid
         kvec = A0.coords(sparse=True)
@@ -809,22 +892,11 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                 toret = jax.device_put(obj)
             return toret
 
-        def oversample(edges, factor=5):
-            return jnp.interp(jnp.linspace(0., 1., (edges.size - 1) * factor + 1), jnp.linspace(0., 1., edges.size), edges)
-
-        if pbar:
-            from tqdm import tqdm
-            t = tqdm(total=len(kin), bar_format='{l_bar}{bar}| {n:.0f}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]')
-
-            def round(n):
-                return int(n * 1e6) / 1e6
-
         if theory_los == 'firstpoint':
 
             ellsin = [ellin if isinstance(ellin, tuple) else (ellin, 0) for ellin in ellsin]
             wmat_tmp = {}
             if 'smooth' in flags:
-                from .utils import TophatPowerToCorrelation, TophatCorrelationToPower
                 sedges = None
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
                 sbin = BinAttrs(rmesh1, edges=sedges)
@@ -844,7 +916,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                         for im1, Yl1m1 in enumerate(Ylms[ell1]):
                             for im, Ylm in enumerate(Ylms[ell]):
                                 Q = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
-                                Qs += 4. * np.pi * sbin(Q * Ylm(*svec) * Yl1m1(*svec)) * rnorm
+                                Qs += 4. * np.pi * sbin(Q * Ylm(*svec) * Yl1m1(*svec)) * rnorm * mattrs.cellsize.prod()
 
                         if ell != 0: Qs = Qs.at[0].set(0.)
                         Qs = jnp.where(sbin.nmodes == 0, 0., Qs)
@@ -858,7 +930,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
                             def f2(args):
                                 kout, nout = args
-                                return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat_Qs) * mattrs.cellsize.prod()
+                                return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat_Qs)
 
                             batch_size = min(max(Qs.size // (koversampling * savg.size), 1), kout.shape[0])
                             power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
@@ -870,6 +942,27 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
                         wmat_tmp[ell1, wa1] += my_map(f, kin)
 
+            elif 'infinite' in flags:
+                for ell1, wa1 in ellsin:
+                    wmat_tmp[ell1, wa1] = 0
+                    for ill, ell in enumerate(ells):
+                        for im, Ylm in enumerate(Ylms[ell]):
+                            xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
+                            snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                            Qs = 0.
+                            for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                                Q = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
+                                Qs += Yl1m1(*svec) * Q * rnorm * mattrs.cellsize.prod()
+                            del xnorm
+
+                            def f(kin):
+                                tophat_Qs = TophatPowerToCorrelation(kin, seval=snorm, ell=ell1, edges=True).w[..., 0] * Qs
+                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                if pbar:
+                                    t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
+                                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
+                                return power.ravel()
+                            wmat_tmp[ell1, wa1] += my_map(f, kin)
             else:
 
                 for ell1, wa1 in ellsin:
@@ -939,7 +1032,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
             wmat_tmp = {}
             if 'smooth' in flags:
-                from .utils import TophatPowerToCorrelation, TophatCorrelationToPower
                 sedges = None
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
                 sbin = BinAttrs(rmesh1, edges=sedges)
@@ -967,7 +1059,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                         if rg is not None:  # rg != 0
                                             tmp += rg * Ylm(*svec) * Ypmp(*svec) * Q
                                     if hasattr(tmp, 'shape'):
-                                        tmp = 4. * np.pi * sbin(tmp) * rnorm
+                                        tmp = 4. * np.pi * sbin(tmp) * rnorm * mattrs.cellsize.prod()
                                         Qs[key] += dump_to_buffer(tmp, key)
 
                         for p in ps:
@@ -982,7 +1074,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
                                 def f2(args):
                                     kout, nout = args
-                                    return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat * Q) * mattrs.cellsize.prod()
+                                    return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat * Q)
 
                                 batch_size = min(max(Q.size // (koversampling * savg.size), 1), kout.shape[0])
                                 power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
@@ -991,6 +1083,36 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
                                 return power.ravel()
 
+                            wmat_tmp[ell1, ell2] += my_map(f, kin)
+
+            elif 'infinite' in flags:
+                for ell1, ell2 in itertools.product((2, 0), (2, 0)):
+                    wmat_tmp[ell1, ell2] = 0
+                    for ill, ell in enumerate(ells):
+                        ps = [p for p in (0, 2, 4) if real_gaunt.get(((p, 0), (ell1, 0), (ell2, 0))) is not None]
+                        for im, Ylm in enumerate(Ylms[ell]):
+                            Qs = {p: 0. for p in ps}
+                            snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                            for (im1, Yl1m1), (im2, Yl2m2) in itertools.product(enumerate(Ylms[ell1]), enumerate(Ylms[ell2])):
+                                Q = (4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * _2r(_2c(rmesh1 * Ylm(*xvec) * Yl1m1(*xvec)).conj() * _2c(rmesh2 * Yl2m2(*xvec)))
+                                for p in ps:
+                                    for imp, Ypmp in enumerate(Ylms[p]):
+                                        rg = real_gaunt.get(((p, imp - p), (ell1, im1 - ell1), (ell2, im2 - ell2)), None)
+                                        if rg is not None:  # rg != 0
+                                            Qs[p] += rg * Ypmp(*svec) * Q
+                            for p in Qs:
+                                Qs[p] = dump_to_buffer(Qs[p] * rnorm * mattrs.cellsize.prod(), p)
+
+                            def f(kin):
+                                power = 0.
+                                for p in ps:
+                                    tophat = TophatPowerToCorrelation(kin, seval=snorm, ell=p, edges=True).w[..., 0]
+                                    Q = load_from_buffer(Qs[p])
+                                    power += 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat * Q), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                if pbar:
+                                    t.update(n=round(1 / sum(len(Ylms[ell]) for ell in ells) / 4))
+                                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
+                                return power.ravel()
                             wmat_tmp[ell1, ell2] += my_map(f, kin)
 
             else:
@@ -1163,7 +1285,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
     if isinstance(poles, tuple):
         kin, poles = poles
     if isinstance(poles, BinnedStatistic):
-        kin, poles = poles._edges[0], {proj: poles.view(projs=proj) for proj in poles.projs}
+        kin, poles = poles._edges[0] if poles._edges[0] is not None else poles._x[0], {proj: poles.view(projs=proj) for proj in poles.projs}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip((0, 2, 4), poles)}
     kvec = mattrs.kcoords(sparse=True, hermitian=True)
@@ -1243,10 +1365,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         xhat = mattrs.xcoords(sparse=True)
         xnorm = jnp.sqrt(sum(xx**2 for xx in xhat))
 
-        def _wrap_rslab(rslab):
-            return tuple(jnp.where(rr > mattrs.boxsize[ii] / 2., rr - mattrs.boxsize[ii], rr) for ii, rr in enumerate(rslab))
-
-        shat = _wrap_rslab(mattrs.clone(boxcenter=mattrs.boxsize / 2.).xcoords(sparse=True))
+        shat = mattrs.xcoords(kind='separation', sparse=True)
         snorm = jnp.sqrt(sum(xx**2 for xx in shat))
 
         # The Fourier-space grid

@@ -1039,11 +1039,11 @@ class BinAttrs(object):
         if isinstance(mattrs, MeshAttrs):
             hermitian = False
             if kind == 'real':
-                vec = mattrs.xcoords(sparse=True, **kwargs)
+                vec = mattrs.xcoords(kind='separation', sparse=True, **kwargs)
                 vec0 = mattrs.cellsize.min()
             else:
                 hermitian = 'hermitian' in kind
-                vec = mattrs.kcoords(sparse=True, hermitian=hermitian, **kwargs)
+                vec = mattrs.kcoords(kind='separation', sparse=True, hermitian=hermitian, **kwargs)
                 vec0 = mattrs.kfun.min()
         else:  # attrs is a mesh
             hermitian = mattrs.shape[-1] < mattrs.meshsize[-1]

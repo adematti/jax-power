@@ -145,6 +145,7 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
 
     test_base_mesh()
+    exit()
     test_mesh_attrs()
     test_resamplers()
     test_static_array()
