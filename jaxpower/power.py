@@ -761,7 +761,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
                         if pbar:
                             t.update(n=round(1 / len(ells) / len(ellsin)))
-                        return power
+                        return (2 * ell + 1) * power
 
                     wmat_tmp.append(my_map(f, kin))
                 wmat.append(jnp.concatenate(wmat_tmp, axis=-1))

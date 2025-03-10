@@ -1370,6 +1370,8 @@ class WindowMatrix(object):
 
     def dot(self, theory, zpt=True, return_type='nparray'):
         """Apply window matrix to input theory."""
+        if isinstance(theory, BinnedStatistic):
+            theory = theory.view()
         theory = jnp.ravel(theory)
         if zpt:
             toret = self.observable.view() + self._value.dot(theory - self.theory.view())
