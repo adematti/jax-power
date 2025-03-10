@@ -756,7 +756,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                             kout, nout = args
                             return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat_Qs)
 
-                        batch_size = min(max(Qs.size // (koversampling * savg.size), 1), kout.shape[0])
+                        batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / (koversampling * savg.size), 1), kout.shape[0]))
                         power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
 
                         if pbar:
@@ -767,7 +767,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                 wmat.append(jnp.concatenate(wmat_tmp, axis=-1))
 
         elif 'infinite' in flags:
-
             snorm = jnp.sqrt(sum(xx**2 for xx in svec))
             smu = sum(xx * ll for xx, ll in zip(svec, vlos)) / jnp.where(snorm == 0., 1., snorm)
 
@@ -932,7 +931,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                 kout, nout = args
                                 return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat_Qs)
 
-                            batch_size = min(max(Qs.size // (koversampling * savg.size), 1), kout.shape[0])
+                            batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / (koversampling * savg.size), 1), kout.shape[0]))
                             power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
 
                             if pbar:
@@ -1070,13 +1069,13 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                             snmodes = sbin.nmodes
 
                             def f(kin):
-                                tophat = TophatPowerToCorrelation(kin, seval=savg, ell=p, edges=True).w[..., 0]
+                                tophat_Q = TophatPowerToCorrelation(kin, seval=savg, ell=p, edges=True).w[..., 0] * Q
 
                                 def f2(args):
                                     kout, nout = args
-                                    return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat * Q)
+                                    return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout[..., None] * savg) * tophat_Q)
 
-                                batch_size = min(max(Q.size // (koversampling * savg.size), 1), kout.shape[0])
+                                batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / (koversampling * savg.size), 1), kout.shape[0]))
                                 power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
                                 if pbar:
                                     t.update(n=round(1 / len(ells) / 6))
