@@ -258,6 +258,12 @@ _registered_correlation_function_tophat_derivatives[5] = (lambda s, a: (16 / s**
                                                           lambda s, a: -a**10 * s**7 / (5405400 * jnp.pi**2) + a**8 * s**5 / (166320 * jnp.pi**2))
 
 
+_registered_bessel = {}
+_registered_bessel[0] = (lambda x: jnp.sin(x) / x, lambda x: -x**6/5040 + x**4/120 - x**2/6 + 1)
+_registered_bessel[2] = (lambda x: (-3*x*jnp.cos(x) + (3 - x**2)*jnp.sin(x))/x**3, lambda x: x**6/7560 - x**4/210 + x**2/15)
+_registered_bessel[4] = (lambda x: (5*x*(2*x**2 - 21)*jnp.cos(x) + (x**4 - 45*x**2 + 105)*jnp.sin(x))/x**5, lambda x: -x**6/20790 + x**4/945)
+
+
 def weights_trapz(x):
     """Return weights for trapezoidal integration."""
     return jnp.concatenate([[x[1] - x[0]], x[2:] - x[:-2], [x[-1] - x[-2]]]) / 2.
@@ -265,13 +271,20 @@ def weights_trapz(x):
 
 class TophatPowerToCorrelation(object):
 
-    def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False):
+    def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False, method='exact'):
         if edges: edges = k
         else: edges = jnp.concatenate([k[:1], (k[1:] + k[:-1]) / 2., k[-1:]], axis=0)
-        tophat = _registered_correlation_function_tophat_derivatives[ell]
         seval = seval[..., None]
-        mask = seval * edges > 0.01
-        self.w = jnp.diff(jnp.where(mask, tophat[0](seval, edges), tophat[1](seval, edges)), axis=-1)
+        if method == 'rectangle':
+            w = (-1)**(ell // 2) / (2 * np.pi**2) * (edges[1:]**3 - edges[:-1]**3) / 3.
+            x = seval * (edges[1:] + edges[:-1]) / 2.
+            mask = seval * edges > 0.01
+            bessel = _registered_bessel[ell]
+            self.w = w * jnp.where(mask, bessel[0](x), bessel[1](x))
+        else:
+            mask = seval * edges > 0.01
+            tophat = _registered_correlation_function_tophat_derivatives[ell]
+            self.w = jnp.diff(jnp.where(mask, tophat[0](seval, edges), tophat[1](seval, edges)), axis=-1)
 
     def __call__(self, fun: jax.Array):
         return jnp.sum(self.w * fun, axis=-1)

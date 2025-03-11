@@ -53,10 +53,6 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
 
     attrs = MeshAttrs(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter)
 
-    def _safe_divide(num, denom):
-        with np.errstate(divide='ignore', invalid='ignore'):
-            return jnp.where(denom == 0., 0., num / denom)
-
     def generate_normal(seed):
         mesh = RealMeshField(random.normal(seed, attrs.meshsize), attrs=attrs).r2c()
         if unitary_amplitude:

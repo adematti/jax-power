@@ -623,6 +623,8 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
     -------
     wmat : WindowMatrix
     """
+    tophat_method = 'rectangle'
+
     from .utils import TophatPowerToCorrelation, TophatCorrelationToPower
 
     meshs = list(meshs)
@@ -750,7 +752,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                     del snorm
 
                     def f(kin):
-                        tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ellin, edges=True).w[..., 0] * rnorm * mattrs.cellsize.prod() * Qs
+                        tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ellin, edges=True, method=tophat_method).w[..., 0] * rnorm * mattrs.cellsize.prod() * Qs
 
                         def f2(args):
                             kout, nout = args
@@ -774,7 +776,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                 legin = legendre(ellin)(smu)
 
                 def f(kin):
-                    Aell = TophatPowerToCorrelation(kin, seval=snorm, ell=ellin, edges=True).w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
+                    Aell = TophatPowerToCorrelation(kin, seval=snorm, ell=ellin, edges=True, method=tophat_method).w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
                     if Q is not None: Aell *= Q
                     power = _bin(_2c(Aell))
                     if pbar:
@@ -925,7 +927,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                         del xnorm, snorm
 
                         def f(kin):
-                            tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ell1, edges=True).w[..., 0] * Qs
+                            tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ell1, edges=True, method=tophat_method).w[..., 0] * Qs
 
                             def f2(args):
                                 kout, nout = args
@@ -955,7 +957,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                             del xnorm
 
                             def f(kin):
-                                tophat_Qs = TophatPowerToCorrelation(kin, seval=snorm, ell=ell1, edges=True).w[..., 0] * Qs
+                                tophat_Qs = TophatPowerToCorrelation(kin, seval=snorm, ell=ell1, edges=True, method=tophat_method).w[..., 0] * Qs
                                 power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
                                 if pbar:
                                     t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
@@ -1069,7 +1071,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                             snmodes = sbin.nmodes
 
                             def f(kin):
-                                tophat_Q = TophatPowerToCorrelation(kin, seval=savg, ell=p, edges=True).w[..., 0] * Q
+                                tophat_Q = TophatPowerToCorrelation(kin, seval=savg, ell=p, edges=True, method=tophat_method).w[..., 0] * Q
 
                                 def f2(args):
                                     kout, nout = args
@@ -1103,11 +1105,12 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                 Qs[p] = dump_to_buffer(Qs[p] * rnorm * mattrs.cellsize.prod(), p)
 
                             def f(kin):
-                                power = 0.
+                                xi = 0.
                                 for p in ps:
-                                    tophat = TophatPowerToCorrelation(kin, seval=snorm, ell=p, edges=True).w[..., 0]
+                                    tophat = TophatPowerToCorrelation(kin, seval=snorm, ell=p, edges=True, method=tophat_method).w[..., 0]
                                     Q = load_from_buffer(Qs[p])
-                                    power += 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat * Q), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                    xi += tophat * Q
+                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
                                 if pbar:
                                     t.update(n=round(1 / sum(len(Ylms[ell]) for ell in ells) / 4))
                                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)

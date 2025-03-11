@@ -700,7 +700,7 @@ def test_window():
     ellsin = (0, 2, 4)
     edgesin = np.array([0.1, 0.11])
     xin = (edgesin[:-1] + edgesin[1:]) / 2.
-    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[edgesin] * len(ellsin), value=[np.ones(1)] + [np.zeros(1)] * (len(ellsin) - 1), projs=ellsin)
+    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[edgesin] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
 
     attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
     edges = {'step': 0.01}
@@ -732,6 +732,41 @@ def test_window():
                 projin = (0, 0) if thlos == 'firstpoint' else 0
                 ax.plot(mean.x(projs=proj), wmatrix.select(projs=proj, select_projs=True, axis='o').select(projs=projin, select_projs=True, axis='t').view(), color=color, linestyle='--')
             plt.show()
+
+
+def test_window_timing():
+
+    from jaxpower import compute_mesh_window
+    from jaxpower.utils import Interpolator1D
+
+    ellsin = (0, 2, 4)
+    edgesin = np.linspace(0.01, 0.1, 20)
+    xin = (edgesin[:-1] + edgesin[1:]) / 2.
+    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[edgesin] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
+
+    attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
+    edges = {'step': 0.01}
+
+    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
+        # Generate Gaussian-distributed positions
+        positions = jnp.array([1., 0.2, 0.2]) * scale * random.normal(seed, shape=(size, 3))
+        bscale = scale
+        mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+        positions = positions * boxsize + boxcenter
+        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
+        return toret
+
+    selection = gaussian_survey(**attrs, paint=True)
+    norm = compute_normalization(selection, selection)
+    ells = (0, 2, 4)
+
+    for flag in ['smooth', 'infinite'][-1:]:
+        for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')][-1:]:
+            print(flag, los, thlos)
+            t0 = time.time()
+            wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, edges=edges, los=los, pbar=True, norm=norm, flags=(flag,))
+            print(f'{time.time() - t0:.2f}')
 
 
 def test_smooth_window():
@@ -865,10 +900,37 @@ def test_wmatrix():
     wmatrix3.plot(show=True)
 
 
+def test_sympy():
+    import sympy as sp
+
+    def tophat(ell):
+        k, s, a = sp.symbols('k s a', real=True, positive=True)
+        integrand = sp.simplify(k**2 * sp.expand_func(sp.jn(ell, k * s)))
+        # i^ell; we take in the imaginary part of the odd power spectrum multipoles
+        expr = (-1)**(ell // 2) / (2 * sp.pi**2) * sp.integrate(integrand, (k, 0, a))
+        expr_lows = sp.series(expr, x=s, x0=0, n=8).removeO()
+        print(expr)
+        print(expr_lows)
+
+    def point(ell):
+        x = sp.symbols('x', real=True, positive=True)
+        integrand = sp.simplify(sp.expand_func(sp.jn(ell, x)))
+        # i^ell; we take in the imaginary part of the odd power spectrum multipoles
+        expr = integrand
+        expr_lows = sp.series(expr, x=x, x0=0, n=8).removeO()
+        print(expr)
+        print(expr_lows)
+
+    for ell in [0, 2, 4]:
+        #tophat(ell)
+        point(ell)
+
+
 if __name__ == '__main__':
 
-    test_window()
-    exit()
+    test_window_timing()
+    #test_sympy()
+    #test_window()
     #test_wmatrix()
     #test_gaunt()
     #test_smooth_window()
