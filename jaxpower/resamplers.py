@@ -35,7 +35,7 @@ def _kernel_ngp(shape: tuple, positions: jax.Array):
     fidx = positions
     idx = jnp.rint(fidx).astype('i4')
 
-    yield tuple(wrap(idx).T), 1
+    yield wrap(idx), 1
 
 
 def _kernel_cic(shape: tuple, positions: jax.Array):
@@ -53,7 +53,7 @@ def _kernel_cic(shape: tuple, positions: jax.Array):
         ishift = np.array(ishift)
         s = jnp.where(ishift <= 0, dx_left, dx_right)  # absolute distance to mesh node, shape (N, 3)
         kernel = 1 - s
-        yield tuple(wrap(idx + ishift).T), jnp.prod(kernel, axis=-1)
+        yield wrap(idx + ishift), jnp.prod(kernel, axis=-1)
 
 
 def _kernel_tsc(shape: tuple, positions: jax.Array):
@@ -71,7 +71,7 @@ def _kernel_tsc(shape: tuple, positions: jax.Array):
         ishift = np.array(ishift)
         s = jnp.where(ishift <= 0, dx_left, dx_right) + 1 * (np.abs(ishift) > 0.5) # absolute distance to mesh node, shape (N, 3)
         kernel = (s <= 0.5) * (0.75 - s**2) + (s > 0.5) / 2. * (1.5 - s)**2
-        yield tuple(wrap(idx + ishift).T), jnp.prod(kernel, axis=-1)
+        yield wrap(idx + ishift), jnp.prod(kernel, axis=-1)
 
 
 def _kernel_pcs(shape: tuple, positions: jax.Array):
@@ -89,12 +89,13 @@ def _kernel_pcs(shape: tuple, positions: jax.Array):
         ishift = np.array(ishift)
         s = jnp.where(ishift <= 0, dx_left, dx_right) + 1 * (np.abs(ishift - 0.5) > 1)  # absolute distance to mesh node, shape (N, 3)
         kernel = (s <= 1) / 6. * (4 - 6 * s**2 + 3 * s**3) + (s > 1) / 6. * (2 - s)**3
-        yield tuple(wrap(idx + ishift).T), jnp.prod(kernel, axis=-1)
+        yield wrap(idx + ishift), jnp.prod(kernel, axis=-1)
 
 
 def _get_painter(kernel: Callable):
     def fn(mesh, positions, weights=None):
         for idx, ker in kernel(mesh.shape, positions):
+            idx = jnp.unstack(idx)
             mesh = mesh.at[idx].add(ker if weights is None else weights * ker)
         return mesh
     return fn
@@ -104,6 +105,7 @@ def _get_reader(kernel: Callable):
     def fn(mesh, positions):
         toret = 0.
         for idx, ker in kernel(mesh.shape, positions):
+            idx = jnp.unstack(idx)
             toret += mesh[idx] * ker
         return toret
     return fn
