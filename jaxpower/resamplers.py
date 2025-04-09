@@ -95,7 +95,7 @@ def _kernel_pcs(shape: tuple, positions: jax.Array):
 def _get_painter(kernel: Callable):
     def fn(mesh, positions, weights=None):
         for idx, ker in kernel(mesh.shape, positions):
-            idx = jnp.unstack(idx)
+            idx = tuple(jnp.moveaxis(idx, -1, 0))
             mesh = mesh.at[idx].add(ker if weights is None else weights * ker)
         return mesh
     return fn
@@ -105,14 +105,14 @@ def _get_reader(kernel: Callable):
     def fn(mesh, positions):
         toret = 0.
         for idx, ker in kernel(mesh.shape, positions):
-            idx = jnp.unstack(idx)
+            idx = tuple(jnp.moveaxis(idx, -1, 0))
             toret += mesh[idx] * ker
         return toret
     return fn
 
 
 # Define namespaces
-ngp = type('ngp', (), dict(paint=_get_painter(_kernel_ngp), read=_get_reader(_kernel_ngp), compensate=_compensate_tophat_convolution_kernel(1)))
-cic = type('cic', (), dict(paint=_get_painter(_kernel_cic), read=_get_reader(_kernel_cic), compensate=_compensate_tophat_convolution_kernel(2)))
-tsc = type('tsc', (), dict(paint=_get_painter(_kernel_tsc), read=_get_reader(_kernel_tsc), compensate=_compensate_tophat_convolution_kernel(3)))
-pcs = type('pcs', (), dict(paint=_get_painter(_kernel_pcs), read=_get_reader(_kernel_pcs), compensate=_compensate_tophat_convolution_kernel(4)))
+ngp = type('ngp', (), dict(paint=_get_painter(_kernel_ngp), read=_get_reader(_kernel_ngp), compensate=_compensate_tophat_convolution_kernel(1), order=1))
+cic = type('cic', (), dict(paint=_get_painter(_kernel_cic), read=_get_reader(_kernel_cic), compensate=_compensate_tophat_convolution_kernel(2), order=2))
+tsc = type('tsc', (), dict(paint=_get_painter(_kernel_tsc), read=_get_reader(_kernel_tsc), compensate=_compensate_tophat_convolution_kernel(3), order=3))
+pcs = type('pcs', (), dict(paint=_get_painter(_kernel_pcs), read=_get_reader(_kernel_pcs), compensate=_compensate_tophat_convolution_kernel(4), order=4))

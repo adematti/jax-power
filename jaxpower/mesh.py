@@ -1,5 +1,6 @@
 import os
 import operator
+import functools
 from functools import partial
 from collections.abc import Callable
 from typing import Any
@@ -7,8 +8,15 @@ from typing import Any
 import numpy as np
 import jax
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 from dataclasses import dataclass, field, fields, asdict
 from . import resamplers, utils
+
+try:
+    import jaxdecomp
+except ImportError:
+    jaxdecomp = None
 
 
 class staticarray(np.ndarray):
@@ -56,16 +64,33 @@ def _get_ndim(*args):
     return ndim
 
 
+def get_sharding_mesh():
+    from jax._src import mesh as mesh_lib
+    return mesh_lib.thread_resources.env.physical_mesh
 
-def fftfreq(shape: tuple, kind: str='wavenumber', sparse: bool | None=None,
-            hermitian: bool=False, spacing: np.ndarray | float=1.):
+
+def default_sharding_mesh(func: Callable):
+
+    @functools.wraps(func)
+    def wrapper(*args, sharding_mesh=None, **kwargs):
+        if sharding_mesh is None:
+            sharding_mesh = get_sharding_mesh()
+        return func(*args, sharding_mesh=sharding_mesh, **kwargs)
+
+    return wrapper
+
+
+@default_sharding_mesh
+def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
+            hermitian: bool=False, spacing: np.ndarray | float=1.,
+            axis_order: tuple=None, sharding_mesh: jax.sharding.Mesh=None):
     r"""
     Return mesh frequencies.
 
     Parameters
     ----------
-    kind : str, default='wavenumber'
-        Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units).
+    kind : str, default='separation'
+        Either 'separation' (i.e. wavenumbers) or 'position'.
 
     sparse : bool, default=None
         If ``None``, return a tuple of 1D-arrays.
@@ -76,7 +101,7 @@ def fftfreq(shape: tuple, kind: str='wavenumber', sparse: bool | None=None,
         If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
 
     spacing : float, default=1.
-        Sampling spacing, typically ``cellsize``.
+        Sampling spacing, typically ``cellsize`` (real space) or ``kfun`` (Fourier space).
 
     Returns
     -------
@@ -84,21 +109,191 @@ def fftfreq(shape: tuple, kind: str='wavenumber', sparse: bool | None=None,
     """
     ndim = len(shape)
     spacing = staticarray.fill(spacing, ndim)
-    if kind is None:
-        toret = [jnp.arange(s) for s in shape]
-    else:
-        if kind == 'circular':
-            period = (2 * jnp.pi,) * ndim
-        else:  # wavenumber
-            period = 2 * jnp.pi / spacing
-        toret = []
-        for axis, s in enumerate(shape):
-            k = (jnp.fft.rfftfreq if axis == ndim - 1 and hermitian else jnp.fft.fftfreq)(s) * period[axis]
-            toret.append(k)
-    if sparse is None:
-        return tuple(toret)
-    return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
 
+    toret = []
+    if kind == 'position':
+        for axis, s in enumerate(shape):
+            k = jnp.arange(s) * spacing[axis]
+            toret.append(k)
+    elif kind == 'separation':
+        for axis, s in enumerate(shape):
+            k = (jnp.fft.rfftfreq if axis == ndim - 1 and hermitian else jnp.fft.fftfreq)(s) * spacing[axis] * s
+            toret.append(k)
+
+    ndim = len(toret)
+    if axis_order is None:
+        axis_order = list(range(ndim))
+    toret = [toret[axis] for axis in axis_order]
+
+    def get_mesh(*freqs):
+        if sparse is None:
+            return tuple(freqs)
+        return jnp.meshgrid(*freqs, sparse=sparse, indexing='ij')
+
+    if sharding_mesh is not None and sharding_mesh.axis_names:
+        in_specs = tuple(P(name) for name in sharding_mesh.axis_names)
+        remaining = ndim - len(sharding_mesh.axis_names)
+        if remaining:
+            in_specs += tuple(P(None) for i in range(remaining))
+        if sparse is None:
+            out_specs = in_specs
+        elif sparse:
+            out_specs = []
+            for i in range(ndim):
+                tmp = [None] * ndim
+                tmp[i] = sharding_mesh.axis_names[i]
+                out_specs.append(P(tmp))
+            out_specs = tuple(out_specs)
+        else:
+            out_specs = tuple(P(sharding_mesh.axis_names) for i in range(ndim))
+        get_mesh = shard_map(get_mesh, sharding_mesh, in_specs, out_specs)
+
+    toret = get_mesh(*toret)
+    toret = [toret[axis_order.index(axis)] for axis in range(len(toret))]
+    return tuple(toret)
+
+
+@default_sharding_mesh
+def shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
+    if not len(sharding_mesh.axis_names):
+        return tuple(shape)
+    return tuple(s // pdim for s, pdim in zip(shape, sharding_mesh.devices.shape)) + shape[sharding_mesh.devices.ndim:]
+
+
+@default_sharding_mesh
+def pad_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
+    pad_width = [(halo_size,) * 2] * len(sharding_mesh.axis_names)
+    pad_width += [(0,) * 2] * len(value.shape[len(sharding_mesh.axis_names):])
+
+    def pad(value):
+        return jnp.pad(value, tuple(pad_width))
+
+    offset = jnp.array([width[0] for width in pad_width])
+    return shard_map(pad, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),), out_specs=P(*sharding_mesh.axis_names))(value), offset
+
+
+@default_sharding_mesh
+def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
+    extents = [(halo_size // 2,) * 2] * len(sharding_mesh.axis_names)
+    return jaxdecomp.halo_exchange(value, halo_extents=tuple(extents), halo_periods=(True,) * len(extents))
+
+
+@default_sharding_mesh
+def make_particles_from_local(per_host_positions, per_host_weights, sharding_mesh: jax.sharding.Mesh=None):
+
+    if not len(sharding_mesh.axis_names):
+        return per_host_positions, per_host_weights
+
+    per_host_size = jnp.array(per_host_positions.size[:1])
+    sizes = jax.make_array_from_process_local_data(sharding_mesh, per_host_size)
+    max_size = jnp.max(sizes)
+    pad_width = [(0, max_size - per_host_positions.size)] + [(0, 0)] * (per_host_positions.ndim - 1)
+    per_host_positions = jnp.pad(per_host_positions, pad_width=pad_width)
+    sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+    global_size = max_size * sizes.size
+    positions = jax.make_array_from_process_local_data(sharding_mesh, per_host_positions, global_shape=(global_size,) + per_host_positions.shape[-1:])
+    pad_width = [(0, max_size - per_host_weights.size)] + [(0, 0)] * (per_host_weights.ndim - 1)
+    per_host_weights = jnp.pad(per_host_weights, pad_width=pad_width, mode='constant', constant_values=0.)
+    weights = jax.make_array_from_process_local_data(sharding_mesh, per_host_weights, global_shape=(global_size,))
+    return positions, weights
+
+
+def exchange_particles(attrs, positions: jax.Array):
+    sharding_mesh = attrs.sharding_mesh
+    devices = sharding_mesh.devices
+
+    if not len(sharding_mesh.axis_names):
+
+        def exchange(positions=None, weights=None):
+            toret = []
+            if positions is not None:
+                toret.append(positions)
+            if weights is not None:
+                toret.append(weights)
+            return toret
+
+        def inverse(values):
+            return values
+
+        exchange.inverse = inverse
+
+        return exchange
+
+    fidx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize)[..., :devices.ndim] / (attrs.boxsize[:devices.ndim] / devices)
+    idx_out_devices = devices[jnp.floor(fidx_out_devices).astype('i4')]
+    count_out_device = jnp.bincount(idx_out_devices, length=devices.max() + 1)[1:]
+    count_out_max = count_out_device.max()
+
+    p_shape = positions.shape
+    p_sharding = positions.sharding
+    out_sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+
+    def exchange(positions=None, weights=None):
+
+        def get_positions(idevice):
+            mask = jnp.all(idx_out_devices == idevice.start, axis=-devices.ndim)
+            p = positions[mask]
+            pad_width = [(0, count_out_max - count_out_device[devices[idevice]])] + [(0, 0)] * (p.ndim - 1)
+            return jnp.pad(p, pad_width=pad_width)
+
+        def get_weights(idevice):
+            mask = jnp.all(idx_out_devices == idevice.start, axis=-devices.ndim)
+            w = weights[mask]
+            pad_width = [(0, count_out_max - count_out_device[devices[idevice]])] + [(0, 0)] * (w.ndim - 1)
+            w = jnp.pad(w, pad_width=pad_width, mode='constant', constant_values=0.)
+            return w
+
+        toret = []
+        if positions is not None:
+            toret.append(jax.make_array_from_callback((devices.size, count_out_max) + positions.shape[-1:], out_sharding, get_positions))
+        if weights is not None:
+            toret.append(jax.make_array_from_callback((devices.size, count_out_max), out_sharding, get_weights))
+        if len(toret) == 1:
+            toret = toret[0]
+        return toret
+
+    def inverse(values):
+
+        def f(carry, idevice):
+            mask = idx_out_devices == idevice
+            carry = carry.at[mask].set(jnp.cumsum(mask)[mask])
+            return carry, idevice
+
+        index_in_out = idx_out_devices.copy()
+        for idevice in devices.ravel():
+            index_in_out, _ = f(index_in_out, idevice)
+
+        #index_in_out = jax.lax.scan(f, index_in_out, devices.ravel())[0]  # it will never be jitted
+        index_in_out = (idx_out_devices, index_in_out)
+
+        def get_values(sl):
+            return values[tuple(tmp[sl] for tmp in index_in_out)]
+
+        return jax.make_array_from_callback(p_shape, p_sharding, get_values)
+
+    exchange.inverse = inverse
+    return exchange
+
+
+@default_sharding_mesh
+def unpad_halo(value, halo_size, sharding_mesh=None):
+
+    def unpad(value):
+        crop = []
+        for axis in range(len(sharding_mesh.axis_names)):
+            slices = [slice(None) for i in range(value.ndim)]
+            slices[axis] = slice(halo_size, halo_size + halo_size // 2)
+            slices_add = list(slices_add)
+            slices_add[axis] = slice(0, halo_size // 2)
+            value = value.at[tuple(slices)].set(value[tuple(slices_add)])
+            slices[axis] = slice(-(halo_size + halo_size // 2), -halo_size)
+            slices_add = list(slices_add)
+            slices_add[axis] = slice(-halo_size // 2)
+            value = value.at[tuple(slices)].set(value[tuple(slices_add)])
+            crop.append(slice(halo_size, -halo_size))
+        return value[tuple(crop)]
+
+    return shard_map(unpad, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),), out_specs=P(*sharding_mesh.axis_names))(value)
 
 
 def _get_bin_attrs(coords: jax.Array, edges: np.ndarray, weights: None | jax.Array=None):
@@ -116,16 +311,28 @@ class MeshAttrs(object):
     meshsize: staticarray = None
     boxsize: staticarray = None
     boxcenter: staticarray = 0.
+    dtype: Any = None
+    fft_engine: str = None
 
-    def __init__(self, meshsize=None, boxsize=None, boxcenter=0.):
-        state = dict(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter)
+    def __init__(self, meshsize=None, boxsize=None, boxcenter=0., dtype=float, fft_engine='auto'):
         ndim = _get_ndim(*[meshsize, boxsize, boxcenter])
         if meshsize is not None:  # meshsize may not be provided (e.g. for particles) and it is fine
             meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
             if boxsize is None: boxsize = 1. * meshsize
         if boxsize is not None: boxsize = staticarray.fill(boxsize, ndim, dtype=float)
         if boxcenter is not None: boxcenter = staticarray.fill(boxcenter, ndim, dtype=float)
-        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter)
+        dtype = jnp.zeros((), dtype=dtype).dtype  # default dtype is float32, except if config.update('jax_enable_x64', True)
+        if fft_engine == 'auto':
+            fft_engine = 'jaxdecomp' if ndim == 3 and jaxdecomp is not None else 'jax'
+        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter, dtype=dtype, fft_engine=fft_engine)
+
+    @property
+    def sharding_mesh(self):
+        return get_sharding_mesh()
+
+    @property
+    def hermitian(self):
+        return self.fft_engine != 'jaxdecomp' and jnp.issubdtype(self.dtype, jnp.floating)
 
     def tree_flatten(self):
         return tuple(), asdict(self)
@@ -150,6 +357,10 @@ class MeshAttrs(object):
         return self.__class__(**state)
 
     @property
+    def ndim(self):
+        return len(self.meshsize)
+
+    @property
     def cellsize(self):
         return self.boxsize / self.meshsize
 
@@ -163,7 +374,7 @@ class MeshAttrs(object):
         """Nyquist wavenumber."""
         return np.pi * self.meshsize / self.boxsize
 
-    def xcoords(self, kind: str='position', sparse: bool | None=None):
+    def rcoords(self, kind: str='position', sparse: bool | None=None):
         """
         Return mesh spatial coordinates.
 
@@ -181,16 +392,19 @@ class MeshAttrs(object):
         -------
         coords : tuple
         """
-        toret = [jnp.arange(s) for s in self.meshsize]
-        if kind != 'index':
-            toret = [idx * cell + offset for idx, cell, offset in zip(toret, self.cellsize, self.boxcenter - self.boxsize / 2.)]
-        if kind == 'separation':
-            toret = fftfreq(self.meshsize, spacing=self.kfun)
-        if sparse is None:
-            return tuple(toret)
-        return jnp.meshgrid(*toret, sparse=sparse, indexing='ij')
+        offset = None
+        spacing = self.cellsize
+        if kind == 'position':
+            offset = self.boxcenter - self.boxsize / 2.
+        if kind == 'index':
+            spacing = 1
+            kind = 'position'
+        toret = fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=False, spacing=spacing, sharding_mesh=self.sharding_mesh)
+        if offset is not None:
+            toret = tuple(tmp + off for off, tmp in zip(offset, toret))
+        return toret
 
-    def kcoords(self, kind: str='wavenumber', sparse: bool | None=None, hermitian: bool=False):
+    def ccoords(self, kind: str='wavenumber', sparse: bool | None=None):
         r"""
         Return mesh Fourier coordinates.
 
@@ -204,48 +418,80 @@ class MeshAttrs(object):
             If ``False``, return a tuple of broadcastable arrays.
             If ``True``, return a tuple of broadcastable arrays of same shape.
 
-        hermitian : bool, default=False
-        If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
-
         Returns
         -------
         coords : tuple
         """
-        if kind == 'separation': kind = 'wavenumber'
-        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=hermitian, spacing=self.cellsize)
+        spacing = self.kfun
+        if kind == 'wavenumber':
+            kind = 'separation'
+        if kind == 'circular':
+            spacing = 2. * np.pi / self.meshsize
+            kind = 'separation'
+        axis_order = None
+        if self.fft_engine == 'jaxdecomp':
+            axis_order = tuple(np.roll(np.arange(self.ndim), shift=len(self.sharding_mesh.axis_names)))
+        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh)
 
-    def create(self, kind: str='real', fill: float=None, dtype=None):
+    xcoords = rcoords
+    kcoords = ccoords
+
+    def create(self, kind: str='real', fill: float | Callable=None):
         """
         Create mesh with these given attributes.
 
         Parameters
         ----------
         kind : str, default='real'
-            Type of mesh to return, 'real', 'complex', or 'hermitian_complex'.
+            Type of mesh to return, 'real' or 'complex'.
 
         fill : float, complex, default=None
             Optionally, value to fill mesh with.
             Empty as a default.
 
-        dtype : DTypeLike, default=None
-            Data type, float or complex.
-
         Returns
         -------
         mesh : New mesh.
         """
-        kind = {'real': RealMeshField, 'complex': ComplexMeshField, 'hermitian_complex': HermitianComplexMeshField}.get(kind, kind)
+        kind = {'real': RealMeshField, 'complex': ComplexMeshField}.get(kind, kind)
         name = kind.__name__.lower()
         shape = tuple(self.meshsize)
-        if 'hermitian' in name:
+        if 'complex' in name and self.hermitian:
             shape = shape[:-1] + (shape[-1] // 2 + 1,)
-        if dtype is None:
-            dtype = complex if 'complex' in name else float
-        if fill is None:
-            value = jnp.empty(shape, dtype=dtype)
+        itemsize = jnp.zeros((), dtype=self.dtype).real.dtype.itemsize
+        dtype = jnp.dtype('c{:d}'.format(2 * itemsize) if 'complex' in name else 'f{:d}'.format(itemsize))
+        if callable(fill):
+            fun = fill
+        elif fill is None:
+            fun = jnp.empty
         else:
-            value = jnp.full(shape, fill, dtype=dtype)
-        return kind(value, **self)
+            fun = lambda shape, **kwargs: jnp.full(shape, fill, **kwargs)
+        fun = partial(fun, shape=shard_shape(shape, sharding_mesh=self.sharding_mesh), dtype=self.dtype)
+        if self.sharding_mesh.axis_names:
+            fun = shard_map(fun, self.sharding_mesh, in_specs=tuple(), out_specs=P(*self.sharding_mesh.axis_names))
+        return kind(fun(), **self)
+
+    def r2c(self, value):
+        """FFT, from real to complex."""
+        if self.fft_engine == 'jaxdecomp':
+            value = jaxdecomp.fft.pfft3d(value)
+        else:
+            if self.hermitian:
+                value = jnp.fft.rfftn(value)
+            else:
+                value = jnp.fft.fftn(value)
+        return value
+
+    def c2r(self, value):
+        """FFT, from complex to real."""
+        if self.fft_engine == 'jaxdecomp':
+            value = jaxdecomp.fft.ipfft3d(value)
+        else:
+            if self.hermitian:
+                value = jnp.fft.irfftn(value, s=tuple(self.meshsize))
+            else:
+                value = jnp.fft.ifftn(value)
+        return value
 
 
 # Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
@@ -259,19 +505,20 @@ class BaseMeshField(object):
     attrs: MeshAttrs = None
 
     def __init__(self, value, *args, **kwargs):
-        state = dict(value=jnp.asarray(value))
-        shape = state['value'].shape
+        value = jnp.asarray(value)
+        shape = value.shape
         if 'attrs' in kwargs:
             args = args + (kwargs.pop('attrs'),)
         if len(args):  # attrs is provided directly
             assert len(args) == 1, f"Do not understand args {args}"
-            state['attrs'] = args[0].clone(**kwargs)
+            mattrs = args[0].clone(**kwargs)
         else:
             meshsize = kwargs.pop('meshsize', None)
             if meshsize is None: meshsize = shape
             meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
-            state['attrs'] = MeshAttrs(meshsize=meshsize, **kwargs)
-        self.__dict__.update(state)
+            mattrs = MeshAttrs(meshsize=meshsize, **kwargs)
+        mattrs = mattrs.clone(dtype=value.dtype if tuple(mattrs.meshsize) == value.shape else value.real.dtype)  # second option = hermitian
+        self.__dict__.update(value=value, attrs=mattrs)
 
     def tree_flatten(self):
         return tuple(getattr(self, name) for name in ['value']), {name: getattr(self, name) for name in ['attrs']}
@@ -519,15 +766,8 @@ class RealMeshField(BaseMeshField):
         return self.attrs.xcoords(kind=kind, sparse=sparse)
 
     def r2c(self):
-        """
-        FFT, from real to complex. If :attr:`value` is of complex type, return :class:`ComplexMeshField`.
-        Else, a :class:`HermitianComplexMeshField`.
-        """
-        if jnp.iscomplexobj(self.value):
-            fft = partial(ComplexMeshField, jnp.fft.fftn(self.value))
-        else:
-            fft = partial(HermitianComplexMeshField, jnp.fft.rfftn(self.value))
-        return fft(self.attrs)
+        """FFT, from real to complex."""
+        return ComplexMeshField(self.attrs.r2c(self.value), self.attrs)
 
     def apply(self, fn: Callable, kind: str=Ellipsis, sparse: bool | None=False):
         """
@@ -564,8 +804,7 @@ class RealMeshField(BaseMeshField):
         assert value.shape == self.shape, f'kernel does not return correct shape: {value.shape} vs expected {self.shape}'
         return self.clone(value=value)
 
-    @partial(jax.jit, static_argnames=['resampler', 'compensate'])
-    def read(self, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False):
+    def read(self, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False, pexchange: bool=True):
         """
         Read mesh, at input ``positions``.
 
@@ -585,20 +824,50 @@ class RealMeshField(BaseMeshField):
         -------
         values : jax.Array
         """
-        resampler = getattr(resamplers, resampler, resampler)
-        if isinstance(compensate, bool):
-            if compensate:
-                kernel_compensate = resampler.compensate
-            else:
-                kernel_compensate = None
+        sharding_mesh = self.attrs.sharding_mesh
+        with_sharding = bool(sharding_mesh.axis_names)
+        exchange = None
+        if with_sharding and pexchange:
+            exchange = exchange_particles(self.attrs, positions)
+            positions = exchange(positions=positions)
+        toret = _read(self, positions, resampler=resampler, compensate=compensate)
+        if exchange is not None:
+            toret = exchange.inverse(toret)
+        return toret
+
+
+@partial(jax.jit, static_argnames=['resampler', 'compensate'])
+def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False):
+    """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
+
+    resampler = getattr(resamplers, resampler, resampler)
+    if isinstance(compensate, bool):
+        if compensate:
+            kernel_compensate = resampler.compensate
         else:
-            kernel_compensate = compensate
-        mesh = self
-        if kernel_compensate is not None:
-            mesh = mesh.r2c().apply(kernel_compensate).c2r()
-        if isinstance(positions, ParticleField):
-            positions = positions.positions
-        return resampler.read(mesh.value, (positions + self.boxsize / 2. - self.boxcenter) / self.cellsize)
+            kernel_compensate = None
+    else:
+        kernel_compensate = compensate
+
+    if kernel_compensate is not None:
+        mesh = mesh.r2c().apply(kernel_compensate).c2r()
+
+    if isinstance(positions, ParticleField):
+        positions = positions.positions
+
+    value, attrs = mesh.value, mesh.attrs
+    sharding_mesh = attrs.sharding_mesh
+    with_sharding = bool(sharding_mesh.axis_names)
+
+    positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
+
+    if with_sharding:
+        kw_sharding = dict(halo_size=resampler.order, sharding_mesh=sharding_mesh)
+        value, offset = pad_halo(value, **kw_sharding)
+        value = exchange_halo(value, **kw_sharding)
+        positions = positions + offset
+        return shard_map(resampler.read, in_specs=(P(*sharding_mesh.axis_names),) * 2, out_specs=P(*sharding_mesh.axis_names))(value, positions)
+    return resampler.read(value, positions)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -640,11 +909,11 @@ class ComplexMeshField(BaseMeshField):
         -------
         coords : tuple
         """
-        return self.attrs.kcoords(kind=kind, sparse=sparse, hermitian=False)
+        return self.attrs.kcoords(kind=kind, sparse=sparse)
 
     def c2r(self):
         """FFT, from complex to real. Return :class:`RealMeshField`."""
-        return RealMeshField(jnp.fft.ifftn(self.value), attrs=self.attrs)
+        return RealMeshField(self.attrs.c2r(self.value), attrs=self.attrs)
 
     def apply(self, fn, sparse=False, kind=Ellipsis):
         """
@@ -682,42 +951,11 @@ class ComplexMeshField(BaseMeshField):
         return self.clone(value=value)
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclass(init=False, frozen=True)
-class HermitianComplexMeshField(ComplexMeshField):
-
-    """Same as :class:`ComplexMeshField`, but with Hermitian symmetry."""
-
-    def coords(self, kind: str='wavenumber', sparse: bool | None=None):
-        r"""
-        Return mesh Fourier coordinates.
-
-        Parameters
-        ----------
-        kind : str, default='wavenumber'
-            Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units).
-
-        sparse : bool, default=None
-            If ``None``, return a tuple of 1D-arrays.
-            If ``False``, return a tuple of broadcastable arrays.
-            If ``True``, return a tuple of broadcastable arrays of same shape.
-
-        Returns
-        -------
-        coords : tuple
-        """
-        return self.attrs.kcoords(kind=kind, sparse=sparse, hermitian=True)
-
-    def c2r(self):
-        """FFT, from complex to real. Return :class:`RealMeshField`."""
-        # shape must be provided in case meshsize is odd
-        return RealMeshField(jnp.fft.irfftn(self.value, s=self.meshsize), attrs=self.attrs)
-
-
+@default_sharding_mesh
 def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                    boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
                    cellsize: np.ndarray | float=None, boxpad: np.ndarray | float=2.,
-                   check: bool=False, dtype=None):
+                   check: bool=False, dtype=None, sharding_mesh=None, **kwargs):
     """
     Compute enclosing box.
     Differentiable if ``meshsize`` is provided.
@@ -766,8 +1004,9 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         nonempty_positions = [pos for pos in positions if pos.size]
         if not nonempty_positions:
             raise ValueError('<= 1 particles found; cannot infer boxsize')
-        pos_min = min(jax.tree.map(partial(jnp.min, axis=0), nonempty_positions))
-        pos_max = max(jax.tree.map(partial(jnp.max, axis=0), nonempty_positions))
+        axis = tuple(range(len(nonempty_positions[0].shape[:-1])))
+        pos_min = min(jax.tree.map(partial(jnp.min, axis=axis), nonempty_positions))
+        pos_max = max(jax.tree.map(partial(jnp.max, axis=axis), nonempty_positions))
         delta = jnp.abs(pos_max - pos_min)
         if boxcenter is None: boxcenter = 0.5 * (pos_min + pos_max)
         if boxsize is None:
@@ -799,7 +1038,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         toret['meshsize'] = meshsize
     boxcenter = staticarray.fill(boxcenter, ndim, dtype=dtype)
     toret = dict(boxsize=boxsize, boxcenter=boxcenter) | toret
-    return MeshAttrs(**{name: staticarray(value) for name, value in toret.items()})
+    return MeshAttrs(**{name: staticarray(value) for name, value in toret.items()}, dtype=dtype, **kwargs)
 
 
 def _get_common_mesh_cache_attrs(*attrs, **kwargs):
@@ -835,11 +1074,14 @@ class ParticleField(object):
     _attrs: MeshAttrs | None = field(init=False, repr=False)
     _cache_attrs: dict = field(init=True, repr=False)
 
-    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, **kwargs):
-        weights = jnp.ones_like(positions, shape=positions.shape[0]) if weights is None else weights
+    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, make_from=None, **kwargs):
+        weights = jnp.ones_like(positions, shape=positions.shape[:-1]) if weights is None else weights
+        if make_from == 'local':
+            positions, weights = make_particles_from_local(positions, weights)
         assert '_cache_attrs' not in kwargs
-        kwargs = {name: staticarray(value) if value is not None else value for name, value in kwargs.items()}
-        self.__dict__.update(positions=positions, weights=weights, _attrs=None, _cache_attrs=kwargs)
+        _cache_attrs = dict(kwargs.pop('attrs', {}))
+        _cache_attrs.update({name: staticarray(value) if name in ['meshsize', 'boxsize', 'boxcenter'] and value is not None else value for name, value in kwargs.items()})
+        self.__dict__.update(positions=positions, weights=weights, _attrs=None, _cache_attrs=_cache_attrs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -928,7 +1170,7 @@ class ParticleField(object):
         return self.concatenate([self], [1. / other])
 
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
-              compensate: bool=False, dtype=None, out: str='real'):
+              compensate: bool=False, out: str='real', dtype=None, pexchange=True):
         r"""
         Paint particles to mesh.
 
@@ -957,15 +1199,29 @@ class ParticleField(object):
         -------
         mesh : Output mesh.
         """
-        return _paint(self.attrs, self.positions, weights=self.weights, resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out)
+        attrs = self.attrs
+        if dtype is not None: attrs = attrs.clone(dtype=dtype)
+        sharding_mesh = attrs.sharding_mesh
+        with_sharding = bool(sharding_mesh.axis_names)
+        positions, weights = self.positions, self.weights
+        if with_sharding and pexchange:
+            exchange = exchange_particles(attrs, positions)
+            positions, weights = exchange(positions=positions, weights=weights)
+        return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
 
 
-@partial(jax.jit, static_argnames=['attrs', 'resampler',  'interlacing', 'compensate', 'dtype', 'out'])
-def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, dtype=None, out: str='real'):
+
+@partial(jax.jit, static_argnames=['attrs', 'resampler',  'interlacing', 'compensate', 'out'])
+def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, out: str='real'):
+    """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
 
     resampler = getattr(resamplers, resampler, resampler)
     interlacing = max(interlacing, 1)
     shifts = np.arange(interlacing) * 1. / interlacing
+
+    sharding_mesh = attrs.sharding_mesh
+    with_sharding = bool(sharding_mesh.axis_names)
+
     positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
 
     if isinstance(compensate, bool):
@@ -977,7 +1233,21 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         kernel_compensate = compensate
 
     def ppaint(positions):
-        return RealMeshField(resampler.paint(jnp.zeros(attrs.meshsize, dtype=dtype), positions, weights.astype(dtype) if dtype is not None else weights), boxsize=attrs.boxsize, boxcenter=attrs.boxcenter)
+        mesh = attrs.create(kind='real', fill=0.)
+        value = mesh.value
+        w = None
+        if weights is not None:
+            w = weights.astype(value.dtype)
+        if with_sharding:
+            kw_sharding = dict(halo_size=resampler.order + interlacing, sharding_mesh=sharding_mesh)
+            value, offset = pad_halo(value, **kw_sharding)
+            positions = positions + offset
+            value = shard_map(resampler.paint, in_specs=(P(*sharding_mesh.axis_names),) * 3, out_specs=P(*sharding_mesh.axis_names))(value, positions, w)
+            value = exchange_halo(value, **kw_sharding)
+            value = unpad_halo(value, **kw_sharding)
+        else:
+            value = resampler.paint(value, positions, w)
+        return mesh.clone(value=value)
 
     toret = ppaint(positions)
     if interlacing > 1:
@@ -1035,15 +1305,14 @@ class BinAttrs(object):
     ibin_zero: jax.Array = None
     wmodes: jax.Array = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, kind='complex_hermitian', mode_oversampling: int=0, **kwargs):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, kind='complex', mode_oversampling: int=0, **kwargs):
         if isinstance(mattrs, MeshAttrs):
-            hermitian = False
+            hermitian = mattrs.hermitian
             if kind == 'real':
                 vec = mattrs.xcoords(kind='separation', sparse=True, **kwargs)
                 vec0 = mattrs.cellsize.min()
             else:
-                hermitian = 'hermitian' in kind
-                vec = mattrs.kcoords(kind='separation', sparse=True, hermitian=hermitian, **kwargs)
+                vec = mattrs.kcoords(kind='separation', sparse=True, **kwargs)
                 vec0 = mattrs.kfun.min()
         else:  # attrs is a mesh
             hermitian = mattrs.shape[-1] < mattrs.meshsize[-1]
@@ -1053,10 +1322,18 @@ class BinAttrs(object):
         nonsingular = None
         if hermitian:
             shape = np.broadcast_shapes(*[xx.shape for xx in vec])
-            nonsingular = jnp.ones(shape, dtype='i4')
-            # Get the indices that have positive freq along symmetry axis = -1
-            nonsingular += vec[-1] > 0.
-            nonsingular = nonsingular.ravel()
+
+            def get_nonsingular(zvec):
+                nonsingular = jnp.ones(shard_shape(shape, sharding_mesh=mattrs.sharding_mesh), dtype='i4')
+                # Get the indices that have positive freq along symmetry axis = -1
+                nonsingular += zvec > 0.
+                return nonsingular.ravel()
+
+            if self.sharding_mesh.axis_names:
+                get_nonsingular = shard_map(get_nonsingular, mattrs.sharding_mesh,
+                                            in_specs=P(*[axis if vec[-1].shape[iaxis] else None for iaxis, axis in enumerate(self.sharding_mesh.axis_names)]),
+                                            out_specs=P(*self.sharding_mesh.axis_names))
+            nonsingular = get_nonsingular(vec[-1])
         if edges is None:
             edges = {}
         if isinstance(edges, dict):
@@ -1076,17 +1353,29 @@ class BinAttrs(object):
             xsum += bin[2]
         self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=nonsingular)
 
+    @property
+    def sharding_mesh(self):
+        return get_sharding_mesh()
+
     def __call__(self, mesh, antisymmetric=False, remove_zero=False):
-        value = mesh.ravel()
         weights = self.wmodes
-        if weights is not None:
-            if antisymmetric: value = value.imag
-            else: value = value.real
-            value *= weights
-        if remove_zero:
-            value = value.at[0].set(0.)
-        value = sum(jnp.bincount(ib, weights=value, length=len(self.xavg) + 2) for ib in self.ibin)
-        return value[1:-1] / len(self.ibin) / self.nmodes
+        value = getattr(mesh, 'value', mesh)
+
+        def bincount(value):
+            value = value.ravel()
+            if weights is not None:
+                if antisymmetric: value = value.imag
+                else: value = value.real
+                value *= weights
+            if remove_zero:
+                value = value.at[0].set(0.)
+            value = sum(jnp.bincount(ib, weights=value, length=len(self.xavg) + 2) for ib in self.ibin)
+            return value[1:-1] / len(self.ibin) / self.nmodes
+
+        if self.sharding_mesh.axis_names:
+            bincount = shard_map(bincount, self.sharding_mesh, in_specs=P(*self.sharding_mesh.axis_names), out_specs=P(None))
+        return bincount(value)
+
 
     def tree_flatten(self):
         return (asdict(self),), {}
@@ -1100,16 +1389,16 @@ class BinAttrs(object):
 
 # For functional programming interface
 
-def c2r(mesh: ComplexMeshField | HermitianComplexMeshField) -> RealMeshField:
+def c2r(mesh: ComplexMeshField) -> RealMeshField:
     return mesh.c2r()
 
 
-def r2c(mesh: RealMeshField) -> ComplexMeshField | HermitianComplexMeshField:
+def r2c(mesh: RealMeshField) -> ComplexMeshField:
     return mesh.r2c()
 
 
-def apply(mesh: RealMeshField | ComplexMeshField | HermitianComplexMeshField,
-          fn: Callable, sparse=False, **kwargs) -> RealMeshField | ComplexMeshField | HermitianComplexMeshField:
+def apply(mesh: RealMeshField | ComplexMeshField,
+          fn: Callable, sparse=False, **kwargs) -> RealMeshField | ComplexMeshField:
     return mesh.apply(fn, sparse=sparse, **kwargs)
 
 
@@ -1117,7 +1406,7 @@ def read(mesh: RealMeshField, positions: jax.Array, *args, **kwargs) -> jax.Arra
     return mesh.read(positions, *args, **kwargs)
 
 
-def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField | HermitianComplexMeshField:
+def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField:
     return mesh.paint(*args, **kwargs)
 
 

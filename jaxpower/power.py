@@ -5,16 +5,18 @@ from collections.abc import Callable
 import itertools
 from pathlib import Path
 
-import jax.experimental
 import numpy as np
+from scipy import special
+
 import jax
 from jax import numpy as jnp
-from jax import random
-from scipy import special
+import jax.experimental
+from jax.sharding import PartitionSpec as P
+from jax.experimental.shard_map import shard_map
 
 from . import utils
 from .utils import legendre, plotter, BinnedStatistic, WindowMatrix
-from .mesh import RealMeshField, ComplexMeshField, HermitianComplexMeshField, ParticleField, staticarray, MeshAttrs, BinAttrs, get_common_mesh_attrs
+from .mesh import RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, BinAttrs, get_sharding_mesh, get_common_mesh_attrs
 
 
 @jax.tree_util.register_pytree_node_class
@@ -115,38 +117,8 @@ class PowerSpectrumMultipoles(BinnedStatistic):
         return fig
 
 
-def _get_batch_Ylm(Ylm):
-
-    if Ylm.ell == 0:
-        return lambda *coords: 1. / jnp.sqrt(4. * jnp.pi)
-
-    def _safe_divide(num, denom):
-        with np.errstate(divide='ignore', invalid='ignore'):
-            return jnp.where(denom == 0., 0., num / denom)
-
-    @jax.checkpoint
-    def func(*coords):
-        if coords[0].ndim < len(coords):
-            coords = jnp.meshgrid(*coords, indexing='ij', sparse=True)
-        coords = tuple(coords)
-        def f(x):
-            x = (x,) + coords[1:]
-            xnorm = jnp.sqrt(sum(xx**2 for xx in x))
-            xhat = tuple(_safe_divide(xx, xnorm) for xx in x)
-            return Ylm(*xhat)#[0]
-        nbatch = 1
-        if nbatch == 1:
-            return f(coords[0])
-        total_size = len(coords[0])
-        batch_size = total_size // nbatch
-        return jnp.concatenate([f(coords[0][i * total_size // nbatch:(i + 1) * total_size // nbatch]) for i in range(nbatch)])
-        #return jax.lax.map(f, coords[0].ravel(), batch_size=batch_size)
-
-    return func
-
-
 @lru_cache(maxsize=32, typed=False)
-def get_real_Ylm(ell, m, batch=True, modules=None):
+def get_real_Ylm(ell, m, modules=None):
     """
     Return a function that computes the real spherical harmonic of order (ell, m).
     Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/convpower/fkp.py.
@@ -201,6 +173,30 @@ def get_real_Ylm(ell, m, batch=True, modules=None):
     elif 'scipy' not in modules:
         raise ValueError('modules must be either ["sympy", "scipy", None]')
 
+    def _safe_divide(num, denom):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return jnp.where(denom == 0., 0., num / denom)
+
+    def get_Ylm_func(func, **attrs):
+
+        def func_xvec(*xvec):
+            xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
+            xhat = tuple(_safe_divide(xx, xnorm) for xx in xvec)
+            return func(*xhat)
+
+        def Ylm(*xvec):
+            Ylm = func_xvec
+            sharding_mesh = get_sharding_mesh()
+            if sharding_mesh.axis_names:
+                Ylm = shard_map(func_xvec, mesh=sharding_mesh,
+                                in_specs=tuple(P(*[axis if vec[-1].shape[iaxis] else None for iaxis, axis in enumerate(sharding_mesh.axis_names)]) for vec in xvec),
+                                out_specs=P(*sharding_mesh.axis_names))
+            return Ylm(*xvec)
+
+        for name, value in attrs.items():
+            setattr(Ylm, name, value)
+        return Ylm
+
     # sympy is not installed, fallback to scipy
     if sp is None:
 
@@ -215,15 +211,13 @@ def get_real_Ylm(ell, m, batch=True, modules=None):
                 toret *= np.cos(m * phi)
             return toret
 
-        def Ylm(xhat, yhat, zhat):
+        def func(xhat, yhat, zhat):
             shape = jnp.broadcast_shapes(jnp.shape(xhat), jnp.shape(yhat), jnp.shape(zhat))
             dtype = jnp.result_type(xhat, yhat, zhat)
             out_type = jax.ShapeDtypeStruct(shape, dtype)
             return jax.pure_callback(_Ylm, out_type, xhat, yhat, zhat)
 
-        # Attach some meta-data
-        Ylm.ell = ell
-        Ylm.m = m
+        Ylm = get_Ylm_func(func, ell=ell, m=m)
 
     else:
         # The relevant cartesian and spherical symbols
@@ -247,19 +241,14 @@ def get_real_Ylm(ell, m, batch=True, modules=None):
         # Simplify
         expr = sp.together(expr.subs(defs)).subs(x**2 + y**2 + z**2, r**2)
         expr = amp * expr.expand().subs([(x / r, xhat), (y / r, yhat), (z / r, zhat)])
-        Ylm = sp.lambdify((xhat, yhat, zhat), expr, modules='jax')
+        func = sp.lambdify((xhat, yhat, zhat), expr, modules='jax')
 
-        # Attach some meta-data
-        Ylm.expr = expr
-        Ylm.ell = ell
-        Ylm.m = m
+        Ylm = get_Ylm_func(func, ell=ell, m=m, expr=expr)
 
-    if batch:
-        return _get_batch_Ylm(Ylm)
     return Ylm
 
 
-[[get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
+[[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
 
 
 def _get_los_vector(los: str | np.ndarray, ndim=3):
@@ -288,19 +277,19 @@ def _get_edges(edges, boxsize=1., meshsize=1., **kw):
 
 def _get_power_zero(mesh):
     toret = mesh[(0,) * mesh.ndim]
-    if isinstance(mesh, HermitianComplexMeshField):
+    if mesh.attrs.hermitian:
         return toret.real
     return toret
 
 
-def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField, edges: np.ndarray | dict | None=None,
+def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarray | dict | None=None,
                        ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
     r"""
     Compute power spectrum from mesh.
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField, HermitianComplexMeshField
+    meshs : RealMeshField, ComplexMeshField
         Input mesh(s).
 
     edges : np.ndarray, dict, default=None
@@ -353,7 +342,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
         return mesh
 
     def _2c(mesh):
-        if not isinstance(mesh, (ComplexMeshField, HermitianComplexMeshField)):
+        if not isinstance(mesh, ComplexMeshField):
             mesh = mesh.r2c()
         return mesh
 
@@ -380,7 +369,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianCompl
             xvec = rmesh1.coords(sparse=True)
             # The Fourier-space grid
             kvec = A0.coords(sparse=True)
-            Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in nonzeroells}
+            Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in nonzeroells}
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
@@ -586,7 +575,7 @@ def compute_wide_angle_poles(poles: dict[Callable]):
     return toret
 
 
-def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
+def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
                         edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0,
                         buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
     r"""
@@ -594,7 +583,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField, HermitianComplexMeshField, MeshAttrs
+    meshs : RealMeshField, ComplexMeshField, MeshAttrs
         Input mesh(s).
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
 
@@ -659,7 +648,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
         return mesh
 
     def _2c(mesh):
-        if not isinstance(mesh, (ComplexMeshField, HermitianComplexMeshField)):
+        if not isinstance(mesh, ComplexMeshField):
             mesh = mesh.r2c()
         return mesh
 
@@ -701,7 +690,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
         else:
             Q = None
 
-        bin = BinAttrs(mattrs, edges=edges, kind='complex_hermitian', mode_oversampling=mode_oversampling)
+        bin = BinAttrs(mattrs, edges=edges, kind='complex', mode_oversampling=mode_oversampling)
         kvec = mattrs.kcoords(sparse=True, hermitian=True)
         knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
         mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
@@ -730,7 +719,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
             #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
             sbin = BinAttrs(mattrs, edges=sedges, kind='real')
             koversampling = 5
-            kbin = BinAttrs(mattrs, edges=oversample(edges, koversampling), kind='complex_hermitian', mode_oversampling=mode_oversampling)
+            kbin = BinAttrs(mattrs, edges=oversample(edges, koversampling), kind='complex', mode_oversampling=mode_oversampling)
             kout, koutnmodes = kbin.xavg.reshape(-1, koversampling), kbin.nmodes.reshape(-1, koversampling)
             koutnmodes /= koutnmodes.sum(axis=-1)[..., None]
             kout = jnp.where(koutnmodes == 0, 0., kout)
@@ -796,7 +785,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                         kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                         return kmask * legin
 
-                    Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
+                    Aell = mattrs.create(kind='complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
                     if Q is not None: Aell = _2c(Q * _2r(Aell))
                     else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
                     power = _bin(Aell)
@@ -834,7 +823,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
         # The Fourier-space grid
         kvec = A0.coords(sparse=True)
 
-        Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
+        Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
         from .utils import spherical_jn
         spherical_jn = {ell: spherical_jn(ell) for ell in set(ells) | set(ellsin)}
         real_gaunt = {((0, 0), (0, 0), (0, 0)): 0.28209479177387814, ((0, 0), (2, -2), (2, -2)): 0.28209479177387814, ((0, 0), (2, -1), (2, -1)): 0.28209479177387814, ((0, 0), (2, 0), (2, 0)): 0.28209479177387814,
@@ -988,7 +977,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                         kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                                         return kmask * rnorm * Yl1m1(*kvec)
 
-                                    xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                                    xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
@@ -1011,7 +1000,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                     kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                                     return kmask * rnorm * Yl1m1(*kvec)
 
-                                xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                                xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
                                 for ell in Aell:
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
@@ -1137,7 +1126,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                         kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                                         return kmask * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
 
-                                    xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                                    xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
@@ -1159,7 +1148,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
                                     kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                                     return kmask * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
 
-                                xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                                xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
                                 # Typically takes ~ 2x the time to load all Qs than the above FFT
                                 # Not great, but... recomputing 15 FFTs would have taken more time
                                 for ell in Aell:
@@ -1198,14 +1187,14 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | HermitianComp
 
 
 
-def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | HermitianComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
+def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
                             edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
     r"""
     Compute mean power spectrum from mesh.
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField, HermitianComplexMeshField, MeshAttrs
+    meshs : RealMeshField, ComplexMeshField, ComplexMeshField, MeshAttrs
         Input mesh(s).
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
 
@@ -1271,7 +1260,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         return mesh
 
     def _2c(mesh):
-        if not isinstance(mesh, (ComplexMeshField, HermitianComplexMeshField)):
+        if not isinstance(mesh, ComplexMeshField):
             mesh = mesh.r2c()
         return mesh
 
@@ -1290,7 +1279,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         kin, poles = poles._edges[0] if poles._edges[0] is not None else poles._x[0], {proj: poles.view(projs=proj) for proj in poles.projs}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip((0, 2, 4), poles)}
-    kvec = mattrs.kcoords(sparse=True, hermitian=True)
+    kvec = mattrs.kcoords(sparse=True)
     kshape = np.broadcast_shapes(*(kk.shape for kk in kvec))
     knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
     is_poles = not callable(poles)
@@ -1321,7 +1310,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         else:
             Q = None
 
-        bin = BinAttrs(mattrs, edges=edges, kind='complex_hermitian', mode_oversampling=mode_oversampling)
+        bin = BinAttrs(mattrs, edges=edges, kind='complex', mode_oversampling=mode_oversampling)
         mu = sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel() / jnp.where(knorm == 0., 1., knorm)
 
         pkvec = theory
@@ -1330,7 +1319,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
             def pkvec(*args):
                 return sum(get_theory(ell) * legendre(ell)(mu) for ell in poles)
 
-        Aell = mattrs.create(kind='hermitian_complex').apply(lambda value, kvec: pkvec(kvec).reshape(kshape) * rnorm, kind='wavenumber')
+        Aell = mattrs.create(kind='complex').apply(lambda value, kvec: pkvec(kvec).reshape(kshape) * rnorm, kind='wavenumber')
         if Q is not None: Aell = _2c(Q * _2r(Aell))
         else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
 
@@ -1373,7 +1362,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
         # The Fourier-space grid
         khat = A0.coords(sparse=True)
 
-        Ylms = {ell: [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
+        Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
 
         power, power_zero = [], []
         for ell in ells:
@@ -1389,7 +1378,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                             def kernel(*args):
                                 return kernel_ell1 * Yl1m1(*khat)
 
-                            xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r() * snorm**wa1
+                            xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r() * snorm**wa1
                             Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
 
                 elif theory_los == 'local':
@@ -1410,7 +1399,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | Hermitian
                                 return kernel_ell2 * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])
 
                             #xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r().real
-                            xi = mattrs.create(kind='hermitian_complex').apply(kernel, kind='wavenumber').c2r()
+                            xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
                             Q += (4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * xi * _2r(_2c(rmesh1 * Ylm(*xhat) * Yl1m1(*xhat)).conj() * _2c(rmesh2 * Yl2m2(*xhat)))
 
                 else:

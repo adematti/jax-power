@@ -47,7 +47,7 @@ def test_binned_statistic():
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
     def mock(seed, los='x'):
-        mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=64, unitary_amplitude=True)
+        mesh = generate_gaussian_mesh(MeshAttrs(boxsize=2000., meshsize=64), pkvec, seed=seed, unitary_amplitude=True)
         return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
 
     power = mock(random.key(43), los='x')
@@ -77,7 +77,8 @@ def test_mesh_power(plot=False):
 
     @partial(jax.jit, static_argnames=['los', 'ells'])
     def mock(seed, los='x', ells=(0, 2, 4)):
-        mesh = generate_gaussian_mesh(pkvec, seed=seed, meshsize=128, unitary_amplitude=True)
+        attrs = MeshAttrs(meshsize=128, boxsize=1000.)
+        mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
         return compute_mesh_power(mesh, ells=ells, los=los, edges={'step': 0.01})
 
     for los in list_los:
@@ -125,12 +126,12 @@ def test_fkp_power(plot=False):
         @partial(jax.jit, static_argnames=['los'])
         def mock(seed, los='x'):
             boxcenter = [1300., 0., 0.]
-            attrs = dict(boxsize=1000., boxcenter=boxcenter, meshsize=128)
-            mesh = generate_gaussian_mesh(pkvec, seed=seed, unitary_amplitude=True, **attrs)
+            attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=128)
+            mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
             size = int(1e6)
-            data = generate_uniform_particles(size, seed=32, **attrs)
+            data = generate_uniform_particles(attrs, size, seed=32)
             data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
-            randoms = generate_uniform_particles(size, seed=42, **attrs)
+            randoms = generate_uniform_particles(attrs, size, seed=42)
             fkp = FKPField(data, randoms)
             return compute_fkp_power(fkp, ells=(0, 2, 4), los=los, edges={'step': 0.01})
 
@@ -243,21 +244,21 @@ def test_checkpoint():
     from jax.ad_checkpoint import checkpoint_name
 
     def mock(poles, los='local', seed=42):
-        mesh = generate_anisotropic_gaussian_mesh(make_callable(poles), los=los, seed=seed, **attrs)
-        #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(make_callable(poles), los='x', seed=seed, **attrs))(poles)
+        mesh = generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los=los, seed=seed)
+        #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
         return compute_mesh_power(mesh, ells=ells, edges=edges, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
 
     def power(mesh, los='local'):
         return compute_mesh_power(mesh, ells=ells, edges=edges, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
+    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
         # Generate Gaussian-distributed positions
-        positions = scale * boxsize * random.normal(seed, shape=(size, 3))
-        toret = ParticleField(positions + boxcenter, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        positions = scale * attrs.boxsize * random.normal(seed, shape=(size, 3))
+        toret = ParticleField(positions + attrs.boxcenter, attrs=attrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(**attrs, paint=True)
+    selection = gaussian_survey(attrs, paint=True)
 
     #@partial(jax.checkpoint, static_argnums=(2,))
     policy = jax.checkpoint_policies.save_only_these_names('save')
@@ -279,8 +280,8 @@ def test_checkpoint():
         return mesh
 
     def mock_diff(theory, selection, los='local', seed=42, unitary_amplitude=True):
-        mesh = generate_anisotropic_gaussian_mesh((kinedges, list(theory)), los=los, seed=seed,
-                                                  unitary_amplitude=unitary_amplitude, **selection.attrs)
+        mesh = generate_anisotropic_gaussian_mesh(selection.attrs, (kinedges, list(theory)), los=los, seed=seed,
+                                                  unitary_amplitude=unitary_amplitude)
         los = {'local': 'firstpoint'}.get(los, los)
         #return compute_mesh_power(apply_selection(mesh, selection, False), edges=edges, los=los, ells=ells).view()[-3]
         toret = [compute_mesh_power(apply_selection(mesh, selection, cv=cv), edges=edges, los=los, ells=ells) for cv in [False, True]]
@@ -289,8 +290,8 @@ def test_checkpoint():
     def mock_vmap(poles, los='local'):
         seeds = random.split(random.key(42), 4)
         def func(seed):
-            mesh = generate_anisotropic_gaussian_mesh(make_callable(poles), los=los, seed=seed, **attrs)
-            #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(make_callable(poles), los='x', seed=seed, **attrs))(poles)
+            mesh = generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los=los, seed=seed)
+            #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
             return compute_mesh_power(mesh, ells=(0, 2, 4), edges=edges, los={'local': 'firstpoint'}.get(los, los)).view()
         return jnp.mean(jax.vmap(func)(seeds), axis=0)
 
@@ -627,17 +628,17 @@ def test_power_to_correlation3():
     mask = (kin > klim[0]) & (kin < klim[1])
     pkin = jnp.array(pk(kin)) * mask
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e7), seed=random.key(42), scale=0.24, paint=False):
+    def gaussian_survey(attrs, size=int(1e7), seed=random.key(42), scale=0.24, paint=False):
         # Generate Gaussian-distributed positions
         positions = scale * random.normal(seed, shape=(size, 3))
         bscale = scale  # cut at 1 sigmas
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * boxsize + boxcenter
-        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        positions = positions * attrs.boxsize + attrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, boxcenter=attrs.boxcenter, boxsize=attrs.boxsize, meshsize=attrs.meshsize)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(**mattrs, paint=True)
+    selection = gaussian_survey(mattrs, paint=True)
     norm = compute_normalization(selection, selection)
     selection = selection.r2c()
     selection = (selection * selection.conj()).c2r()
@@ -705,17 +706,17 @@ def test_window():
     attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
     edges = {'step': 0.01}
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
+    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
         positions = jnp.array([1., 0.2, 0.2]) * scale * random.normal(seed, shape=(size, 3))
         bscale = scale
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * boxsize + boxcenter
-        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        positions = positions * attrs.boxsize + attrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(**attrs, paint=True)
+    selection = gaussian_survey(attrs, paint=True)
     norm = compute_normalization(selection, selection)
     ells = (0, 2, 4)
 
@@ -747,17 +748,17 @@ def test_window_timing():
     attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
     edges = {'step': 0.01}
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
+    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
         positions = jnp.array([1., 0.2, 0.2]) * scale * random.normal(seed, shape=(size, 3))
         bscale = scale
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * boxsize + boxcenter
-        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        positions = positions * attrs.boxsize + attrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(**attrs, paint=True)
+    selection = gaussian_survey(attrs, paint=True)
     norm = compute_normalization(selection, selection)
     ells = (0, 2, 4)
 
@@ -792,18 +793,18 @@ def test_smooth_window():
     #klim = (0.1, 0.106)
     #poles = poles.at[..., (kin < klim[0]) | (kin > klim[1])].set(0.)
 
-    def gaussian_survey(boxsize=2000., meshsize=128, boxcenter=0., size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
+    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
         # Generate Gaussian-distributed positions
         positions = scale * random.normal(seed, shape=(size, 3))
         bscale = 2. * scale  # cut at 2 sigmas
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * boxsize + boxcenter
-        toret = ParticleField(positions, weights=1. * mask, boxcenter=boxcenter, boxsize=boxsize, meshsize=meshsize)
+        positions = positions * attrs.boxsize + attrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
     if False:
-        selection = gaussian_survey(meshsize=128, size=int(1e7), paint=True)
+        selection = gaussian_survey(attrs, size=int(1e7), paint=True)
         norm = compute_normalization(selection, selection)
         selection = selection.r2c()
         selection = (selection * selection.conj()).c2r()
@@ -818,7 +819,7 @@ def test_smooth_window():
         ax.set_xscale('log')
         plt.show()
 
-    selection = gaussian_survey(**attrs, paint=True)
+    selection = gaussian_survey(attrs, paint=True)
     norm = compute_normalization(selection, selection)
 
     for thlos in ['firstpoint', 'local'][:1]:
@@ -927,6 +928,12 @@ def test_sympy():
 
 
 if __name__ == '__main__':
+
+    test_fkp_power(plot=False)
+    test_mean_power(plot=True)
+    test_window()
+    test_wmatrix()
+    exit()
 
     test_window_timing()
     #test_sympy()

@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from functools import partial
 
 import numpy as np
 import jax
@@ -10,17 +11,15 @@ from .power import _get_los_vector, legendre, get_real_Ylm
 from .utils import BinnedStatistic
 
 
-def generate_gaussian_mesh(power: Callable, seed: int=42,
-                           boxsize: float | np.ndarray=1000., meshsize: int | np.ndarray=128,
-                           unitary_amplitude: bool=False, boxcenter=0.):
+def generate_gaussian_mesh(attrs, power: Callable, seed: int=42,
+                           unitary_amplitude: bool=False):
 
     """Generate :class:`RealMeshField` with input power."""
 
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    attrs = MeshAttrs(boxsize=boxsize, meshsize=meshsize, boxcenter=boxcenter)
-    mesh = RealMeshField(random.normal(seed, attrs.meshsize), boxsize=boxsize, boxcenter=boxcenter).r2c()
+    mesh = attrs.create(kind='real', fill=partial(random.normal, seed)).r2c()
 
     def kernel(value, kvec):
         ker = jnp.sqrt(power(kvec) / mesh.cellsize.prod())
@@ -32,9 +31,7 @@ def generate_gaussian_mesh(power: Callable, seed: int=42,
     return mesh.c2r()
 
 
-def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los: str='x',
-                                       boxsize: float | np.ndarray=1000., meshsize: int | np.ndarray=128,
-                                       unitary_amplitude: bool=False, boxcenter=0.):
+def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False):
 
     """Generate :class:`RealMeshField` with input power spectrum multipoles."""
 
@@ -51,10 +48,8 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    attrs = MeshAttrs(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter)
-
     def generate_normal(seed):
-        mesh = RealMeshField(random.normal(seed, attrs.meshsize), attrs=attrs).r2c()
+        mesh = attrs.create(kind='real', fill=partial(random.normal, seed)).r2c()
         if unitary_amplitude:
             mesh *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
         return mesh
@@ -117,7 +112,7 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
         mesh, mesh2 = get_meshs(random.split(seed))
         xvec = mesh.coords()
         ell = 2
-        Ylms = [get_real_Ylm(ell, m, batch=True) for m in range(-ell, ell + 1)]
+        Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
 
         @jax.checkpoint
         def f(carry, im):
@@ -147,13 +142,12 @@ def generate_anisotropic_gaussian_mesh(poles: dict[Callable], seed: int=42, los:
 
 
 
-def generate_uniform_particles(size, seed: int=42, boxsize: float | np.ndarray=1000., boxcenter: float | np.ndarray=0., meshsize=None):
+def generate_uniform_particles(attrs, size, seed: int=42):
 
     """Generate :class:`ParticleField` in input box."""
 
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    attrs = MeshAttrs(boxsize=boxsize, meshsize=meshsize, boxcenter=boxcenter)
     positions = attrs.boxsize * random.uniform(seed, (size, len(attrs.boxsize))) - attrs.boxsize / 2. + attrs.boxcenter
-    return ParticleField(positions, **attrs)
+    return ParticleField(positions, attrs=attrs)
