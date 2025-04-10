@@ -929,13 +929,9 @@ def test_sympy():
 
 if __name__ == '__main__':
 
-    test_fkp_power(plot=False)
-    test_mean_power(plot=True)
-    test_window()
-    test_wmatrix()
+    test_mesh_power(plot=False)
     exit()
-
-    test_window_timing()
+    #test_window_timing()
     #test_sympy()
     #test_window()
     #test_wmatrix()

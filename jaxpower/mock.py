@@ -54,7 +54,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
             mesh *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
         return mesh
 
-    kvec = attrs.kcoords(sparse=True, hermitian=True)
+    kvec = attrs.kcoords(sparse=True)
     knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
     kshape = np.broadcast_shapes(*(kk.shape for kk in kvec))
 
@@ -110,7 +110,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
             return mesh, mesh2
 
         mesh, mesh2 = get_meshs(random.split(seed))
-        xvec = mesh.coords()
+        xvec = mesh.coords(sparse=True)
         ell = 2
         Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
 

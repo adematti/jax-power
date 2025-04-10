@@ -179,19 +179,10 @@ def get_real_Ylm(ell, m, modules=None):
 
     def get_Ylm_func(func, **attrs):
 
-        def func_xvec(*xvec):
+        def Ylm(*xvec):
             xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
             xhat = tuple(_safe_divide(xx, xnorm) for xx in xvec)
             return func(*xhat)
-
-        def Ylm(*xvec):
-            Ylm = func_xvec
-            sharding_mesh = get_sharding_mesh()
-            if sharding_mesh.axis_names:
-                Ylm = shard_map(func_xvec, mesh=sharding_mesh,
-                                in_specs=tuple(P(*[axis if vec[-1].shape[iaxis] else None for iaxis, axis in enumerate(sharding_mesh.axis_names)]) for vec in xvec),
-                                out_specs=P(*sharding_mesh.axis_names))
-            return Ylm(*xvec)
 
         for name, value in attrs.items():
             setattr(Ylm, name, value)
@@ -378,8 +369,8 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
 
             for ell in nonzeroells:
                 Ylm = Ylms[ell]
-                Aell = jax.lax.scan(partial(f, Ylm), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0].conj() * A0
-                #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell]).conj() * A0
+                #Aell = jax.lax.scan(partial(f, Ylm), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0].conj() * A0
+                Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell]).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 power.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
                 power_zero.append(4. * jnp.pi * 0.)
@@ -691,7 +682,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
             Q = None
 
         bin = BinAttrs(mattrs, edges=edges, kind='complex', mode_oversampling=mode_oversampling)
-        kvec = mattrs.kcoords(sparse=True, hermitian=True)
+        kvec = mattrs.kcoords(sparse=True)
         knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
         mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
 
@@ -766,6 +757,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
 
                 def f(kin):
                     Aell = TophatPowerToCorrelation(kin, seval=snorm, ell=ellin, edges=True, method=tophat_method).w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
+                    Aell = mattrs.create(kind='real', fill=Aell)
                     if Q is not None: Aell *= Q
                     power = _bin(_2c(Aell))
                     if pbar:
@@ -780,12 +772,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                 legin = legendre(ellin)(mu)
 
                 def f(kin):
-
-                    def pkvec(*args):
-                        kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                        return kmask * legin
-
-                    Aell = mattrs.create(kind='complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
+                    Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * legin)
                     if Q is not None: Aell = _2c(Q * _2r(Aell))
                     else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
                     power = _bin(Aell)
@@ -972,12 +959,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                                 def f(kin):
                                     Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
                                     knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
-
-                                    def kernel(*args):
-                                        kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                                        return kmask * rnorm * Yl1m1(*kvec)
-
-                                    xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
+                                    xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec)).c2r()
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
@@ -1000,7 +982,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                                     kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
                                     return kmask * rnorm * Yl1m1(*kvec)
 
-                                xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
+                                xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec)).c2r()
                                 for ell in Aell:
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
@@ -1122,11 +1104,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                                 def f(kin):
                                     knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
                                     Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
-                                    def kernel(*args):
-                                        kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                                        return kmask * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
-
-                                    xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
+                                    xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])).c2r()
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
@@ -1143,12 +1121,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                         def f(kin):
                             Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
                             for im12, (Yl1m1, Yl2m2) in enumerate(itertools.product(Ylms[ell1], Ylms[ell2])):
-
-                                def kernel(*args):
-                                    kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                                    return kmask * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])
-
-                                xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
+                                xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])).c2r()
                                 # Typically takes ~ 2x the time to load all Qs than the above FFT
                                 # Not great, but... recomputing 15 FFTs would have taken more time
                                 for ell in Aell:
@@ -1280,8 +1253,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip((0, 2, 4), poles)}
     kvec = mattrs.kcoords(sparse=True)
-    kshape = np.broadcast_shapes(*(kk.shape for kk in kvec))
-    knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
+    knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
     is_poles = not callable(poles)
     if is_poles:
         is_callable = all(callable(pole) for pole in poles.values())
@@ -1311,7 +1283,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
             Q = None
 
         bin = BinAttrs(mattrs, edges=edges, kind='complex', mode_oversampling=mode_oversampling)
-        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel() / jnp.where(knorm == 0., 1., knorm)
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
 
         pkvec = theory
 
@@ -1319,12 +1291,11 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
             def pkvec(*args):
                 return sum(get_theory(ell) * legendre(ell)(mu) for ell in poles)
 
-        Aell = mattrs.create(kind='complex').apply(lambda value, kvec: pkvec(kvec).reshape(kshape) * rnorm, kind='wavenumber')
+        Aell = mattrs.create(kind='complex').apply(lambda value, kvec: pkvec(kvec) * rnorm, kind='wavenumber')
         if Q is not None: Aell = _2c(Q * _2r(Aell))
         else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
 
         power, power_zero = [], []
-        mu = mu.reshape(kshape)
         for ell in ells:
             leg = legendre(ell)(mu)
             odd = ell % 2
@@ -1371,14 +1342,9 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
                 Q = 0.
                 if theory_los == 'firstpoint':
                     for ell1, wa1 in poles:
-                        kernel_ell1 = get_theory((ell1, wa1))
-                        kernel_ell1 = kernel_ell1.reshape(kshape) * rnorm
+                        kernel_ell1 = get_theory((ell1, wa1)) * rnorm
                         for Yl1m1 in Ylms[ell1]:
-
-                            def kernel(*args):
-                                return kernel_ell1 * Yl1m1(*khat)
-
-                            xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r() * snorm**wa1
+                            xi = mattrs.create(kind='complex', fill=kernel_ell1 * Yl1m1(*khat)).c2r() * snorm**wa1
                             Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
 
                 elif theory_los == 'local':
@@ -1392,14 +1358,9 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
                         else:
                             pole = sum(coeff * poles[ell, 0] for ell, coeff in coeff2[ell1, ell2])
                             kernel_ell2 = get_theory(pole=pole)
-                        kernel_ell2 = kernel_ell2.reshape(kshape) * rnorm
+                        kernel_ell2 = kernel_ell2 * rnorm
                         for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
-
-                            def kernel(*args):
-                                return kernel_ell2 * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])
-
-                            #xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r().real
-                            xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
+                            xi = mattrs.create(kind='complex', fill=kernel_ell2 * Yl1m1(*khat) * Yl2m2(*[-kk for kk in khat])).c2r()
                             Q += (4. * np.pi)**2 / ((2 * ell1 + 1) * (2 * ell2 + 1)) * xi * _2r(_2c(rmesh1 * Ylm(*xhat) * Yl1m1(*xhat)).conj() * _2c(rmesh2 * Yl2m2(*xhat)))
 
                 else:

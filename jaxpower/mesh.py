@@ -8,7 +8,9 @@ from typing import Any
 import numpy as np
 import jax
 from jax import numpy as jnp
+from jax import sharding
 from jax.sharding import PartitionSpec as P
+from jax.experimental import mesh_utils
 from jax.experimental.shard_map import shard_map
 from dataclasses import dataclass, field, fields, asdict
 from . import resamplers, utils
@@ -17,6 +19,11 @@ try:
     import jaxdecomp
 except ImportError:
     jaxdecomp = None
+
+
+def get_sharding_mesh():
+    from jax._src import mesh as mesh_lib
+    return mesh_lib.thread_resources.env.physical_mesh
 
 
 class staticarray(np.ndarray):
@@ -56,17 +63,48 @@ class staticarray(np.ndarray):
         return cls(toret)
 
 
-def _get_ndim(*args):
-    ndim = 3
+def _get_ndim(*args, default=3):
+    ndim = default
     for value in args:
         try: ndim = len(value)
         except: pass
     return ndim
 
 
-def get_sharding_mesh():
-    from jax._src import mesh as mesh_lib
-    return mesh_lib.thread_resources.env.physical_mesh
+def create_sharding_mesh(meshsize=None, device_mesh_shape=None):
+
+    if device_mesh_shape is None:
+        count = jax.process_count()
+        if meshsize is None:
+            meshsize = 0
+        ndim = _get_ndim(meshsize, default=2)
+        meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
+
+        def closest_divisors_to_sqrt(n):
+            sqrt_n = int(np.sqrt(n))
+
+            for i in range(sqrt_n, 0, -1):
+                if n % i == 0:
+                    a = i
+                    b = n // i
+                    if meshsize[0] % a == meshsize[1] % b == 0:
+                        return (a, b)
+                    if meshsize[0] % b == meshsize[1] % a == 0:
+                        return (b, a)
+            # Fallback, n is prime
+            if meshsize[0] % n == 0:
+                return (n, 1)
+            if meshsize[1] % n == 0:
+                return (1, n)
+            raise ValueError('did not find any 2-dim mesh shape that divides meshsize = {}'.format(meshsize))
+
+        device_mesh_shape = closest_divisors_to_sqrt(count)
+    device_mesh_shape = tuple(s for s in device_mesh_shape if s > 1)
+    if len(device_mesh_shape) > 2:
+        raise NotImplementedError('device mesh with ndim {:d} > 2 not implemented'.format(len(device_mesh_shape)))
+    device_mesh_shape = (1,) * (2 - len(device_mesh_shape)) + device_mesh_shape
+    devices = mesh_utils.create_device_mesh(device_mesh_shape)
+    return sharding.Mesh(devices, axis_names=('x', 'y'))
 
 
 def default_sharding_mesh(func: Callable):
@@ -78,6 +116,34 @@ def default_sharding_mesh(func: Callable):
         return func(*args, sharding_mesh=sharding_mesh, **kwargs)
 
     return wrapper
+
+
+@partial(jax.jit, static_argnames=('sparse', 'sharding_mesh'))
+def _get_freq_mesh(*freqs, sparse=None, sharding_mesh: jax.sharding.Mesh=None):
+    def get_mesh(*freqs):
+        if sparse is None:
+            return tuple(freqs)
+        return tuple(jnp.meshgrid(*freqs, sparse=sparse, indexing='ij'))
+
+    if sharding_mesh is not None and sharding_mesh.axis_names:
+        ndim = len(freqs)
+        in_specs = tuple(P(name) for name in sharding_mesh.axis_names)
+        remaining = ndim - len(sharding_mesh.axis_names)
+        if remaining:
+            in_specs += tuple(P(None) for i in range(remaining))
+        if sparse is None:
+            out_specs = in_specs
+        elif sparse:
+            out_specs = []
+            for i in range(ndim):
+                tmp = [None] * ndim
+                if i < len(sharding_mesh.axis_names): tmp[i] = sharding_mesh.axis_names[i]
+                out_specs.append(P(*tmp))
+            out_specs = tuple(out_specs)
+        else:
+            out_specs = tuple(P(*sharding_mesh.axis_names) for i in range(ndim))
+        get_mesh = shard_map(get_mesh, sharding_mesh, in_specs=in_specs, out_specs=out_specs)
+    return get_mesh(*freqs)
 
 
 @default_sharding_mesh
@@ -124,33 +190,8 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
     if axis_order is None:
         axis_order = list(range(ndim))
     toret = [toret[axis] for axis in axis_order]
-
-    def get_mesh(*freqs):
-        if sparse is None:
-            return tuple(freqs)
-        return jnp.meshgrid(*freqs, sparse=sparse, indexing='ij')
-
-    if sharding_mesh is not None and sharding_mesh.axis_names:
-        in_specs = tuple(P(name) for name in sharding_mesh.axis_names)
-        remaining = ndim - len(sharding_mesh.axis_names)
-        if remaining:
-            in_specs += tuple(P(None) for i in range(remaining))
-        if sparse is None:
-            out_specs = in_specs
-        elif sparse:
-            out_specs = []
-            for i in range(ndim):
-                tmp = [None] * ndim
-                tmp[i] = sharding_mesh.axis_names[i]
-                out_specs.append(P(tmp))
-            out_specs = tuple(out_specs)
-        else:
-            out_specs = tuple(P(sharding_mesh.axis_names) for i in range(ndim))
-        get_mesh = shard_map(get_mesh, sharding_mesh, in_specs, out_specs)
-
-    toret = get_mesh(*toret)
-    toret = [toret[axis_order.index(axis)] for axis in range(len(toret))]
-    return tuple(toret)
+    toret = _get_freq_mesh(*toret, sparse=sparse, sharding_mesh=sharding_mesh)
+    return tuple(toret[axis_order.index(axis)] for axis in range(len(toret)))
 
 
 @default_sharding_mesh
@@ -296,14 +337,6 @@ def unpad_halo(value, halo_size, sharding_mesh=None):
     return shard_map(unpad, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),), out_specs=P(*sharding_mesh.axis_names))(value)
 
 
-def _get_bin_attrs(coords: jax.Array, edges: np.ndarray, weights: None | jax.Array=None):
-    r"""Return bin index, binned number of modes and coordinates."""
-    ibin = jnp.digitize(coords, edges, right=False)
-    nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
-    x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
-    return ibin, nmodes, x
-
-
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class MeshAttrs(object):
@@ -436,7 +469,7 @@ class MeshAttrs(object):
     xcoords = rcoords
     kcoords = ccoords
 
-    def create(self, kind: str='real', fill: float | Callable=None):
+    def create(self, kind: str='real', fill: float | jax.Array | Callable=None):
         """
         Create mesh with these given attributes.
 
@@ -456,20 +489,25 @@ class MeshAttrs(object):
         kind = {'real': RealMeshField, 'complex': ComplexMeshField}.get(kind, kind)
         name = kind.__name__.lower()
         shape = tuple(self.meshsize)
-        if 'complex' in name and self.hermitian:
-            shape = shape[:-1] + (shape[-1] // 2 + 1,)
+        if 'complex' in name:
+            if self.hermitian:
+                shape = shape[:-1] + (shape[-1] // 2 + 1,)
+            if self.fft_engine == 'jaxdecomp':
+                shape = tuple(np.roll(shape, shift=len(self.sharding_mesh.axis_names)))
         itemsize = jnp.zeros((), dtype=self.dtype).real.dtype.itemsize
         dtype = jnp.dtype('c{:d}'.format(2 * itemsize) if 'complex' in name else 'f{:d}'.format(itemsize))
         if callable(fill):
             fun = fill
         elif fill is None:
             fun = jnp.empty
+        elif getattr(fill, 'shape', None) == shape:
+            return kind(fill, attrs=self)
         else:
             fun = lambda shape, **kwargs: jnp.full(shape, fill, **kwargs)
-        fun = partial(fun, shape=shard_shape(shape, sharding_mesh=self.sharding_mesh), dtype=self.dtype)
+        fun = partial(fun, shape=shard_shape(shape, sharding_mesh=self.sharding_mesh), dtype=dtype)
         if self.sharding_mesh.axis_names:
             fun = shard_map(fun, self.sharding_mesh, in_specs=tuple(), out_specs=P(*self.sharding_mesh.axis_names))
-        return kind(fun(), **self)
+        return kind(fun(), attrs=self)
 
     def r2c(self, value):
         """FFT, from real to complex."""
@@ -485,7 +523,9 @@ class MeshAttrs(object):
     def c2r(self, value):
         """FFT, from complex to real."""
         if self.fft_engine == 'jaxdecomp':
-            value = jaxdecomp.fft.ipfft3d(value)
+            value = jaxdecomp.fft.pifft3d(value)
+            if jnp.issubdtype(self.dtype, jnp.floating):
+                value = value.real.astype(self.dtype)
         else:
             if self.hermitian:
                 value = jnp.fft.irfftn(value, s=tuple(self.meshsize))
@@ -517,7 +557,7 @@ class BaseMeshField(object):
             if meshsize is None: meshsize = shape
             meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
             mattrs = MeshAttrs(meshsize=meshsize, **kwargs)
-        mattrs = mattrs.clone(dtype=value.dtype if tuple(mattrs.meshsize) == value.shape else value.real.dtype)  # second option = hermitian
+        mattrs = mattrs.clone(dtype=value.dtype if mattrs.meshsize.prod(dtype='i8') == value.size else value.real.dtype)  # second option = hermitian
         self.__dict__.update(value=value, attrs=mattrs)
 
     def tree_flatten(self):
@@ -1029,7 +1069,12 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
     if meshsize is None:
         if cellsize is not None:
             cellsize = staticarray.fill(cellsize, ndim, dtype=dtype)
-            toret['meshsize'] = meshsize = np.ceil(boxsize / cellsize).astype('i4')
+            meshsize = np.ceil(boxsize / cellsize).astype('i4')
+            sharding_mesh = get_sharding_mesh()
+            if sharding_mesh.axis_names:
+                ndevices = staticarray(sharding_mesh.devices.shape + (1,) * (meshsize.ndim - sharding_mesh.devices.ndim))
+                meshsize = (meshsize + ndevices - 1) // ndevices * ndevices  # to make it a multiple of devices
+            toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
         else:
             raise ValueError('meshsize (or cellsize) must be specified')
@@ -1306,19 +1351,16 @@ class BinAttrs(object):
     wmodes: jax.Array = None
 
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, kind='complex', mode_oversampling: int=0, **kwargs):
-        if isinstance(mattrs, MeshAttrs):
-            hermitian = mattrs.hermitian
-            if kind == 'real':
-                vec = mattrs.xcoords(kind='separation', sparse=True, **kwargs)
-                vec0 = mattrs.cellsize.min()
-            else:
-                vec = mattrs.kcoords(kind='separation', sparse=True, **kwargs)
-                vec0 = mattrs.kfun.min()
-        else:  # attrs is a mesh
-            hermitian = mattrs.shape[-1] < mattrs.meshsize[-1]
-            vec = mattrs.coords(kind='separation', sparse=True)
-            vec0 = mattrs.spacing.min()
+        if not isinstance(mattrs, MeshAttrs):
+            kind = 'complex' if 'complex' in mattrs.__class__.__name__.lower() else 'real'
             mattrs = mattrs.attrs
+        hermitian = mattrs.hermitian
+        if kind == 'real':
+            vec = mattrs.xcoords(kind='separation', sparse=True, **kwargs)
+            vec0 = mattrs.cellsize.min()
+        else:
+            vec = mattrs.kcoords(kind='separation', sparse=True, **kwargs)
+            vec0 = mattrs.kfun.min()
         nonsingular = None
         if hermitian:
             shape = np.broadcast_shapes(*[xx.shape for xx in vec])
@@ -1332,7 +1374,7 @@ class BinAttrs(object):
             if self.sharding_mesh.axis_names:
                 get_nonsingular = shard_map(get_nonsingular, mattrs.sharding_mesh,
                                             in_specs=P(*[axis if vec[-1].shape[iaxis] else None for iaxis, axis in enumerate(self.sharding_mesh.axis_names)]),
-                                            out_specs=P(*self.sharding_mesh.axis_names))
+                                            out_specs=P(self.sharding_mesh.axis_names))
             nonsingular = get_nonsingular(vec[-1])
         if edges is None:
             edges = {}
@@ -1346,8 +1388,30 @@ class BinAttrs(object):
         shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
         shifts = list(itertools.product(*shifts))
         ibin, nmodes, xsum = [], 0, 0
+
+        def _get_bin_attrs(coords: jax.Array, edges: np.ndarray, weights: None | jax.Array=None):
+            r"""Return bin index, binned number of modes and coordinates."""
+            coords = coords.ravel()
+            ibin = jnp.digitize(coords, edges, right=False)
+            nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+            x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+            return ibin, nmodes, x
+        
+        get_bin_attrs = _get_bin_attrs
+        if self.sharding_mesh.axis_names:
+
+            @partial(shard_map, mesh=self.sharding_mesh,
+                     in_specs=(P(*self.sharding_mesh.axis_names), P(None), P(self.sharding_mesh.axis_names)),
+                     out_specs=(P(self.sharding_mesh.axis_names), P(None), P(None)))
+            def get_bin_attrs(coords, edges, weights):
+                r"""Return bin index, binned number of modes and coordinates."""
+                ibin, nmodes, x = _get_bin_attrs(coords, edges, weights)
+                nmodes = jax.lax.psum(nmodes, self.sharding_mesh.axis_names)
+                x = jax.lax.psum(x, self.sharding_mesh.axis_names)
+                return ibin, nmodes, x
+
         for shift in shifts:
-            bin = _get_bin_attrs(jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift))).ravel(), edges=edges, weights=nonsingular)
+            bin = get_bin_attrs(jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift))), edges, nonsingular)
             ibin.append(bin[0])
             nmodes += bin[1]
             xsum += bin[2]
@@ -1360,22 +1424,32 @@ class BinAttrs(object):
     def __call__(self, mesh, antisymmetric=False, remove_zero=False):
         weights = self.wmodes
         value = getattr(mesh, 'value', mesh)
+        if remove_zero:
+            value = value.at[(0,) * value.ndim].set(0.)
 
-        def bincount(value):
+        def _bincount(value, *ibin):
             value = value.ravel()
             if weights is not None:
                 if antisymmetric: value = value.imag
                 else: value = value.real
                 value *= weights
-            if remove_zero:
-                value = value.at[0].set(0.)
-            value = sum(jnp.bincount(ib, weights=value, length=len(self.xavg) + 2) for ib in self.ibin)
-            return value[1:-1] / len(self.ibin) / self.nmodes
+            length = len(self.xavg) + 2
+            count = lambda ib: jnp.bincount(ib, weights=value, length=length)
+            if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
+                count = lambda ib: jnp.bincount(ib, weights=value.real, length=length) + 1j * jnp.bincount(ib, weights=value.imag, length=length)
+            value = sum(count(ib) for ib in ibin)
+            return value[1:-1] / len(ibin) / self.nmodes
+
+        bincount = _bincount
 
         if self.sharding_mesh.axis_names:
-            bincount = shard_map(bincount, self.sharding_mesh, in_specs=P(*self.sharding_mesh.axis_names), out_specs=P(None))
-        return bincount(value)
 
+            @partial(shard_map, mesh=self.sharding_mesh, in_specs=(P(*self.sharding_mesh.axis_names),) + (P(self.sharding_mesh.axis_names),) * len(self.ibin), out_specs=P(None))
+            def bincount(value, *ibin):
+                value = _bincount(value, *ibin)
+                return jax.lax.psum(value, self.sharding_mesh.axis_names)
+
+        return bincount(value, *self.ibin)
 
     def tree_flatten(self):
         return (asdict(self),), {}
