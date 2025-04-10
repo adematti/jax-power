@@ -6,7 +6,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from .mesh import RealMeshField, ParticleField, MeshAttrs
+from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles
 from .power import _get_los_vector, legendre, get_real_Ylm
 from .utils import BinnedStatistic
 
@@ -149,5 +149,9 @@ def generate_uniform_particles(attrs, size, seed: int=42):
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    positions = attrs.boxsize * random.uniform(seed, (size, len(attrs.boxsize))) - attrs.boxsize / 2. + attrs.boxcenter
+    from jax import sharding
+    from jax.sharding import PartitionSpec as P
+
+    positions = attrs.boxsize * random.uniform(seed, (size, len(attrs.boxsize)), sharding=sharding.NamedSharding(attrs.sharding_mesh, P(attrs.sharding_mesh.axis_names))) - attrs.boxsize / 2. + attrs.boxcenter
+    positions = exchange_particles(attrs, positions=positions, return_inverse=False)(positions)
     return ParticleField(positions, attrs=attrs)
