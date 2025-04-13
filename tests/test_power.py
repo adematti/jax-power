@@ -929,8 +929,6 @@ def test_sympy():
 
 if __name__ == '__main__':
 
-    test_mesh_power(plot=False)
-    exit()
     #test_window_timing()
     #test_sympy()
     #test_window()

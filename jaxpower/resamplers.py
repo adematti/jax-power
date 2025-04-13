@@ -95,7 +95,7 @@ def _kernel_pcs(shape: tuple, positions: jax.Array):
 def _get_painter(kernel: Callable):
     def fn(mesh, positions, weights=None):
         for idx, ker in kernel(mesh.shape, positions):
-            idx = tuple(jnp.moveaxis(idx, -1, 0))
+            idx = jnp.unstack(idx, axis=-1)
             mesh = mesh.at[idx].add(ker if weights is None else weights * ker)
         return mesh
     return fn
@@ -105,7 +105,7 @@ def _get_reader(kernel: Callable):
     def fn(mesh, positions):
         toret = 0.
         for idx, ker in kernel(mesh.shape, positions):
-            idx = tuple(jnp.moveaxis(idx, -1, 0))
+            idx = jnp.unstack(idx, axis=-1)
             toret += mesh[idx] * ker
         return toret
     return fn

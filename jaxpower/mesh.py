@@ -77,7 +77,7 @@ def _get_ndim(*args, default=3):
 def create_sharding_mesh(meshsize=None, device_mesh_shape=None):
 
     if device_mesh_shape is None:
-        count = jax.process_count()
+        count = len(jax.devices())
         if meshsize is None:
             meshsize = 0
         ndim = _get_ndim(meshsize, default=2)
@@ -119,6 +119,57 @@ def default_sharding_mesh(func: Callable):
         return func(*args, sharding_mesh=sharding_mesh, **kwargs)
 
     return wrapper
+
+
+@partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
+@default_sharding_mesh
+def create_sharded_array(func, shape, out_specs=None, sharding_mesh=None):
+    if np.ndim(shape) == 0: shape = (shape,)
+    shape = tuple(shape)
+    if sharding_mesh.axis_names:
+        if out_specs is None:
+            out_specs = P(*sharding_mesh.axis_names)
+        if not isinstance(out_specs, P):
+            axis_names = []
+            axis = out_specs
+            if np.ndim(axis) == 0:
+                out_specs = P((None,) * axis + (sharding_mesh.axis_names,))
+            else:
+                assert len(axis) <= len(sharding_mesh.axis_names), 'cannot have more array axes than device mesh'
+                out_specs = [None] * np.max(axis)
+                for iax, ax in enumerate(axis): out_specs[ax] = sharding_mesh.axis_names[iax]
+                out_specs = P(*out_specs)
+        shard_shape = jax.sharding.NamedSharding(sharding_mesh, spec=out_specs).shard_shape(shape)
+        f = shard_map(partial(func, shape=shard_shape), mesh=sharding_mesh, in_specs=(), out_specs=out_specs)
+    else:
+        f = partial(func, shape=shape)
+    return f()
+
+
+@partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
+@default_sharding_mesh
+def create_sharded_random(func, key, shape, out_specs=None, sharding_mesh=None):
+    if np.ndim(shape) == 0: shape = (shape,)
+    shape = tuple(shape)
+    if sharding_mesh.axis_names:
+        key = jnp.array(jax.random.split(key, sharding_mesh.devices.size))
+        if out_specs is None:
+            out_specs = P(*sharding_mesh.axis_names)
+        if not isinstance(out_specs, P):
+            axis_names = []
+            axis = out_specs
+            if np.ndim(axis) == 0:
+                out_specs = P((None,) * axis + (sharding_mesh.axis_names,))
+            else:
+                assert len(axis) <= len(sharding_mesh.axis_names), 'cannot have more array axes than device mesh'
+                out_specs = [None] * np.max(axis)
+                for iax, ax in enumerate(axis): out_specs[ax] = sharding_mesh.axis_names[iax]
+                out_specs = P(*out_specs)
+        shard_shape = jax.sharding.NamedSharding(sharding_mesh, spec=out_specs).shard_shape(shape)
+        f = shard_map(lambda key: func(key[0], shape=shard_shape), mesh=sharding_mesh, in_specs=P(sharding_mesh.axis_names,), out_specs=out_specs)
+    else:
+        f = partial(func, shape=shape)
+    return f(key)
 
 
 @partial(jax.jit, static_argnames=('sparse', 'sharding_mesh'))
@@ -198,7 +249,7 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
 
 
 @default_sharding_mesh
-def shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
+def mesh_shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
     if not len(sharding_mesh.axis_names):
         return tuple(shape)
     return tuple(s // pdim for s, pdim in zip(shape, sharding_mesh.devices.shape)) + shape[sharding_mesh.devices.ndim:]
@@ -207,7 +258,7 @@ def shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
 def pad_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
-    pad_width = [(2 * halo_size,) * 2] * len(sharding_mesh.axis_names)
+    pad_width = [(2 * halo_size if sharding_mesh.devices.shape[axis] > 1 else 0,) * 2 for axis in range(len(sharding_mesh.axis_names))]
     pad_width += [(0,) * 2] * len(value.shape[len(sharding_mesh.axis_names):])
 
     def pad(value):
@@ -224,16 +275,19 @@ def unpad_halo(value, halo_size=0, sharding_mesh=None):
     def unpad(value):
         crop = []
         for axis in range(len(sharding_mesh.axis_names)):
-            slices = [slice(None) for i in range(value.ndim)]
-            slices[axis] = slice(2 * halo_size, 3 * halo_size)
-            slices_add = list(slices_add)
-            slices_add[axis] = slice(0, halo_size)
-            value = value.at[tuple(slices)].set(value[tuple(slices_add)])
-            slices[axis] = slice(-3 * halo_size, -2 * halo_size)
-            slices_add = list(slices_add)
-            slices_add[axis] = slice(-halo_size)
-            value = value.at[tuple(slices)].set(value[tuple(slices_add)])
-            crop.append(slice(2 * halo_size, -2 * halo_size))
+            if sharding_mesh.devices.shape[axis] > 1:
+                slices = [slice(None) for i in range(value.ndim)]
+                slices[axis] = slice(2 * halo_size, 3 * halo_size)
+                slices_add = list(slices)
+                slices_add[axis] = slice(0, halo_size)
+                value = value.at[tuple(slices)].add(value[tuple(slices_add)])
+                slices[axis] = slice(value.shape[axis] - 3 * halo_size, value.shape[axis] - 2 * halo_size)
+                slices_add = list(slices)
+                slices_add[axis] = slice(value.shape[axis] - halo_size, value.shape[axis])
+                value = value.at[tuple(slices)].add(value[tuple(slices_add)])
+                crop.append(slice(2 * halo_size, value.shape[axis] - 2 * halo_size))
+            else:
+                crop.append(slice(None))
         return value[tuple(crop)]
 
     return shard_map(unpad, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),), out_specs=P(*sharding_mesh.axis_names))(value)
@@ -242,7 +296,7 @@ def unpad_halo(value, halo_size=0, sharding_mesh=None):
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
 def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
-    extents = [(halo_size,) * 2] * len(sharding_mesh.axis_names)
+    extents = (halo_size,) * len(sharding_mesh.axis_names)
     return jaxdecomp.halo_exchange(value, halo_extents=tuple(extents), halo_periods=(True,) * len(extents))
 
 
@@ -256,208 +310,162 @@ def make_particles_from_local(positions, weights=None, sharding_mesh: jax.shardi
             return per_host_positions
         return per_host_positions, per_host_weights
 
-    per_host_size = jnp.array(per_host_positions.size[:1])
-    sizes = jax.make_array_from_process_local_data(sharding_mesh, per_host_size)
-    max_size = jnp.max(sizes)
-    pad_width = [(0, max_size - per_host_positions.size)] + [(0, 0)] * (per_host_positions.ndim - 1)
-    per_host_positions = jnp.pad(per_host_positions, pad_width=pad_width)
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
-    global_size = max_size * sizes.size
-    positions = jax.make_array_from_process_local_data(sharding, per_host_positions, global_shape=(global_size,) + per_host_positions.shape[-1:])
+    per_host_size = np.repeat(per_host_positions.shape[0], sharding_mesh.devices.size)
+    sizes = jax.make_array_from_process_local_data(sharding, per_host_size)
+    nlocal = len(jax.local_devices())
+    max_size = (sizes.max().item() + nlocal - 1) // nlocal * nlocal
+    pad_width = [(0, max_size - per_host_positions.shape[0])] + [(0, 0)] * (per_host_positions.ndim - 1)
+    per_host_positions = np.pad(per_host_positions, pad_width=pad_width)
+    positions = jax.make_array_from_process_local_data(sharding, per_host_positions)#, global_shape=(global_size,) + per_host_positions.shape[-1:])
     if per_host_weights is None:
         return positions
-    pad_width = [(0, max_size - per_host_weights.size)] + [(0, 0)] * (per_host_weights.ndim - 1)
+    pad_width = [(0, max_size - per_host_weights.shape[0])] + [(0, 0)] * (per_host_weights.ndim - 1)
     per_host_weights = jnp.pad(per_host_weights, pad_width=pad_width, mode='constant', constant_values=0.)
-    weights = jax.make_array_from_process_local_data(sharding, per_host_weights, global_shape=(global_size,))
+    weights = jax.make_array_from_process_local_data(sharding, per_host_weights)
     return positions, weights
 
 
-def exchange_particles(attrs, positions: jax.Array, return_inverse=False):
-    sharding_mesh = attrs.sharding_mesh
+def _identity_fn(x):
+  return x
 
-    if not len(sharding_mesh.axis_names):
 
-        def exchange(positions=None, weights=None):
-            toret = []
-            if positions is not None:
-                toret.append(positions)
-            if weights is not None:
-                toret.append(weights)
-            return toret
+def global_array_from_single_device_arrays(sharding, arrays, return_slices=False, pad=None):
+    if pad is None:
+        pad = np.nan
+    if not callable(pad):
+        constant_values = pad
+        pad = lambda array, pad_width: jnp.pad(array, pad_width, mode='constant', constant_values=constant_values)
+    ndevices = sharding.num_devices
+    per_host_chunks = arrays
+    ndim = per_host_chunks[0].ndim
+    per_host_size = jnp.array([per_host_chunk.shape[0] for per_host_chunk in per_host_chunks])
+    all_size = jax.make_array_from_process_local_data(sharding, per_host_size)
+    all_size = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(all_size).addressable_data(0)
+    max_size = all_size.max().item()
+    if not np.all(all_size == max_size):
+        per_host_chunks = [pad(per_host_chunk, [(0, max_size - per_host_chunk.shape[0])] + [(0, 0)] * (ndim - 1)) for per_host_chunk in per_host_chunks]
+    global_shape = (max_size * ndevices,) + per_host_chunks[0].shape[1:]
+    tmp = jax.make_array_from_single_device_arrays(global_shape, sharding, per_host_chunks)
+    del per_host_chunks
+    slices = [slice(j * max_size, j * max_size + all_size[j].item()) for j in range(ndevices)]
+    if return_slices:
+        return tmp, slices
+    return tmp
 
-        def inverse(values):
-            return values
 
-        exchange.inverse = inverse
+def allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwargs):
+    tmp, slices = global_array_from_single_device_arrays(sharding, arrays, return_slices=True, **kwargs)
+    tmp = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(tmp).addressable_data(0)  # replicated accross all devices
+    tmp = jnp.concatenate([tmp[sl] for sl in slices], axis=0)
+    if return_slices:
+        sizes = np.cumsum([0] + [sl.stop - sl.start for sl in slices])
+        slices = [slice(start, stop) for start, stop in zip(sizes[:-1], sizes[1:])]
+        return tmp, slices
+    return tmp
 
-        return exchange
 
-    shape_devices = staticarray(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
-    size_devices = shape_devices.prod(dtype='i4')
-    fidx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
-    idx_out_devices = jnp.ravel_multi_index(jnp.floor(fidx_out_devices).astype('i4'), tuple(shape_devices))
-    count_out_device = jnp.bincount(idx_out_devices, length=size_devices + 1)[1:]
-    count_out_max = count_out_device.max()
-    shifts = jnp.meshgrid(*[np.arange(s) * attrs.boxsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
-    shifts = jnp.stack(shifts, axis=-1).reshape(-1, len(shifts))
+def exchange_array(array, device, pad=jnp.nan, return_indices=False):
+    # Exchange array along the first (0) axis
+    # TODO: generalize to any axis
+    sharding = array.sharding
+    ndevices = sharding.num_devices
+    per_host_arrays = [_.data for _ in array.addressable_shards]
+    per_host_devices = [_.data for _ in device.addressable_shards]
+    devices = sharding.mesh.devices.ravel().tolist()
+    local_devices = [_.device for _ in per_host_arrays]
+    per_host_final_arrays = [None] * len(local_devices)
+    ndim = array.ndim
+    per_host_indices = [[] for i in range(len(local_devices))]
+    slices = [None] * ndevices
 
-    p_shape = positions.shape
-    p_sharding = positions.sharding
-    out_sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+    for idevice in range(ndevices):
+        # single-device arrays
+        per_host_chunks = []
+        for ilocal_device, (per_host_array, per_host_device, local_device) in enumerate(zip(per_host_arrays, per_host_devices, local_devices)):
+            mask_idevice = per_host_device == idevice
+            per_host_chunks.append(jax.device_put(per_host_array[mask_idevice], local_device, donate=True))
+            if return_indices: per_host_indices[ilocal_device].append(jax.device_put(np.flatnonzero(mask_idevice), local_device, donate=True))
+        tmp, slices[idevice] = allgather_single_device_arrays(sharding, per_host_chunks, return_slices=True)
+        del per_host_chunks
+        if devices[idevice] in local_devices:
+            per_host_final_arrays[local_devices.index(devices[idevice])] = jax.device_put(tmp, devices[idevice], donate=True)
+        del tmp
 
-    def exchange(positions=None, weights=None):
+    final = global_array_from_single_device_arrays(sharding, per_host_final_arrays, pad=pad)
+    if return_indices:
+        for ilocal_device, local_device in enumerate(local_devices):
+            per_host_indices[ilocal_device] = jax.device_put(jnp.concatenate(per_host_indices[ilocal_device]), local_device, donate=True)
+        return final, (per_host_indices, slices)
+    return final
 
-        def get_positions(idevice):
-            idevice = idevice.start
-            mask = jnp.all(idx_out_devices == idevice, axis=-shape_devices.ndim)
-            p = positions[mask] - shifts[idevice]
-            pad_width = [(0, count_out_max - count_out_device[idevice])] + [(0, 0)] * (p.ndim - 1)
-            p = jnp.pad(p, pad_width=pad_width)
-            return p
 
-        def get_weights(idevice):
-            idevice = idevice.start
-            mask = jnp.all(idx_out_devices == idevice, axis=-shape_devices.ndim)
-            w = weights[mask]
-            pad_width = [(0, count_out_max - count_out_device[idevice])] + [(0, 0)] * (w.ndim - 1)
-            w = jnp.pad(w, pad_width=pad_width, mode='constant', constant_values=0.)
-            return w
+def exchange_inverse(array, indices):
+    # Reciprocal exchange
+    indices = per_host_indices, slices
+    sharding = array.sharding
+    ndevices = sharding.num_devices
+    per_host_arrays = [_.data for _ in array.addressable_shards]
+    devices = sharding.mesh.devices.ravel().tolist()
+    local_devices = [_.device for _ in per_host_arrays]
+    per_host_final_arrays = [None] * len(local_devices)
 
-        toret = []
-        if positions is not None:
-            toret.append(jax.make_array_from_callback((shape_devices.size, count_out_max) + positions.shape[-1:], out_sharding, get_positions))
-        if weights is not None:
-            toret.append(jax.make_array_from_callback((shape_devices.size, count_out_max), out_sharding, get_weights))
-        if len(toret) == 1:
-            toret = toret[0]
-        return toret
+    for idevice in range(ndevices):
+        per_host_chunks = []
+        for ilocal_device, (per_host_array, local_device) in enumerate(zip(per_host_arrays, local_devices)):
+            sl = slices[devices.index(local_device)][idevice]
+            per_host_chunks.append(jax.device_put(per_host_array[sl], local_device, donate=True))
+        tmp = allgather_single_device_arrays(sharding, per_host_chunks, return_slices=False)
+        del per_host_chunks
+        if devices[idevice] in local_devices:
+            ilocal_device = local_devices.index(devices[idevice])
+            indices = per_host_indices[ilocal_device]
+            tmp = jax.device_put(tmp, devices[idevice], donate=True)
+            tmp = jnp.empty_like(tmp).at[indices].set(tmp)
+            per_host_final_arrays[local_devices.index(devices[idevice])] = jax.device_put(tmp, devices[idevice], donate=True)
+        del tmp
 
-    if not return_inverse:
-        return exchange
-
-    def f(carry, idevice):
-        mask = idx_out_devices == idevice
-        carry = carry.at[mask].set(jnp.cumsum(mask)[mask])
-        return carry, idevice
-
-    index_in_out = idx_out_devices.copy()
-    for idevice in jnp.arange(size_devices):
-        index_in_out, _ = f(index_in_out, idevice)
-
-    #index_in_out = jax.lax.scan(f, index_in_out, devices.ravel())[0]  # it will never be jitted
-    index_in_out = (idx_out_devices, index_in_out)
-
-    def inverse(values):
-
-        def get_values(sl):
-            return values[tuple(tmp[sl] for tmp in index_in_out)]
-
-        return jax.make_array_from_callback(p_shape, p_sharding, get_values)
-
-    return exchange, inverse
+    return global_array_from_single_device_arrays(sharding, per_host_final_arrays)
 
 
 @default_sharding_mesh
-def make_particles_from_local(per_host_positions, per_host_weights, sharding_mesh: jax.sharding.Mesh=None):
-
-    if not len(sharding_mesh.axis_names):
-        return per_host_positions, per_host_weights
-
-    per_host_size = jnp.array(per_host_positions.size[:1])
-    sizes = jax.make_array_from_process_local_data(sharding_mesh, per_host_size)
-    max_size = jnp.max(sizes)
-    pad_width = [(0, max_size - per_host_positions.size)] + [(0, 0)] * (per_host_positions.ndim - 1)
-    per_host_positions = jnp.pad(per_host_positions, pad_width=pad_width)
-    sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
-    global_size = max_size * sizes.size
-    positions = jax.make_array_from_process_local_data(sharding, per_host_positions, global_shape=(global_size,) + per_host_positions.shape[-1:])
-    pad_width = [(0, max_size - per_host_weights.size)] + [(0, 0)] * (per_host_weights.ndim - 1)
-    per_host_weights = jnp.pad(per_host_weights, pad_width=pad_width, mode='constant', constant_values=0.)
-    weights = jax.make_array_from_process_local_data(sharding, per_host_weights, global_shape=(global_size,))
-    return positions, weights
-
-
-def exchange_particles2(attrs, positions: jax.Array, return_inverse=False):
-    sharding_mesh = attrs.sharding_mesh
+def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, sharding_mesh=None):
+    sharding = positions.sharding
 
     if not len(sharding_mesh.axis_names):
 
-        def exchange(positions=None, weights=None):
-            toret = []
-            if positions is not None:
-                toret.append(positions)
-            if weights is not None:
-                toret.append(weights)
-            return toret
+        def exchange(values, pad=0.):
+            return values
 
         def inverse(values):
             return values
 
-        exchange.inverse = inverse
-
-        return exchange
+        if return_inverse:
+            return positions, exchange, inverse
+        return positions, exchange
 
     shape_devices = staticarray(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     size_devices = shape_devices.prod(dtype='i4')
-    fidx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
-    idx_out_devices = jnp.ravel_multi_index(jnp.floor(fidx_out_devices).astype('i4'), tuple(shape_devices))
-    count_out_device = jnp.bincount(idx_out_devices, length=size_devices + 1)[1:]
-    count_out_max = count_out_device.max()
+
+    idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
+    idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
     shifts = jnp.meshgrid(*[np.arange(s) * attrs.boxsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
     shifts = jnp.stack(shifts, axis=-1).reshape(-1, len(shifts))
 
-    p_shape = positions.shape
-    p_sharding = positions.sharding
+    positions = jax.jit(lambda positions, idx: positions - shifts[idx], out_shardings=sharding)(positions, idx_out_devices)
+    positions = exchange_array(positions, idx_out_devices, pad=partial(jnp.pad, mode='edge'), return_indices=return_inverse)
 
-    @partial(shard_map, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(sharding_mesh.axis_names,)), out=P(sharding_mesh.axis_names,))
-    def exchange_positions(idevice, positions):
-        mask = jnp.all(idx_out_devices == idevice, axis=0)
-        p = positions[mask] - shifts[idevice]
-        pad_width = [(0, count_out_max - count_out_device[idevice])] + [(0, 0)] * (p.ndim - 1)
-        p = jnp.pad(p, pad_width=pad_width)
-        return jax.lax.all_to_all(p, sharding_mesh.axis_names, 0, 0)
-
-    @partial(shard_map, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(sharding_mesh.axis_names,)), out=P(sharding_mesh.axis_names,))
-    def exchange_weights(idevice, weights):
-        mask = jnp.all(idx_out_devices == idevice, axis=0)
-        w = weights[mask]
-        pad_width = [(0, count_out_max - count_out_device[idevice])] + [(0, 0)] * (w.ndim - 1)
-        w = jnp.pad(w, pad_width=pad_width, mode='constant', constant_values=0.)
-        return jax.lax.all_to_all(w, sharding_mesh.axis_names, 0, 0)
-
-    def exchange(positions=None, weights=None):
-        toret = []
-        if positions is not None:
-            toret.append(exchange_positions(jnp.arange(size_devices)))
-        if weights is not None:
-            toret.append(exchange_weights(jnp.arange(size_devices)))
-        if len(toret) == 1:
-            toret = toret[0]
-        return toret
+    def exchange(values, pad=0.):
+        return exchange_array(values, idx_out_devices, pad=pad, return_indices=False)
 
     if return_inverse:
-        return exchange
+        positions, indices = positions
 
-    def f(carry, idevice):
-        mask = idx_out_devices == idevice
-        carry = carry.at[mask].set(jnp.cumsum(mask)[mask])
-        return carry, idevice
+        def inverse(values):
+            return exchange_inverse(values, indices)
 
-    index_in_out = idx_out_devices.copy()
-    for idevice in jnp.arange(size_devices):
-        index_in_out, _ = f(index_in_out, idevice)
-
-    #index_in_out = jax.lax.scan(f, index_in_out, devices.ravel())[0]  # it will never be jitted
-    index_in_out = (idx_out_devices, index_in_out)
-
-    def inverse(values):
-
-        def get_values(sl):
-            return values[tuple(tmp[sl] for tmp in index_in_out)]
-
-        return jax.make_array_from_callback(p_shape, p_sharding, get_values)
-
-    return exchange, inverse
+        return positions, exchange, inverse
+    return positions, exchange
 
 
 @jax.tree_util.register_pytree_node_class
@@ -586,7 +594,7 @@ class MeshAttrs(object):
             kind = 'separation'
         axis_order = None
         if self.fft_engine == 'jaxdecomp':
-            axis_order = tuple(np.roll(np.arange(self.ndim), shift=len(self.sharding_mesh.axis_names)))
+            axis_order = tuple(np.roll(np.arange(self.ndim), shift=2))
         return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh)
 
     xcoords = rcoords
@@ -622,15 +630,13 @@ class MeshAttrs(object):
         if callable(fill):
             fun = fill
         elif fill is None:
-            fun = jnp.empty
+            fun = partial(jnp.empty, dtype=dtype)
         elif getattr(fill, 'shape', None) == shape:
             return kind(fill, attrs=self)
         else:
-            fun = lambda shape, **kwargs: jnp.full(shape, fill, **kwargs)
-        fun = partial(fun, shape=shard_shape(shape, sharding_mesh=self.sharding_mesh), dtype=dtype)
-        if self.sharding_mesh.axis_names:
-            fun = shard_map(fun, self.sharding_mesh, in_specs=tuple(), out_specs=P(*self.sharding_mesh.axis_names))
-        return kind(fun(), attrs=self)
+            fun = lambda shape: jnp.full(shape, fill, dtype=dtype)
+        value = create_sharded_array(fun, shape, out_specs=P(*self.sharding_mesh.axis_names), sharding_mesh=self.sharding_mesh)
+        return kind(value, attrs=self)
 
     def r2c(self, value):
         """FFT, from real to complex."""
@@ -991,8 +997,7 @@ class RealMeshField(BaseMeshField):
         with_sharding = bool(sharding_mesh.axis_names)
         inverse = None
         if with_sharding and pexchange:
-            exchange, inverse = exchange_particles(self.attrs, positions, return_inverse=True)
-            positions = exchange(positions=positions)
+            positions, exchange, inverse = exchange_particles(self.attrs, positions, return_inverse=True)
         toret = _read(self, positions, resampler=resampler, compensate=compensate)
         if inverse is not None:
             toret = inverse(toret)
@@ -1187,11 +1192,12 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if ndim is None:
             ndim = positions[0].shape[-1]
 
-    boxsize = staticarray.fill(boxsize, ndim, dtype=dtype)
+    rdtype = jnp.zeros((), dtype=dtype).real.dtype
+    boxsize = staticarray.fill(boxsize, ndim, dtype=rdtype)
     toret = dict()
     if meshsize is None:
         if cellsize is not None:
-            cellsize = staticarray.fill(cellsize, ndim, dtype=dtype)
+            cellsize = staticarray.fill(cellsize, ndim, dtype=rdtype)
             meshsize = np.ceil(boxsize / cellsize).astype('i4')
             sharding_mesh = get_sharding_mesh()
             if sharding_mesh.axis_names:
@@ -1204,7 +1210,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
     else:
         meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
         toret['meshsize'] = meshsize
-    boxcenter = staticarray.fill(boxcenter, ndim, dtype=dtype)
+    boxcenter = staticarray.fill(boxcenter, ndim, dtype=rdtype)
     toret = dict(boxsize=boxsize, boxcenter=boxcenter) | toret
     return MeshAttrs(**{name: staticarray(value) for name, value in toret.items()}, dtype=dtype, **kwargs)
 
@@ -1221,6 +1227,19 @@ def get_common_mesh_attrs(*particles, **kwargs):
     """Get common mesh attributes for multiple :class:`ParticleField`."""
     attrs = _get_common_mesh_cache_attrs(*[p._cache_attrs for p in particles], **kwargs)
     return get_mesh_attrs(*[p.positions for p in particles], **attrs)
+
+
+@default_sharding_mesh
+@partial(jax.jit, static_argnames=['axis', 'sharding_mesh'])
+def _local_concatenate(arrays, axis=0, sharding_mesh: jax.sharding.Mesh=None):
+
+    def f(arrays):
+        return jnp.concatenate(arrays, axis=axis)
+
+    if sharding_mesh.axis_names:
+        f = shard_map(f, mesh=sharding_mesh, in_specs=P(sharding_mesh.axis_names), out_specs=P(sharding_mesh.axis_names))
+
+    return f(arrays)
 
 
 # Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
@@ -1296,7 +1315,7 @@ class ParticleField(object):
         return tuple(other.clone(**attrs) for other in others)
 
     @classmethod
-    def concatenate(cls, others, weights=None, **kwargs):
+    def concatenate(cls, others, weights=None, local=False, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
             weights = [1] * len(weights)
@@ -1310,7 +1329,9 @@ class ParticleField(object):
             gather['weights'].append(factor * other.weights)
         cache_attrs = _get_common_mesh_cache_attrs(*[other._cache_attrs for other in others], **kwargs)
         for name, value in gather.items():
-            gather[name] = jnp.concatenate(value, axis=0)
+            if local: value = _local_concatenate(value, axis=0)
+            else: value = jnp.concatenate(value, axis=0)
+            gather[name] = value
         return cls(**gather, **cache_attrs)
 
     def __add__(self, other):
@@ -1373,8 +1394,8 @@ class ParticleField(object):
         with_sharding = bool(sharding_mesh.axis_names)
         positions, weights = self.positions, self.weights
         if with_sharding and pexchange:
-            exchange = exchange_particles(attrs, positions)
-            positions, weights = exchange(positions=positions, weights=weights)
+            positions, exchange = exchange_particles(attrs, positions)
+            weights = exchange(weights)
         return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
 
 
@@ -1400,21 +1421,33 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
     else:
         kernel_compensate = compensate
 
+    _paint = resampler.paint
+    if with_sharding:
+        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))
+
     def ppaint(positions):
         mesh = attrs.create(kind='real', fill=0.)
         value = mesh.value
         w = None
         if weights is not None:
             w = weights.astype(value.dtype)
+        positions = positions % attrs.meshsize
         if with_sharding:
             kw_sharding = dict(halo_size=resampler.order + interlacing, sharding_mesh=sharding_mesh)
+            #print(value.shape)
             value, offset = pad_halo(value, **kw_sharding)
+            #print('padded', value.shape, offset)
             positions = positions + offset
-            value = shard_map(resampler.paint, in_specs=(P(*sharding_mesh.axis_names),) * 3, out_specs=P(*sharding_mesh.axis_names))(value, positions, w)
+            #print(positions.min(axis=0), positions.max(axis=0), value.shape)
+            value = _paint(value, positions, w)
+            #hs = kw_sharding['halo_size']
+            #print(value[:2 * hs].std(), value[-2 * hs:].std(), value[:, :2 * hs].std(), value[:, -2 * hs:].std())
             value = exchange_halo(value, **kw_sharding)
+            #print('exchanged', value[:2 * hs].std(), value[-2 * hs:].std(), value[:, :2 * hs].std(), value[:, -2 * hs:].std())
             value = unpad_halo(value, **kw_sharding)
+            #print('unpadded', value.shape)
         else:
-            value = resampler.paint(value, positions, w)
+            value = _paint(value, positions, w)
         return mesh.clone(value=value)
 
     toret = ppaint(positions)
@@ -1468,13 +1501,14 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
     shape = np.broadcast_shapes(*[xx.shape for xx in coords])
 
     def get_nonsingular(zvec):
-        nonsingular = jnp.ones(shard_shape(shape, sharding_mesh=sharding_mesh), dtype='i4')
+        nonsingular = jnp.ones(shape, dtype='i4')
         # Get the indices that have positive freq along symmetry axis = -1
         nonsingular += zvec > 0.
         return nonsingular.ravel()
 
     if sharding_mesh.axis_names:
-        get_nonsingular = shard_map(get_nonsingular, sharding_mesh,
+        shape = jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names)).shard_shape(shape)
+        get_nonsingular = shard_map(get_nonsingular, mesh=sharding_mesh,
                                     in_specs=P(*[axis if coords[-1].shape[iaxis] else None for iaxis, axis in enumerate(sharding_mesh.axis_names)]),
                                     out_specs=P(sharding_mesh.axis_names))
     return get_nonsingular(coords[-1])

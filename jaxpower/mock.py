@@ -6,7 +6,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles
+from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
 from .power import _get_los_vector, legendre, get_real_Ylm
 from .utils import BinnedStatistic
 
@@ -19,7 +19,7 @@ def generate_gaussian_mesh(attrs, power: Callable, seed: int=42,
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    mesh = attrs.create(kind='real', fill=partial(random.normal, seed)).r2c()
+    mesh = attrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=attrs.meshsize)).r2c()
 
     def kernel(value, kvec):
         ker = jnp.sqrt(power(kvec) / mesh.cellsize.prod())
@@ -49,7 +49,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         seed = random.key(seed)
 
     def generate_normal(seed):
-        mesh = attrs.create(kind='real', fill=partial(random.normal, seed)).r2c()
+        mesh = attrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=attrs.meshsize)).r2c()
         if unitary_amplitude:
             mesh *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
         return mesh
@@ -141,7 +141,6 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         return mesh
 
 
-
 def generate_uniform_particles(attrs, size, seed: int=42):
 
     """Generate :class:`ParticleField` in input box."""
@@ -149,9 +148,9 @@ def generate_uniform_particles(attrs, size, seed: int=42):
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    from jax import sharding
-    from jax.sharding import PartitionSpec as P
+    def sample(key, shape):
+        return attrs.boxsize * random.uniform(seed, shape + (len(attrs.boxsize),), dtype=attrs.dtype) - attrs.boxsize / 2. + attrs.boxcenter
 
-    positions = attrs.boxsize * random.uniform(seed, (size, len(attrs.boxsize)), sharding=sharding.NamedSharding(attrs.sharding_mesh, P(attrs.sharding_mesh.axis_names))) - attrs.boxsize / 2. + attrs.boxcenter
-    positions = exchange_particles(attrs, positions=positions, return_inverse=False)(positions)
+    positions = create_sharded_random(sample, seed, shape=size, out_specs=0)
+    positions = exchange_particles(attrs, positions=positions, return_inverse=False)[0]
     return ParticleField(positions, attrs=attrs)
