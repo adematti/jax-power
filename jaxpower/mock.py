@@ -55,7 +55,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         return mesh
 
     kvec = attrs.kcoords(sparse=True)
-    knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).ravel()
+    knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
     kshape = np.broadcast_shapes(*(kk.shape for kk in kvec))
 
     is_callable = all(callable(pole) for pole in poles.values())
@@ -130,9 +130,9 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         mesh = generate_normal(seed)
 
         def kernel(value, kvec):
-            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)).ravel() / jnp.where(knorm == 0., 1., knorm)
+            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
             ker = sum(get_theory(ell) / attrs.cellsize.prod() * legendre(ell)(mu) for ell in ells)
-            ker = jnp.sqrt(ker).reshape(value.shape)
+            ker = jnp.sqrt(ker)
             if unitary_amplitude:
                 ker *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(value)
             return value * ker

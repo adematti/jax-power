@@ -389,13 +389,15 @@ def compute_power_spectrum():
         #data = ParticleField(**load(kind='data'), attrs=attrs)
         #randoms = ParticleField(**load(kind='randoms'), attrs=attrs)
         #print(data.weights.min(), data.weights.max())
+        #jax.debug.inspect_array_sharding(data.positions, callback=print)
         fkp = FKPField(data, randoms)
         #fkp = FKPField.same_mesh(fkp)[0]
         mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
         #t0 = time.time()
         #for i in range(3): jax.block_until_ready(fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real'))
         #print(time.time() - t0)
-        #jax.block_until_ready(mesh)
+        #jax.block_until_ready(mesh.value)
+        jax.debug.inspect_array_sharding(mesh.value, callback=print)
         #mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
         #mesh = RealMeshField.load(get_mock_fn(kind='mesh'))
         #mesh = mesh.clone(value=jax.device_put(mesh.value, jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names))))
@@ -415,6 +417,7 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
     import warnings
     warnings.simplefilter("error")
+    #print(jax.devices())
     #save_reference_mock()
     # Setting up distributed jax
     jax.distributed.initialize()

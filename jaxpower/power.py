@@ -343,24 +343,29 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
         if swap: meshs = meshs[::-1]
 
-        A0 = _2c(meshs[0] if autocorr else meshs[1])
+        rmesh1 = meshs[0]
+        A0 = _2c(rmesh1 if autocorr else meshs[1])
+        del meshs
         bin = BinAttrs(A0, edges=edges, mode_oversampling=mode_oversampling)
 
         power, power_zero = [], []
         if 0 in ells:
-            Aell = A0 if autocorr else _2c(meshs[1])
-            Aell = Aell.conj() * A0
+            if autocorr:
+                Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
+            else:
+                Aell = _2c(rmesh1) * A0.conj()
             power.append(bin(Aell, antisymmetric=False))
             power_zero.append(_get_power_zero(Aell))
+            del Aell
 
         if nonzeroells:
-
-            rmesh1 = _2r(meshs[0])
+            rmesh1 = _2r(rmesh1)
             # The real-space grid
             xvec = rmesh1.coords(sparse=True)
             # The Fourier-space grid
             kvec = A0.coords(sparse=True)
             Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in nonzeroells}
+            sharding_mesh = rmesh1.attrs.sharding_mesh
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
@@ -369,6 +374,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
 
             for ell in nonzeroells:
                 Ylm = Ylms[ell]
+                #jax.debug.inspect_array_sharding(jnp.zeros_like(A0.value), callback=print)
                 Aell = jax.lax.scan(partial(f, Ylm), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0].conj() * A0
                 #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell]).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
@@ -387,24 +393,27 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
         for imesh, mesh in enumerate(meshs):
             meshs[imesh] = _2c(mesh)
         if autocorr:
-            meshs.append(meshs[0])
-
-        Aell = meshs[0] * meshs[1].conj()
+            Aell = meshs[0].clone(value=meshs[0].real**2 + meshs[0].imag**2)  # saves a bit of memory
+        else:
+            Aell = meshs[0] * meshs[1].conj()
         del meshs
+
+        nonzeroells = ells
+        if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
         bin = BinAttrs(Aell, edges=edges, mode_oversampling=mode_oversampling)
-        kvec = Aell.coords(sparse=True)
-        knorm = jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * kvec[0].ndim].set(1.)
-        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / knorm
-        del knorm
+
         power, power_zero = [], []
-        for ell in ells:
-            leg = legendre(ell)(mu)
-            odd = ell % 2
-            if odd: leg += legendre(ell)(-mu)
-            power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg))
-            power_zero.append(0.)
-            if ell == 0:
-                power_zero[-1] += _get_power_zero(Aell)
+        if 0 in ells:
+            power.append(bin(Aell, antisymmetric=False))
+            power_zero.append(_get_power_zero(Aell))
+
+        if nonzeroells:
+            kvec = Aell.coords(sparse=True)
+            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * kvec[0].ndim].set(1.)
+            for ell in nonzeroells:  # TODO: jax.lax.scan
+                power.append((2 * ell + 1) * bin(Aell * legendre(ell)(mu), antisymmetric=bool(ell % 2)))
+                power_zero.append(0.)
+
         power, power_zero = jnp.array(power), jnp.array(power_zero)
         return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=edges, ells=ells, norm=norm,
                                        power_zero_nonorm=power_zero, attrs=attrs)

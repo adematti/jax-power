@@ -50,9 +50,10 @@ class staticarray(np.ndarray):
     def __eq__(self, other):
         if isinstance(other, numbers.Number) and not self.shape:
             return self.view(np.ndarray) == other
-        if not isinstance(other, np.ndarray):
+        try:
+            return np.all(self.view(np.ndarray) == np.asarray(other))
+        except ValueError:
             return False
-        return other.shape == self.shape and np.all(self.view(np.ndarray) == np.asarray(other))
 
     @classmethod
     def fill(cls, fill: float | np.ndarray, shape: int | tuple, **kwargs):
@@ -309,14 +310,15 @@ def make_particles_from_local(positions, weights=None, sharding_mesh: jax.shardi
         if per_host_weights is None:
             return per_host_positions
         return per_host_positions, per_host_weights
-
-    sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
-    per_host_size = np.repeat(per_host_positions.shape[0], sharding_mesh.devices.size)
-    sizes = jax.make_array_from_process_local_data(sharding, per_host_size)
     nlocal = len(jax.local_devices())
+    sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+    per_host_size = np.repeat(per_host_positions.shape[0], nlocal)
+    sizes = jax.make_array_from_process_local_data(sharding, per_host_size)
+    per_host_sum = np.repeat(per_host_positions.sum(axis=0, keepdims=True), nlocal, axis=0)
+    mean = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0) / sizes.sum()
     max_size = (sizes.max().item() + nlocal - 1) // nlocal * nlocal
     pad_width = [(0, max_size - per_host_positions.shape[0])] + [(0, 0)] * (per_host_positions.ndim - 1)
-    per_host_positions = np.pad(per_host_positions, pad_width=pad_width)
+    per_host_positions = np.append(per_host_positions, np.repeat(mean[None, :], pad_width[0][1], axis=0), axis=0)
     positions = jax.make_array_from_process_local_data(sharding, per_host_positions)#, global_shape=(global_size,) + per_host_positions.shape[-1:])
     if per_host_weights is None:
         return positions
@@ -452,8 +454,14 @@ def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, s
     shifts = jnp.meshgrid(*[np.arange(s) * attrs.boxsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
     shifts = jnp.stack(shifts, axis=-1).reshape(-1, len(shifts))
 
-    positions = jax.jit(lambda positions, idx: positions - shifts[idx], out_shardings=sharding)(positions, idx_out_devices)
-    positions = exchange_array(positions, idx_out_devices, pad=partial(jnp.pad, mode='edge'), return_indices=return_inverse)
+    mean = positions.mean(axis=0)
+    pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, :], pad_width[0][1], axis=0), axis=0)
+    positions = exchange_array(positions, idx_out_devices, pad=pad, return_indices=return_inverse)
+
+    def f(positions, idevice):
+        return positions - shifts[idevice[0]]
+
+    positions = shard_map(f, mesh=sharding_mesh, in_specs=(sharding.spec, sharding.spec), out_specs=sharding.spec)(positions, jnp.arange(size_devices))
 
     def exchange(values, pad=0.):
         return exchange_array(values, idx_out_devices, pad=pad, return_indices=False)
@@ -641,6 +649,7 @@ class MeshAttrs(object):
     def r2c(self, value):
         """FFT, from real to complex."""
         if self.fft_engine == 'jaxdecomp':
+            value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
             value = jaxdecomp.fft.pfft3d(value)
         else:
             if self.hermitian:
@@ -652,6 +661,7 @@ class MeshAttrs(object):
     def c2r(self, value):
         """FFT, from complex to real."""
         if self.fft_engine == 'jaxdecomp':
+            value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
             value = jaxdecomp.fft.pifft3d(value)
             if jnp.issubdtype(self.dtype, jnp.floating):
                 value = value.real.astype(self.dtype)
@@ -1173,8 +1183,8 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if not nonempty_positions:
             raise ValueError('<= 1 particles found; cannot infer boxsize')
         axis = tuple(range(len(nonempty_positions[0].shape[:-1])))
-        pos_min = min(jax.tree.map(partial(jnp.min, axis=axis), nonempty_positions))
-        pos_max = max(jax.tree.map(partial(jnp.max, axis=axis), nonempty_positions))
+        pos_min = jnp.array([jnp.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
+        pos_max = jnp.array([jnp.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
         delta = jnp.abs(pos_max - pos_min)
         if boxcenter is None: boxcenter = 0.5 * (pos_min + pos_max)
         if boxsize is None:
@@ -1199,9 +1209,13 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if cellsize is not None:
             cellsize = staticarray.fill(cellsize, ndim, dtype=rdtype)
             meshsize = np.ceil(boxsize / cellsize).astype('i4')
-            sharding_mesh = get_sharding_mesh()
             if sharding_mesh.axis_names:
-                shape_devices = staticarray(sharding_mesh.devices.shape + (1,) * (meshsize.ndim - sharding_mesh.devices.ndim))
+                same = np.all(meshsize.view(np.ndarray) == meshsize[0])
+                if same:
+                    # FIXME
+                    shape_devices = max(sharding_mesh.devices.shape)
+                else:
+                    shape_devices = staticarray(sharding_mesh.devices.shape + (1,) * (ndim - sharding_mesh.devices.ndim))
                 meshsize = (meshsize + shape_devices - 1) // shape_devices * shape_devices  # to make it a multiple of devices
             toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
@@ -1338,13 +1352,13 @@ class ParticleField(object):
         if isinstance(other, ParticleField):
             return self.concatenate([self, other], [1, 1])
         else:
-            raise RuntimeError("Type of `other` not understood.")
+            raise RuntimeError(f"Type of `other` {type(other)} not understood.")
 
     def __sub__(self, other):
         if isinstance(other, ParticleField):
             return self.concatenate([self, other], [1, -1])
         else:
-            raise RuntimeError("Type of `other` not understood.")
+            raise RuntimeError(f"Type of `other` {type(other)} not understood.")
 
     def __mul__(self, other):
         return self.concatenate([self], [other])
@@ -1450,30 +1464,25 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
             value = _paint(value, positions, w)
         return mesh.clone(value=value)
 
-    toret = ppaint(positions)
-    if interlacing > 1:
-        toret = toret.r2c()
-        for shift in shifts[1:]: # remove 0 shift, already computed
-
-            # convention is F(k) = \sum_{r} e^{-ikr} F(r)
-            # shifting by "shift * cellsize" we compute F(k) = \sum_{r} e^{-ikr} F(r - shift * cellsize)
-            # i.e. F(k) = e^{- i shift * kc} e^{-ikr} F(r)
-            # Hence compensation below
-
+    if interlacing <= 1:
+        toret = ppaint(positions)
+        if kernel_compensate is not None:
+            toret = toret.r2c().apply(kernel_compensate)
+            if out == 'real': toret = toret.c2r()
+        elif out != 'real': toret = toret.r2c()
+    else:
+        @jax.checkpoint
+        def f(carry, shift):
             def kernel_shift(value, kvec):
                 kvec = sum(kvec)
-                return value * jnp.exp(shift * 1j * kvec)
+                return value * jnp.exp(shift * 1j * kvec) / interlacing
 
-            toret += ppaint(positions + shift).r2c().apply(kernel_shift, kind='circular')
+            carry += ppaint(positions + shift).r2c().apply(kernel_shift, kind='circular')
+            return carry, shift
+        toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=shifts)[0]
         if kernel_compensate is not None:
             toret = toret.apply(kernel_compensate)
-        toret /= interlacing
         if out == 'real': toret = toret.c2r()
-    elif kernel_compensate is not None:
-        toret = toret.r2c().apply(kernel_compensate)
-        if out == 'real': toret = toret.c2r()
-    else:
-        if out != 'real': toret = toret.r2c()
     return toret
 
 
@@ -1515,15 +1524,17 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('sharding_mesh',))
-def _get_bin_attrs(coords, edges: np.ndarray, weights: None | jax.Array=None, sharding_mesh=None):
+@partial(jax.jit, static_argnames=('edges', 'linear', 'sharding_mesh'))  # linear saves memory
+def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, linear: bool=False, sharding_mesh=None):
 
     def _get_attrs(coords, edges, weights):
         r"""Return bin index, binned number of modes and coordinates."""
         coords = coords.ravel()
-        ibin = jnp.digitize(coords, edges, right=False)
-        nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+        if linear: ibin = jnp.clip(jnp.floor((coords - edges[0]) / (edges[1] - edges[0])).astype('i4') + 1, 0, len(edges))
+        else: ibin = jnp.digitize(coords, edges, right=False)
         x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+        del coords
+        nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
         return ibin, nmodes, x
 
     get_attrs = _get_attrs
@@ -1606,13 +1617,17 @@ class BinAttrs(object):
             if step is None:
                 edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
             else:
-                edges = jnp.arange(edges.get('min', 0.), edges.get('max', vec0 * mattrs.meshsize / 2.), step)
+                edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * mattrs.meshsize / 2.), step)
         import itertools
-        shifts = [np.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
+        shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
         shifts = list(itertools.product(*shifts))
         ibin, nmodes, xsum = [], 0, 0
+        edges = staticarray(edges)
+        linear = np.allclose(edges, np.linspace(edges[0], edges[-1], len(edges)), atol=1e-8, rtol=1e-8)
         for shift in shifts:
-            bin = _get_bin_attrs(jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift))), edges, wmodes)
+            coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
+            bin = _get_bin_attrs(coords, edges, wmodes, linear=linear)
+            del coords
             ibin.append(bin[0])
             nmodes += bin[1]
             xsum += bin[2]
