@@ -649,7 +649,7 @@ class MeshAttrs(object):
     def r2c(self, value):
         """FFT, from real to complex."""
         if self.fft_engine == 'jaxdecomp':
-            value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
+            if self.sharding_mesh.axis_names: value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
             value = jaxdecomp.fft.pfft3d(value)
         else:
             if self.hermitian:
@@ -661,7 +661,7 @@ class MeshAttrs(object):
     def c2r(self, value):
         """FFT, from complex to real."""
         if self.fft_engine == 'jaxdecomp':
-            value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
+            if self.sharding_mesh.axis_names: value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
             value = jaxdecomp.fft.pifft3d(value)
             if jnp.issubdtype(self.dtype, jnp.floating):
                 value = value.real.astype(self.dtype)
@@ -1420,7 +1420,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
     resampler = getattr(resamplers, resampler, resampler)
     interlacing = max(interlacing, 1)
-    shifts = np.arange(interlacing) * 1. / interlacing
+    shifts = jnp.arange(interlacing) * 1. / interlacing
 
     sharding_mesh = attrs.sharding_mesh
     with_sharding = bool(sharding_mesh.axis_names)
@@ -1479,7 +1479,10 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
             carry += ppaint(positions + shift).r2c().apply(kernel_shift, kind='circular')
             return carry, shift
+
         toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=shifts)[0]
+        #toret = attrs.create(kind='complex', fill=0.)
+        #for shift in shifts: toret, _ = f(toret, shift)
         if kernel_compensate is not None:
             toret = toret.apply(kernel_compensate)
         if out == 'real': toret = toret.c2r()

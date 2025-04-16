@@ -7,7 +7,7 @@ import jax
 from jax import numpy as jnp
 
 from mockfactory import Catalog
-from jaxpower import (compute_mesh_power, ParticleField, FKPField, compute_fkp_power, MeshAttrs, BinAttrs, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, setup_logging)
+from jaxpower import (compute_mesh_power, ParticleField, FKPField, compute_fkp_power, MeshAttrs, BinAttrs, compute_fkp_normalization_and_shotnoise, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, setup_logging)
 
 
 def get_clustering_positions_weights(catalog, zrange=None):
@@ -23,7 +23,7 @@ def get_clustering_positions_weights(catalog, zrange=None):
     return np.column_stack([catalog['RA'][mask], catalog['DEC'][mask], dist]), np.asarray(weight[mask])
 
 
-def get_data_fn(kind='data'):
+def get_data_fn(kind='power'):
     base_dir = Path('_tests')
     return base_dir / '{}.npy'.format(kind)
 
@@ -35,21 +35,22 @@ def compute_power_spectrum(data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     with create_sharding_mesh() as sharding_mesh:
         #get_clustering_positions_weights(data, zrange=zrange)
         #get_clustering_positions_weights(randoms, zrange=zrange)
-        data = get_clustering_positions_weights(data, zrange=zrange))
-        randoms = get_clustering_positions_weights(randoms, zrange=zrange))
+        data = get_clustering_positions_weights(data, zrange=zrange)
+        randoms = get_clustering_positions_weights(randoms, zrange=zrange)
         print('read', time.time() - t0)
-        data = ParticleField(*make_particles_from_local(*data, **attrs)
-        randoms = ParticleField(*make_particles_from_local(*randoms, **attrs)
+        data = ParticleField(*make_particles_from_local(*data), **attrs)
+        randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
         fkp = FKPField(data, randoms)
         jax.block_until_ready(fkp.randoms.sum())
         print('field', time.time() - t0)
+        norm, shotnoise_nonorm = compute_fkp_normalization_and_shotnoise(fkp)
         mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
         del fkp
         jax.block_until_ready(mesh.std())
         print('painting', time.time() - t0)
         compute = partial(compute_mesh_power, edges={'step': 0.001}, ells=(0, 2, 4), los='firstpoint')
         compute = jax.jit(compute)
-        mesh_power = compute(mesh)
+        mesh_power = compute(mesh).clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
         #power = compute_fkp_power(fkp, resampler='tsc', interlacing=3, edges={'step': 0.001}, ells=(0, 2, 4), los='firstpoint')
         #power.save(get_data_fn(kind='power'))
         jax.block_until_ready(mesh_power)
@@ -101,7 +102,7 @@ if __name__ == '__main__':
     tracer = 'LRG'
     region = 'NGC'
     data_fn = catalog_dir / f'{tracer}_{region}_clustering.dat.fits'
-    all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)]
+    all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(2)]
 
     jax.distributed.initialize()
     setup_logging()

@@ -369,17 +369,18 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
-                carry += _2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
+                carry += _2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)).conj() * jax.lax.switch(im, Ylm, *kvec)
                 return carry, im
 
             for ell in nonzeroells:
                 Ylm = Ylms[ell]
                 #jax.debug.inspect_array_sharding(jnp.zeros_like(A0.value), callback=print)
-                Aell = jax.lax.scan(partial(f, Ylm), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0].conj() * A0
+                Aell = jax.lax.scan(partial(f, Ylm), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=np.arange(len(Ylm)))[0] * A0
                 #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms[ell]).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 power.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
                 power_zero.append(4. * jnp.pi * 0.)
+                del Aell
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
         power, power_zero = jnp.array(power), jnp.array(power_zero)
@@ -461,7 +462,7 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
     Input particles are considered uncorrelated.
     """
     meshs, particles = [], []
-    attrs = {}
+    attrs = dict(kwargs)
     for inp in inputs:
         if isinstance(inp, RealMeshField):
             meshs.append(inp)
@@ -475,6 +476,34 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
     for particle in particles:
         normalization *= particle.paint(resampler=resampler, interlacing=1, compensate=False)
     return normalization.sum() / normalization.cellsize.prod()
+
+
+def compute_fkp_normalization_and_shotnoise(*fkps, statistic='power', cellsize=10.):
+    # TODO: generalize to N fkp fields
+    fkps = FKPField.same_mesh(*fkps)
+    if statistic in ['power', 'power_spectrum']:
+        # This is the pypower normalization - move to new one?
+        if len(fkps) > 1:
+            shotnoise = 0.
+            randoms = [fkps[0].data, fkps[1].randoms]
+            alpha2 = fkps[1].data.sum() / fkps[1].randoms.sum()
+            norm = alpha2 * compute_normalization(*randoms, cellsize=cellsize)
+            randoms = [fkps[1].data, fkps[0].randoms]
+            alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
+            norm += alpha2 * compute_normalization(*randoms, cellsize=cellsize)
+            norm = norm / 2
+        else:
+            fkp = fkps[0]
+            alpha = fkp.data.sum() / fkp.randoms.sum()
+            shotnoise = jnp.sum(fkp.data.weights**2) + alpha**2 * jnp.sum(fkp.randoms.weights**2)
+            randoms = [fkp.data, fkp.randoms]
+            #mask = random.uniform(random.key(42), shape=fkp.randoms.size) < 0.5
+            #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
+            #randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
+            norm = alpha * compute_normalization(*randoms, cellsize=cellsize)
+    else:
+        raise NotImplementedError
+    return norm, shotnoise
 
 
 def compute_fkp_power(*fkps: FKPField, edges: np.ndarray | dict | None=None,
@@ -522,29 +551,8 @@ def compute_fkp_power(*fkps: FKPField, edges: np.ndarray | dict | None=None,
     power : PowerSpectrumMultipoles
     """
     fkps = FKPField.same_mesh(*fkps)
-    meshs = [fkp.paint(resampler=resampler, interlacing=interlacing, compensate=True, out='complex') for fkp in fkps]
-    cellsize = 10.  # for normalization
-    # This is the pypower normalization - move to new one?
-    # TODO: generalize to N fkp fields
-    if len(fkps) > 1:
-        shotnoise = 0.
-        randoms = [fkps[0].data, fkps[1].randoms]
-        alpha2 = fkps[1].data.sum() / fkps[1].randoms.sum()
-        norm = alpha2 * compute_normalization(*randoms, cellsize=cellsize)
-        randoms = [fkps[1].data, fkps[0].randoms]
-        alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
-        norm += alpha2 * compute_normalization(*randoms, cellsize=cellsize)
-        norm = norm / 2
-    else:
-        fkp = fkps[0]
-        alpha = fkp.data.sum() / fkp.randoms.sum()
-        shotnoise = jnp.sum(fkp.data.weights**2) + alpha**2 * jnp.sum(fkp.randoms.weights**2)
-        randoms = [fkp.data, fkp.randoms]
-        #mask = random.uniform(random.key(42), shape=fkp.randoms.size) < 0.5
-        #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
-        #randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
-        norm = alpha * compute_normalization(*randoms, cellsize=cellsize)
-    return compute_mesh_power(*meshs, edges=edges, ells=ells, los=los, mode_oversampling=mode_oversampling).clone(norm=norm, shotnoise_nonorm=shotnoise)
+    norm, shotnoise_nonorm = compute_fkp_normalization_and_shotnoise(*fkps, statistic='power')
+    return compute_mesh_power(*[fkp.paint(resampler=resampler, interlacing=interlacing, compensate=True, out='complex') for fkp in fkps], edges=edges, ells=ells, los=los, mode_oversampling=mode_oversampling).clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
 
 
 def compute_wide_angle_poles(poles: dict[Callable]):
