@@ -412,6 +412,55 @@ def compute_power_spectrum():
     #print(power.view().sum(), ref.view().sum(), diff, diff[~jnp.isnan(diff)].max())
 
 
+def test_scaling():
+
+    with create_sharding_mesh() as sharding_mesh:
+        from jaxpower import MeshAttrs, create_sharded_random
+        attrs = MeshAttrs(meshsize=600, boxsize=1000.)
+        mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
+
+        @jax.jit
+        def f(mesh):
+            return mesh.r2c()
+
+        jax.block_until_ready(f(mesh))
+        n = 15
+        t0 = time.time()
+        for i in range(n): jax.block_until_ready(f(mesh + 0.001))
+        print(time.time() - t0)
+
+
+def test_scaling2():
+    import jax
+    from jax.sharding import PartitionSpec as P
+    from jax.experimental import mesh_utils
+    from jax.experimental.shard_map import shard_map
+    import jaxdecomp
+
+    device_mesh_shape = (4, 4)
+    devices = mesh_utils.create_device_mesh(device_mesh_shape)
+
+    with jax.sharding.Mesh(devices, axis_names=('x', 'y')) as sharding_mesh:
+
+        def mesh_shard_shape(shape: tuple):
+            return tuple(s // pdim for s, pdim in zip(shape, sharding_mesh.devices.shape)) + shape[sharding_mesh.devices.ndim:]
+
+        shape = (512,) * 3
+        key = jax.random.key(43)
+        value = shard_map(partial(jax.random.normal, shape=mesh_shard_shape(shape), dtype='float32'), sharding_mesh, in_specs=P(), out_specs=P('x', 'y'))(key)  # yapf: disable
+
+        @jax.jit
+        def f(value):
+            jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(sharding_mesh, spec=P('x', 'y')))
+            return jaxdecomp.fft.pfft3d(value)
+
+        jax.block_until_ready(f(value))
+        n = 15
+        t0 = time.time()
+        for i in range(n): jax.block_until_ready(f(value + 0.001))
+        print(time.time() - t0)
+
+
 if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
@@ -427,6 +476,7 @@ if __name__ == '__main__':
     #test_mesh_power()
     #test_sharding()
     #test_mem()
-    compute_power_spectrum()
+    #compute_power_spectrum()
+    test_scaling2()
     # Closing distributed jax
     jax.distributed.shutdown()
