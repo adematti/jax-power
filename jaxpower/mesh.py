@@ -1285,9 +1285,11 @@ class ParticleField(object):
         if make_from == 'local':
             positions, weights = make_particles_from_local(positions, weights)
         assert '_cache_attrs' not in kwargs
-        _cache_attrs = dict(kwargs.pop('attrs', {}))
-        _cache_attrs.update({name: staticarray(value) if name in ['meshsize', 'boxsize', 'boxcenter'] and value is not None else value for name, value in kwargs.items()})
-        self.__dict__.update(positions=positions, weights=weights, _attrs=None, _cache_attrs=_cache_attrs)
+        _attrs = kwargs.pop('attrs', None)
+        if _attrs is not None:
+            _attrs = MeshAttrs(**_attrs)
+        _cache_attrs = {name: staticarray(value) if name in ['meshsize', 'boxsize', 'boxcenter'] and value is not None else value for name, value in kwargs.items()}
+        self.__dict__.update(positions=positions, weights=weights, _attrs=_attrs, _cache_attrs=_cache_attrs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -1297,6 +1299,7 @@ class ParticleField(object):
                 state[name] = kwargs.pop(name)
         state.pop('_attrs')
         attrs = state.pop('_cache_attrs')
+        attrs.update(kwargs.pop('attrs', {}))
         attrs.update(kwargs)
         state.update(attrs)
         return self.__class__(**state)
@@ -1330,7 +1333,9 @@ class ParticleField(object):
 
     @staticmethod
     def same_mesh(*others, **kwargs):
-        attrs = get_common_mesh_attrs(*others, **kwargs)
+        attrs = kwargs.pop('attrs', None)
+        if attrs is None:
+            attrs = get_common_mesh_attrs(*others, **kwargs)
         return tuple(other.clone(**attrs) for other in others)
 
     @classmethod
