@@ -131,7 +131,6 @@ def create_sharded_array(func, shape, out_specs=None, sharding_mesh=None):
         if out_specs is None:
             out_specs = P(*sharding_mesh.axis_names)
         if not isinstance(out_specs, P):
-            axis_names = []
             axis = out_specs
             if np.ndim(axis) == 0:
                 out_specs = P((None,) * axis + (sharding_mesh.axis_names,))
@@ -157,7 +156,6 @@ def create_sharded_random(func, key, shape, out_specs=None, sharding_mesh=None):
         if out_specs is None:
             out_specs = P(*sharding_mesh.axis_names)
         if not isinstance(out_specs, P):
-            axis_names = []
             axis = out_specs
             if np.ndim(axis) == 0:
                 out_specs = P((None,) * axis + (sharding_mesh.axis_names,))
@@ -404,7 +402,7 @@ def exchange_array(array, device, pad=jnp.nan, return_indices=False):
 
 def exchange_inverse(array, indices):
     # Reciprocal exchange
-    indices = per_host_indices, slices
+    per_host_indices, slices = indices
     sharding = array.sharding
     ndevices = sharding.num_devices
     per_host_arrays = [_.data for _ in array.addressable_shards]
@@ -655,6 +653,8 @@ class MeshAttrs(object):
                 value = jnp.fft.rfftn(value)
             else:
                 value = jnp.fft.fftn(value)
+        if value.dtype.itemsize != 2 * self.dtype.itemsize:
+            value = value.astype('c{:d}'.format(2 * self.dtype.itemsize))
         return value
 
     def c2r(self, value):
@@ -669,6 +669,12 @@ class MeshAttrs(object):
                 value = jnp.fft.irfftn(value, s=tuple(self.meshsize))
             else:
                 value = jnp.fft.ifftn(value)
+        if jnp.issubdtype(self.dtype, jnp.floating):
+            if value.dtype.itemsize != self.dtype.itemsize:
+                value = value.astype('f{:d}'.format(self.dtype.itemsize))
+        else:
+            if value.dtype.itemsize != 2 * self.dtype.itemsize:
+                value = value.astype('c{:d}'.format(2 * self.dtype.itemsize))
         return value
 
 
@@ -695,7 +701,7 @@ class BaseMeshField(object):
             if meshsize is None: meshsize = shape
             meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
             mattrs = MeshAttrs(meshsize=meshsize, **kwargs)
-        mattrs = mattrs.clone(dtype=value.dtype if mattrs.meshsize.prod(dtype='i8') == value.size else value.real.dtype)  # second option = hermitian
+        mattrs = mattrs.clone(dtype=value.real.dtype if 'complex' in self.__class__.__name__.lower() else value.dtype)  # second option = hermitian
         self.__dict__.update(value=value, attrs=mattrs)
 
     def tree_flatten(self):
@@ -767,7 +773,7 @@ def _set_property(base, name: str):
     setattr(base, name, property(lambda self: getattr(self.attrs, name)))
 
 
-for name in [field.name for field in fields(MeshAttrs)] + ['cellsize']:
+for name in ['meshsize', 'boxsize', 'boxcenter'] + ['cellsize']:
     _set_property(BaseMeshField, name)
 
 

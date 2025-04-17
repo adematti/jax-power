@@ -155,11 +155,25 @@ def test_timing():
     print(time.time() - t0)
 
 
+def test_dtype():
+    for dtype in ['f4', 'f8']:
+        attrs = MeshAttrs(boxsize=1000., meshsize=64, dtype=dtype)
+        mesh = attrs.create(kind='real', fill=0.)
+        assert mesh.value.dtype == mesh.dtype == attrs.dtype, (mesh.value.dtype, attrs.dtype)
+        mesh = mesh.r2c()
+        assert mesh.value.dtype.itemsize == 2 * attrs.dtype.itemsize, (mesh.value.dtype, attrs.dtype)
+        mesh = mesh.c2r()
+        assert mesh.value.dtype == mesh.dtype == attrs.dtype, (mesh.value.dtype, attrs.dtype)
+
+
+
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
 
+    test_dtype()
+    exit()
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
