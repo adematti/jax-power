@@ -929,12 +929,17 @@ def test_sympy():
 
 def test_mem():
 
-    from jaxpower import MeshAttrs, create_sharded_random
-    attrs = MeshAttrs(meshsize=450, boxsize=1000.)
-    mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
-    compute = partial(compute_mesh_power, edges={'step': 0.001}, ells=(0, 2, 4), los='firstpoint')
-    compute = jax.jit(compute)
-    mesh_power = compute(mesh)
+    from jaxpower import MeshAttrs, create_sharded_random, create_sharding_mesh
+    with create_sharding_mesh() as sharding_mesh:
+        attrs = MeshAttrs(meshsize=1600, boxsize=1000.)
+        #attrs = MeshAttrs(meshsize=850, boxsize=1000.)
+        mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
+        compute = partial(compute_mesh_power, edges={'step': 0.001}, ells=(0, 2, 4), los='firstpoint')
+        compute = jax.jit(compute)
+        t0 = time.time()
+        mesh_power = compute(mesh)
+        jax.block_until_ready(mesh_power)
+        print(time.time() - t0)
 
 
 if __name__ == '__main__':

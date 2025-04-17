@@ -41,6 +41,7 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     jax.block_until_ready(mesh)
     if jax.process_index() == 0: print(f'painting {time.time() - t0:.2f}')
+    del fkp
     t0 = time.time()
     power = jitted_compute_mesh_power(mesh).clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
     jax.block_until_ready(power)
@@ -61,8 +62,9 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
 if __name__ == '__main__':
     tracer = 'QSO'
     region = 'NGC'
-    cellsize, meshsize = 8., 1500 #1620
-    cellsize, meshsize = 20., 952
+    #cellsize, meshsize = 8., 1500 #1620
+    #cellsize, meshsize = 20., 952
+    cellsize, meshsize = 20., 750
     cutsky_args = dict(zrange=(0.8, 2.1), cellsize=cellsize, boxsize=cellsize * meshsize, boxcenter=(193.,  34.,  2806.))
     setup_logging()
     t0 = time.time()
@@ -77,10 +79,10 @@ if __name__ == '__main__':
         from jax import config
         config.update('jax_enable_x64', True)
         from jax import numpy as jnp
-        jax.distributed.initialize()
+        #jax.distributed.initialize()
         from jaxpower import compute_mesh_power, create_sharding_mesh
         jitted_compute_mesh_power = jax.jit(partial(compute_mesh_power, **poles_args))
-        #jitted_compute_mesh_power = partial(compute_mesh_power, **poles_args)
+        jitted_compute_mesh_power = partial(compute_mesh_power, **poles_args)
 
     for imock in range(5):
         catalog_dir = Path(f'/global/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
@@ -100,5 +102,4 @@ if __name__ == '__main__':
 
     print('Elapsed time: {:.2f}'.format(time.time() - t0))
 
-    if todo == 'jaxpower':
-        jax.distributed.shutdown()
+    if todo == 'jaxpower': jax.distributed.shutdown()

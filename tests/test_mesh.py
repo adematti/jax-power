@@ -139,6 +139,22 @@ def test_particle_field():
                 assert value.shape == tuple(particle.meshsize)
 
 
+def test_timing():
+    from jaxpower import generate_uniform_particles
+    size = int(1e8)
+    attrs = MeshAttrs(boxsize=1000., meshsize=512)
+    particles = generate_uniform_particles(attrs, size, seed=42)
+
+    kw = dict(resampler='tsc', interlacing=0, compensate=False, out='real')
+    value = particles.paint(**kw)
+    jax.block_until_ready(value)
+    t0 = time.time()
+    for i in range(10):
+        value = particles.clone(weights=particles.weights * 1.1).paint(**kw)
+        jax.block_until_ready(value)
+    print(time.time() - t0)
+
+
 if __name__ == '__main__':
 
     from jax import config

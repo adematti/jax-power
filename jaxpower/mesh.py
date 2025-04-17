@@ -432,7 +432,6 @@ def exchange_inverse(array, indices):
 
 @default_sharding_mesh
 def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, sharding_mesh=None):
-    sharding = positions.sharding
 
     if not len(sharding_mesh.axis_names):
 
@@ -461,7 +460,7 @@ def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, s
     def f(positions, idevice):
         return positions - shifts[idevice[0]]
 
-    positions = shard_map(f, mesh=sharding_mesh, in_specs=(sharding.spec, sharding.spec), out_specs=sharding.spec)(positions, jnp.arange(size_devices))
+    positions = shard_map(f, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
     def exchange(values, pad=0.):
         return exchange_array(values, idx_out_devices, pad=pad, return_indices=False)
