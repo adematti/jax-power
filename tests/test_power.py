@@ -927,6 +927,16 @@ def test_sympy():
         point(ell)
 
 
+def test_mem():
+
+    from jaxpower import MeshAttrs, create_sharded_random
+    attrs = MeshAttrs(meshsize=450, boxsize=1000.)
+    mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
+    compute = partial(compute_mesh_power, edges={'step': 0.001}, ells=(0, 2, 4), los='firstpoint')
+    compute = jax.jit(compute)
+    mesh_power = compute(mesh)
+
+
 if __name__ == '__main__':
 
     #test_window_timing()

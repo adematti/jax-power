@@ -365,7 +365,6 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
             # The Fourier-space grid
             kvec = A0.coords(sparse=True)
             Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in nonzeroells}
-            sharding_mesh = rmesh1.attrs.sharding_mesh
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):

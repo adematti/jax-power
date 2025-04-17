@@ -451,7 +451,7 @@ def test_scaling2():
 
         @jax.jit
         def f(value):
-            jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(sharding_mesh, spec=P('x', 'y')))
+            value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(sharding_mesh, spec=P('x', 'y')))
             return jaxdecomp.fft.pfft3d(value)
 
         jax.block_until_ready(f(value))
@@ -459,6 +459,7 @@ def test_scaling2():
         t0 = time.time()
         for i in range(n): jax.block_until_ready(f(value + 0.001))
         print(time.time() - t0)
+
 
 
 if __name__ == '__main__':
@@ -469,7 +470,7 @@ if __name__ == '__main__':
     #print(jax.devices())
     #save_reference_mock()
     # Setting up distributed jax
-    jax.distributed.initialize()
+    #jax.distributed.initialize()
     #test_halo()
     #test_exchange_array()
     #test_jaxdecomp()
@@ -477,6 +478,6 @@ if __name__ == '__main__':
     #test_sharding()
     #test_mem()
     #compute_power_spectrum()
-    test_scaling2()
+    #test_scaling2()
     # Closing distributed jax
-    jax.distributed.shutdown()
+    #jax.distributed.shutdown()
