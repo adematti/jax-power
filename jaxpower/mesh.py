@@ -27,6 +27,19 @@ def get_sharding_mesh():
     return mesh_lib.thread_resources.env.physical_mesh
 
 
+def _np_array_fill(fill: float | np.ndarray, shape: int | tuple, **kwargs):
+    fill = np.array(fill)
+    toret = np.empty_like(fill, shape=shape, **kwargs)
+    toret[...] = fill
+    return toret
+
+
+def _jnp_array_fill(fill: float | np.ndarray, shape: int | tuple, **kwargs):
+    fill = jnp.array(fill)
+    toret = jnp.empty_like(fill, shape=shape, **kwargs).at[...].set(fill)
+    return toret
+
+
 class staticarray(np.ndarray):
     """
     Class overriding a numpy array, so that it can be passed in ``meta_fields``.
@@ -61,10 +74,7 @@ class staticarray(np.ndarray):
         Create a :class:`staticarray` of shape ``shape``, filled with ``fill``,
         which can be a numpy array, as long as its shape is brodcastable with ``shape``.
         """
-        fill = np.array(fill)
-        toret = np.empty_like(fill, shape=shape, **kwargs)
-        toret[...] = fill
-        return cls(toret)
+        return cls(_np_array_fill(fill, shape, **kwargs))
 
 
 def _get_ndim(*args, default=3):
@@ -82,7 +92,7 @@ def create_sharding_mesh(meshsize=None, device_mesh_shape=None):
         if meshsize is None:
             meshsize = 0
         ndim = _get_ndim(meshsize, default=2)
-        meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
+        meshsize = _np_array_fill(meshsize, ndim, dtype='i4')
 
         def closest_divisors_to_sqrt(n):
             sqrt_n = int(np.sqrt(n))
@@ -227,7 +237,7 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
     freqs : tuple
     """
     ndim = len(shape)
-    spacing = staticarray.fill(spacing, ndim)
+    spacing = _jnp_array_fill(spacing, ndim)
 
     toret = []
     if kind == 'position':
@@ -443,7 +453,7 @@ def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, s
             return positions, exchange, inverse
         return positions, exchange
 
-    shape_devices = staticarray(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
+    shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     size_devices = shape_devices.prod(dtype='i4')
 
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
@@ -653,8 +663,12 @@ class MeshAttrs(object):
                 value = jnp.fft.rfftn(value)
             else:
                 value = jnp.fft.fftn(value)
-        if value.dtype.itemsize != 2 * self.dtype.itemsize:
-            value = value.astype('c{:d}'.format(2 * self.dtype.itemsize))
+        if jnp.issubdtype(self.dtype, jnp.floating):
+            if value.dtype.itemsize != 2 * self.dtype.itemsize:
+                value = value.astype('c{:d}'.format(2 * self.dtype.itemsize))
+        else:
+            if value.dtype.itemsize != self.dtype.itemsize:
+                value = value.astype('c{:d}'.format(self.dtype.itemsize))
         return value
 
     def c2r(self, value):
@@ -673,8 +687,8 @@ class MeshAttrs(object):
             if value.dtype.itemsize != self.dtype.itemsize:
                 value = value.astype('f{:d}'.format(self.dtype.itemsize))
         else:
-            if value.dtype.itemsize != 2 * self.dtype.itemsize:
-                value = value.astype('c{:d}'.format(2 * self.dtype.itemsize))
+            if value.dtype.itemsize != self.dtype.itemsize:
+                value = value.astype('c{:d}'.format(self.dtype.itemsize))
         return value
 
 
@@ -1220,7 +1234,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                     # FIXME
                     shape_devices = max(sharding_mesh.devices.shape)
                 else:
-                    shape_devices = staticarray(sharding_mesh.devices.shape + (1,) * (ndim - sharding_mesh.devices.ndim))
+                    shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (ndim - sharding_mesh.devices.ndim))
                 meshsize = (meshsize + shape_devices - 1) // shape_devices * shape_devices  # to make it a multiple of devices
             toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
@@ -1658,11 +1672,12 @@ class BinAttrs(object):
         return _bincount(self.ibin, value, weights=weights, length=len(self.xavg) + 2, antisymmetric=antisymmetric) / self.nmodes
 
     def tree_flatten(self):
-        return (asdict(self),), {}
+        return tuple(getattr(self, name) for name in self.__annotations__.keys()), {}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
+        new.__dict__.update(zip(cls.__annotations__.keys(), children))
         new.__dict__.update(aux_data)
         return new
 

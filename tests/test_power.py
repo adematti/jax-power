@@ -955,6 +955,8 @@ if __name__ == '__main__':
     #test_checkpoint()
     #test_power_to_correlation()
     #test_power_to_correlation2()
+    test_mesh_power(plot=False)
+    exit()
     test_binned_statistic()
     test_mesh_power(plot=False)
     test_fkp_power(plot=False)
