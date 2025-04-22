@@ -47,19 +47,26 @@ def test_binned_statistic():
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
     def mock(seed, los='x'):
-        mesh = generate_gaussian_mesh(MeshAttrs(boxsize=2000., meshsize=64), pkvec, seed=seed, unitary_amplitude=True)
-        return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+        mesh = generate_gaussian_mesh(MeshAttrs(boxsize=500., meshsize=64), pkvec, seed=seed, unitary_amplitude=True)
+        bin = BinAttrs(mesh.attrs, edges={'step': 0.01})
+        return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, bin=bin)
 
     power = mock(random.key(43), los='x')
     power.save(fn)
     power2 = BinnedStatistic.load(fn)
     assert np.allclose(power2.view(), power.view())
     assert type(power2) == PowerSpectrumMultipoles
-    power2.plot(show=True)
+    power2.plot(show=False)
     assert power.clone(norm=0.1).norm == 0.1
     power3 = power.clone(value=power.view())
     assert np.allclose(power3.view(), power.view())
     assert type(power3) == BinnedStatistic
+    power1 = power.select(xlim=(0., 0.05))
+    power2 = power.select(xlim=(0.05, 0.5))
+    powerc = power.concatenate((power1, power2))
+    assert np.allclose(powerc.view(), power.view())
+    powers = power.sum([power] * 5)
+    assert np.allclose(powers.view(), power.view())
 
 
 def test_mesh_power(plot=False):
@@ -74,27 +81,30 @@ def test_mesh_power(plot=False):
         return dirname / 'tmp_{}.npy'.format(los)
 
     list_los = ['x', 'endpoint']
+    attrs = MeshAttrs(meshsize=128, boxsize=1000.)
+    bin = BinAttrs(attrs, edges={'step': 0.01})
 
     @partial(jax.jit, static_argnames=['los', 'ells'])
-    def mock(seed, los='x', ells=(0, 2, 4)):
-        attrs = MeshAttrs(meshsize=128, boxsize=1000.)
+    def mock(attrs, bin, seed, los='x', ells=(0, 2, 4)):
         mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
-        return compute_mesh_power(mesh, ells=ells, los=los, edges={'step': 0.01})
+        return compute_mesh_power(mesh, ells=ells, los=los, bin=bin)
 
     for los in list_los:
 
         nmock = 5
         t0 = time.time()
-        power = mock(random.key(43), los=los)
+        power = mock(attrs, bin, random.key(43), los=los)
+        jax.block_until_ready(power)
         print(f'time for jit {time.time() - t0:.2f}')
         t0 = time.time()
         for i in range(nmock):
-            jax.block_until_ready(mock(random.key(i + 42), los=los))
+            power = mock(attrs, bin, random.key(i + 42), los=los)
+            jax.block_until_ready(power)
         print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         power.save(get_fn(los))
         # remove first few bins because of binning effects
         assert np.allclose(power.view(projs=0)[2:], pk(power.x(projs=0))[2:], rtol=1e-2)
-        power = mock(random.key(i + 42), los=los, ells=(4,))
+        power = mock(attrs, bin, random.key(i + 42), los=los, ells=(4,))
         assert tuple(power.projs) == (4,)
 
     if plot:
@@ -894,7 +904,16 @@ def test_wmatrix():
 
     value = np.bmat([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
     wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
-    wmatrix.plot(show=True)
+    wmatrix.plot(show=False)
+
+    wmatrix1 = wmatrix.select(axis='o', xlim=(0., 0.081))
+    wmatrix2 = wmatrix.select(axis='o', xlim=(0.081, 0.5))
+    wmatrixc = wmatrix.concatenate([wmatrix1, wmatrix2], axis='o')
+
+    assert np.allclose(wmatrixc._value, wmatrix._value)
+    wmatrixs = wmatrix.sum([wmatrix] * 3)
+    assert np.allclose(wmatrixs._value, wmatrix._value * 3)
+
     wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
     wmatrix2.plot(show=True)
     wmatrix3 = wmatrix.interp(observable2, axis='o', extrap=True)
@@ -942,6 +961,47 @@ def test_mem():
         print(time.time() - t0)
 
 
+def test_split():
+    from pathlib import Path
+
+    import numpy as np
+    from jax import numpy as jnp
+    from jax import random
+    from matplotlib import pyplot as plt
+
+    from cosmoprimo.fiducial import DESI
+    from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
+                        compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, BinAttrs, compute_mean_mesh_power, compute_mesh_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, compute_fkp_normalization_and_shotnoise)
+
+    attrs = MeshAttrs(meshsize=(64,) * 3, boxsize=1000., boxcenter=1200.)
+    size = int(1e-3 * attrs.boxsize.prod())
+    data = generate_uniform_particles(attrs, size + 1, seed=42)
+    randoms = generate_uniform_particles(attrs, 4 * size + 1, seed=43)
+
+    cosmo = DESI()
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=1.)
+
+    f, b = 0.8, 1.5
+    beta = f / b
+    kinedges = np.linspace(0.001, 0.7, 100)
+    kin = (kinedges[:-1] + kinedges[1:]) / 2.
+    ells = (0, 2, 4)
+    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
+                        8. / 35 * beta ** 2 * pk(kin)])
+    theory = BinnedStatistic(x=[kin] * len(ells), edges=[kinedges] * len(ells), value=poles, projs=ells)
+    mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=random.key(42), los='local', unitary_amplitude=True)
+    data = data.clone(weights=1. + mesh.read(data.positions))
+
+    fkp = FKPField(data, randoms, **attrs.clone(boxsize=2. * attrs.boxsize))  # x2 padding
+    from jaxpower.mesh import _paint
+    for split_fkp in fkp.split(nsplits=2):
+        t0 = time.time()
+        mesh = split_fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+        jax.block_until_ready(mesh)
+        print(f'cache {_paint._cache_size()} {time.time() - t0:.2f}')
+
+
 if __name__ == '__main__':
 
     #test_window_timing()
@@ -955,7 +1015,7 @@ if __name__ == '__main__':
     #test_checkpoint()
     #test_power_to_correlation()
     #test_power_to_correlation2()
-    test_mesh_power(plot=False)
+    test_split()
     exit()
     test_binned_statistic()
     test_mesh_power(plot=False)

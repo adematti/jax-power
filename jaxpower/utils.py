@@ -568,11 +568,12 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     _label_x = None
     _label_proj = None
     _label_value = None
-    _data_fields = ['_x', '_value', '_weights']
-    _meta_fields = ['_edges', '_projs', 'name', 'attrs']
+    _data_fields = ['_x', '_edges', '_value', '_weights']
+    _meta_fields = ['_projs', 'name', 'attrs']
     _rename_fields = {'_x': 'x', '_value': 'value', '_weights': 'weights', '_edges': 'edges', '_projs': 'projs'}
     _select_x_fields = ['_x', '_value', '_weights', '_edges']
     _select_proj_fields = ['_x', '_value', '_weights', '_edges', '_projs']
+    _sum_fields = ['_value']
 
     def __init__(self, x=None, edges=None, projs=None, value=None, weights=None, name=None, attrs=None):
         """
@@ -621,7 +622,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         nprojs = len(state['_projs'])
         if x is None:
             if edges is not None:
-                edges = [np.atleast_1d(xx) for xx in edges]
+                edges = [jnp.atleast_1d(xx) for xx in edges]
                 state['_x'] = [(edges[:-1] + edges[1:]) / 2. for edges in edges]
             else:
                 state['_x'] = [jnp.full(1, np.nan) for xx in range(nprojs)]
@@ -634,12 +635,12 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             for xx in state['_x']:
                 if len(xx) >= 2:
                     tmp = (xx[:-1] + xx[1:]) / 2.
-                    tmp = np.concatenate([[tmp[0] - (xx[1] - xx[0])], tmp, [tmp[-1] + (xx[-1] - xx[-2])]])
+                    tmp = jnp.concatenate([jnp.array([tmp[0] - (xx[1] - xx[0])]), tmp, jnp.array([tmp[-1] + (xx[-1] - xx[-2])])])
                 else:
-                    tmp = np.full(len(xx) + 1, np.nan)
+                    tmp = jnp.full(len(xx) + 1, np.nan)
                 state['_edges'].append(tmp)
         else:
-            state['_edges'] = [np.atleast_1d(xx) for xx in edges]
+            state['_edges'] = [jnp.atleast_1d(xx) for xx in edges]
         shape = tuple(len(xx) for xx in state['_x'])
         eshape = tuple(len(edges) - 1 for edges in state['_edges'])
         if eshape != shape:
@@ -685,6 +686,20 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         state.update(kwargs)
         return self.__class__(**state)
 
+    def copy(self):
+        import copy
+        new = self.__class__.__new__(self.__class__)
+        state = {}
+        for name in self._data_fields + self._meta_fields:
+            value = getattr(self, name)
+            if name in self._select_proj_fields:
+                value = tuple(copy.copy(xx) for xx in value)
+            else:
+                value = copy.copy(value)
+            state[name] = value
+        new.__dict__.update(state)
+        return new
+
     def __getstate__(self):
         state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields}
         state['__class__name__'] = self.__class__.__name__
@@ -719,12 +734,12 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         return cls.from_state(state)
 
     def tree_flatten(self):
-        return ({name: getattr(self, name) for name in self._data_fields},), {name: getattr(self, name) for name in self._meta_fields}
+        return tuple(getattr(self, name) for name in self._data_fields), {name: getattr(self, name) for name in self._meta_fields}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__setstate__(aux_data | children[0])
+        new.__setstate__(aux_data | {name: value for name, value in zip(cls._data_fields, children)})
         return new
 
     @property
@@ -735,6 +750,45 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     @property
     def value(self):
         return self._value
+
+    @classmethod
+    def sum(cls, others, weights=None):
+        if weights is None:
+            weights = [1] * len(others)
+        new = None
+        for other, weight in zip(others, weights):
+            if new is None:
+                new = other.copy()
+            else:
+                for name in new._sum_fields:
+                    value, other_value = getattr(new, name), getattr(other, name)
+                    if name in new._select_proj_fields:
+                        value = tuple(vv + weight * ov for vv, ov in zip(value, other_value))
+                    else:
+                        value = value + weight * other_value
+                    setattr(new, name, value)
+        return new
+
+    @classmethod
+    def concatenate(cls, others):
+        # No check performed
+        new = None
+        for other in others:
+            if new is None:
+                new = other.copy()
+                values = {name: [] for name in new._select_x_fields}
+            for name in values:
+                values[name].append(getattr(other, name))
+        for name in new._select_x_fields:
+            value = values[name]
+            if name in new._select_proj_fields:
+                if name == '_edges': indices = [slice(int(i > 0), None, 1) for i in range(len(value))]
+                else: indices = [slice(None)] * len(value)
+                value = tuple(jnp.concatenate([vv[iv][idx] for vv, idx in zip(value, indices)], axis=0) for iv in range(len(value[0])))
+            else:
+                value = jnp.concatenate(value, axis=0)
+            setattr(new, name, value)
+        return new
 
     def _slice_xmatch(self, x, projs=Ellipsis, method='mid'):
         """Return list of (proj, slice1, slice2) to apply to obtain the same x-coordinates."""
@@ -1132,7 +1186,7 @@ class WindowMatrix(object):
             self.__dict__.update(value.__dict__)
             return
         state = {}
-        state['_value'] = np.array(value)
+        state['_value'] = np.asarray(value)
         shape = state['_value'].shape
         for axis, (name, value) in enumerate({'observable': observable, 'theory': theory}.items()):
             _name = '_' + name
@@ -1235,6 +1289,34 @@ class WindowMatrix(object):
             new = new.slice(axis=axis, projs=projs, select_projs=select_projs)
         return new
 
+    @classmethod
+    def sum(cls, others, axis='o', weights=None):
+        if weights is None:
+            weights = [1] * len(others)
+        new = None
+        for other, weight in zip(others, weights):
+            if new is None:
+                new = other.copy()
+                axis, name, observable = new._axis_index(axis=axis)
+                setattr(new, '_' + name, observable.sum([other._axis_index(axis=axis)[-1] for other in others], weights=weights))
+            else:
+                new._value = new._value + weight * other._value
+        return new
+
+    @classmethod
+    def concatenate(cls, others, axis='o'):
+        # No check performed
+        new = None
+        values = []
+        for other in others:
+            if new is None:
+                new = other.copy()
+                axis, name, observable = new._axis_index(axis=axis)
+                setattr(new, '_' + name, observable.concatenate([other._axis_index(axis=axis)[-1] for other in others]))
+            values.append([other.slice(axis=axis, projs=proj, select_projs=True)._value for proj in observable.projs])
+        new._value = np.concatenate([np.concatenate([value[iv] for value in values], axis=axis) for iv in range(len(values[0]))], axis=axis)
+        return new
+
     def _index(self, axis='o', xlim=None, projs=Ellipsis, method='mid', concatenate=True):
         """
         Return indices for given x-limits and projs.
@@ -1327,6 +1409,12 @@ class WindowMatrix(object):
         state.update(kwargs)
         return self.__class__(**state)
 
+    def copy(self):
+        new = self.__class__.__new__(self.__class__)
+        state = {name: getattr(self, name).copy() for name in self._data_fields + self._meta_fields}
+        new.__dict__.update(state)
+        return new
+
     def __getstate__(self):
         state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields}
         for name in ['_theory', '_observable']:
@@ -1362,12 +1450,12 @@ class WindowMatrix(object):
         return cls.from_state(state)
 
     def tree_flatten(self):
-        return ({name: getattr(self, name) for name in self._data_fields},), {name: getattr(self, name) for name in self._meta_fields}
+        return tuple(getattr(self, name) for name in self._data_fields), {name: getattr(self, name) for name in self._meta_fields}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__setstate__(aux_data | children[0])
+        new.__setstate__(aux_data | {name: value for name, value in zip(cls._data_fields, children)})
         return new
 
     def __repr__(self):
@@ -1463,7 +1551,7 @@ class WindowMatrix(object):
         -------
         new : WindowMatrix
         """
-        axis, name, observable = self._axis_index(axis=axis)
+        axis, name, _ = self._axis_index(axis=axis)
         from scipy import interpolate
         shape = list(self._value.shape)
         shape[axis] = new.size

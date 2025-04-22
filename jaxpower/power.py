@@ -29,6 +29,7 @@ class PowerSpectrumMultipoles(BinnedStatistic):
     _label_value = r'$P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{3}$]'
     _data_fields = BinnedStatistic._data_fields + ['_norm', '_shotnoise_nonorm', '_power_zero_nonorm']
     _select_proj_fields = BinnedStatistic._select_proj_fields + ['_power_zero_nonorm']
+    _sum_fields = BinnedStatistic._sum_fields + ['_norm', '_shotnoise_nonorm', '_power_zero_nonorm']
 
     def __init__(self, k: np.ndarray, power_nonorm: jax.Array, nmodes: np.ndarray, edges: np.ndarray, ells: tuple, norm: jax.Array=1.,
                  shotnoise_nonorm: jax.Array=0., power_zero_nonorm: jax.Array=None, name: str=None, attrs: dict=None):
@@ -38,7 +39,7 @@ class PowerSpectrumMultipoles(BinnedStatistic):
                 item = (item,) * len(ells)
             return tuple(item)
 
-        self.__dict__.update(_norm=norm, _shotnoise_nonorm=shotnoise_nonorm, _power_zero_nonorm=tuple(power_zero_nonorm))
+        self.__dict__.update(_norm=jnp.asarray(norm), _shotnoise_nonorm=jnp.asarray(shotnoise_nonorm), _power_zero_nonorm=tuple(jnp.asarray(p) for p in power_zero_nonorm))
         super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=power_nonorm,
                          weights=_tuple(nmodes), name=name, attrs=attrs)
 
@@ -252,20 +253,6 @@ def _get_los_vector(los: str | np.ndarray, ndim=3):
     return staticarray(vlos)
 
 
-def _get_edges(edges, boxsize=1., meshsize=1., **kw):
-    kfun, knyq = np.min(2. * np.pi / boxsize), np.min(np.pi *  meshsize / boxsize)
-    if edges is None:
-        edges = {}
-    if isinstance(edges, dict):
-        kmin = edges.get('min', 0.)
-        kmax = edges.get('max', knyq)
-        kstep = edges.get('step', kfun)
-        edges = np.arange(kmin, kmax, kstep)
-    else:
-        edges = np.asarray(edges)
-    return edges
-
-
 def _get_power_zero(mesh):
     toret = mesh[(0,) * mesh.ndim]
     if mesh.attrs.hermitian:
@@ -273,8 +260,8 @@ def _get_power_zero(mesh):
     return toret
 
 
-def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarray | dict | None=None,
-                       ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
+def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, bin: BinAttrs=None,
+                       ells: int | tuple=0, los: str | np.ndarray='x') -> PowerSpectrumMultipoles:
     r"""
     Compute power spectrum from mesh.
 
@@ -313,7 +300,6 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
     rdtype = meshs[0].real.dtype
     mattrs = meshs[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
-    edges = _get_edges(edges, **mattrs)
 
     ndim = len(mattrs.boxsize)
     vlos, swap = None, False
@@ -321,7 +307,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
         swap = los == 'endpoint'
     else:
         vlos = _get_los_vector(los, ndim=ndim)
-    attrs = dict(los=vlos if vlos is not None else los) | dict(mattrs)
+    attrs = dict(los=vlos if vlos is not None else los)
 
     if np.ndim(ells) == 0:
         ells = (ells,)
@@ -346,7 +332,6 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
         rmesh1 = meshs[0]
         A0 = _2c(rmesh1 if autocorr else meshs[1])
         del meshs
-        bin = BinAttrs(A0, edges=edges, mode_oversampling=mode_oversampling)
 
         power, power_zero = [], []
         if 0 in ells:
@@ -385,7 +370,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
         power, power_zero = jnp.array(power), jnp.array(power_zero)
         if swap: power, power_zero = power.conj(), power_zero.conj()
         # Format the power results into :class:`PowerSpectrumMultipoles` instance
-        return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=edges, ells=ells, norm=norm,
+        return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
                                        power_zero_nonorm=power_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
@@ -400,7 +385,6 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
 
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
-        bin = BinAttrs(Aell, edges=edges, mode_oversampling=mode_oversampling)
 
         power, power_zero = [], []
         if 0 in ells:
@@ -415,8 +399,7 @@ def compute_mesh_power(*meshs: RealMeshField | ComplexMeshField, edges: np.ndarr
                 power_zero.append(0.)
 
         power, power_zero = jnp.array(power), jnp.array(power_zero)
-        return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=edges, ells=ells, norm=norm,
-                                       power_zero_nonorm=power_zero, attrs=attrs)
+        return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, power_zero_nonorm=power_zero, attrs=attrs)
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
@@ -440,6 +423,14 @@ class FKPField(object):
         """Create a new instance, updating some attributes."""
         state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
         return self.__class__(**state)
+
+    def split(self, nsplits=1, extent=None):
+        from .mesh import _get_extent
+        if extent is None:
+            extent = _get_extent(self.data.positions, self.randoms.positions)
+        for data, randoms in zip(self.data.split(nsplits=nsplits, extent=extent), self.randoms.split(nsplits=nsplits, extent=extent)):
+            new = self.clone(data=data, randoms=randoms)
+            yield new
 
     def paint(self, resampler: str | Callable='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real', **kwargs):
@@ -505,7 +496,7 @@ def compute_fkp_normalization_and_shotnoise(*fkps, statistic='power', cellsize=1
     return norm, shotnoise
 
 
-def compute_fkp_power(*fkps: FKPField, edges: np.ndarray | dict | None=None,
+def compute_fkp_power(*fkps: FKPField, bin: BinAttrs=None,
                       resampler='tsc', interlacing=3, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
     r"""
     Compute power spectrum from FKP field.
@@ -551,7 +542,7 @@ def compute_fkp_power(*fkps: FKPField, edges: np.ndarray | dict | None=None,
     """
     fkps = FKPField.same_mesh(*fkps)
     norm, shotnoise_nonorm = compute_fkp_normalization_and_shotnoise(*fkps, statistic='power')
-    return compute_mesh_power(*[fkp.paint(resampler=resampler, interlacing=interlacing, compensate=True, out='complex') for fkp in fkps], edges=edges, ells=ells, los=los, mode_oversampling=mode_oversampling).clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
+    return compute_mesh_power(*[fkp.paint(resampler=resampler, interlacing=interlacing, compensate=True, out='complex') for fkp in fkps], bin=bin, ells=ells, los=los, mode_oversampling=mode_oversampling).clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
 
 
 def compute_wide_angle_poles(poles: dict[Callable]):
@@ -590,7 +581,7 @@ def compute_wide_angle_poles(poles: dict[Callable]):
 
 
 def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
-                        edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0,
+                        bin: BinAttrs=None, ells: int | tuple=0, los: str | np.ndarray='x',
                         buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
     r"""
     Compute mean power spectrum from mesh.
@@ -644,7 +635,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
     _norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
     if norm is None: norm = _norm
     rnorm = _norm / norm / mattrs.meshsize.prod(dtype=rdtype)
-    edges = _get_edges(edges, **mattrs)
 
     ndim = len(mattrs.boxsize)
     vlos, swap = None, False
@@ -704,7 +694,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
         else:
             Q = None
 
-        bin = BinAttrs(mattrs, edges=edges, kind='complex', mode_oversampling=mode_oversampling)
         kvec = mattrs.kcoords(sparse=True)
         knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
         mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
@@ -733,7 +722,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
             #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
             sbin = BinAttrs(mattrs, edges=sedges, kind='real')
             koversampling = 5
-            kbin = BinAttrs(mattrs, edges=oversample(edges, koversampling), kind='complex', mode_oversampling=mode_oversampling)
+            kbin = BinAttrs(mattrs, edges=oversample(bin.edges, koversampling), kind='complex')
             kout, koutnmodes = kbin.xavg.reshape(-1, koversampling), kbin.nmodes.reshape(-1, koversampling)
             koutnmodes /= koutnmodes.sum(axis=-1)[..., None]
             kout = jnp.where(koutnmodes == 0, 0., kout)
@@ -825,8 +814,6 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
         A0 = _2c(meshs[0] if autocorr else meshs[1])
         del meshs
 
-        bin = BinAttrs(A0, edges=edges, mode_oversampling=mode_oversampling)
-
         # The real-space grid
         xvec = mattrs.xcoords(sparse=True)
 
@@ -901,7 +888,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
                 sbin = BinAttrs(rmesh1, edges=sedges)
                 koversampling = 5
-                kbin = BinAttrs(A0, edges=oversample(edges, koversampling), mode_oversampling=mode_oversampling)
+                kbin = BinAttrs(A0, edges=oversample(bin.edges, koversampling))
                 kout, koutnmodes = kbin.xavg.reshape(-1, koversampling), kbin.nmodes.reshape(-1, koversampling)
                 koutnmodes /= koutnmodes.sum(axis=-1)[..., None]
                 kout = jnp.where(koutnmodes == 0, 0., kout)
@@ -1031,7 +1018,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
                 sbin = BinAttrs(rmesh1, edges=sedges)
                 koversampling = 5
-                kbin = BinAttrs(A0, edges=oversample(edges, koversampling), mode_oversampling=mode_oversampling)
+                kbin = BinAttrs(A0, edges=oversample(bin.edges, koversampling))
                 kout, koutnmodes = kbin.xavg.reshape(-1, koversampling), kbin.nmodes.reshape(-1, koversampling)
                 koutnmodes /= koutnmodes.sum(axis=-1)[..., None]
                 kout = jnp.where(koutnmodes == 0, 0., kout)
@@ -1175,7 +1162,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
         else:
             raise NotImplementedError(f'theory los {theory_los} not implemented')
 
-    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[edges] * len(ells), projs=ells)
+    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells), projs=ells)
     xin = np.mean(kin, axis=-1)
     theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[edgesin] * len(ellsin) if edgesin is not None else None, projs=ellsin)
     wmat = WindowMatrix(observable, theory, wmat, attrs={'norm': norm})
@@ -1184,7 +1171,7 @@ def compute_mesh_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, ed
 
 
 def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
-                            edges: np.ndarray | dict | None=None, ells: int | tuple=0, los: str | np.ndarray='x', mode_oversampling: int=0) -> PowerSpectrumMultipoles:
+                            bin: BinAttrs=None, ells: int | tuple=0, los: str | np.ndarray='x') -> PowerSpectrumMultipoles:
     r"""
     Compute mean power spectrum from mesh.
 
@@ -1236,7 +1223,6 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
         mattrs = meshs[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
     rnorm = norm / mattrs.meshsize.prod(dtype=rdtype)
-    edges = _get_edges(edges, **mattrs)
 
     ndim = len(mattrs.boxsize)
     vlos, swap = None, False
@@ -1244,7 +1230,7 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
         swap = los == 'endpoint'
     else:
         vlos = _get_los_vector(los, ndim=ndim)
-    attrs = dict(los=vlos if vlos is not None else los) | dict(mattrs)
+    attrs = dict(los=vlos if vlos is not None else los)
 
     if np.ndim(ells) == 0:
         ells = (ells,)
@@ -1305,7 +1291,6 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
         else:
             Q = None
 
-        bin = BinAttrs(mattrs, edges=edges, kind='complex', mode_oversampling=mode_oversampling)
         mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
 
         pkvec = theory
@@ -1345,7 +1330,6 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
         A0 = _2c(meshs[0] if autocorr else meshs[1])
         del meshs
 
-        bin = BinAttrs(A0, edges=edges, mode_oversampling=mode_oversampling)
         # The real-space grid
         xhat = mattrs.xcoords(sparse=True)
         xnorm = jnp.sqrt(sum(xx**2 for xx in xhat))
@@ -1400,5 +1384,5 @@ def compute_mean_mesh_power(*meshs: RealMeshField | ComplexMeshField | MeshAttrs
         power, power_zero = jnp.array(power), jnp.array(power_zero)
         if swap: power, power_zero = power.conj(), power_zero.conj()
         # Format the power results into :class:`PowerSpectrumMultipoles` instance
-        return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=edges, ells=ells, norm=norm,
+        return PowerSpectrumMultipoles(bin.xavg, power_nonorm=power, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
                                        power_zero_nonorm=power_zero, attrs=attrs)

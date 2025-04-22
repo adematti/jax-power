@@ -1,6 +1,7 @@
 import os
 import operator
 import functools
+import itertools
 from functools import partial
 from collections.abc import Callable
 import numbers
@@ -488,8 +489,8 @@ def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, s
 class MeshAttrs(object):
 
     meshsize: staticarray = None
-    boxsize: staticarray = None
-    boxcenter: staticarray = 0.
+    boxsize: jax.Array = None
+    boxcenter: jax.Array = 0.
     dtype: Any = None
     fft_engine: str = None
 
@@ -498,8 +499,8 @@ class MeshAttrs(object):
         if meshsize is not None:  # meshsize may not be provided (e.g. for particles) and it is fine
             meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
             if boxsize is None: boxsize = 1. * meshsize
-        if boxsize is not None: boxsize = staticarray.fill(boxsize, ndim, dtype=float)
-        if boxcenter is not None: boxcenter = staticarray.fill(boxcenter, ndim, dtype=float)
+        if boxsize is not None: boxsize = _jnp_array_fill(boxsize, ndim, dtype=float)
+        if boxcenter is not None: boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=float)
         dtype = jnp.zeros((), dtype=dtype).dtype  # default dtype is float32, except if config.update('jax_enable_x64', True)
         if fft_engine == 'auto':
             fft_engine = 'jaxdecomp' if ndim == 3 and jaxdecomp is not None else 'jax'
@@ -514,11 +515,13 @@ class MeshAttrs(object):
         return self.fft_engine != 'jaxdecomp' and jnp.issubdtype(self.dtype, jnp.floating)
 
     def tree_flatten(self):
-        return tuple(), asdict(self)
+        state = asdict(self)
+        return tuple(state.pop(name) for name in ['boxsize', 'boxcenter']), state
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
+        new.__dict__.update({name: value for name, value in zip(['boxsize', 'boxcenter'], children)})
         new.__dict__.update(aux_data)
         return new
 
@@ -719,12 +722,12 @@ class BaseMeshField(object):
         self.__dict__.update(value=value, attrs=mattrs)
 
     def tree_flatten(self):
-        return tuple(getattr(self, name) for name in ['value']), {name: getattr(self, name) for name in ['attrs']}
+        return tuple(getattr(self, name) for name in ['value', 'attrs']), {}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update(value=children[0], attrs=aux_data['attrs'])
+        new.__dict__.update(value=children[0], attrs=children[1])
         return new
 
     def __getitem__(self, item):
@@ -794,8 +797,10 @@ for name in ['meshsize', 'boxsize', 'boxcenter'] + ['cellsize']:
 def _set_binary(base, name: str, op: Callable[[Any, Any], Any]) -> None:
     def fn(self, other):
         if type(other) == type(self):
-            return jax.tree.map(op, self, other)
-        return jax.tree.map(lambda x: op(x, other), self)
+            value = op(self.value, other.value)
+        else:
+            value = op(self.value, other)
+        return self.clone(value=value)
 
     fn.__name__ = name
     fn.__qualname__ = base.__qualname__ + "." + name
@@ -804,7 +809,7 @@ def _set_binary(base, name: str, op: Callable[[Any, Any], Any]) -> None:
 
 def _set_unary(base, name: str, op: Callable[[Any], Any]) -> None:
     def fn(self):
-        return jax.tree.map(op, self)
+        return self.clone(value=op(self.value))
 
     fn.__name__ = name
     fn.__qualname__ = base.__qualname__ + "." + name
@@ -909,8 +914,10 @@ class _UpdateRef(object):
 def _set_binary_at(base, name: str) -> None:
     def fn(self, other, **kwargs):
         if type(other) == type(self.value):
-            return jax.tree.map(lambda x, z: getattr(x.at[self.item], name)(z, **kwargs), self.value, other)
-        return jax.tree.map(lambda x: getattr(x.at[self.item], name)(other, **kwargs), self.value)
+            value = getattr(self.value.at[self.item], name)(other.value, **kwargs)
+        else:
+            value = getattr(self.value.at[self.item], name)(other, **kwargs)
+        return self.clone(value=value)
 
     fn.__name__ = name
     fn.__qualname__ = base.__qualname__ + "." + name
@@ -1148,6 +1155,20 @@ class ComplexMeshField(BaseMeshField):
         return self.clone(value=value)
 
 
+def _get_extent(*positions):
+    """Return minimum physical extent (min, max) corresponding to input positions."""
+    if not positions:
+        raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
+    # Find bounding coordinates
+    nonempty_positions = [pos for pos in positions if pos.size]
+    if not nonempty_positions:
+        raise ValueError('<= 1 particles found; cannot infer boxsize')
+    axis = tuple(range(len(nonempty_positions[0].shape[:-1])))
+    pos_min = jnp.array([jnp.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
+    pos_max = jnp.array([jnp.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+    return pos_min, pos_max
+
+
 @default_sharding_mesh
 def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                    boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
@@ -1198,12 +1219,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if not positions:
             raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
         # Find bounding coordinates
-        nonempty_positions = [pos for pos in positions if pos.size]
-        if not nonempty_positions:
-            raise ValueError('<= 1 particles found; cannot infer boxsize')
-        axis = tuple(range(len(nonempty_positions[0].shape[:-1])))
-        pos_min = jnp.array([jnp.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
-        pos_max = jnp.array([jnp.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+        pos_min, pos_max = _get_extent(*positions)
         delta = jnp.abs(pos_max - pos_min)
         if boxcenter is None: boxcenter = 0.5 * (pos_min + pos_max)
         if boxsize is None:
@@ -1222,14 +1238,14 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
             ndim = positions[0].shape[-1]
 
     rdtype = jnp.zeros((), dtype=dtype).real.dtype
-    boxsize = staticarray.fill(boxsize, ndim, dtype=rdtype)
+    boxsize = _jnp_array_fill(boxsize, ndim, dtype=rdtype)
     toret = dict()
     if meshsize is None:
         if cellsize is not None:
-            cellsize = staticarray.fill(cellsize, ndim, dtype=rdtype)
+            cellsize = _np_array_fill(cellsize, ndim, dtype=rdtype)
             meshsize = np.ceil(boxsize / cellsize).astype('i4')
             if sharding_mesh.axis_names:
-                same = np.all(meshsize.view(np.ndarray) == meshsize[0])
+                same = np.all(meshsize == meshsize[0])
                 if same:
                     # FIXME
                     shape_devices = max(sharding_mesh.devices.shape)
@@ -1241,18 +1257,22 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         else:
             raise ValueError('meshsize (or cellsize) must be specified')
     else:
-        meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
+        meshsize = _np_array_fill(meshsize, ndim, dtype='i4')
         toret['meshsize'] = meshsize
-    boxcenter = staticarray.fill(boxcenter, ndim, dtype=rdtype)
+    boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=rdtype)
     toret = dict(boxsize=boxsize, boxcenter=boxcenter) | toret
-    return MeshAttrs(**{name: staticarray(value) for name, value in toret.items()}, dtype=dtype, **kwargs)
+    return MeshAttrs(**toret, dtype=dtype, **kwargs)
 
 
 def _get_common_mesh_cache_attrs(*attrs, **kwargs):
-    gather = attrs[0]
-    for a in attrs:
-         if a != gather:
-            raise RuntimeError("Not same attrs, {} vs {}".format(a, gather))
+    gather = {}
+    for attr in attrs:
+         for name, value in attr.items():
+            if name in gather:
+                if not np.all(value == gather[name]):
+                    raise RuntimeError("Not same {}, {} vs {}".format(value, gather[name]))
+            else:
+                gather[name] = value
     return gather | kwargs
 
 
@@ -1302,7 +1322,7 @@ class ParticleField(object):
         _attrs = kwargs.pop('attrs', None)
         if _attrs is not None:
             _attrs = MeshAttrs(**_attrs)
-        _cache_attrs = {name: staticarray(value) if name in ['meshsize', 'boxsize', 'boxcenter'] and value is not None else value for name, value in kwargs.items()}
+        _cache_attrs = dict(kwargs)
         self.__dict__.update(positions=positions, weights=weights, _attrs=_attrs, _cache_attrs=_cache_attrs)
 
     def clone(self, **kwargs):
@@ -1396,6 +1416,26 @@ class ParticleField(object):
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
 
+    def split(self, nsplits=1, extent=None):
+        attrs = self.attrs
+        nsplits = _np_array_fill(nsplits, attrs.ndim, dtype='i4')
+        split_boxsize = attrs.boxsize / nsplits
+        if extent is None:
+            extent = _get_extent(*self.positions)
+        extent_boxsize = (extent[1] - extent[0]) / nsplits
+        extent_offset = extent[0]
+
+        def split_particles(isplit):
+            isplit = np.array(isplit)
+            mask = jnp.all((self.positions >= isplit * extent_boxsize + extent_offset) & (self.positions <= (isplit + 1) * extent_boxsize + extent_offset), axis=-1)
+            return self.clone(positions=self.positions[mask], weights=self.weights[mask],
+                              boxsize=split_boxsize, boxcenter=(isplit + 0.5) * extent_boxsize + extent_offset,
+                              meshsize=attrs.meshsize)
+
+        for isplit in itertools.product(*(range(nsplit) for nsplit in nsplits)):
+            yield split_particles(isplit)
+
+
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
               compensate: bool=False, out: str='real', dtype=None, pexchange=True):
         r"""
@@ -1434,11 +1474,14 @@ class ParticleField(object):
         if with_sharding and pexchange:
             positions, exchange = exchange_particles(attrs, positions)
             weights = exchange(weights)
+        #size = 2**20
+        #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
+        #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
         return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
 
 
 
-@partial(jax.jit, static_argnames=['attrs', 'resampler',  'interlacing', 'compensate', 'out'])
+@partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out'])
 def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, out: str='real'):
     """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
 
@@ -1551,14 +1594,13 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('edges', 'linear', 'sharding_mesh'))  # linear saves memory
-def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, linear: bool=False, sharding_mesh=None):
+@partial(jax.jit, static_argnames=('sharding_mesh',))  # linear saves memory
+def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, sharding_mesh=None):
 
     def _get_attrs(coords, edges, weights):
         r"""Return bin index, binned number of modes and coordinates."""
         coords = coords.ravel()
-        if linear: ibin = jnp.clip(jnp.floor((coords - edges[0]) / (edges[1] - edges[0])).astype('i4') + 1, 0, len(edges))
-        else: ibin = jnp.digitize(coords, edges, right=False)
+        ibin = jnp.digitize(coords, edges, right=False)
         x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
         del coords
         nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
@@ -1644,16 +1686,14 @@ class BinAttrs(object):
             if step is None:
                 edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
             else:
-                edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * mattrs.meshsize / 2.), step)
-        import itertools
+                edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
+
         shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
         shifts = list(itertools.product(*shifts))
         ibin, nmodes, xsum = [], 0, 0
-        edges = staticarray(edges)
-        linear = np.allclose(edges, np.linspace(edges[0], edges[-1], len(edges)), atol=1e-8, rtol=1e-8)
         for shift in shifts:
             coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
-            bin = _get_bin_attrs(coords, edges, wmodes, linear=linear)
+            bin = _get_bin_attrs(coords, edges, wmodes)
             del coords
             ibin.append(bin[0])
             nmodes += bin[1]
