@@ -424,6 +424,10 @@ class FKPField(object):
         state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
         return self.__class__(**state)
 
+    @property
+    def attrs(self):
+        return self.data.attrs
+    
     def split(self, nsplits=1, extent=None):
         from .mesh import _get_extent
         if extent is None:
@@ -464,13 +468,12 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
     for mesh in meshs:
         normalization *= mesh
     for particle in particles:
-        normalization *= particle.paint(resampler=resampler, interlacing=1, compensate=False)
+        normalization *= particle.paint(resampler=resampler, interlacing=0, compensate=False)
     return normalization.sum() / normalization.cellsize.prod()
 
 
 def compute_fkp_normalization_and_shotnoise(*fkps, statistic='power', cellsize=10.):
     # TODO: generalize to N fkp fields
-    fkps = FKPField.same_mesh(*fkps)
     if statistic in ['power', 'power_spectrum']:
         # This is the pypower normalization - move to new one?
         if len(fkps) > 1:

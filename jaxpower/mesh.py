@@ -1273,7 +1273,11 @@ def _get_common_mesh_cache_attrs(*attrs, **kwargs):
                     raise RuntimeError("Not same {}, {} vs {}".format(value, gather[name]))
             else:
                 gather[name] = value
-    return gather | kwargs
+    for name, value in kwargs.items():
+        if name == 'cellsize' and 'boxsize' in gather:
+            gather.pop('meshsize')
+        gather[name] = value
+    return gather
 
 
 def get_common_mesh_attrs(*particles, **kwargs):
@@ -1345,12 +1349,12 @@ class ParticleField(object):
         return self._attrs
 
     def tree_flatten(self):
-        return tuple(getattr(self, name) for name in ['positions', 'weights']), {name: getattr(self, name) for name in ['_attrs', '_cache_attrs']}
+        return tuple(getattr(self, name) for name in ['positions', 'weights', '_attrs', '_cache_attrs']), {}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update(positions=children[0], weights=children[1], **aux_data)
+        new.__dict__.update({name: value for name, value in zip(['positions', 'weights', '_attrs', '_cache_attrs'], children)})
         return new
 
     def __getitem__(self, name):
@@ -1435,7 +1439,6 @@ class ParticleField(object):
         for isplit in itertools.product(*(range(nsplit) for nsplit in nsplits)):
             yield split_particles(isplit)
 
-
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
               compensate: bool=False, out: str='real', dtype=None, pexchange=True):
         r"""
@@ -1476,10 +1479,15 @@ class ParticleField(object):
             weights = exchange(weights)
         # jit is fast enough that it is not worth padding to fixed size
         #size = 2**24
+        #size = 2**22
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
-        return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
-
+        #import time
+        #t0 = time.time()
+        toret = _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
+        #jax.block_until_ready(toret)
+        #print(time.time() - t0, positions.shape[0] / size, _paint._cache_size())
+        return toret
 
 
 @partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out'])
@@ -1507,7 +1515,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
     if with_sharding:
         _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))
 
-    def ppaint(positions):
+    def ppaint(positions, weights=None):
         mesh = attrs.create(kind='real', fill=0.)
         value = mesh.value
         w = None
@@ -1533,7 +1541,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         return mesh.clone(value=value)
 
     if interlacing <= 1:
-        toret = ppaint(positions)
+        toret = ppaint(positions, weights)
         if kernel_compensate is not None:
             toret = toret.r2c().apply(kernel_compensate)
             if out == 'real': toret = toret.c2r()
@@ -1545,7 +1553,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
                 kvec = sum(kvec)
                 return value * jnp.exp(shift * 1j * kvec) / interlacing
 
-            carry += ppaint(positions + shift).r2c().apply(kernel_shift, kind='circular')
+            carry += ppaint(positions + shift, weights).r2c().apply(kernel_shift, kind='circular')
             return carry, shift
 
         toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=shifts)[0]
@@ -1652,7 +1660,6 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
         count = shard_map(count, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),) + (P(sharding_mesh.axis_names),) * len(ibin), out_specs=P(None))
 
     return count(value, *ibin)
-
 
 
 @jax.tree_util.register_pytree_node_class
