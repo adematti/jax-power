@@ -1474,7 +1474,8 @@ class ParticleField(object):
         if with_sharding and pexchange:
             positions, exchange = exchange_particles(attrs, positions)
             weights = exchange(weights)
-        #size = 2**20
+        # jit is fast enough that it is not worth padding to fixed size
+        #size = 2**24
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
         return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)

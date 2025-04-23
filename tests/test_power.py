@@ -973,8 +973,8 @@ def test_split():
     from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
                         compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, BinAttrs, compute_mean_mesh_power, compute_mesh_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, compute_fkp_normalization_and_shotnoise)
 
-    attrs = MeshAttrs(meshsize=(64,) * 3, boxsize=1000., boxcenter=1200.)
-    size = int(1e-3 * attrs.boxsize.prod())
+    attrs = MeshAttrs(meshsize=(512,) * 3, boxsize=1000., boxcenter=1200.)
+    size = int(1e-2 * attrs.boxsize.prod())
     data = generate_uniform_particles(attrs, size + 1, seed=42)
     randoms = generate_uniform_particles(attrs, 4 * size + 1, seed=43)
 
