@@ -1474,19 +1474,20 @@ class ParticleField(object):
         sharding_mesh = attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         positions, weights = self.positions, self.weights
+        #import time
+        #t0 = time.time()
         if with_sharding and pexchange:
             positions, exchange = exchange_particles(attrs, positions)
             weights = exchange(weights)
+            #t1 = time.time()
         # jit is fast enough that it is not worth padding to fixed size
         #size = 2**24
         #size = 2**22
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
-        #import time
-        #t0 = time.time()
         toret = _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
         #jax.block_until_ready(toret)
-        #print(time.time() - t0, positions.shape[0] / size, _paint._cache_size())
+        #print(f'exchange {t1 - t0:.2f} painting {time.time() - t1:.2f}', positions.shape[0] / size, _paint._cache_size())
         return toret
 
 

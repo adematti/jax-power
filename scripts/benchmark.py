@@ -8,17 +8,49 @@ import numpy as np
 from mockfactory import Catalog, setup_logging
 
 
-def get_clustering_positions_weights(catalog, zrange=None):
-    from cosmoprimo.fiducial import DESI
-    fiducial = DESI()
-    catalog.get(catalog.columns())
-    z = catalog['Z']
-    weight = catalog['WEIGHT'] * catalog['WEIGHT_FKP']
-    mask = Ellipsis
-    if zrange:
-        mask = (z >= zrange[0]) & (z <= zrange[1])
-    dist = fiducial.comoving_radial_distance(z[mask])
-    return np.column_stack([catalog['RA'][mask], catalog['DEC'][mask], dist]).astype(dtype='f8'), np.asarray(weight[mask]).astype(dtype='f8')
+def get_clustering_positions_weights(*fns, zrange=None):
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
+    from cosmoprimo.fiducial import TabulatedDESI, DESI
+    fiducial = TabulatedDESI()  # faster than DESI/class (which takes ~30 s for 10 random catalogs)
+
+    def get(fn):
+        catalog = None
+        if mpicomm.rank == 0:  # Faster to read catalogs from one rank
+            catalog = Catalog.read(fn, mpicomm=MPI.COMM_SELF)
+            catalog.get(catalog.columns())  # Faster to read all columns at once
+            catalog = catalog[['RA', 'DEC', 'Z', 'WEIGHT', 'WEIGHT_FKP']]
+        catalog = Catalog.scatter(catalog, mpicomm=mpicomm)
+        z = catalog['Z']
+        weight = catalog['WEIGHT'] * catalog['WEIGHT_FKP']
+        mask = Ellipsis
+        if zrange:
+            mask = (z >= zrange[0]) & (z <= zrange[1])
+        dist = fiducial.comoving_radial_distance(z[mask])
+        return np.column_stack([catalog['RA'][mask], catalog['DEC'][mask], dist]).astype(dtype='f8'), np.asarray(weight[mask], dtype='f8')
+
+    pw = [get(fn) for fn in fns]
+    return np.concatenate([_[0] for _ in pw], axis=0), np.concatenate([_[1] for _ in pw], axis=0)
+
+
+def get_clustering_positions_weights2(*fns, zrange=None):
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
+    from cosmoprimo.fiducial import TabulatedDESI, DESI
+    fiducial = TabulatedDESI()  # faster than DESI/class (which takes ~30 s for 10 random catalogs)
+
+    def get(fns):
+        catalog = Catalog.read(fns, mpicomm=mpicomm)
+        catalog.get(catalog.columns())  # Faster to read all columns at once
+        z = catalog['Z']
+        weight = catalog['WEIGHT'] * catalog['WEIGHT_FKP']
+        mask = Ellipsis
+        if zrange:
+            mask = (z >= zrange[0]) & (z <= zrange[1])
+        dist = fiducial.comoving_radial_distance(z[mask])
+        return np.column_stack([catalog['RA'][mask], catalog['DEC'][mask], dist]).astype(dtype='f8'), np.asarray(weight[mask], dtype='f8')
+
+    return get(fns)
 
 
 def get_mock_fn(kind='power'):
@@ -28,35 +60,44 @@ def get_mock_fn(kind='power'):
 
 def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     from jaxpower import (ParticleField, FKPField, compute_fkp_power, compute_fkp_normalization_and_shotnoise, create_sharding_mesh, make_particles_from_local, BinAttrs)
-
-    data = Catalog.read(data_fn)
-    randoms = Catalog.read(all_randoms_fn)
-    data = get_clustering_positions_weights(data, zrange=zrange)
-    randoms = get_clustering_positions_weights(randoms, zrange=zrange)
+    t0 = time.time()
+    data = get_clustering_positions_weights(data_fn, zrange=zrange)
+    randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
+    mpicomm.barrier()
+    t1 = time.time()
     data = ParticleField(*make_particles_from_local(*data), **attrs)
     randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
     fkp = FKPField(data, randoms)
-    t0 = time.time()
+    t2 = time.time()
     #norm, shotnoise_nonorm = compute_fkp_normalization_and_shotnoise(fkp)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     jax.block_until_ready(mesh)
-    if jax.process_index() == 0: print(f'painting {time.time() - t0:.2f}')
+    t3 = time.time()
     del fkp
     bin = BinAttrs(mesh.attrs, edges={'step': 0.001})
-    t0 = time.time()
     power = jitted_compute_mesh_power(mesh, bin=bin)#.clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
     jax.block_until_ready(power)
-    if jax.process_index() == 0: print(f'power {time.time() - t0:.2f}')
+    t4 = time.time()
+    if jax.process_index() == 0:
+        print(f'reading {t1 - t0:.2f} fkp {t2 - t1:.2f} painting {t3 - t2:.2f} power {t4 - t3:.2f}')
     power.save(fn)
 
 
 def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     from pypower import CatalogFFTPower
-    data = Catalog.read(data_fn)
-    randoms = Catalog.read(all_randoms_fn)
-    data_positions, data_weights = get_clustering_positions_weights(data, zrange=zrange)
-    randoms_positions, randoms_weights = get_clustering_positions_weights(randoms, zrange=zrange)
-    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **poles_args, **attrs)
+    t0 = time.time()
+    data_positions, data_weights = get_clustering_positions_weights2(data_fn, zrange=zrange)
+    randoms_positions, randoms_weights = get_clustering_positions_weights2(*all_randoms_fn, zrange=zrange)
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
+    mpicomm.barrier()
+    t1 = time.time()
+    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **poles_args, **attrs, wnorm=1., shotnoise_nonorm=0.)
+    t2 = time.time()
+    if mpicomm.rank == 0:
+        print(f'reading {t1 - t0:.2f} power {t2 - t1:.2f}')
     power.save(fn)
 
 
@@ -64,8 +105,9 @@ if __name__ == '__main__':
     tracer = 'QSO'
     region = 'NGC'
     #cellsize, meshsize = 8., 1500 #1620
-    #cellsize, meshsize = 20., 952
-    cellsize, meshsize = 20., 750
+    cellsize, meshsize = 20., 1024  # 40GB nodes
+    #cellsize, meshsize = 20., 950
+    #cellsize, meshsize = 20., 750
     cutsky_args = dict(zrange=(0.8, 2.1), cellsize=cellsize, boxsize=cellsize * meshsize, boxcenter=(193.,  34.,  2806.))
     setup_logging()
     t0 = time.time()
@@ -80,23 +122,25 @@ if __name__ == '__main__':
         from jax import config
         config.update('jax_enable_x64', True)
         from jax import numpy as jnp
-        #jax.distributed.initialize()
+        jax.distributed.initialize()
         from jaxpower import compute_mesh_power, create_sharding_mesh
-        jitted_compute_mesh_power = jax.jit(partial(compute_mesh_power, **poles_args))
-        jitted_compute_mesh_power = partial(compute_mesh_power, **poles_args)
+        jitted_compute_mesh_power = jax.jit(partial(compute_mesh_power, **poles_args), donate_argnums=[0])
+        #jitted_compute_mesh_power = partial(compute_mesh_power, **poles_args)
 
-    for imock in range(2):
-        catalog_dir = Path(f'/global/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
+    for imock in range(4):
+        catalog_dir = Path(f'/dvs_ro/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
         data_fn = catalog_dir / f'{tracer}_{region}_clustering.dat.fits'
-        all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(2)]
+        all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)]
 
         if todo == 'jaxpower':
             fn = get_mock_fn(f'jaxpower_{imock:d}')
             if jax.process_count() > 1: 
                 with create_sharding_mesh() as sharding_mesh:
-                    compute_jaxpower(fn, data_fn, all_randoms_fn, **cutsky_args)
+                    power = compute_jaxpower(fn, data_fn, all_randoms_fn, **cutsky_args)
+                    jax.block_until_ready(power)
             else:
-                compute_jaxpower(fn, data_fn, all_randoms_fn, **cutsky_args)
+                power = compute_jaxpower(fn, data_fn, all_randoms_fn, **cutsky_args)
+                jax.block_until_ready(power)
 
         if todo == 'pypower':
             compute_pypower(get_mock_fn(f'pypower_{imock:d}'), data_fn, all_randoms_fn, **cutsky_args)
