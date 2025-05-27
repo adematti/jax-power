@@ -7,7 +7,7 @@ from jax import random
 from jax import numpy as jnp
 
 from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
-from .power import _get_los_vector, legendre, get_real_Ylm
+from .pspec import _get_los_vector, get_legendre, get_real_Ylm
 from .utils import BinnedStatistic
 
 
@@ -40,7 +40,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
     if isinstance(poles, tuple):
         kin, poles = poles
     if isinstance(poles, BinnedStatistic):
-        kin, poles = poles._edges[0], {proj: poles.view(projs=proj) for proj in poles.projs}
+        kin, poles = jnp.append(poles._edges[0][..., 0], poles._edges[0][-1, 1]), {proj: poles.view(projs=proj) for proj in poles.projs}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip(ells, poles)}
     ells = list(poles)
@@ -131,7 +131,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
 
         def kernel(value, kvec):
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
-            ker = sum(get_theory(ell) / attrs.cellsize.prod() * legendre(ell)(mu) for ell in ells)
+            ker = sum(get_theory(ell) / attrs.cellsize.prod() * get_legendre(ell)(mu) for ell in ells)
             ker = jnp.sqrt(ker)
             if unitary_amplitude:
                 ker *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(value)

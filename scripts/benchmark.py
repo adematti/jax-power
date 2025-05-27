@@ -59,7 +59,7 @@ def get_mock_fn(kind='power'):
 
 
 def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp_power, compute_fkp_normalization_and_shotnoise, create_sharding_mesh, make_particles_from_local, BinAttrs)
+    from jaxpower import (ParticleField, FKPField, compute_fkp_pspec, compute_fkp_pspec_normalization, compute_fkp_pspec_shotnoise, create_sharding_mesh, make_particles_from_local, bin_spec)
     t0 = time.time()
     data = get_clustering_positions_weights(data_fn, zrange=zrange)
     randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
@@ -71,18 +71,36 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
     fkp = FKPField(data, randoms)
     t2 = time.time()
-    #norm, shotnoise_nonorm = compute_fkp_normalization_and_shotnoise(fkp)
+    norm, num_shotnoise = compute_fkp_pspec_normalization(fkp), compute_fkp_pspec_shotnoise(fkp)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     jax.block_until_ready(mesh)
     t3 = time.time()
     del fkp
-    bin = BinAttrs(mesh.attrs, edges={'step': 0.001})
-    power = jitted_compute_mesh_power(mesh, bin=bin)#.clone(norm=norm, shotnoise_nonorm=shotnoise_nonorm)
+    bin = bin_spec(mesh.attrs, edges={'step': 0.001})
+    power = jitted_compute_mesh_pspec(mesh, bin=bin)#.clone(norm=norm, num_shotnoise=num_shotnoise)
+    power.attrs.udpate(mesh=dict(mesh.attrs), zrange=zrange)
     jax.block_until_ready(power)
     t4 = time.time()
     if jax.process_index() == 0:
         print(f'reading {t1 - t0:.2f} fkp {t2 - t1:.2f} painting {t3 - t2:.2f} power {t4 - t3:.2f}')
     power.save(fn)
+
+
+def compute_jaxpower_window(fn, power_fn, data_fn, all_randoms_fn):
+    from jaxpower import (ParticleField, FKPField, compute_mesh_pspec_window, create_sharding_mesh, make_particles_from_local, bin_spec, BinnedStatistic, MeshAttrs)
+    power = BinnedStatistic.load(power_fn)
+    zrange = power.attrs['zrange']
+    attrs = MeshAttrs(**power.attrs['mesh'])
+    data = get_clustering_positions_weights(data_fn, zrange=zrange)
+    randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
+    data = ParticleField(*make_particles_from_local(*data), **attrs)
+    randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
+    mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    bin = bin_spec(mesh.attrs, edges=power.edges(projs=0))
+    ells = power.projs()
+    edgesin = np.linspace(bin.edges.min(), bin.edges.max(), 2 * (len(bin.edges) - 1))
+    wmatrix = compute_mesh_pspec_window(mesh, edgesin=edgesin, ellsin=(ells, 'local'), bin=bin, ells=ells, pbar=True)
+    wmatrix.save(fn)
 
 
 def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
@@ -94,11 +112,13 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **poles_args, **attrs, wnorm=1., shotnoise_nonorm=0.)
+    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **poles_args, **attrs, wnorm=1., num_shotnoise=0.)
     t2 = time.time()
     if mpicomm.rank == 0:
         print(f'reading {t1 - t0:.2f} power {t2 - t1:.2f}')
     power.save(fn)
+
+
 
 
 if __name__ == '__main__':
@@ -123,9 +143,9 @@ if __name__ == '__main__':
         config.update('jax_enable_x64', True)
         from jax import numpy as jnp
         jax.distributed.initialize()
-        from jaxpower import compute_mesh_power, create_sharding_mesh
-        jitted_compute_mesh_power = jax.jit(partial(compute_mesh_power, **poles_args), donate_argnums=[0])
-        #jitted_compute_mesh_power = partial(compute_mesh_power, **poles_args)
+        from jaxpower import compute_mesh_pspec, create_sharding_mesh
+        jitted_compute_mesh_pspec = jax.jit(partial(compute_mesh_pspec, **poles_args), donate_argnums=[0])
+        #jitted_compute_mesh_pspec = partial(compute_mesh_pspec, **poles_args)
 
     for imock in range(4):
         catalog_dir = Path(f'/dvs_ro/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
@@ -134,7 +154,7 @@ if __name__ == '__main__':
 
         if todo == 'jaxpower':
             fn = get_mock_fn(f'jaxpower_{imock:d}')
-            if jax.process_count() > 1: 
+            if jax.process_count() > 1:
                 with create_sharding_mesh() as sharding_mesh:
                     power = compute_jaxpower(fn, data_fn, all_randoms_fn, **cutsky_args)
                     jax.block_until_ready(power)

@@ -718,7 +718,7 @@ class BaseMeshField(object):
             if meshsize is None: meshsize = shape
             meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
             mattrs = MeshAttrs(meshsize=meshsize, **kwargs)
-        mattrs = mattrs.clone(dtype=value.real.dtype if 'complex' in self.__class__.__name__.lower() else value.dtype)  # second option = hermitian
+            mattrs = mattrs.clone(dtype=value.real.dtype if 'complex' in self.__class__.__name__.lower() and mattrs.hermitian else value.dtype)
         self.__dict__.update(value=value, attrs=mattrs)
 
     def tree_flatten(self):
@@ -914,10 +914,9 @@ class _UpdateRef(object):
 def _set_binary_at(base, name: str) -> None:
     def fn(self, other, **kwargs):
         if type(other) == type(self.value):
-            value = getattr(self.value.at[self.item], name)(other.value, **kwargs)
-        else:
-            value = getattr(self.value.at[self.item], name)(other, **kwargs)
-        return self.clone(value=value)
+            other = other.value
+        value = getattr(self.value.value.at[self.item], name)(other, **kwargs)
+        return self.value.clone(value=value)
 
     fn.__name__ = name
     fn.__qualname__ = base.__qualname__ + "." + name
@@ -1282,6 +1281,9 @@ def _get_common_mesh_cache_attrs(*attrs, **kwargs):
 
 def get_common_mesh_attrs(*particles, **kwargs):
     """Get common mesh attributes for multiple :class:`ParticleField`."""
+    assert len(particles)
+    if not kwargs and not any(p._cache_attrs for p in particles) and all(p._attrs for p in particles):
+        return particles[0].attrs
     attrs = _get_common_mesh_cache_attrs(*[p._cache_attrs for p in particles], **kwargs)
     return get_mesh_attrs(*[p.positions for p in particles], **attrs)
 
@@ -1324,22 +1326,34 @@ class ParticleField(object):
             positions, weights = make_particles_from_local(positions, weights)
         assert '_cache_attrs' not in kwargs
         _attrs = kwargs.pop('attrs', None)
-        if _attrs is not None:
-            _attrs = MeshAttrs(**_attrs)
         _cache_attrs = dict(kwargs)
+        if _attrs is not None:
+            if _cache_attrs:
+                raise ValueError('cannot provide "attrs" and {}'.format(list(kwargs)))
+            if not isinstance(_attrs, MeshAttrs): _attrs = MeshAttrs(**_attrs)
         self.__dict__.update(positions=positions, weights=weights, _attrs=_attrs, _cache_attrs=_cache_attrs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
         state = asdict(self)
+        state.pop('_cache_attrs')
+        current_attrs = state.pop('_attrs')
+        if self._cache_attrs and 'positions' in kwargs:
+            current_attrs = None  # remove already-computed _attrs
+
         for name in ['positions', 'weights']:
             if name in kwargs:
                 state[name] = kwargs.pop(name)
-        state.pop('_attrs')
-        attrs = state.pop('_cache_attrs')
-        attrs.update(kwargs.pop('attrs', {}))
-        attrs.update(kwargs)
-        state.update(attrs)
+
+        input_attrs = kwargs.pop('attrs', {})
+        if input_attrs:
+            state['attrs'] = input_attrs
+        elif current_attrs:
+            state['attrs'] = current_attrs
+        else:
+            attrs = dict(self._cache_attrs)
+            attrs.update(kwargs)
+            state.update(attrs)
         return self.__class__(**state)
 
     @property
@@ -1485,10 +1499,9 @@ class ParticleField(object):
         #size = 2**22
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
-        toret = _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
+        return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
         #jax.block_until_ready(toret)
         #print(f'exchange {t1 - t0:.2f} painting {time.time() - t1:.2f}', positions.shape[0] / size, _paint._cache_size())
-        return toret
 
 
 @partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out'])
@@ -1574,6 +1587,31 @@ for name in [field.name for field in fields(MeshAttrs)] + ['cellsize']:
     _set_property(ParticleField, name)
 
 
+# For functional programming interface
+
+def c2r(mesh: ComplexMeshField) -> RealMeshField:
+    return mesh.c2r()
+
+
+def r2c(mesh: RealMeshField) -> ComplexMeshField:
+    return mesh.r2c()
+
+
+def apply(mesh: RealMeshField | ComplexMeshField,
+          fn: Callable, sparse=False, **kwargs) -> RealMeshField | ComplexMeshField:
+    return mesh.apply(fn, sparse=sparse, **kwargs)
+
+
+def read(mesh: RealMeshField, positions: jax.Array, *args, **kwargs) -> jax.Array:
+    return mesh.read(positions, *args, **kwargs)
+
+
+def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField:
+    return mesh.paint(*args, **kwargs)
+
+
+
+
 def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf):
     x2 = sum(xx**2 for xx in xvec).ravel()
     x2 = x2[(x2 >= xmin**2) & (x2 <= xmax**2)]
@@ -1644,9 +1682,9 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
             if antisymmetric: value = value.imag
             else: value = value.real
             value *= weights
-        count = lambda ib: jnp.bincount(ib, weights=value, length=length)
+        count = lambda ib: jnp.bincount(ib, weights=value, length=length + 2)
         if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
-            count = lambda ib: jnp.bincount(ib, weights=value.real, length=length) + 1j * jnp.bincount(ib, weights=value.imag, length=length)
+            count = lambda ib: jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
         value = sum(count(ib) for ib in ibin)
         return value[1:-1] / len(ibin)
 
@@ -1661,105 +1699,3 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
         count = shard_map(count, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),) + (P(sharding_mesh.axis_names),) * len(ibin), out_specs=P(None))
 
     return count(value, *ibin)
-
-
-@jax.tree_util.register_pytree_node_class
-@dataclass(init=False, frozen=True)
-class BinAttrs(object):
-
-    edges: jax.Array = None
-    nmodes: jax.Array = None
-    xavg: jax.Array = None
-    ibin: jax.Array = None
-    ibin_zero: jax.Array = None
-    wmodes: jax.Array = None
-
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, kind='complex', mode_oversampling: int=0, **kwargs):
-        if not isinstance(mattrs, MeshAttrs):
-            kind = 'complex' if 'complex' in mattrs.__class__.__name__.lower() else 'real'
-            mattrs = mattrs.attrs
-        hermitian = mattrs.hermitian
-        if kind == 'real':
-            vec = mattrs.xcoords(kind='separation', sparse=True, **kwargs)
-            vec0 = mattrs.cellsize.min()
-        else:
-            vec = mattrs.kcoords(kind='separation', sparse=True, **kwargs)
-            vec0 = mattrs.kfun.min()
-        wmodes = None
-        if hermitian:
-            wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
-        if edges is None:
-            edges = {}
-        if isinstance(edges, dict):
-            step = edges.get('step', None)
-            if step is None:
-                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
-            else:
-                edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
-
-        shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
-        shifts = list(itertools.product(*shifts))
-        ibin, nmodes, xsum = [], 0, 0
-        for shift in shifts:
-            coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
-            bin = _get_bin_attrs(coords, edges, wmodes)
-            del coords
-            ibin.append(bin[0])
-            nmodes += bin[1]
-            xsum += bin[2]
-        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes)
-
-    @property
-    def sharding_mesh(self):
-        return get_sharding_mesh()
-
-    def __call__(self, mesh, antisymmetric=False, remove_zero=False):
-        weights = self.wmodes
-        value = getattr(mesh, 'value', mesh)
-        if remove_zero:
-            value = value.at[(0,) * value.ndim].set(0.)
-        return _bincount(self.ibin, value, weights=weights, length=len(self.xavg) + 2, antisymmetric=antisymmetric) / self.nmodes
-
-    def tree_flatten(self):
-        return tuple(getattr(self, name) for name in self.__annotations__.keys()), {}
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        new = cls.__new__(cls)
-        new.__dict__.update(zip(cls.__annotations__.keys(), children))
-        new.__dict__.update(aux_data)
-        return new
-
-
-# For functional programming interface
-
-def c2r(mesh: ComplexMeshField) -> RealMeshField:
-    return mesh.c2r()
-
-
-def r2c(mesh: RealMeshField) -> ComplexMeshField:
-    return mesh.r2c()
-
-
-def apply(mesh: RealMeshField | ComplexMeshField,
-          fn: Callable, sparse=False, **kwargs) -> RealMeshField | ComplexMeshField:
-    return mesh.apply(fn, sparse=sparse, **kwargs)
-
-
-def read(mesh: RealMeshField, positions: jax.Array, *args, **kwargs) -> jax.Array:
-    return mesh.read(positions, *args, **kwargs)
-
-
-def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField:
-    return mesh.paint(*args, **kwargs)
-
-
-def bin(mesh, battrs=None, antisymmetric=False, remove_zero=False, *args, **kwargs):
-    """Bin input mesh."""
-    input_battrs = battrs is not None
-    if not input_battrs:
-        battrs = BinAttrs(mesh, *args, **kwargs)
-    value = battrs(mesh, antisymmetric=antisymmetric, remove_zero=remove_zero)
-    if not input_battrs:
-        return battrs
-    return value

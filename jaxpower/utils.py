@@ -229,7 +229,7 @@ _ells = np.arange(11)
 _registered_legendres = [globals()['_legendre_{:d}'.format(ell)] for ill, ell in enumerate(_ells)]
 
 
-def legendre(ell):
+def get_legendre(ell):
 
     def f(mu):
         return jax.lax.switch(ell, _registered_legendres, mu)
@@ -240,11 +240,11 @@ def legendre(ell):
 from scipy import special
 
 
-def Si(x):
+def Si_scipy(x):
     return jax.pure_callback(lambda x: special.sici(x)[0], x, x)
 
 
-def spherical_jn(ell):
+def get_spherical_jn_scipy(ell):
     return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x)
 
 
@@ -254,11 +254,11 @@ _registered_correlation_function_tophat_derivatives[0] = (lambda s, a: (-a * jnp
                                                           lambda s, a: -a**9 * s**6 / (90720 * jnp.pi**2) + a**7 * s**4 / (1680 * jnp.pi**2) - a**5 * s**2 / (60 * jnp.pi**2) + a**3 / (6 * jnp.pi**2))
 _registered_correlation_function_tophat_derivatives[1] = (lambda s, a: ((-a * jnp.sin(a * s) - 2 * jnp.cos(a * s) / s) / s**2 + 2 / s**3) / (2 * jnp.pi**2),
                                                           lambda s, a: -a**10 * s**7 / (907200 * jnp.pi**2) + a**8 * s**5 / (13440 * jnp.pi**2) - a**6 * s**3 / (360 * jnp.pi**2) + a**4 * s / (24 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[2] = (lambda s, a: -(a * s * jnp.cos(a * s) - 4 * jnp.sin(a * s) + 3 * Si(a * s)) / (2 * jnp.pi**2 * s**3),
+_registered_correlation_function_tophat_derivatives[2] = (lambda s, a: -(a * s * jnp.cos(a * s) - 4 * jnp.sin(a * s) + 3 * Si_scipy(a * s)) / (2 * jnp.pi**2 * s**3),
                                                           lambda s, a: -a**9 * s**6 / (136080 * jnp.pi**2) + a**7 * s**4 / (2940 * jnp.pi**2) - a**5 * s**2 / (150 * jnp.pi**2))
 _registered_correlation_function_tophat_derivatives[3] = (lambda s, a: -(8 / s**3 + (a * s**2 * jnp.sin(a * s) + 7 * s * jnp.cos(a * s) - 15 * jnp.sin(a * s) / a) / s**4) / (2 * jnp.pi**2),
                                                           lambda s, a: -a**10 * s**7 / (1663200 * jnp.pi**2) + a**8 * s**5 / (30240 * jnp.pi**2) - a**6 * s**3 / (1260 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[4] = (lambda s, a: (-a * s**3 * jnp.cos(a * s) + 11 * s**2 * jnp.sin(a * s) + 15 * s**2 * Si(a * s) / 2 + 105 * s * jnp.cos(a * s) / (2 * a) - 105 * jnp.sin(a * s) / (2 * a**2)) / (2 * jnp.pi**2 * s**5),
+_registered_correlation_function_tophat_derivatives[4] = (lambda s, a: (-a * s**3 * jnp.cos(a * s) + 11 * s**2 * jnp.sin(a * s) + 15 * s**2 * Si_scipy(a * s) / 2 + 105 * s * jnp.cos(a * s) / (2 * a) - 105 * jnp.sin(a * s) / (2 * a**2)) / (2 * jnp.pi**2 * s**5),
                                                           lambda s, a: -a**9 * s**6 / (374220 * jnp.pi**2) + a**7 * s**4 / (13230 * jnp.pi**2))
 _registered_correlation_function_tophat_derivatives[5] = (lambda s, a: (16 / s**3 + (-a * s**4 * jnp.sin(a * s) - 16 * s**3 * jnp.cos(a * s) + 105 * s**2 * jnp.sin(a * s) / a + 315 * s * jnp.cos(a * s) / a**2 - 315 * jnp.sin(a * s) / a**3) / s**6) / (2 * jnp.pi**2),
                                                           lambda s, a: -a**10 * s**7 / (5405400 * jnp.pi**2) + a**8 * s**5 / (166320 * jnp.pi**2))
@@ -268,6 +268,16 @@ _registered_bessel = {}
 _registered_bessel[0] = (lambda x: jnp.sin(x) / x, lambda x: -x**6/5040 + x**4/120 - x**2/6 + 1)
 _registered_bessel[2] = (lambda x: (-3*x*jnp.cos(x) + (3 - x**2)*jnp.sin(x))/x**3, lambda x: x**6/7560 - x**4/210 + x**2/15)
 _registered_bessel[4] = (lambda x: (5*x*(2*x**2 - 21)*jnp.cos(x) + (x**4 - 45*x**2 + 105)*jnp.sin(x))/x**5, lambda x: -x**6/20790 + x**4/945)
+
+
+def get_spherical_jn(ell):
+
+    def jn(x):
+        mask = x > 0.01
+        bessel = _registered_bessel[ell]
+        return jnp.where(mask, bessel[0](x), bessel[1](x))
+
+    return jn
 
 
 def weights_trapz(x):
@@ -319,7 +329,7 @@ class BesselPowerToCorrelation(object):
             k = (edges[:-1] + edges[1:]) / 2.
         else:
             if volume is None: volume = 4. / 3. * np.pi * weights_trapz(k**3)
-        self.w = (-1)**(ell // 2) / (2. * np.pi)**3 * volume * spherical_jn(ell)(seval[..., None] * k)
+        self.w = (-1)**(ell // 2) / (2. * np.pi)**3 * volume * get_spherical_jn_scipy(ell)(seval[..., None] * k)
 
     def __call__(self, fun: jax.Array):
         return jnp.sum(self.w * fun, axis=-1)
@@ -362,7 +372,7 @@ def _format_slice(sl, size):
     # To handle slice(0, None, 1)
     if start is None: start = 0
     if step is None: step = 1
-    if stop is None: stop = (size - start) // step * step
+    stop = min((size - start) // step * step, stop if stop is not None else size)
     #start, stop, step = sl.indices(len(self._x[iproj]))
     if step < 0:
         raise IndexError('positive slicing step only supported')
@@ -380,7 +390,7 @@ def compute_real_gaunt(*ellms):
             fac = 1
             for n in range(ell - abs(m) + 1, ell + abs(m) + 1): fac *= n  # (ell + |m|)!/(ell - |m|)!
             amp *= sp.sqrt(2) / sp.sqrt(fac)
-        expr = (-1)**m * sp.assoc_legendre(ell, abs(m), sp.cos(theta))
+        expr = (-1)**m * sp.assoc_get_legendre(ell, abs(m), sp.cos(theta))
         # The phi dependence
         if m < 0:
             expr *= sp.sin(abs(m) * phi)
@@ -564,16 +574,15 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     attrs : dict
         Other attributes.
     """
-    _rename_fields = {}
     _label_x = None
     _label_proj = None
     _label_value = None
     _data_fields = ['_x', '_edges', '_value', '_weights']
-    _meta_fields = ['_projs', 'name', 'attrs']
-    _rename_fields = {'_x': 'x', '_value': 'value', '_weights': 'weights', '_edges': 'edges', '_projs': 'projs'}
+    _meta_fields = ['_projs', 'name', 'attrs', '_label_x', '_label_proj', '_label_value']
     _select_x_fields = ['_x', '_value', '_weights', '_edges']
     _select_proj_fields = ['_x', '_value', '_weights', '_edges', '_projs']
     _sum_fields = ['_value']
+    _init_fields = {'x': '_x', 'edges': '_edges', 'projs': '_projs', 'value': '_value', 'weights': '_weights', 'name': 'name', 'attrs': 'attrs'}
 
     def __init__(self, x=None, edges=None, projs=None, value=None, weights=None, name=None, attrs=None):
         """
@@ -630,21 +639,25 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             state['_x'] = [jnp.atleast_1d(xx) for xx in x]
         if len(state['_x']) != nprojs:
             raise ValueError('x should be of same length as the number of projs = {:d}, found {:d}'.format(nprojs, len(state['_x'])))
+        state['_edges'] = []
         if edges is None:
-            state['_edges'] = []
             for xx in state['_x']:
                 if len(xx) >= 2:
                     tmp = (xx[:-1] + xx[1:]) / 2.
                     tmp = jnp.concatenate([jnp.array([tmp[0] - (xx[1] - xx[0])]), tmp, jnp.array([tmp[-1] + (xx[-1] - xx[-2])])])
+                    tmp = jnp.column_stack([tmp[:-1], tmp[1:]])
                 else:
-                    tmp = jnp.full(len(xx) + 1, np.nan)
+                    tmp = jnp.full(xx.shape + (2,), np.nan)
                 state['_edges'].append(tmp)
         else:
-            state['_edges'] = [jnp.atleast_1d(xx) for xx in edges]
+            for ix, xx in enumerate(edges):
+                tmp = jnp.atleast_2d(xx)
+                eshape = state['_x'][ix].shape + (2,)
+                if tmp.shape != eshape:
+                    raise ValueError('edges should be of shape {} (since x shape is {}), found {}'.format(eshape, eshape[:-1], tmp.shape))
+                state['_edges'].append(tmp)
+
         shape = tuple(len(xx) for xx in state['_x'])
-        eshape = tuple(len(edges) - 1 for edges in state['_edges'])
-        if eshape != shape:
-            raise ValueError('edges should be of length(x) + 1 = {}, found = {}'.format(shape, eshape))
         if weights is None:
             weights = [None] * len(state['_x'])
         state['_weights'] = [jnp.atleast_1d(ww) if ww is not None else jnp.ones(len(xx), dtype=float) for xx, ww in zip(state['_x'], weights)]
@@ -667,24 +680,22 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         self.__dict__.update(state)
 
     def _clone_as_binned_statistic(self, **kwargs):
-        state = {'x': self.x(), 'value': self.value, 'weights': self.weights(), 'edges': self.edges()}
-        state |= {name: getattr(self, name) for name in ['projs', 'name', 'attrs']}
-        state.update(kwargs)
-        return BinnedStatistic(**state)
+        init_kw = {'x': self.x(), 'value': self.value, 'weights': self.weights(), 'edges': self.edges()}
+        init_kw |= {name: getattr(self, name) for name in ['projs', 'name', 'attrs']}
+        init_kw.update(kwargs)
+        return BinnedStatistic(**init_kw)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        fields = self._data_fields + self._meta_fields
-        renames = [self._rename_fields.get(name, name) for name in fields]
-        not_in_fields = [name for name in kwargs if name not in renames]
-        if not_in_fields:
+        init_kw = {name: getattr(self, rename) for name, rename in self._init_fields.items()}
+        not_in_init = [name for name in kwargs if name not in init_kw]
+        if not_in_init:
             if type(self) == BinnedStatistic:
-                raise ValueError('arguments {} not known'.format(not_in_fields))
+                raise ValueError('arguments {} cannot be passed to {}'.format(not_in_init, self.__init__))
             else:
                 return self._clone_as_binned_statistic(**kwargs)  # try preceding clone
-        state = {rename: getattr(self, name) for name, rename in zip(fields, renames)}  # remove front _
-        state.update(kwargs)
-        return self.__class__(**state)
+        init_kw.update(kwargs)
+        return self.__class__(**init_kw)
 
     def copy(self):
         import copy
@@ -782,72 +793,11 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         for name in new._select_x_fields:
             value = values[name]
             if name in new._select_proj_fields:
-                if name == '_edges': indices = [slice(int(i > 0), None, 1) for i in range(len(value))]
-                else: indices = [slice(None)] * len(value)
+                indices = [slice(None)] * len(value)
                 value = tuple(jnp.concatenate([vv[iv][idx] for vv, idx in zip(value, indices)], axis=0) for iv in range(len(value[0])))
             else:
                 value = jnp.concatenate(value, axis=0)
             setattr(new, name, value)
-        return new
-
-    def _slice_xmatch(self, x, projs=Ellipsis, method='mid'):
-        """Return list of (proj, slice1, slice2) to apply to obtain the same x-coordinates."""
-        if projs is Ellipsis: projs = self._projs
-        if not isinstance(x, list):
-            x = [x] * len(projs)
-        toret = []
-        for xx, proj in zip(x, projs):
-            xx = np.asarray(xx)
-            iproj = self._index_projs(proj)
-            if method == 'mid': sx = (self._edges[iproj][:-1] + self._edges[iproj][1:]) / 2.
-            else: sx = self._x[iproj]
-            found = False
-            for step in range(1, len(sx) // len(xx) + 1):
-                sl1 = slice(0, len(sx) // step * step, step)
-                if method == 'mid':
-                    edges = self._edges[iproj][::sl1.step]
-                    x1 = (edges[:-1] + edges[1:]) / 2.
-                else:
-                    nmatrix1 = self._slice_matrix(sl1, projs=proj, normalize=True)
-                    x1 = nmatrix1.dot(sx)
-                index = np.flatnonzero(np.isclose(xx[0], x1, equal_nan=True))
-                if index.size:
-                    if len(xx) > 1:
-                        if np.allclose(xx, x1[index[0]:index[0] + len(xx)], equal_nan=True):
-                            found = True
-                            break
-                    else:
-                        found = True
-                        break
-            if not found:
-                raise ValueError('could not find slice to match {} to {} (proj {})'.format(xx, sx, proj))
-            sl2 = slice(index[0], index[0] + len(xx), 1)
-            toret.append((proj, sl1, sl2))
-        return toret
-
-    def xmatch(self, x, projs=Ellipsis, select_projs=False, method='mid'):
-        """
-        Apply selection to match input x-coordinates.
-
-        Parameters
-        ----------
-        x : array, list
-            Coordinates. Can be a list of ``x`` for the list of ``projs``.
-
-        projs : list, default=None
-            List of projections.
-            Defaults to :attr:`projs`.
-
-        Returns
-        -------
-        new : ObservableArray
-        """
-        new = self.slice()
-        for proj, sl1, sl2 in self._slice_xmatch(x=x, projs=projs, method=method):
-            new = new.slice(sl1, projs=proj)
-            new = new.slice(sl2, projs=proj)
-        if select_projs:
-            new = new.slice(projs=projs, select_projs=True)
         return new
 
     def _index(self, xlim=None, projs=Ellipsis, method='mid', concatenate=True):
@@ -875,7 +825,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         if not isinstance(iprojs, list): iprojs = [iprojs]
         toret = []
         for iproj in iprojs:
-            if method == 'mid': xx = (self._edges[iproj][:-1] + self._edges[iproj][1:]) / 2.
+            if method == 'mid': xx = (self._edges[iproj][..., 0] + self._edges[iproj][..., 1]) / 2.
             else: xx = self._x[iproj]
             if xlim is not None:
                 tmp = (xx >= xlim[0]) & (xx <= xlim[1])
@@ -908,7 +858,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             return toret[0]
         return toret
 
-    def select(self, xlim=None, rebin=1, projs=Ellipsis, select_projs=False, method='mid'):
+    def select(self, xlim=None, projs=Ellipsis, select_projs=False, method='mid'):
         """
         Apply x-cuts for given projections.
 
@@ -931,13 +881,12 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         """
         iprojs = self._index_projs(projs)
         if not isinstance(iprojs, list): iprojs = [iprojs]
-        self = self.slice(slice(0, None, rebin), projs=projs)
         state = {name: list(getattr(self, name)) for name in self._select_x_fields}
         for iproj in iprojs:
             index = self._index(xlim=xlim, projs=[self._projs[iproj]], method=method, concatenate=False)[0]
             for name in state:
                 tmpidx = index
-                if name == '_edges': tmpidx = np.append(index, index[-1] + 1)
+                # continuous (no rebinning), should be all fine even for edges
                 state[name][iproj] = getattr(self, name)[iproj][tmpidx]
         state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields} | {name: tuple(value) for name, value in state.items()}
         projs = self._projs
@@ -948,35 +897,40 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         new.__dict__.update(state)
         return new
 
-    def _slice_matrix(self, sl=None, projs=Ellipsis, weighted=True, normalize=True):
+    def _slice_matrix(self, edges=None, projs=Ellipsis, weighted=True, normalize=True):
         # Return, for a given slice, the corresponding matrix to apply to the data arrays.
         toret = []
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         if isscalar: iprojs = [iprojs]
-        if sl is None: sl = slice(None)
+        if edges is None:
+            edges = slice(None)
+        if isinstance(edges, BinnedStatistic):
+            edges = list(edges._edges)
+        toret = []
         for iproj in iprojs:
-            sl = _format_slice(sl, len(self._x[iproj]))
-            start, stop, step = sl.start, sl.stop, sl.step
-            oneslice = slice(start, stop, 1)
-            ww = self._weights[iproj][oneslice]
-            if not weighted:
-                ww = np.ones(ww.shape)
-            if len(ww) % step != 0:
-                raise IndexError('slicing step = {:d} does not divide length {:d}'.format(step, len(ww)))
-            tmp_lim = np.zeros((len(ww), len(self._weights[iproj])), dtype=float)
-            tmp_lim[np.arange(tmp_lim.shape[0]), start + np.arange(tmp_lim.shape[0])] = 1.
-            tmp_bin = jnp.zeros((len(ww) // step, len(ww)), dtype=float)
-            #print(np.repeat(np.arange(tmp_bin.shape[0]), step).shape, np.arange(tmp_bin.shape[-1]).shape, ww.shape)
-            tmp_bin = tmp_bin.at[np.repeat(np.arange(tmp_bin.shape[0]), step), np.arange(tmp_bin.shape[-1])].set(ww)
-            #print(step, self._projs[iproj], ww, np.sum(tmp_bin, axis=-1))
-            if normalize: tmp_bin /= jnp.sum(tmp_bin, axis=-1)[:, None]
-            toret.append(tmp_bin.dot(tmp_lim))
+            if isinstance(edges, list): iedges = edges[iproj]
+            else: iedges = edges
+            if isinstance(iedges, slice):
+                sl = _format_slice(iedges, len(self._x[iproj]))
+                sl1 = self._edges[iproj][sl, ..., 0]
+                sl2 = self._edges[iproj][sl.start + sl.step - 1:sl.stop + sl.step - 1:sl.step, ..., 1]
+                iedges = jnp.concatenate([sl1[..., None], sl2[..., None]], axis=-1)
+            matrix = np.zeros((len(iedges), len(self._weights[iproj])), dtype=float)
+            for iedge, edge in enumerate(iedges):  # iterate on data vector size
+                mask = (self._edges[iproj][..., 0] >= edge[..., 0]) & (self._edges[iproj][..., 1] <= edge[..., 1])  # (size, ndim, 2)
+                if mask.ndim > 2: mask = mask.all(axis=1)  # (N>1)-dim vector
+                if weighted:
+                    matrix[iedge, mask] = self._weights[iproj][mask]
+                else:
+                    matrix[iedge, mask] = 1.
+            if normalize: matrix /= jnp.sum(matrix, axis=-1)[:, None]
+            toret.append(matrix)
         if isscalar:
             return toret[0]
         return toret
 
-    def slice(self, slice=None, projs=Ellipsis, select_projs=False):
+    def slice(self, edges=None, projs=Ellipsis, select_projs=False):
         """
         Apply selections to the data, slicing for given projections.
 
@@ -997,16 +951,27 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         isscalar = not isinstance(iprojs, list)
         if isscalar: iprojs = [iprojs]
         state = {name: list(getattr(self, name)) for name in self._select_x_fields}
+        if edges is None:
+            edges = slice(None)
+        if isinstance(edges, BinnedStatistic):
+            edges = list(edges._edges)
         for iproj in iprojs:
             proj = self._projs[iproj]
-            sl = _format_slice(slice, len(self._x[iproj]))
-            start, stop, step = sl.start, sl.stop, sl.step
-            matrix = self._slice_matrix(slice, projs=proj, weighted=False, normalize=False)
-            nwmatrix = self._slice_matrix(slice, projs=proj, weighted=True, normalize=True)
+            if isinstance(edges, list): iedges = edges[iproj]
+            else: iedges = edges
+            matrix = self._slice_matrix(iedges, projs=proj, weighted=False, normalize=False)
+            nwmatrix = self._slice_matrix(iedges, projs=proj, weighted=True, normalize=True)
             for name in state:
-                if name == '_edges': state[name][iproj] = state[name][iproj][start::step][:matrix.shape[0] + 1]
-                elif name == '_weights': state[name][iproj] = matrix.dot(state[name][iproj])
-                else: state[name][iproj] = nwmatrix.dot(state[name][iproj])
+                if name == '_edges':
+                    _edges = []
+                    for row in nwmatrix:
+                        edge = state[name][iproj][row != 0]
+                        _edges.append(jnp.concatenate([edge[0, ..., 0][None, ..., None], edge[-1, ..., 1][None, ..., None]], axis=-1))
+                    state[name][iproj] = jnp.concatenate(_edges, axis=0)
+                elif name == '_weights':
+                    state[name][iproj] = matrix.dot(state[name][iproj])
+                else:
+                    state[name][iproj] = nwmatrix.dot(state[name][iproj])
         state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields} | {name: tuple(value) for name, value in state.items()}
         projs = self._projs
         if select_projs:
@@ -1216,18 +1181,31 @@ class WindowMatrix(object):
             return 1, 'theory', self._theory
         raise ValueError('axis must be in {} or {}'.format(observable_names, theory_names))
 
-    def _slice_matrix(self, slice, axis='o', projs=Ellipsis, normalize=False):
+    def _slice_matrix(self, edges, axis='o', projs=Ellipsis, normalize=False):
         # Return, for a given slice, the corresponding matrix to apply to the data arrays.
         axis, _, observable = self._axis_index(axis=axis)
         if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
         proj_indices = observable._index_projs(projs)
-        matrix = []
-        for iproj, proj in enumerate(observable._projs):
-            matrix.append(observable._slice_matrix(slice if iproj in proj_indices else None, projs=proj, normalize=normalize))
+        list_projs = list(observable._projs)
+        if edges is None:
+            edges = slice(None)
+        if isinstance(edges, BinnedStatistic):
+            edges = list(edges._edges)
+        list_edges = []
+        iiproj = 0
+        for iproj, proj in enumerate(list_projs):
+            if iproj in proj_indices:
+                if isinstance(edges, list): iedges = edges[iiproj]
+                else: iedges = edges
+                iiproj += 1
+            else:
+                iedges = slice(None)
+            list_edges.append(iedges)
+        matrix = observable._slice_matrix(list_edges, projs=list_projs, normalize=normalize)
         import scipy
         return scipy.linalg.block_diag(*matrix)
 
-    def slice(self, slice=None, axis='o', projs=Ellipsis, select_projs=False):
+    def slice(self, edges=None, axis='o', projs=Ellipsis, select_projs=False):
         """
         Apply selections to the window matrix, slicing for given axis and projections.
 
@@ -1249,44 +1227,14 @@ class WindowMatrix(object):
         new : WindowMatrix
         """
         axis, name, observable = self._axis_index(axis=axis)
-        observable = observable.slice(slice, projs=projs)
-        matrix = self._slice_matrix(slice, axis=axis, projs=projs, normalize=axis == 0)
+        observable = observable.slice(edges, projs=projs)
+        matrix = self._slice_matrix(edges, axis=axis, projs=projs, normalize=axis == 0)
         value = matrix.dot(self._value) if axis == 0 else self._value.dot(matrix.T)
         if select_projs:
             observable = observable.select(projs=projs, select_projs=True)
             index = self._index(projs=projs, concatenate=True)
             value = np.take(value, index, axis=axis)
         new = self.clone(value=value, attrs=self.attrs, **{name: observable})
-        return new
-
-    def xmatch(self, x, axis='o', projs=Ellipsis, select_projs=False, method='mid'):
-        """
-        Apply selection to match input x-coordinates.
-
-        Parameters
-        ----------
-        x : array, list
-            Coordinates. Can be a list of ``x`` for the list of ``projs``.
-
-        axis : str
-            Axis to match ``x`` to.
-            One of ('o', 'observable') or ('t', 'theory').
-
-        projs : list, default=None
-            List of projections.
-            Defaults to :attr:`projs`.
-
-        Returns
-        -------
-        new : WindowMatrix
-        """
-        new = self.slice()
-        axis, _, observable = self._axis_index(axis=axis)
-        for proj, sl1, sl2 in observable._slice_xmatch(x=x, projs=projs, method=method):
-            new = new.slice(sl1, axis=axis, projs=proj)
-            new = new.slice(sl2, axis=axis, projs=proj)
-        if select_projs:
-            new = new.slice(axis=axis, projs=projs, select_projs=select_projs)
         return new
 
     @classmethod
@@ -1345,7 +1293,7 @@ class WindowMatrix(object):
         axis, _, observable = self._axis_index(axis=axis)
         return observable._index(xlim=xlim, projs=projs, method=method, concatenate=concatenate)
 
-    def select(self, xlim=None, rebin=1, axis='o', projs=Ellipsis, select_projs=False, method='mid'):
+    def select(self, xlim=None, axis='o', projs=Ellipsis, select_projs=False, method='mid'):
         """
         Apply selections for given observables and projections.
 
@@ -1373,7 +1321,6 @@ class WindowMatrix(object):
         axis, name, observable = self._axis_index(axis=axis)
         if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
         #print(observable_indices, projs)
-        new = self.slice(slice(0, None, rebin), axis=axis, projs=projs)
         proj_indices = observable._index_projs(projs)
         index = np.concatenate([observable._index(xlim=xlim if iproj in proj_indices else None, projs=proj, method=method, concatenate=True) for iproj, proj in enumerate(observable._projs)])
         observable = observable.select(xlim=xlim, projs=projs, method=method)
@@ -1714,3 +1661,25 @@ def plot_matrix(matrix, x1=None, x2=None, xlabel1=None, xlabel2=None, barlabel=N
     cbar = fig.colorbar(mesh, cax=cbar_ax)
     if barlabel: cbar.set_label(barlabel, rotation=90)
     return fig
+
+
+real_gaunt = {((0, 0), (0, 0), (0, 0)): 0.28209479177387814, ((0, 0), (2, -2), (2, -2)): 0.28209479177387814, ((0, 0), (2, -1), (2, -1)): 0.28209479177387814, ((0, 0), (2, 0), (2, 0)): 0.28209479177387814,
+            ((0, 0), (2, 1), (2, 1)): 0.28209479177387814, ((0, 0), (2, 2), (2, 2)): 0.28209479177387814, ((2, -2), (0, 0), (2, -2)): 0.28209479177387814, ((2, -1), (0, 0), (2, -1)): 0.28209479177387814,
+            ((2, 0), (0, 0), (2, 0)): 0.28209479177387814, ((2, 1), (0, 0), (2, 1)): 0.28209479177387814, ((2, 2), (0, 0), (2, 2)): 0.28209479177387814, ((2, -2), (2, -2), (0, 0)): 0.28209479177387814,
+            ((2, -1), (2, -1), (0, 0)): 0.28209479177387814, ((2, 0), (2, 0), (0, 0)): 0.28209479177387814, ((2, 1), (2, 1), (0, 0)): 0.28209479177387814, ((2, 2), (2, 2), (0, 0)): 0.28209479177387814,
+            ((2, -2), (2, -2), (2, 0)): -0.1802237515728686, ((2, -2), (2, -1), (2, 1)): 0.15607834722743974, ((2, -2), (2, 0), (2, -2)): -0.1802237515728686, ((2, -2), (2, 1), (2, -1)): 0.15607834722743974,
+            ((2, -1), (2, -2), (2, 1)): 0.15607834722743974, ((2, -1), (2, -1), (2, 0)): 0.0901118757864343, ((2, -1), (2, -1), (2, 2)): -0.15607834722743985, ((2, -1), (2, 0), (2, -1)): 0.0901118757864343,
+            ((2, -1), (2, 1), (2, -2)): 0.15607834722743974, ((2, -1), (2, 2), (2, -1)): -0.15607834722743985, ((2, 0), (2, -2), (2, -2)): -0.1802237515728686, ((2, 0), (2, -1), (2, -1)): 0.0901118757864343,
+            ((2, 0), (2, 0), (2, 0)): 0.18022375157286857, ((2, 0), (2, 1), (2, 1)): 0.09011187578643429, ((2, 0), (2, 2), (2, 2)): -0.18022375157286857, ((2, 1), (2, -2), (2, -1)): 0.15607834722743974,
+            ((2, 1), (2, -1), (2, -2)): 0.15607834722743974, ((2, 1), (2, 0), (2, 1)): 0.09011187578643429, ((2, 1), (2, 1), (2, 0)): 0.09011187578643429, ((2, 1), (2, 1), (2, 2)): 0.15607834722743988,
+            ((2, 1), (2, 2), (2, 1)): 0.15607834722743988, ((2, 2), (2, -1), (2, -1)): -0.15607834722743985, ((2, 2), (2, 0), (2, 2)): -0.18022375157286857, ((2, 2), (2, 1), (2, 1)): 0.15607834722743988,
+            ((2, 2), (2, 2), (2, 0)): -0.18022375157286857, ((4, -4), (2, -2), (2, 2)): 0.23841361350444812, ((4, -4), (2, 2), (2, -2)): 0.23841361350444812, ((4, -3), (2, -2), (2, 1)): 0.16858388283618375,
+            ((4, -3), (2, -1), (2, 2)): 0.1685838828361839, ((4, -3), (2, 1), (2, -2)): 0.16858388283618375, ((4, -3), (2, 2), (2, -1)): 0.1685838828361839, ((4, -2), (2, -2), (2, 0)): 0.15607834722744057,
+            ((4, -2), (2, -1), (2, 1)): 0.18022375157286857, ((4, -2), (2, 0), (2, -2)): 0.15607834722744057, ((4, -2), (2, 1), (2, -1)): 0.18022375157286857, ((4, -1), (2, -2), (2, 1)): -0.06371871843402716,
+            ((4, -1), (2, -1), (2, 0)): 0.2207281154418226, ((4, -1), (2, -1), (2, 2)): 0.06371871843402753, ((4, -1), (2, 0), (2, -1)): 0.2207281154418226, ((4, -1), (2, 1), (2, -2)): -0.06371871843402717,
+            ((4, -1), (2, 2), (2, -1)): 0.06371871843402753, ((4, 0), (2, -2), (2, -2)): 0.04029925596769687, ((4, 0), (2, -1), (2, -1)): -0.1611970238707875, ((4, 0), (2, 0), (2, 0)): 0.24179553580618127,
+            ((4, 0), (2, 1), (2, 1)): -0.16119702387078752, ((4, 0), (2, 2), (2, 2)): 0.04029925596769688, ((4, 1), (2, -2), (2, -1)): -0.06371871843402717, ((4, 1), (2, -1), (2, -2)): -0.06371871843402717,
+            ((4, 1), (2, 0), (2, 1)): 0.2207281154418226, ((4, 1), (2, 1), (2, 0)): 0.2207281154418226, ((4, 1), (2, 1), (2, 2)): -0.06371871843402754, ((4, 1), (2, 2), (2, 1)): -0.06371871843402754,
+            ((4, 2), (2, -1), (2, -1)): -0.18022375157286857, ((4, 2), (2, 0), (2, 2)): 0.15607834722743988, ((4, 2), (2, 1), (2, 1)): 0.18022375157286857, ((4, 2), (2, 2), (2, 0)): 0.15607834722743988,
+            ((4, 3), (2, -2), (2, -1)): -0.16858388283618375, ((4, 3), (2, -1), (2, -2)): -0.16858388283618375, ((4, 3), (2, 1), (2, 2)): 0.16858388283618386, ((4, 3), (2, 2), (2, 1)): 0.16858388283618386,
+            ((4, 4), (2, -2), (2, -2)): -0.23841361350444804, ((4, 4), (2, 2), (2, 2)): 0.23841361350444806}

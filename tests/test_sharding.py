@@ -9,8 +9,8 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                      compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, BinAttrs, compute_mean_mesh_power, compute_mesh_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
+from jaxpower import (compute_mesh_pspec, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
+                      compute_fkp_pspec, BinnedStatistic, WindowMatrix, MeshAttrs, bin_pspec, compute_mesh_pspec_mean, compute_mesh_pspec_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
 
 
 dirname = Path('_tests')
@@ -259,7 +259,7 @@ def test_mesh_power():
     poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
                         0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
                         8. / 35 * beta ** 2 * pk(kin)])
-    theory = BinnedStatistic(x=[kin] * len(ells), edges=[kinedges] * len(ells), value=poles, projs=ells)
+    theory = BinnedStatistic(x=[kin] * len(ells), edges=[np.array(list(zip(kinedges[:-1], kinedges[1:])))] * len(ells), value=poles, projs=ells)
 
     list_los = ['x', 'endpoint']
 
@@ -267,13 +267,13 @@ def test_mesh_power():
     with create_sharding_mesh(meshsize=meshsize) as mesh:
 
         attrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
-        edges = {'step': 0.01}
+        bin = bin_pspec(attrs, edges={'step': 0.01})
         ellsin = ells
 
         @partial(jax.jit, static_argnames=['los', 'ells'])
         def mock(seed, los='x', ells=(0, 2, 4)):
             mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=seed, los=los, unitary_amplitude=True)
-            return compute_mesh_power(mesh, ells=ells, los={'local': 'firstpoint'}.get(los, los), edges=edges)
+            return compute_mesh_pspec(mesh, ells=ells, los={'local': 'firstpoint'}.get(los, los), bin=bin)
 
         #mock(random.key(43), los='x')
         #mock(random.key(43), los='local')
@@ -281,8 +281,8 @@ def test_mesh_power():
         for flag in ['smooth', 'infinite'][1:]:
             for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')]:
                 print(flag, los, thlos, flush=True)
-                mean = compute_mean_mesh_power(attrs, theory=(theory, thlos) if thlos is not None else theory, ells=ells, edges=edges, los=los)
-                wmatrix = compute_mesh_window(attrs, edgesin=kinedges, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, edges=edges, los=los, pbar=True, flags=(flag,))
+                mean = compute_mesh_pspec_mean(attrs, theory=(theory, thlos) if thlos is not None else theory, ells=ells, bin=bin, los=los)
+                wmatrix = compute_mesh_pspec_window(attrs, edgesin=kinedges, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, bin=bin, los=los, pbar=True, flags=(flag,))
 
 
 def test_mem():
@@ -311,8 +311,8 @@ def test_particles():
 
     mesh = ParticleField(positions=per_host_positions, attrs=attrs).paint(resmpler='tsc', interlacing=3, compensate=True, pexchange=True)
     ells = (0, 2, 4)
-    edges = {'step': 0.01}
-    compute_mesh_power(mesh, ells=ells, los='firstpoint', edges=edges)
+    bin = bin_pspec(attrs, edges={'step': 0.01})
+    compute_mesh_pspec(mesh, ells=ells, los='firstpoint', bin=bin)
 
 
 def get_mock_fn(kind='data'):
@@ -355,9 +355,10 @@ def save_reference_mock():
     fkp = FKPField(data, randoms)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     mesh.save(get_mock_fn('mesh'))
-    power = compute_mesh_power(mesh, edges={'step': 0.01}, ells=(0, 2, 4), los='firstpoint')
+    bin = bin_pspec(attrs, edges={'step': 0.01})
+    power = compute_mesh_pspec(mesh, bin=bin, ells=(0, 2, 4), los='firstpoint')
     power.save(get_mock_fn('mesh_power'))
-    power = compute_fkp_power(fkp, resampler='tsc', interlacing=3, edges={'step': 0.01}, ells=(0, 2, 4), los='firstpoint')
+    power = compute_fkp_pspec(fkp, resampler='tsc', interlacing=3, bin=bin, ells=(0, 2, 4), los='firstpoint')
     power.save(get_mock_fn('fkp_power'))
 
 
@@ -378,6 +379,7 @@ def compute_power_spectrum():
     los = ref_mesh_power.attrs.pop('los')
     ref_mesh_power.attrs.pop('dtype')
     attrs = MeshAttrs(**ref_mesh_power.attrs)
+    bin = bin_pspec(attrs, edges={'step': 0.01})
     ref_fkp_power = PowerSpectrumMultipoles.load(get_mock_fn('fkp_power'))
 
     with create_sharding_mesh(meshsize=attrs.meshsize) as sharding_mesh:
@@ -401,8 +403,8 @@ def compute_power_spectrum():
         #mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
         #mesh = RealMeshField.load(get_mock_fn(kind='mesh'))
         #mesh = mesh.clone(value=jax.device_put(mesh.value, jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names))))
-        mesh_power = compute_mesh_power(mesh, edges={'step': 0.01}, ells=(0, 2, 4), los='firstpoint')
-        fkp_power = compute_fkp_power(fkp, edges={'step': 0.01}, resampler='tsc', interlacing=3, ells=(0, 2, 4), los='firstpoint')
+        mesh_power = compute_mesh_pspec(mesh, bin=bin, ells=(0, 2, 4), los='firstpoint')
+        fkp_power = compute_fkp_pspec(fkp, bin=bin, resampler='tsc', interlacing=3, ells=(0, 2, 4), los='firstpoint')
     diff = jnp.abs(mesh_power.view() - ref_mesh_power.view())
     print(diff)
     diff = jnp.abs(fkp_power.view() - ref_fkp_power.view())

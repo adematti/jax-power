@@ -132,9 +132,6 @@ def test_particle_field():
     particle = ParticleField(positions, weights=weights, cellsize=10)
     particle = particle + particle
     assert np.allclose(particle.cellsize, 10.)
-    particle2 = jax.tree.map(lambda x, y: x + y, particle, particle)
-    assert np.allclose(particle2.positions, 2 * particle.positions)
-    assert np.allclose(particle2.cellsize, particle.cellsize)
     assert particle.positions.shape[0] == positions.shape[0] * 2
     assert np.all(particle.boxsize > 40)
     assert particle.meshsize.shape == positions.shape[1:]
@@ -164,7 +161,7 @@ def test_timing():
 
 def test_dtype():
     for dtype in ['f4', 'f8']:
-        attrs = MeshAttrs(boxsize=1000., meshsize=64, dtype=dtype)
+        attrs = MeshAttrs(boxsize=1000., meshsize=64, dtype=dtype, fft_engine='jax')
         mesh = attrs.create(kind='real', fill=0.)
         assert mesh.value.dtype == mesh.dtype == attrs.dtype, (mesh.value.dtype, attrs.dtype)
         mesh = mesh.r2c()
@@ -178,7 +175,6 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()

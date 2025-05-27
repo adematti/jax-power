@@ -7,8 +7,8 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
-                      compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, BinAttrs, compute_mean_mesh_power, compute_mesh_window, compute_normalization, utils)
+from jaxpower import (compute_mesh_pspec, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
+                      compute_fkp_pspec, BinnedStatistic, WindowMatrix, MeshAttrs, bin_pspec, compute_mesh_pspec_mean, compute_mesh_pspec_window, compute_normalization, utils)
 
 
 dirname = Path('_tests')
@@ -21,7 +21,7 @@ def test_binned_statistic():
     observable = BinnedStatistic(x=x, value=v, projs=[0, 2])
     assert np.allclose(observable.view(projs=2), v[0])
     assert np.allclose(observable.view(xlim=(0., 0.1), projs=0), v[0][v[0] <= 0.1])
-    assert np.allclose(observable.select(rebin=2).view(projs=0), (v[0][::2] + v[0][1::2]) / 2.)
+    assert np.allclose(observable.slice(slice(0, None, 2)).view(projs=0), (v[0][::2] + v[0][1::2]) / 2.)
     fn = dirname / 'tmp.npy'
     observable.save(fn)
     observable2 = BinnedStatistic.load(fn)
@@ -48,8 +48,8 @@ def test_binned_statistic():
 
     def mock(seed, los='x'):
         mesh = generate_gaussian_mesh(MeshAttrs(boxsize=500., meshsize=64), pkvec, seed=seed, unitary_amplitude=True)
-        bin = BinAttrs(mesh.attrs, edges={'step': 0.01})
-        return compute_mesh_power(mesh, ells=(0, 2, 4), los=los, bin=bin)
+        bin = bin_pspec(mesh.attrs, edges={'step': 0.01})
+        return compute_mesh_pspec(mesh, ells=(0, 2, 4), los=los, bin=bin)
 
     power = mock(random.key(43), los='x')
     power.save(fn)
@@ -69,7 +69,7 @@ def test_binned_statistic():
     assert np.allclose(powers.view(), power.view())
 
 
-def test_mesh_power(plot=False):
+def test_mesh_pspec(plot=False):
 
     def pk(k):
         kp = 0.03
@@ -82,12 +82,12 @@ def test_mesh_power(plot=False):
 
     list_los = ['x', 'endpoint']
     attrs = MeshAttrs(meshsize=128, boxsize=1000.)
-    bin = BinAttrs(attrs, edges={'step': 0.01})
+    bin = bin_pspec(attrs, edges={'step': 0.01})
 
     @partial(jax.jit, static_argnames=['los', 'ells'])
     def mock(attrs, bin, seed, los='x', ells=(0, 2, 4)):
         mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
-        return compute_mesh_power(mesh, ells=ells, los=los, bin=bin)
+        return compute_mesh_pspec(mesh, ells=ells, los=los, bin=bin)
 
     for los in list_los:
 
@@ -119,7 +119,7 @@ def test_mesh_power(plot=False):
             plt.show()
 
 
-def test_fkp_power(plot=False):
+def test_fkp_pspec(plot=False):
 
     def pk(k):
         kp = 0.03
@@ -131,19 +131,20 @@ def test_fkp_power(plot=False):
         return dirname / 'tmp_{}.npy'.format(los)
 
     list_los = ['x', 'endpoint']
+    boxcenter = [1300., 0., 0.]
+    attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=128)
+    bin = bin_pspec(attrs, edges={'step': 0.01})
 
     for los in list_los:
         @partial(jax.jit, static_argnames=['los'])
         def mock(seed, los='x'):
-            boxcenter = [1300., 0., 0.]
-            attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=128)
             mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
             size = int(1e6)
             data = generate_uniform_particles(attrs, size, seed=32)
             data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
             randoms = generate_uniform_particles(attrs, size, seed=42)
             fkp = FKPField(data, randoms)
-            return compute_fkp_power(fkp, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+            return compute_mesh_pspec(fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='complex'), bin=bin, ells=(0, 2, 4), los=los)
 
         nmock = 5
         t0 = time.time()
@@ -167,7 +168,7 @@ def test_fkp_power(plot=False):
             plt.show()
 
 
-def test_mean_power(plot=False):
+def test_mean_pspec(plot=False):
 
     def pk(k):
         kp = 0.01
@@ -181,13 +182,14 @@ def test_mean_power(plot=False):
 
     list_los = [('x', None), ('endpoint', None), ('endpoint', 'local')][1:2]
     attrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
+    bin = bin_pspec(attrs, edges={'step': 0.01})
 
     @partial(jax.jit, static_argnames=['los', 'thlos'])
     def mean(los='x', thlos=None):
         theory = poles
         if thlos is not None:
             theory = (poles, thlos)
-        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), los=los, edges={'step': 0.01})
+        return compute_mesh_pspec_mean(attrs, theory=theory, ells=(0, 2, 4), los=los, bin=bin)
 
     for los, thlos in list_los:
 
@@ -228,7 +230,7 @@ def test_checkpoint():
                         8. / 35 * beta ** 2 * pk(kin)])
 
     attrs = MeshAttrs(boxsize=2000., meshsize=350, boxcenter=1000.)
-    edges = {'step': 0.01}
+    bin = bin_pspec(attrs, edges={'step': 0.01})
 
     def make_callable(poles):
         def get_fun(ill):
@@ -248,7 +250,7 @@ def test_checkpoint():
         if los == 'local':
             theory = (theory, los)
             los = 'firstpoint'
-        return compute_mean_mesh_power(attrs, theory=theory, ells=(0, 2, 4), edges=edges, los=los)
+        return compute_mesh_pspec_mean(attrs, theory=theory, ells=(0, 2, 4), bin=bin, los=los)
 
     #print(jax.grad(lambda poles: mean(poles).view()[2])(poles))
     from jax.ad_checkpoint import checkpoint_name
@@ -256,10 +258,10 @@ def test_checkpoint():
     def mock(poles, los='local', seed=42):
         mesh = generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los=los, seed=seed)
         #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
-        return compute_mesh_power(mesh, ells=ells, edges=edges, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
+        return compute_mesh_pspec(mesh, ells=ells, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
 
     def power(mesh, los='local'):
-        return compute_mesh_power(mesh, ells=ells, edges=edges, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
+        return compute_mesh_pspec(mesh, ells=ells, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
 
     def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
         # Generate Gaussian-distributed positions
@@ -293,8 +295,8 @@ def test_checkpoint():
         mesh = generate_anisotropic_gaussian_mesh(selection.attrs, (kinedges, list(theory)), los=los, seed=seed,
                                                   unitary_amplitude=unitary_amplitude)
         los = {'local': 'firstpoint'}.get(los, los)
-        #return compute_mesh_power(apply_selection(mesh, selection, False), edges=edges, los=los, ells=ells).view()[-3]
-        toret = [compute_mesh_power(apply_selection(mesh, selection, cv=cv), edges=edges, los=los, ells=ells) for cv in [False, True]]
+        #return compute_mesh_pspec(apply_selection(mesh, selection, False), bin=bin, los=los, ells=ells).view()[-3]
+        toret = [compute_mesh_pspec(apply_selection(mesh, selection, cv=cv), bin=bin, los=los, ells=ells) for cv in [False, True]]
         return toret[0].clone(value=toret[0].view() - toret[1].view()).view()[-3]
 
     def mock_vmap(poles, los='local'):
@@ -302,7 +304,7 @@ def test_checkpoint():
         def func(seed):
             mesh = generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los=los, seed=seed)
             #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
-            return compute_mesh_power(mesh, ells=(0, 2, 4), edges=edges, los={'local': 'firstpoint'}.get(los, los)).view()
+            return compute_mesh_pspec(mesh, ells=(0, 2, 4), bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()
         return jnp.mean(jax.vmap(func)(seeds), axis=0)
 
     option = 1
@@ -340,7 +342,7 @@ def test_gaunt():
     import sympy as sp
     from sympy.physics.wigner import real_gaunt
     from jaxpower.utils import compute_real_gaunt
-    from jaxpower.power import get_real_Ylm
+    from jaxpower.pspec import get_real_Ylm
 
     if False:
         for ell1, ell2, ell3 in itertools.product((0, 2, 4), (0, 2), (0, 2)):
@@ -370,32 +372,38 @@ def test_gaunt():
                 tmp2 = get_real_Ylm(ell, m, batch=False)(*xyz.T)
                 assert np.allclose(tmp2, tmp, rtol=1e-6, atol=1e-6)
 
-    for ell1, ell2, ell3 in itertools.product((0, 2, 4), (0, 2), (0, 2)):
-        ms = list(itertools.product(list(range(-ell1, ell1 + 1)),
-                                    list(range(-ell2, ell2 + 1)),
-                                    list(range(-ell3, ell3 + 1))))
-        if any(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3)) for m1, m2, m3 in ms):
+    if False:
+        for ell1, ell2, ell3 in itertools.product((0, 2, 4), (0, 2), (0, 2)):
+            ms = list(itertools.product(list(range(-ell1, ell1 + 1)),
+                                        list(range(-ell2, ell2 + 1)),
+                                        list(range(-ell3, ell3 + 1))))
+            if any(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3)) for m1, m2, m3 in ms):
 
-            for m1, m2, m3 in ms:
-                mattrs = MeshAttrs(boxsize=500, meshsize=64)
-                mesh = mattrs.create(kind='hermitian_complex')
-                kvec = mesh.coords(sparse=True)
-                knorm = sum(kk**2 for kk in kvec)**0.5
-                kedges = jnp.array([0.8 * mesh.knyq.min(), 0.9 * mesh.knyq.min()])
-                kmask = (knorm >= kedges[0]) & (knorm <= kedges[-1])
-                bin = BinAttrs(mesh, edges=kedges)
-                mesh = mesh.clone(value=kmask * get_real_Ylm(ell1, m1)(*kvec) * get_real_Ylm(ell2, m2)(*kvec) * get_real_Ylm(ell3, m3)(*kvec))
-                value = bin(mesh)[0]
-                g = float(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))) / (4 * np.pi)
-                if not np.allclose(value, g, rtol=1e-2, atol=1e-3):
-                     print(ell1, ell2, ell3, m1, m2, m3, value, g)
+                for m1, m2, m3 in ms:
+                    mattrs = MeshAttrs(boxsize=500, meshsize=64)
+                    mesh = mattrs.create(kind='hermitian_complex')
+                    kvec = mesh.coords(sparse=True)
+                    knorm = sum(kk**2 for kk in kvec)**0.5
+                    kedges = jnp.array([0.8 * mesh.knyq.min(), 0.9 * mesh.knyq.min()])
+                    kmask = (knorm >= kedges[0]) & (knorm <= kedges[-1])
+                    bin = bin_pspec(mesh, edges=kedges)
+                    mesh = mesh.clone(value=kmask * get_real_Ylm(ell1, m1)(*kvec) * get_real_Ylm(ell2, m2)(*kvec) * get_real_Ylm(ell3, m3)(*kvec))
+                    value = bin(mesh)[0]
+                    g = float(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))) / (4 * np.pi)
+                    if not np.allclose(value, g, rtol=1e-2, atol=1e-3):
+                        print(ell1, ell2, ell3, m1, m2, m3, value, g)
+
+    if True:
+        ell = 2
+        for m in range(-ell, ell + 1):
+            print(ell, m, get_real_Ylm(ell, m)(0, 0, 1))
 
 
 def test_power_to_correlation():
 
     from matplotlib import pyplot as plt
     from jaxpower.utils import TophatPowerToCorrelation, BesselPowerToCorrelation, Interpolator1D
-    from jaxpower import BinAttrs
+    from jaxpower import bin_pspec
 
     def pk(k):
         kp = 0.01
@@ -414,7 +422,7 @@ def test_power_to_correlation():
     pkin = jnp.array(pk(kin))#.at[kin < mattrs.knyq[0] / 2.].set(0.)
 
     edges = np.arange(0., np.sqrt(3.) * 1.1 * knyq, 0.01)
-    bin = BinAttrs(mattrs, edges=edges)
+    bin = bin_pspec(mattrs, edges=edges)
     volume = mattrs.kfun.prod() * bin.nmodes
     volume2 = 4. / 3. * np.pi * (edges[1:]**3 - edges[:-1]**3)
     _k = (edges[:-1] + edges[1:]) / 2.
@@ -447,7 +455,7 @@ def test_power_to_correlation():
 
     if False:
         edges = np.arange(0., np.sqrt(3.) * mattrs.knyq[0], 0.01)
-        bin = BinAttrs(mattrs, edges=edges)
+        bin = bin_pspec(mattrs, edges=edges)
         volume = mattrs.kfun.prod() * bin.nmodes
         volume2 = 4. / 3. * np.pi * utils.weights_trapz(bin.xavg**3)
         ax = plt.gca()
@@ -471,7 +479,7 @@ def test_power_to_correlation():
 
         xi = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
         sedges = np.linspace(0.1, mattrs.boxsize[0] / 2, 1000)
-        bin = BinAttrs(xi, edges=sedges)
+        bin = bin_pspec(xi, edges=sedges)
         xi = bin(xi).real
         ax.plot(bin.xavg, bin.xavg**2 * xi)
 
@@ -513,7 +521,7 @@ def test_power_to_correlation2():
 
     from matplotlib import pyplot as plt
     from jaxpower.utils import TophatPowerToCorrelation, BesselPowerToCorrelation, Interpolator1D
-    from jaxpower.power import BinAttrs
+    from jaxpower.pspec import bin_pspec
 
     def pk(k):
         kp = 0.01
@@ -550,7 +558,7 @@ def test_power_to_correlation2():
         mesh = mattrs.create(kind='real')
         mesh = mesh.clone(value=value)
         mesh = mesh.r2c() * mattrs.cellsize.prod()
-        bin = BinAttrs(mesh, edges=kinedges)
+        bin = bin_pspec(mesh, edges=kinedges)
         pk = bin(mesh).real
 
     if False:
@@ -561,7 +569,7 @@ def test_power_to_correlation2():
         mesh = mattrs.create(kind='real')
         mesh = mesh.clone(value=value)
         mesh = mesh.r2c() * mattrs.cellsize.prod()
-        bin = BinAttrs(mesh, edges=kinedges)
+        bin = bin_pspec(mesh, edges=kinedges)
         pk = bin(mesh).real
 
     if True:
@@ -582,7 +590,7 @@ def test_power_to_correlation2():
         mesh = mattrs.create(kind='real')
         mesh = mesh.clone(value=value)
         mesh = mesh.r2c() * mattrs.cellsize.prod()
-        bin = BinAttrs(mesh, edges=kinedges)
+        bin = bin_pspec(mesh, edges=kinedges)
         pk = bin(mesh).real
 
         if False:
@@ -594,7 +602,7 @@ def test_power_to_correlation2():
                 return toret.at[0, 0, 0].set(0.)
 
             xi2 = mattrs.create(kind='complex').apply(kernel, kind='wavenumber').c2r()
-            bin = BinAttrs(xi2, edges=sedges)
+            bin = bin_pspec(xi2, edges=sedges)
             xi2 = bin(xi2, bin).real
 
             ax = plt.gca()
@@ -607,7 +615,7 @@ def test_power_to_correlation2():
     knorm = jnp.sqrt(sum(xx**2 for xx in mattrs.kcoords(kind='separation', hermitian=True, sparse=True)))
     interp = Interpolator1D(kinedges, knorm, order=0, edges=True)
     mesh2 = mesh2.clone(value=interp(pkin))
-    bin = BinAttrs(mesh2, edges=kinedges)
+    bin = bin_pspec(mesh2, edges=kinedges)
     pk2 = bin(mesh2).real
 
     #mesh += mesh2.mean() - mesh.mean()
@@ -625,7 +633,7 @@ def test_power_to_correlation3():
 
     from matplotlib import pyplot as plt
     from jaxpower.utils import TophatPowerToCorrelation, BesselPowerToCorrelation, Interpolator1D
-    from jaxpower import BinAttrs
+    from jaxpower import bin_pspec
 
     from cosmoprimo.fiducial import DESI
     cosmo = DESI(engine='eisenstein_hu')
@@ -662,9 +670,9 @@ def test_power_to_correlation3():
         return toret.at[0, 0, 0].set(0.)
 
     pk = mattrs.create(kind='complex').apply(kernel, kind='wavenumber')
-    kbin = BinAttrs(pk, edges=kinedges)
+    kbin = bin_pspec(pk, edges=kinedges)
     xi = pk.c2r() * selection
-    bin = BinAttrs(xi)
+    bin = bin_pspec(xi)
     bxi = bin(xi)
     bpk = kbin(xi.r2c())
     snorm = jnp.sqrt(sum(xx**2 for xx in xi.coords(kind='separation', sparse=True)))
@@ -674,7 +682,7 @@ def test_power_to_correlation3():
     bpk2 = kbin(xi.r2c())
 
     if True:
-        kbin2 = BinAttrs(pk) #, edges=dict(max=mattrs.knyq[0]))
+        kbin2 = bin_pspec(pk) #, edges=dict(max=mattrs.knyq[0]))
         kinterp = Interpolator1D(kinedges, kbin2.xavg, order=0, edges=True)
         bessel = BesselPowerToCorrelation(kbin2.xavg, bin.xavg, ell=0, volume=mattrs.kfun.prod() * kbin2.nmodes)
         bxi3 = bessel(kinterp(pkin))
@@ -703,18 +711,18 @@ def test_power_to_correlation3():
         plt.show()
 
 
-def test_window():
+def test_window(plot=False):
 
-    from jaxpower import compute_mesh_window
+    from jaxpower import compute_mesh_pspec_window
     from jaxpower.utils import Interpolator1D
 
     ellsin = (0, 2, 4)
     edgesin = np.array([0.1, 0.11])
     xin = (edgesin[:-1] + edgesin[1:]) / 2.
-    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[edgesin] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
+    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[np.array(list(zip(edgesin[:-1], edgesin[1:])))] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
 
     attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
-    edges = {'step': 0.01}
+    bin = bin_pspec(attrs, edges={'step': 0.01})
 
     def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
@@ -733,30 +741,31 @@ def test_window():
     for flag in ['smooth', 'infinite']:
         for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')]:
             print(flag, los, thlos)
-            mean = compute_mean_mesh_power(selection, theory=(theory, thlos) if thlos is not None else theory, ells=ells, edges=edges, los=los).clone(norm=norm)
-            wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, edges=edges, los=los, pbar=True, norm=norm, flags=(flag,))
-            from matplotlib import pyplot as plt
-            ax = plt.gca()
-            for iproj, proj in enumerate(mean.projs):
-                color = 'C{:d}'.format(iproj)
-                ax.plot(mean.x(projs=proj), mean.view(projs=proj), color=color, linestyle='-')
-                projin = (0, 0) if thlos == 'firstpoint' else 0
-                ax.plot(mean.x(projs=proj), wmatrix.select(projs=proj, select_projs=True, axis='o').select(projs=projin, select_projs=True, axis='t').view(), color=color, linestyle='--')
-            plt.show()
+            mean = compute_mesh_pspec_mean(selection, theory=(theory, thlos) if thlos is not None else theory, ells=ells, bin=bin, los=los).clone(norm=norm)
+            wmatrix = compute_mesh_pspec_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, bin=bin, los=los, pbar=True, norm=norm, flags=(flag,))
+            if plot:
+                from matplotlib import pyplot as plt
+                ax = plt.gca()
+                for iproj, proj in enumerate(mean.projs):
+                    color = 'C{:d}'.format(iproj)
+                    ax.plot(mean.x(projs=proj), mean.view(projs=proj).real, color=color, linestyle='-')
+                    projin = (0, 0) if thlos == 'firstpoint' else 0
+                    ax.plot(mean.x(projs=proj), wmatrix.select(projs=proj, select_projs=True, axis='o').select(projs=projin, select_projs=True, axis='t').view().real, color=color, linestyle='--')
+                plt.show()
 
 
 def test_window_timing():
 
-    from jaxpower import compute_mesh_window
+    from jaxpower import compute_mesh_pspec_window
     from jaxpower.utils import Interpolator1D
 
     ellsin = (0, 2, 4)
     edgesin = np.linspace(0.01, 0.1, 20)
     xin = (edgesin[:-1] + edgesin[1:]) / 2.
-    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[edgesin] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
+    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[np.array(list(zip(edgesin[:-1], edgesin[1:])))] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
 
     attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
-    edges = {'step': 0.01}
+    bin = bin_pspec(attrs, edges={'step': 0.01})
 
     def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
@@ -776,7 +785,7 @@ def test_window_timing():
         for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')][-1:]:
             print(flag, los, thlos)
             t0 = time.time()
-            wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, edges=edges, los=los, pbar=True, norm=norm, flags=(flag,))
+            wmatrix = compute_mesh_pspec_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, ells=ells, bin=bin, los=los, pbar=True, norm=norm, flags=(flag,))
             print(f'{time.time() - t0:.2f}')
 
 
@@ -788,7 +797,7 @@ def test_smooth_window():
     pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
 
     attrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
-    edges = {'step': 0.005}
+    bin = bin_pspec(attrs, edges={'step': 0.005})
     #edgesin = np.arange(0., 1.1 * attrs.knyq.max(), 0.002)
     edgesin = np.arange(0., attrs.knyq.max(), 0.002)
     kin = (edgesin[:-1] + edgesin[1:]) / 2.
@@ -819,7 +828,7 @@ def test_smooth_window():
         selection = selection.r2c()
         selection = (selection * selection.conj()).c2r()
         edges = np.arange(0., selection.boxsize.max(), selection.cellsize.min())
-        bin = BinAttrs(selection, edges=edges)
+        bin = bin_pspec(selection, edges=edges)
         pole = bin(selection) / norm / selection.cellsize.prod()
         print(pole)
 
@@ -833,10 +842,10 @@ def test_smooth_window():
     norm = compute_normalization(selection, selection)
 
     for thlos in ['firstpoint', 'local'][:1]:
-        mean = compute_mean_mesh_power(selection, theory=(edgesin, list(poles), thlos),
-                                       ells=ells, edges=edges, los='firstpoint').clone(norm=norm)
-        wmatrix = compute_mesh_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos),
-                                      edges=edges, ells=ells, los='firstpoint', norm=norm, flags=('smooth',), pbar=True)
+        mean = compute_mesh_pspec_mean(selection, theory=(edgesin, list(poles), thlos),
+                                       ells=ells, bin=bin, los='firstpoint').clone(norm=norm)
+        wmatrix = compute_mesh_pspec_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos),
+                                            bin=bin, ells=ells, los='firstpoint', norm=norm, flags=('smooth',), pbar=True)
         wpoles = wmatrix.dot(poles, return_type=None)
         ax = plt.gca()
         for iproj, proj in enumerate(mean.projs):
@@ -902,7 +911,7 @@ def test_wmatrix():
         delta = (xo - xt) / sigma
         return np.exp(-delta**2)
 
-    value = np.bmat([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
+    value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
     wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
     wmatrix.plot(show=False)
 
@@ -952,8 +961,9 @@ def test_mem():
     with create_sharding_mesh() as sharding_mesh:
         attrs = MeshAttrs(meshsize=1600, boxsize=1000.)
         #attrs = MeshAttrs(meshsize=850, boxsize=1000.)
+        bin = bin_pspec(attrs, edges={'step': 0.001})
         mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
-        compute = partial(compute_mesh_power, edges={'step': 0.001}, ells=(0, 2, 4), los='firstpoint')
+        compute = partial(compute_mesh_pspec, bin=bin, ells=(0, 2, 4), los='firstpoint')
         compute = jax.jit(compute)
         t0 = time.time()
         mesh_power = compute(mesh)
@@ -970,11 +980,11 @@ def test_split():
     from matplotlib import pyplot as plt
 
     from cosmoprimo.fiducial import DESI
-    from jaxpower import (compute_mesh_power, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                        compute_fkp_power, BinnedStatistic, WindowMatrix, MeshAttrs, BinAttrs, compute_mean_mesh_power, compute_mesh_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, compute_fkp_normalization_and_shotnoise)
+    from jaxpower import (compute_mesh_pspec, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
+                          BinnedStatistic, WindowMatrix, MeshAttrs, bin_pspec, compute_mesh_pspec_mean, compute_mesh_pspec_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
 
-    attrs = MeshAttrs(meshsize=(512,) * 3, boxsize=1000., boxcenter=1200.)
-    size = int(1e-2 * attrs.boxsize.prod())
+    attrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1000., boxcenter=1200.)
+    size = int(1e-4 * attrs.boxsize.prod())
     data = generate_uniform_particles(attrs, size + 1, seed=42)
     randoms = generate_uniform_particles(attrs, 4 * size + 1, seed=43)
 
@@ -989,7 +999,7 @@ def test_split():
     poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
                         0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
                         8. / 35 * beta ** 2 * pk(kin)])
-    theory = BinnedStatistic(x=[kin] * len(ells), edges=[kinedges] * len(ells), value=poles, projs=ells)
+    theory = BinnedStatistic(x=[kin] * len(ells), edges=[np.array(list(zip(kinedges[:-1], kinedges[1:])))] * len(ells), value=poles, projs=ells)
     mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=random.key(42), los='local', unitary_amplitude=True)
     data = data.clone(weights=1. + mesh.read(data.positions))
 
@@ -1004,6 +1014,10 @@ def test_split():
 
 if __name__ == '__main__':
 
+    import warnings
+    warnings.simplefilter("error")
+    test_fkp_pspec(plot=False)
+    exit()
     #test_window_timing()
     #test_sympy()
     #test_window()
@@ -1015,11 +1029,11 @@ if __name__ == '__main__':
     #test_checkpoint()
     #test_power_to_correlation()
     #test_power_to_correlation2()
-    test_split()
-    exit()
+    #test_gaunt()
     test_binned_statistic()
-    test_mesh_power(plot=False)
-    test_fkp_power(plot=False)
-    test_mean_power(plot=True)
+    test_mesh_pspec(plot=False)
+    test_fkp_pspec(plot=False)
+    test_mean_pspec(plot=True)
     test_window()
     test_wmatrix()
+    #test_split()
