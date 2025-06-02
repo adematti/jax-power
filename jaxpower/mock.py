@@ -7,8 +7,8 @@ from jax import random
 from jax import numpy as jnp
 
 from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
-from .pspec import _get_los_vector, get_legendre, get_real_Ylm
-from .utils import BinnedStatistic
+from .mesh2 import _get_los_vector
+from .utils import BinnedStatistic, get_legendre, get_real_Ylm
 
 
 def generate_gaussian_mesh(attrs, power: Callable, seed: int=42,

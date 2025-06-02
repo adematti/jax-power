@@ -4,7 +4,7 @@ import time
 import logging
 import traceback
 from collections.abc import Callable
-from functools import partial
+from functools import partial, lru_cache
 
 import numpy as np
 import jax
@@ -407,14 +407,35 @@ def compute_real_gaunt(*ellms):
 
 def export_real_gaunt():
     import itertools
-    gaunt = {}
+    toret = {}
     for ells in itertools.product((0, 2, 4), (0, 2), (0, 2)):
         for ms in itertools.product(*(list(range(-ell, ell + 1)) for ell in ells)):
             ellms = tuple(zip(ells, ms))
             tmp = float(compute_real_gaunt(*ellms))
             if tmp != 0.:
-                gaunt[ellms] = tmp
-    return gaunt
+                toret[ellms] = tmp
+    return toret
+
+
+def compute_legendre_product(*ells):
+    import sympy as sp
+    mu = sp.symbols('mu', real=True)
+
+    legendre = 1
+    for ell in ells:
+        legendre *= sp.legendre(ell, mu)
+    expr = sp.integrate(legendre, (mu, -1, 1)) / 2
+    return expr
+
+
+def export_legendre_product(ellmax=8, n=3):
+    import itertools
+    toret = {}
+    for ells in itertools.combinations_with_replacement(tuple(range(ellmax)), n):
+        tmp = compute_legendre_product(*ells)
+        if tmp != 0.:
+            toret[ells] = tmp
+    return toret
 
 
 class FakeFigure(object):
@@ -674,6 +695,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             vshape = tuple(len(vv) for vv in state['_value'])
             if vshape != shape:
                 raise ValueError('value should be of same length as x = {}, found = {}'.format(shape, vshape))
+        # Turn everything into tuples
         for name, value in state.items():
             if isinstance(value, list):
                 state[name] = tuple(value)
@@ -765,20 +787,50 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     @classmethod
     def sum(cls, others, weights=None):
         if weights is None:
-            weights = [1] * len(others)
+            weights = np.ones(len(others))
+        weights = np.asarray(weights)
+        if weights.ndim == 0: weights = np.full(len(others), weights)
+        assert weights.shape == (len(others),), 'weights must be of same shape as number of input statistics'
         new = None
         for other, weight in zip(others, weights):
             if new is None:
                 new = other.copy()
+                states = {name: [[] for i in range(len(getattr(new, name)))] if name in new._select_proj_fields else [] for name in new._sum_fields}
+            for name in new._sum_fields:
+                value = getattr(other, name)
+                if name in new._select_proj_fields:
+                    for iproj, value in enumerate(value):
+                        states[name][iproj].append(value)
+                else:
+                    states[name].append(weight * value)
+        for name in new._sum_fields:
+            if name in new._select_proj_fields:
+                value = tuple(sum(values) for values in states[name])
             else:
-                for name in new._sum_fields:
-                    value, other_value = getattr(new, name), getattr(other, name)
-                    if name in new._select_proj_fields:
-                        value = tuple(vv + weight * ov for vv, ov in zip(value, other_value))
-                    else:
-                        value = value + weight * other_value
-                    setattr(new, name, value)
+                value = sum(states[name])
+            setattr(new, name, value)
         return new
+
+    @classmethod
+    def mean(cls, others):
+        return cls.sum(others, weights=1. / len(others))
+
+    @classmethod
+    def cov(cls, others, return_type=None):
+        observables = None
+        values = []
+        for other in others:
+            islist = isinstance(other, (tuple, list))
+            if observables is None:
+                if islist:
+                    observables = tuple(cls.mean([other[i] for other in others]) for i in range(len(others)))
+                else:
+                    observables = (cls.mean(others),)
+            values.append(other.view())
+        value = np.cov(values, rowvar=False)
+        if return_type == 'nparray':
+            return value
+        return CovarianceMatrix(observables=observables, value=value)
 
     @classmethod
     def concatenate(cls, others):
@@ -821,9 +873,8 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         -------
         indices : array, list
         """
-        iprojs = self._index_projs(projs)
-        if not isinstance(iprojs, list): iprojs = [iprojs]
-        toret = []
+        iprojs = self._index_projs(projs, return_list=True)
+        indices = []
         for iproj in iprojs:
             if method == 'mid': xx = (self._edges[iproj][..., 0] + self._edges[iproj][..., 1]) / 2.
             else: xx = self._x[iproj]
@@ -835,67 +886,28 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
                 #print(xlim, self._x[iproj].shape, self._edges[iproj].shape)
             tmp = np.flatnonzero(tmp)
             if concatenate: tmp += sum(len(xx) for xx in self._x[:iproj])
-            toret.append(tmp)
+            indices.append(tmp)
         if concatenate:
-            return np.concatenate(toret, axis=0)
+            return np.concatenate(indices, axis=0)
         #if isscalar:
         #    return toret[0]
-        return toret
+        return indices
 
-    def _index_projs(self, projs=Ellipsis):
+    def _index_projs(self, projs=Ellipsis, return_list=False):
         """Return projs indices."""
         if projs is Ellipsis:
             return list(range(len(self._projs)))
-        isscalar = not isinstance(projs, list)
-        if isscalar: projs = [projs]
-        toret = []
-        for proj in projs:
-            try: iproj = self._projs.index(proj)
-            except (ValueError, IndexError):
+
+        def _get_index(proj):
+            try: return self._projs.index(proj)
+            except ValueError:
                 raise ValueError('{} could not be found in {}'.format(proj, self._projs))
-            toret.append(iproj)
-        if isscalar:
-            return toret[0]
-        return toret
 
-    def select(self, xlim=None, projs=Ellipsis, select_projs=False, method='mid'):
-        """
-        Apply x-cuts for given projections.
-
-        Parameters
-        ----------
-        xlim : tuple, default=None
-            Restrict coordinates to these (min, max) limits.
-            Defaults to ``(-np.inf, np.inf)``.
-
-        rebin : int, default=1
-            Optionally, rebinning factor (after ``xlim`` cut).
-
-        projs : list, default=None
-            List of projections to apply ``xlim`` and ``rebin`` to.
-            Defaults to :attr:`projs`.
-
-        Returns
-        -------
-        new : ObservableArray
-        """
-        iprojs = self._index_projs(projs)
-        if not isinstance(iprojs, list): iprojs = [iprojs]
-        state = {name: list(getattr(self, name)) for name in self._select_x_fields}
-        for iproj in iprojs:
-            index = self._index(xlim=xlim, projs=[self._projs[iproj]], method=method, concatenate=False)[0]
-            for name in state:
-                tmpidx = index
-                # continuous (no rebinning), should be all fine even for edges
-                state[name][iproj] = getattr(self, name)[iproj][tmpidx]
-        state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields} | {name: tuple(value) for name, value in state.items()}
-        projs = self._projs
-        if select_projs:
-            for name in self._select_proj_fields:
-                state[name] = tuple(state[name][iproj] for iproj in iprojs)
-        new = self.__class__.__new__(self.__class__)
-        new.__dict__.update(state)
-        return new
+        if not isinstance(projs, list):
+            index = _get_index(projs)
+            if return_list: return [index]
+            return index
+        return [_get_index(proj) for proj in projs]
 
     def _slice_matrix(self, edges=None, projs=Ellipsis, weighted=True, normalize=True):
         # Return, for a given slice, the corresponding matrix to apply to the data arrays.
@@ -947,9 +959,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         -------
         new : ObservableArray
         """
-        iprojs = self._index_projs(projs)
-        isscalar = not isinstance(iprojs, list)
-        if isscalar: iprojs = [iprojs]
+        iprojs = self._index_projs(projs, return_list=True)
         state = {name: list(getattr(self, name)) for name in self._select_x_fields}
         if edges is None:
             edges = slice(None)
@@ -972,6 +982,44 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
                     state[name][iproj] = matrix.dot(state[name][iproj])
                 else:
                     state[name][iproj] = nwmatrix.dot(state[name][iproj])
+        state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields} | {name: tuple(value) for name, value in state.items()}
+        projs = self._projs
+        if select_projs:
+            for name in self._select_proj_fields:
+                state[name] = tuple(state[name][iproj] for iproj in iprojs)
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(state)
+        return new
+
+    def select(self, xlim=None, projs=Ellipsis, select_projs=False, method='mid'):
+        """
+        Apply x-cuts for given projections.
+
+        Parameters
+        ----------
+        xlim : tuple, default=None
+            Restrict coordinates to these (min, max) limits.
+            Defaults to ``(-np.inf, np.inf)``.
+
+        rebin : int, default=1
+            Optionally, rebinning factor (after ``xlim`` cut).
+
+        projs : list, default=None
+            List of projections to apply ``xlim`` and ``rebin`` to.
+            Defaults to :attr:`projs`.
+
+        Returns
+        -------
+        new : ObservableArray
+        """
+        iprojs = self._index_projs(projs, return_list=True)
+        state = {name: list(getattr(self, name)) for name in self._select_x_fields}
+        for iproj in iprojs:
+            index = self._index(xlim=xlim, projs=[self._projs[iproj]], method=method, concatenate=False)[0]
+            for name in state:
+                tmpidx = index
+                # continuous (no rebinning), should be all fine even for edges
+                state[name][iproj] = getattr(self, name)[iproj][tmpidx]
         state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields} | {name: tuple(value) for name, value in state.items()}
         projs = self._projs
         if select_projs:
@@ -1182,7 +1230,7 @@ class WindowMatrix(object):
         raise ValueError('axis must be in {} or {}'.format(observable_names, theory_names))
 
     def _slice_matrix(self, edges, axis='o', projs=Ellipsis, normalize=False):
-        # Return, for a given slice, the corresponding matrix to apply to the data arrays.
+        # Return, for a given slice, the corresponding matrix to apply to the data arrays
         axis, _, observable = self._axis_index(axis=axis)
         if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
         proj_indices = observable._index_projs(projs)
@@ -1205,50 +1253,22 @@ class WindowMatrix(object):
         import scipy
         return scipy.linalg.block_diag(*matrix)
 
-    def slice(self, edges=None, axis='o', projs=Ellipsis, select_projs=False):
-        """
-        Apply selections to the window matrix, slicing for given axis and projections.
-
-        Parameters
-        ----------
-        slice : slice, default=None
-            Slicing to apply, defaults to ``slice(None)``.
-
-        axis : str
-            Axis to apply ``slice`` to.
-            One of ('o', 'observable') or ('t', 'theory').
-
-        projs : list, default=None
-            List of projections to apply ``slice`` to.
-            Defaults to :attr:`projs`.
-
-        Returns
-        -------
-        new : WindowMatrix
-        """
-        axis, name, observable = self._axis_index(axis=axis)
-        observable = observable.slice(edges, projs=projs)
-        matrix = self._slice_matrix(edges, axis=axis, projs=projs, normalize=axis == 0)
-        value = matrix.dot(self._value) if axis == 0 else self._value.dot(matrix.T)
-        if select_projs:
-            observable = observable.select(projs=projs, select_projs=True)
-            index = self._index(projs=projs, concatenate=True)
-            value = np.take(value, index, axis=axis)
-        new = self.clone(value=value, attrs=self.attrs, **{name: observable})
-        return new
-
     @classmethod
     def sum(cls, others, axis='o', weights=None):
         if weights is None:
-            weights = [1] * len(others)
+            weights = np.ones(len(others))
+        weights = np.asarray(weights)
+        if weights.ndim == 0: weights = np.full(len(others), weights)
+        assert weights.shape == (len(others),), 'weights must be of same shape as number of input matrices'
         new = None
+        values = []
         for other, weight in zip(others, weights):
             if new is None:
                 new = other.copy()
                 axis, name, observable = new._axis_index(axis=axis)
                 setattr(new, '_' + name, observable.sum([other._axis_index(axis=axis)[-1] for other in others], weights=weights))
-            else:
-                new._value = new._value + weight * other._value
+            values.append(weight * other._value)
+        new._value = sum(values)
         return new
 
     @classmethod
@@ -1293,6 +1313,34 @@ class WindowMatrix(object):
         axis, _, observable = self._axis_index(axis=axis)
         return observable._index(xlim=xlim, projs=projs, method=method, concatenate=concatenate)
 
+    def slice(self, edges=None, axis='o', projs=Ellipsis, select_projs=False):
+        """
+        Apply selections to the window matrix, slicing for given axis and projections.
+
+        Parameters
+        ----------
+        slice : slice, default=None
+            Slicing to apply, defaults to ``slice(None)``.
+
+        axis : str
+            Axis to apply ``slice`` to.
+            One of ('o', 'observable') or ('t', 'theory').
+
+        projs : list, default=None
+            List of projections to apply ``slice`` to.
+            Defaults to :attr:`projs`.
+
+        Returns
+        -------
+        new : WindowMatrix
+        """
+        new = self.select(axis=axis, projs=projs, select_projs=select_projs)
+        axis, name, observable = new._axis_index(axis=axis)
+        observable = observable.slice(edges, projs=projs)
+        matrix = new._slice_matrix(edges, axis=axis, projs=projs, normalize=axis == 0)
+        value = matrix.dot(new._value) if axis == 0 else new._value.dot(matrix.T)
+        return new.clone(value=value, attrs=new.attrs, **{name: observable})
+
     def select(self, xlim=None, axis='o', projs=Ellipsis, select_projs=False, method='mid'):
         """
         Apply selections for given observables and projections.
@@ -1319,17 +1367,13 @@ class WindowMatrix(object):
         new : WindowMatrix
         """
         axis, name, observable = self._axis_index(axis=axis)
-        if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
         #print(observable_indices, projs)
-        proj_indices = observable._index_projs(projs)
-        index = np.concatenate([observable._index(xlim=xlim if iproj in proj_indices else None, projs=proj, method=method, concatenate=True) for iproj, proj in enumerate(observable._projs)])
-        observable = observable.select(xlim=xlim, projs=projs, method=method)
-        new = self.clone(value=np.take(self._value, index, axis=axis), **{name: observable}, attrs=self.attrs)
-        if select_projs:
-            index = self._index(axis=axis, projs=projs, concatenate=True)
-            observable = observable.select(projs=projs, select_projs=True)
-            new = self.clone(value=np.take(new._value, index, axis=axis), **{name: observable}, attrs=self.attrs)
-        return new
+        proj_indices = observable._index_projs(projs, return_list=True)
+        select_iprojs = proj_indices if select_projs else range(len(observable._projs))
+        index = np.concatenate([observable._index(xlim=xlim if iproj in proj_indices else None, projs=observable._projs[iproj], method=method, concatenate=True) for iproj in select_iprojs])
+        observable = observable.select(xlim=xlim, projs=projs, method=method, select_projs=select_projs)
+        value = np.take(self._value, index, axis=axis)
+        return self.clone(value=value, **{name: observable}, attrs=self.attrs)
 
     def view(self, return_type='nparray'):
         """
@@ -1339,7 +1383,7 @@ class WindowMatrix(object):
         ----------
         return_type : str, default='nparray'
             If 'nparray', return numpy array :attr:`value`.
-            Else, return a new :class:`ObservableCovariance`, restricting to ``xlim`` and ``projs``.
+            Else, return a new :class:`WindowMatrix`, restricting to ``xlim`` and ``projs``.
 
         Returns
         -------
@@ -1481,6 +1525,49 @@ class WindowMatrix(object):
         mat = [[self._value[np.ix_(index1, index2)] for index2 in indices[1]] for index1 in indices[0]]
         return plot_matrix(mat, x1=x[0], x2=x[1], **kwargs)
 
+    @plotter
+    def plot_slice(self, indices, axis='o', color='C0', label=None, xscale='linear', yscale='log', fig=None):
+        from matplotlib import pyplot as plt
+        if np.ndim(indices) == 0: indices = [indices]
+        indices = np.array(indices)
+        alphas = np.linspace(1, 0.2, len(indices))
+        fshape = len(self.observable.projs), len(self.theory.projs)
+        if fig is None:
+            fig, lax = plt.subplots(*fshape, sharey=True, figsize=(8, 6), squeeze=False)
+        else:
+            lax = np.array(fig.axes).reshape(fshape[::-1])
+        axis, _, observable = self._axis_index(axis=axis)
+        plotted_observable = [self.observable, self.theory][axis - 1]
+
+        for it, pt in enumerate(self.theory.projs):
+            for io, po in enumerate(self.observable.projs):
+                ax = lax[io][it]
+                for ix, idx in enumerate(indices):
+                    ii = [io, it][axis]
+                    plotted_ii = [io, it][axis - 1]
+                    if np.issubdtype(idx.dtype, np.floating):
+                        idx = np.abs(observable._x[ii] - idx).argmin()
+                    # Indices in approximate window matrix
+                    x = plotted_observable._x[plotted_ii]
+                    dx = 1.
+                    if axis == 0:  # axis = 'o'
+                        dx = plotted_observable._edges[plotted_ii]
+                        dx = dx[..., 1] - dx[..., 0]
+                    value = np.take(self._value[np.ix_(self.observable._index(projs=pt, concatenate=True), self.theory._index(projs=po, concatenate=True))], idx, axis=axis)
+                    value = value / dx
+                    if yscale == 'log': value = np.abs(value)
+                    ax.plot(x, value, alpha=alphas[ix], color=color, label=label if ix == 0 else None)
+                ax.set_title(r'${} \times {}$'.format(pt, po))
+                ax.set_xscale(xscale)
+                ax.set_yscale(yscale)
+                ax.grid(True)
+                if io == len(self.observable.projs) - 1: ax.set_xlabel(plotted_observable._label_x)
+                if label and it == io == 0: lax[it][io].legend()
+
+        fig.tight_layout()
+        fig.subplots_adjust(hspace=0.35, wspace=0.25)
+        return fig
+
     def interp(self, new, axis='o', extrap=False):
         """
         Interpolate window matrix.
@@ -1543,6 +1630,401 @@ class WindowMatrix(object):
                         idx = (ixo, ix)
                     value[idx] += interp(x, xt - xo)
         return self.clone(**{name: new, 'value': value})
+
+
+
+@jax.tree_util.register_pytree_node_class
+class CovarianceMatrix(object):
+    """
+    Class representing a covariance matrix.
+
+    Attributes
+    ----------
+    _value : array
+        Window matrix 2D array.
+
+    _observables : BinnedStatistic
+        (Mean) observable corresponding to the window matrix.
+
+    attrs : dict
+        Other attributes.
+    """
+    _data_fields = ['_observables', '_value']
+    _meta_fields = ['attrs']
+
+    def __init__(self, observables, value, attrs=None):
+        """
+        Initialize :class:`CovarianceMatrix`.
+
+        Parameters
+        ----------
+        observables : BinnedStatistic
+            (Mean) observable corresponding to the covariance matrix.
+
+        value : array
+            Covariance matrix 2D array.
+
+        attrs : dict, default=None
+            Optionally, other attributes, stored in :attr:`attrs`.
+        """
+        if isinstance(value, self.__class__):
+            self.__dict__.update(value.__dict__)
+            return
+        state = {}
+        state['_value'] = np.asarray(value)
+        shape = state['_value'].shape
+        if len(shape) != 2 or shape[0] != shape[1]:
+            raise ValueError('Covariance matrix must be square, got shape = {}'.format(shape))
+        if not isinstance(observables, (tuple, list)):
+            observables = [observables]
+        state['_observables'], size = [], 0
+        for value in observables:
+            value if isinstance(value, BinnedStatistic) else BinnedStatistic(**value)
+            state['_observables'].append(value)
+            size += value.size
+        if size != shape[0]:
+            raise ValueError('size = {:d} of input observables must match input matrix shape = {}'.format(size, shape))
+        state['_observables'] = tuple(state['_observables'])
+        state['attrs'] = dict(attrs or {})
+        self.__dict__.update(state)
+
+    def _observable_index(self, observables, return_list=False):
+        if observables is None or observables is Ellipsis:
+            return tuple(range(len(self._observables)))
+        names = [observable.name for observable in self._observables]
+
+        def _get_index(observable):
+            name = observable
+            if isinstance(observable, BinnedStatistic): name = observable.name
+            try:
+                idx = names.index(name)
+            except ValueError:
+                raise ValueError('Observable {} not found in {}'.format(observable, self._observables))
+            return idx
+
+        if not isinstance(observables, (tuple, list)):
+            index = _get_index(observables)
+            if return_list: return [index]
+        return [_get_index(observable) for observable in observables]
+
+    def observables(self, observables):
+        """(Mean) observables."""
+        index = self._observable_index(observables)
+        if isinstance(index, tuple):
+            return tuple(self._observables[idx] for idx in index)
+        return self._observables[index]
+
+    def _slice_matrix(self, observables=Ellipsis, edges=None, projs=Ellipsis, normalize=False):
+        # Return, for a given slice, the corresponding matrix to apply to the data arrays
+        if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
+        obs_indices = self._observable_index(observables, return_list=True)
+        if edges is None:
+            edges = slice(None)
+        if isinstance(edges, BinnedStatistic):
+            edges = list(edges._edges)
+        matrix = []
+        for iobs, observable in enumerate(self._observables):
+            if iobs not in obs_indices:
+                matrix += observable._slice_matrix(normalize=normalize)
+                continue
+            observable = self._observables[iobs]
+            proj_indices = observable._index_projs(projs, return_list=True)
+            list_projs = list(observable._projs)
+            list_edges = []
+            iiproj = 0
+            for iproj, proj in enumerate(list_projs):
+                if iproj in proj_indices:
+                    if isinstance(edges, list): iedges = edges[iiproj]
+                    else: iedges = edges
+                    iiproj += 1
+                else:
+                    iedges = slice(None)
+                list_edges.append(iedges)
+            matrix += observable._slice_matrix(list_edges, projs=list_projs, normalize=normalize)
+        import scipy
+        return scipy.linalg.block_diag(*matrix)
+
+    @classmethod
+    def sum(cls, others, weights=None):
+        if weights is None:
+            weights = np.ones(len(others))
+        weights = np.asarray(weights)
+        if weights.ndim == 0: weights = np.full(len(others), weights)
+        assert weights.shape == (len(others),), 'weights must be of same shape as number of input matrices'
+        new = None
+        values = []
+        for other, weight in zip(others, weights):
+            if new is None:
+                new = other.copy()
+            values.append(weight**2 * other._value)
+        new._value = sum(values)
+        return new
+
+    def __add__(self, other):
+        """Sum of `self`` + ``other`` covariance matrices."""
+        return self.sum([self, other])
+
+    def __radd__(self, other):
+        if other == 0: return self.slice()
+        return self.__add__(other)
+
+    def _index(self, observables=Ellipsis, xlim=None, projs=Ellipsis, method='mid', concatenate=True):
+        """
+        Return indices for given x-limits and projs.
+
+        Parameters
+        ----------
+        observables : BinnedStatistic, str
+            Observable(s).
+
+        xlim : tuple, default=None
+            Restrict coordinates to these (min, max) limits.
+            Defaults to ``(-np.inf, np.inf)``.
+
+        projs : list, default=None
+            List of projections to return indices for.
+            Defaults to :attr:`projs`.
+
+        concatenate : bool, default=True
+            If ``False``, return list of indices, for each input observable and projection.
+
+        Returns
+        -------
+        indices : array, list
+        """
+        obs_indices = self._observable_index(observables, return_list=True)
+        indices = []
+        for iobs in obs_indices:
+            observable = self._observables[iobs]
+            index = observable._index(xlim=xlim, projs=projs, method=method, concatenate=concatenate)
+            if concatenate: indices.append(sum(xx.size for xx in self._observables[:iobs]) + index)
+            else: indices += index
+        if concatenate:
+            return np.concatenate(indices, axis=0)
+        return indices
+
+    def slice(self, observables=Ellipsis, edges=None, projs=Ellipsis, select_observables=False, select_projs=False):
+        """
+        Apply selections to the covariance matrix, slicing for given observable and projections.
+
+        Parameters
+        ----------
+        observables : BinnedStatistic, str
+            Observable(s) to apply ``slice`` to.
+
+        edges : slice, default=None
+            Slicing to apply, defaults to ``slice(None)``.
+
+        projs : list, default=None
+            List of projections to apply ``slice`` to.
+            Defaults to :attr:`projs`.
+
+        Returns
+        -------
+        new : CovarianceMatrix
+        """
+        new = self.select(observables=observables, projs=projs, select_observables=select_observables, select_projs=select_projs)
+        matrix = new._slice_matrix(observables=observables, edges=edges, projs=projs)
+        value = matrix.dot(new._value).dot(matrix.T)
+        observables = list(new._observables)
+        obs_indices = new._observable_index(observables, return_list=True)
+        for iobs in obs_indices:
+            observables[iobs] = observables[iobs].slice(edges, projs=projs)
+        return new.clone(value=value, observables=observables, attrs=new.attrs)
+
+    def select(self, observables=Ellipsis, xlim=None, projs=Ellipsis, select_observables=False, select_projs=False, method='mid'):
+        """
+        Apply selections for given observables and projections.
+
+        Parameters
+        ----------
+       observables : BinnedStatistic, str
+            Observable(s).
+
+        xlim : tuple, default=None
+            Restrict coordinates to these (min, max) limits.
+            Defaults to ``(-np.inf, np.inf)``.
+
+        axis : str
+            Axis to apply the selection to.
+            One of ('o', 'observable') or ('t', 'theory').
+
+        projs : list, default=None
+            List of projections to apply ``xlim`` and ``rebin`` to.
+            Defaults to :attr:`projs`.
+
+        Returns
+        -------
+        new : CovarianceMatrix
+        """
+        obs_indices = self._observable_index(observables, return_list=True)
+        nobs = len(obs_indices) if select_observables else len(self._observables)
+        observables, indices = [None] * nobs, [None] * nobs
+        for iobs, observable in enumerate(self._observables):
+            if iobs in obs_indices:
+                observable = observable.select(xlim=xlim, projs=projs, select_projs=select_projs)
+            if iobs in obs_indices or not select_observables:
+                idx = obs_indices.index(iobs) if select_observables else iobs
+                observables[idx] = observable
+                proj_indices = observable._index_projs(projs, return_list=True)
+                select_iprojs = proj_indices if select_projs else range(len(observable._projs))
+                index = np.concatenate([observable._index(xlim=xlim if iproj in proj_indices else None, projs=observable._projs[iproj], method=method, concatenate=True) for iproj in select_iprojs])
+                indices[idx] = index
+        indices = np.concatenate(indices)
+        value = self._value[np.ix_(indices, indices)]
+        new = self.clone(value=value, observables=observables, attrs=self.attrs)
+        return new
+
+    def view(self, return_type='nparray'):
+        """
+        Return covariance matrix.
+
+        Parameters
+        ----------
+        return_type : str, default='nparray'
+            If 'nparray', return numpy array :attr:`value`.
+            Else, return a new :class:`CovarianceMatrix`, restricting to ``xlim`` and ``projs``.
+
+        Returns
+        -------
+        new : array, CovarianceMatrix
+        """
+        toret = self.slice()
+        if return_type is None:
+            return toret
+        return toret._value
+
+    def clone(self, **kwargs):
+        """Create a new instance, updating some attributes."""
+        state = {name[1:] if name.startswith('_') else name: getattr(self, name) for name in self._data_fields + self._meta_fields}  # remove front _
+        state.update(kwargs)
+        return self.__class__(**state)
+
+    def copy(self):
+        new = self.__class__.__new__(self.__class__)
+        state = {}
+        for name in self._data_fields + self._meta_fields:
+            value = getattr(self, name)
+            if isinstance(value, tuple):  # observables
+                value = tuple(observable.copy() for observable in value)
+            else:
+                value = value.copy()
+            state[name] = value
+        new.__dict__.update(state)
+        return new
+
+    def __getstate__(self):
+        state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields}
+        for name in ['_observables']:
+            value = getattr(self, name)
+            state[name] = tuple(value.__getstate__() for value in value)
+        return state
+
+    def __setstate__(self, state):
+        for name in ['_observables']:
+            state[name] = tuple(BinnedStatistic.from_state(value) for value in state[name])
+        self.__dict__.update(state)
+
+    @classmethod
+    def from_state(cls, state):
+        new = cls.__new__(cls)
+        new.__setstate__(state)
+        return new
+
+    def save(self, filename):
+        """Save object."""
+        state = self.__getstate__()
+        #self.log_info('Saving {}.'.format(filename))
+        mkdir(os.path.dirname(filename))
+        np.save(filename, state, allow_pickle=True)
+
+    @classmethod
+    def load(cls, filename):
+        """Load object."""
+        filename = str(filename)
+        state = np.load(filename, allow_pickle=True)
+        #cls.log_info('Loading {}.'.format(filename))
+        state = state[()]
+        return cls.from_state(state)
+
+    def tree_flatten(self):
+        return tuple(getattr(self, name) for name in self._data_fields), {name: getattr(self, name) for name in self._meta_fields}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__setstate__(aux_data | {name: value for name, value in zip(cls._data_fields, children)})
+        return new
+
+    def __repr__(self):
+        """Return string representation of covariance matrix."""
+        return '{}({}, {})'.format(self.__class__.__name__, self._observable, self._theory)
+
+    def __array__(self, *args, **kwargs):
+        return np.asarray(self._value, *args, **kwargs)
+
+    @property
+    def shape(self):
+        """Return covariance matrix shape."""
+        return self._value.shape
+
+    @plotter
+    def plot(self, corrcoef=False, split_observables=True, split_projs=True, **kwargs):
+        """
+        Plot covariance matrix.
+
+        Parameters
+        ----------
+        barlabel : str, default=None
+            Optionally, label for the color bar.
+
+        figsize : int, tuple, default=None
+            Optionally, figure size.
+
+        norm : matplotlib.colors.Normalize, default=None
+            Scales the matrix to the canonical colormap range [0, 1] for mapping to colors.
+            By default, the matrix range is mapped to the color bar range using linear scaling.
+
+        labelsize : int, default=None
+            Optionally, size for labels.
+
+        fig : matplotlib.figure.Figure, default=None
+            Optionally, a figure with at least ``len(self._observables) * len(self._observables)`` axes.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        """
+        assert split_projs if split_observables else True, 'Cannot split projections without splitting observables.'
+        indices, x, xlabels, plabels = [], [], [], []
+        for observable in self._observables:
+            indices2 = [self._index(observables=observable, projs=proj, concatenate=True) for proj in observable._projs]
+            x2 = [observable.x(projs=proj) for proj in observable._projs]
+            xlabels2 = [observable._label_x] * len(observable._projs)
+            plabels2 = [observable._get_label_proj(proj) for proj in observable._projs]
+            if not split_projs:
+                indices2 = [np.concatenate(indices2, axis=0)]
+                x2 = [np.concatenate(x2, axis=0)]
+                xlabels2 = [xlabels2[0]]
+                plabels2 = ['']
+            indices += indices2
+            x += x2
+            xlabels += xlabels2
+            plabels += plabels2
+        if not split_observables:
+            x = [np.concatenate(x, axis=0)]
+            indices = [np.concatenate(indices, axis=0)]
+            xlabels = []
+            plabels = []
+        for ilabel in range(2):
+            kwargs.setdefault(f'xlabel{ilabel + 1:d}', xlabels)
+            kwargs.setdefault(f'label{ilabel + 1:d}', plabels)
+        value = self._value
+        if corrcoef:
+            std = np.sqrt(np.diag(value))
+            value = value / (std[..., None] * std)
+        mat = [[value[np.ix_(index1, index2)] for index2 in indices] for index1 in indices]
+        return plot_matrix(mat, x1=x, x2=x, **kwargs)
 
 
 @plotter
@@ -1663,7 +2145,152 @@ def plot_matrix(matrix, x1=None, x2=None, xlabel1=None, xlabel2=None, barlabel=N
     return fig
 
 
-real_gaunt = {((0, 0), (0, 0), (0, 0)): 0.28209479177387814, ((0, 0), (2, -2), (2, -2)): 0.28209479177387814, ((0, 0), (2, -1), (2, -1)): 0.28209479177387814, ((0, 0), (2, 0), (2, 0)): 0.28209479177387814,
+@lru_cache(maxsize=32, typed=False)
+def get_real_Ylm(ell, m, modules=None):
+    """
+    Return a function that computes the real spherical harmonic of order (ell, m).
+    Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/convpower/fkp.py.
+
+    Note
+    ----
+    Faster (and differentiable) evaluation will be achieved if sympy is available.
+    Else, fallback to scipy's functions.
+    I am not using :func:`jax.scipy.special.lpmn_values` as this returns all ``ell``, ``m``'s at once,
+    which is not great for memory reasons.
+
+    Parameters
+    ----------
+    ell : int
+        The degree of the harmonic.
+
+    m : int
+        The order of the harmonic; abs(m) <= ell.
+
+    Returns
+    -------
+    Ylm : callable
+        A function that takes 3 arguments: (xhat, yhat, zhat)
+        unit-normalized Cartesian coordinates and returns the
+        specified Ylm.
+
+    References
+    ----------
+    https://en.wikipedia.org/wiki/Spherical_harmonics#Real_form
+
+    """
+    # Make sure ell, m are integers
+    ell = int(ell)
+    m = int(m)
+
+    # Normalization of Ylms
+    amp = np.sqrt((2 * ell + 1) / (4 * np.pi))
+    if m != 0:
+        fac = 1
+        for n in range(ell - abs(m) + 1, ell + abs(m) + 1): fac *= n  # (ell + |m|)!/(ell - |m|)!
+        amp *= np.sqrt(2. / fac)
+
+    sp = None
+
+    if modules is None:
+        try: import sympy as sp
+        except ImportError: pass
+
+    elif 'sympy' in modules:
+        import sympy as sp
+
+    elif 'scipy' not in modules:
+        raise ValueError('modules must be either ["sympy", "scipy", None]')
+
+    def _safe_divide(num, denom):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            return jnp.where(denom == 0., 0., num / denom)
+
+    def get_Ylm_func(func, **attrs):
+
+        def Ylm(*xvec):
+            xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
+            xhat = tuple(_safe_divide(xx, xnorm) for xx in xvec)
+            return func(*xhat)
+
+        for name, value in attrs.items():
+            setattr(Ylm, name, value)
+        return Ylm
+
+    # sympy is not installed, fallback to scipy
+    if sp is None:
+
+        def _Ylm(xhat, yhat, zhat):
+            # The cos(theta) dependence encoded by the associated Legendre polynomial
+            toret = amp * (-1)**m * special.lpmv(abs(m), ell, zhat)
+            # The phi dependence
+            phi = np.arctan2(yhat, xhat)
+            if m < 0:
+                toret *= np.sin(abs(m) * phi)
+            else:
+                toret *= np.cos(m * phi)
+            return toret
+
+        def func(xhat, yhat, zhat):
+            shape = jnp.broadcast_shapes(jnp.shape(xhat), jnp.shape(yhat), jnp.shape(zhat))
+            dtype = jnp.result_type(xhat, yhat, zhat)
+            out_type = jax.ShapeDtypeStruct(shape, dtype)
+            return jax.pure_callback(_Ylm, out_type, xhat, yhat, zhat)
+
+        Ylm = get_Ylm_func(func, ell=ell, m=m)
+
+    else:
+        # The relevant cartesian and spherical symbols
+        # Using intermediate variable r helps sympy simplify expressions
+        x, y, z, r = sp.symbols('x y z r', real=True, positive=True)
+        xhat, yhat, zhat = sp.symbols('xhat yhat zhat', real=True, positive=True)
+        phi, theta = sp.symbols('phi theta', real=True)
+        defs = [(sp.sin(phi), y / sp.sqrt(x**2 + y**2)),
+                (sp.cos(phi), x / sp.sqrt(x**2 + y**2)),
+                (sp.cos(theta), z / sp.sqrt(x**2 + y**2 + z**2))]
+
+        # The cos(theta) dependence encoded by the associated Legendre polynomial
+        expr = (-1)**m * sp.assoc_legendre(ell, abs(m), sp.cos(theta))
+
+        # The phi dependence
+        if m < 0:
+            expr *= sp.expand_trig(sp.sin(abs(m) * phi))
+        elif m > 0:
+            expr *= sp.expand_trig(sp.cos(m * phi))
+
+        # Simplify
+        expr = sp.together(expr.subs(defs)).subs(x**2 + y**2 + z**2, r**2)
+        expr = amp * expr.expand().subs([(x / r, xhat), (y / r, yhat), (z / r, zhat)])
+        func = sp.lambdify((xhat, yhat, zhat), expr, modules='jax')
+
+        Ylm = get_Ylm_func(func, ell=ell, m=m, expr=expr)
+
+    return Ylm
+
+
+[[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
+
+
+def register_pytree_dataclass(cls, meta_fields=None):
+
+    def tree_flatten(self):
+        return tuple(getattr(self, name) for name in cls._data_fields), {name: getattr(self, name) for name in cls._meta_fields}
+
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(zip(cls._data_fields, children))
+        new.__dict__.update(aux_data)
+        return new
+
+    cls._meta_fields = tuple(meta_fields or [])
+    cls._data_fields = tuple(name for name in cls.__annotations__.keys() if name not in cls._meta_fields)
+    cls.tree_flatten = tree_flatten
+    cls.tree_unflatten = classmethod(tree_unflatten)
+    return jax.tree_util.register_pytree_node_class(cls)
+
+
+
+
+_real_gaunt = {((0, 0), (0, 0), (0, 0)): 0.28209479177387814, ((0, 0), (2, -2), (2, -2)): 0.28209479177387814, ((0, 0), (2, -1), (2, -1)): 0.28209479177387814, ((0, 0), (2, 0), (2, 0)): 0.28209479177387814,
             ((0, 0), (2, 1), (2, 1)): 0.28209479177387814, ((0, 0), (2, 2), (2, 2)): 0.28209479177387814, ((2, -2), (0, 0), (2, -2)): 0.28209479177387814, ((2, -1), (0, 0), (2, -1)): 0.28209479177387814,
             ((2, 0), (0, 0), (2, 0)): 0.28209479177387814, ((2, 1), (0, 0), (2, 1)): 0.28209479177387814, ((2, 2), (0, 0), (2, 2)): 0.28209479177387814, ((2, -2), (2, -2), (0, 0)): 0.28209479177387814,
             ((2, -1), (2, -1), (0, 0)): 0.28209479177387814, ((2, 0), (2, 0), (0, 0)): 0.28209479177387814, ((2, 1), (2, 1), (0, 0)): 0.28209479177387814, ((2, 2), (2, 2), (0, 0)): 0.28209479177387814,
@@ -1683,3 +2310,20 @@ real_gaunt = {((0, 0), (0, 0), (0, 0)): 0.28209479177387814, ((0, 0), (2, -2), (
             ((4, 2), (2, -1), (2, -1)): -0.18022375157286857, ((4, 2), (2, 0), (2, 2)): 0.15607834722743988, ((4, 2), (2, 1), (2, 1)): 0.18022375157286857, ((4, 2), (2, 2), (2, 0)): 0.15607834722743988,
             ((4, 3), (2, -2), (2, -1)): -0.16858388283618375, ((4, 3), (2, -1), (2, -2)): -0.16858388283618375, ((4, 3), (2, 1), (2, 2)): 0.16858388283618386, ((4, 3), (2, 2), (2, 1)): 0.16858388283618386,
             ((4, 4), (2, -2), (2, -2)): -0.23841361350444804, ((4, 4), (2, 2), (2, 2)): 0.23841361350444806}
+
+
+def real_gaunt(*ellms):
+    return _real_gaunt.get(ellms, 0)
+
+
+_legendre_product3 = {(0, 0, 0): 1, (0, 1, 1): 1/3, (0, 2, 2): 1/5, (0, 3, 3): 1/7, (0, 4, 4): 1/9, (0, 5, 5): 1/11, (0, 6, 6): 1/13, (0, 7, 7): 1/15, (1, 1, 2): 2/15, (1, 2, 3): 3/35, (1, 3, 4): 4/63, (1, 4, 5): 5/99,
+                      (1, 5, 6): 6/143, (1, 6, 7): 7/195, (2, 2, 2): 2/35, (2, 2, 4): 2/35, (2, 3, 3): 4/105, (2, 3, 5): 10/231, (2, 4, 4): 20/693, (2, 4, 6): 5/143, (2, 5, 5): 10/429, (2, 5, 7): 21/715, (2, 6, 6): 14/715,
+                      (2, 7, 7): 56/3315, (3, 3, 4): 2/77, (3, 3, 6): 100/3003, (3, 4, 5): 20/1001, (3, 4, 7): 35/1287, (3, 5, 6): 7/429, (3, 6, 7): 168/12155, (4, 4, 4): 18/1001, (4, 4, 6): 20/1287, (4, 5, 5): 2/143,
+                      (4, 5, 7): 280/21879, (4, 6, 6): 28/2431, (4, 7, 7): 2268/230945, (5, 5, 6): 80/7293, (5, 6, 7): 420/46189, (6, 6, 6): 400/46189, (6, 7, 7): 1000/138567}
+
+
+def legendre_product(*ells):
+    ells = tuple(sorted(ells))
+    if len(ells) == 3:
+        return _legendre_product3.get(ells, 0.)
+    raise NotImplementedError('product of 3-legendre polynomials only is implemented')

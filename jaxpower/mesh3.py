@@ -7,13 +7,13 @@ from jax import numpy as jnp
 from dataclasses import dataclass
 
 from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount
-from .pspec import get_real_Ylm, _get_los_vector, _get_zero
-from .utils import real_gaunt, BinnedStatistic, get_legendre, get_spherical_jn, plotter
+from .mesh2 import _get_los_vector, _get_zero, FKPField
+from .utils import real_gaunt, BinnedStatistic, get_legendre, get_spherical_jn, get_real_Ylm, plotter, register_pytree_dataclass
 
 
-@jax.tree_util.register_pytree_node_class
+@partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
 @dataclass(init=False, frozen=True)
-class bin_bspec(object):
+class BinMesh3Spectrum(object):
 
     edges: jax.Array = None
     nmodes: jax.Array = None
@@ -23,11 +23,13 @@ class bin_bspec(object):
     _iedges: jax.Array = None
     _buffer_iedges: tuple = None
     _nmodes1d: jax.Array = None
+    mattrs: MeshAttrs = None
     basis: str = 'sugiyama'
     batch_size: int = 1
     buffer_size: int = 0
+    ells: tuple = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, basis='sugyama', batch_size=1, buffer_size=0):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugyama', batch_size=1, buffer_size=0):
         kind = 'complex'
         if not isinstance(mattrs, MeshAttrs):
             kind = 'complex' if 'complex' in mattrs.__class__.__name__.lower() else 'real'
@@ -113,12 +115,9 @@ class bin_bspec(object):
 
             nmodes = jax.lax.map(f, iedges) * symfactor
 
+        ells = _format_ells(ells, basis=basis)
         self.__dict__.update(edges=edges, xavg=xavg, nmodes=nmodes, ibin=ibin, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size,
-                             _iedges=iedges, _buffer_iedges=_buffer_iedges, _nmodes1d=nmodes1d)
-
-    @property
-    def sharding_mesh(self):
-        return get_sharding_mesh()
+                             _iedges=iedges, _buffer_iedges=_buffer_iedges, _nmodes1d=nmodes1d, ells=ells)
 
     def __call__(self, *meshs, remove_zero=False):
         values = []
@@ -159,21 +158,9 @@ class bin_bspec(object):
 
             return jax.lax.map(f, *self._buffer_iedges[:2]).ravel()[self._buffer_iedges[2]] / self.nmodes
 
-    def tree_flatten(self):
-        state = {name: getattr(self, name) for name in self.__annotations__.keys()}
-        meta_fields = ['basis', 'batch_size']
-        return tuple(state[name] for name in state if name not in meta_fields), {name: state[name] for name in meta_fields}
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        new = cls.__new__(cls)
-        new.__dict__.update(zip(cls.__annotations__.keys(), children))
-        new.__dict__.update(aux_data)
-        return new
-
 
 @jax.tree_util.register_pytree_node_class
-class BispectrumMultipoles(BinnedStatistic):
+class Spectrum3Poles(BinnedStatistic):
 
     _data_fields = BinnedStatistic._data_fields + ['_norm', '_num_shotnoise', '_num_zero']
     _select_x_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise']
@@ -182,7 +169,6 @@ class BispectrumMultipoles(BinnedStatistic):
     _meta_fields = BinnedStatistic._meta_fields + ['basis']
     _init_fields = BinnedStatistic._init_fields | {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
                                                    'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
-
 
     def __init__(self, k: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=None, num_zero: jax.Array=None, name: str=None, basis: str=None, attrs: dict=None):
@@ -324,8 +310,7 @@ def _format_los(los, ndim=3):
     return los, vlos
 
 
-def compute_mesh_bspec(*meshs: RealMeshField | ComplexMeshField, bin: bin_bspec=None,
-                        ells: int | tuple=0, los: str | np.ndarray='x'):
+def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh3Spectrum=None, los: str | np.ndarray='x'):
 
     meshs, same = _format_meshs(*meshs)
     rdtype = meshs[0].real.dtype
@@ -334,7 +319,7 @@ def compute_mesh_bspec(*meshs: RealMeshField | ComplexMeshField, bin: bin_bspec=
 
     los, vlos = _format_los(los, ndim=mattrs.ndim)
     attrs = dict(los=vlos if vlos is not None else los)
-    ells = _format_ells(ells, basis=bin.basis)
+    ells = bin.ells
 
     def _2r(mesh):
         if not isinstance(mesh, RealMeshField):
@@ -402,25 +387,25 @@ def compute_mesh_bspec(*meshs: RealMeshField | ComplexMeshField, bin: bin_bspec=
             num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0])
             num_zero.append(jnp.real(prod(map(_get_zero, meshs[:2])) * meshs[2].sum()) if (ell1, ell2, ell3) == (0, 0, 0) else 0.)
 
-    return BispectrumMultipoles(k=bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs, basis=bin.basis)
+    return Spectrum3Poles(k=bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs, basis=bin.basis)
 
 
-from .pspec import compute_normalization
+from .mesh2 import compute_normalization
 
 
-def compute_fkp_bspec_normalization(*fkps, cellsize=10.):
+def compute_fkp3_spectrum_normalization(*fkps, cellsize=10.):
     fkps, same = _format_meshs(*fkps)
     alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum(), fkps))
     norm = alpha * compute_normalization(*[fkp.randoms for fkp in fkps], cellsize=cellsize)
     return norm
 
 
-def compute_fkp_bspec_shotnoise(*fkps, bin=None, ells=None, los: str | np.ndarray='x', **kwargs):
+def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', **kwargs):
     fkps, same = _format_meshs(*fkps)
     ells = _format_ells(ells, basis=bin.basis)
     shotnoise = [jnp.ones_like(bin.xavg[..., 0]) for ill in range(len(ells))]
 
-    def bin_pspec(mesh):
+    def bin_mesh2_spectrum(mesh):
         return _bincount(bin.ibin, mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin.nmodes1d
 
     if same[2] == same[1] + 1 == same[0] + 2:
@@ -428,8 +413,12 @@ def compute_fkp_bspec_shotnoise(*fkps, bin=None, ells=None, los: str | np.ndarra
 
     particles = []
     for fkp, s in zip(fkp, same):
-        if s < len(particles): particles.append(particles[s])
-        else: particles.append(fkp.data - fkp.data.sum() / fkp.randoms.sum() * fkp.randoms)
+        if s < len(particles):
+            particles.append(particles[s])
+        else:
+            if isinstance(fkp, FKPField):
+                fkp = fkp.data - fkp.data.sum() / fkp.randoms.sum() * fkp.randoms
+            particles.append(fkp)
 
 
     mattrs = particles.attrs
@@ -438,6 +427,8 @@ def compute_fkp_bspec_shotnoise(*fkps, bin=None, ells=None, los: str | np.ndarra
     xvec = mattrs.rcoords(sparse=True)
     # The Fourier-space grid
     kvec = mattrs.kcoords(sparse=True)
+    # ells
+    ells = bin.ells
 
     if 'scoccimaro' in bin.basis:
 
@@ -466,7 +457,7 @@ def compute_fkp_bspec_shotnoise(*fkps, bin=None, ells=None, los: str | np.ndarra
 
             for ell in ells:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
-                s122.append(4. * jnp.pi * bin_pspec(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0] * cmesh) - s111 * (ell == 0))
+                s122.append(4. * jnp.pi * bin_mesh2_spectrum(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0] * cmesh) - s111 * (ell == 0))
             return s122
 
         def compute_S113(particles, ells):

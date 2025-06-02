@@ -7,14 +7,13 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh_bspec, bin_bspec, MeshAttrs, BispectrumMultipoles, generate_gaussian_mesh, utils)
+from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, utils)
 
 
 dirname = Path('_tests')
 
 
-
-def test_mesh_bspec(plot=False):
+def test_mesh3_spectrum(plot=False):
 
     def pk(k):
         kp = 0.03
@@ -26,18 +25,18 @@ def test_mesh_bspec(plot=False):
         return dirname / 'tmp_{}.npy'.format(los)
 
     list_los = ['x', 'local']
-    attrs = MeshAttrs(meshsize=64, boxsize=1000.)
+    attrs = MeshAttrs(meshsize=128, boxsize=1000.)
 
-    for basis in ['sugiyama-diagonal', 'scoccimarro-equilateral'][:1]:
+    for basis in ['sugiyama-diagonal', 'scoccimarro-equilateral']:
 
         ells = [0] if 'scoccimarro' in basis else [(0, 0, 0)]
 
-        bin = bin_bspec(attrs, edges={'step': 0.01}, basis=basis)
+        bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells)
 
-        #@partial(jax.jit, static_argnames=['los', 'ells'])
+        @partial(jax.jit, static_argnames=['los'])
         def mock(attrs, bin, seed, los='x'):
             mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
-            return compute_mesh_bspec(mesh, ells=ells, los=los, bin=bin)
+            return compute_mesh3_spectrum(mesh, los=los, bin=bin)
 
         for los in list_los:
 
@@ -57,7 +56,7 @@ def test_mesh_bspec(plot=False):
             from matplotlib import pyplot as plt
 
             for los in list_los:
-                power = BispectrumMultipoles.load(get_fn(los=los))
+                power = Spectrum3Poles.load(get_fn(los=los))
                 ax = power.plot().axes[0]
                 ax.set_title(los)
                 plt.show()
@@ -109,5 +108,5 @@ if __name__ == '__main__':
 
     import warnings
     warnings.filterwarnings('error')
-    test_mesh_bspec(plot=False)
-    test_timing()
+    test_mesh3_spectrum(plot=False)
+    #test_timing()

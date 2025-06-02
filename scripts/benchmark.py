@@ -58,8 +58,8 @@ def get_mock_fn(kind='power'):
     return base_dir / '{}.npy'.format(kind)
 
 
-def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp_pspec, compute_fkp_pspec_normalization, compute_fkp_pspec_shotnoise, create_sharding_mesh, make_particles_from_local, bin_spec)
+def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4), **attrs):
+    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, create_sharding_mesh, make_particles_from_local, BinMesh2Spectrum)
     t0 = time.time()
     data = get_clustering_positions_weights(data_fn, zrange=zrange)
     randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
@@ -71,13 +71,13 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
     fkp = FKPField(data, randoms)
     t2 = time.time()
-    norm, num_shotnoise = compute_fkp_pspec_normalization(fkp), compute_fkp_pspec_shotnoise(fkp)
+    norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     jax.block_until_ready(mesh)
     t3 = time.time()
     del fkp
-    bin = bin_spec(mesh.attrs, edges={'step': 0.001})
-    power = jitted_compute_mesh_pspec(mesh, bin=bin)#.clone(norm=norm, num_shotnoise=num_shotnoise)
+    bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=ells)
+    power = jitted_compute_mesh2_spectrum(mesh, bin=bin)#.clone(norm=norm, num_shotnoise=num_shotnoise)
     power.attrs.udpate(mesh=dict(mesh.attrs), zrange=zrange)
     jax.block_until_ready(power)
     t4 = time.time()
@@ -87,7 +87,7 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
 
 
 def compute_jaxpower_window(fn, power_fn, data_fn, all_randoms_fn):
-    from jaxpower import (ParticleField, FKPField, compute_mesh_pspec_window, create_sharding_mesh, make_particles_from_local, bin_spec, BinnedStatistic, MeshAttrs)
+    from jaxpower import (ParticleField, FKPField, compute_mesh2_spectrum_window, create_sharding_mesh, make_particles_from_local, BinMesh2Spectrum, BinnedStatistic, MeshAttrs)
     power = BinnedStatistic.load(power_fn)
     zrange = power.attrs['zrange']
     attrs = MeshAttrs(**power.attrs['mesh'])
@@ -96,10 +96,10 @@ def compute_jaxpower_window(fn, power_fn, data_fn, all_randoms_fn):
     data = ParticleField(*make_particles_from_local(*data), **attrs)
     randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
     mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
-    bin = bin_spec(mesh.attrs, edges=power.edges(projs=0))
+    bin = BinMesh2Spectrum(mesh.attrs, edges=power.edges(projs=0))
     ells = power.projs()
     edgesin = np.linspace(bin.edges.min(), bin.edges.max(), 2 * (len(bin.edges) - 1))
-    wmatrix = compute_mesh_pspec_window(mesh, edgesin=edgesin, ellsin=(ells, 'local'), bin=bin, ells=ells, pbar=True)
+    wmatrix = compute_mesh2_spectrum_window(mesh, edgesin=edgesin, ellsin=(ells, 'local'), bin=bin, ells=ells, pbar=True)
     wmatrix.save(fn)
 
 
@@ -119,9 +119,8 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     power.save(fn)
 
 
-
-
 if __name__ == '__main__':
+
     tracer = 'QSO'
     region = 'NGC'
     #cellsize, meshsize = 8., 1500 #1620
@@ -143,9 +142,9 @@ if __name__ == '__main__':
         config.update('jax_enable_x64', True)
         from jax import numpy as jnp
         jax.distributed.initialize()
-        from jaxpower import compute_mesh_pspec, create_sharding_mesh
-        jitted_compute_mesh_pspec = jax.jit(partial(compute_mesh_pspec, **poles_args), donate_argnums=[0])
-        #jitted_compute_mesh_pspec = partial(compute_mesh_pspec, **poles_args)
+        from jaxpower import compute_mesh2_spectrum, create_sharding_mesh
+        jitted_compute_mesh2_spectrum = jax.jit(partial(compute_mesh2_spectrum, **poles_args), donate_argnums=[0])
+        #jitted_compute_mesh2_spectrum = partial(compute_mesh2_spectrum, **poles_args)
 
     for imock in range(4):
         catalog_dir = Path(f'/dvs_ro/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
