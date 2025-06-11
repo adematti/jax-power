@@ -145,11 +145,11 @@ class BaseWindowRotation(object):
         return self.mmatrix, self.state
 
     @plotter
-    def plot_wmatrix_slice(self, indices):
+    def plot_wmatrix_slice(self, index):
         wmatrix = WindowMatrix(observable=self.observable, theory=self.theory, value=self.wmatrix)
         wmatrix_rotated = WindowMatrix(observable=self.observable, theory=self.theory, value=self.rotate()[0])
-        fig = wmatrix.plot_slice(indices=indices, color='C0', label='$W$', yscale='log')
-        return wmatrix_rotated.plot_slice(indices=indices, color='C1', label='$W^{\prime}$', yscale='log', fig=fig)
+        fig = wmatrix.plot_slice(index=index, color='C0', label='$W$', yscale='log')
+        return wmatrix_rotated.plot_slice(index=index, color='C1', label='$W^{\prime}$', yscale='log', fig=fig)
 
     @plotter
     def plot_compactness(self, frac=0.95, xlim=None, projs=None):

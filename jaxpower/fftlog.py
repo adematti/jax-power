@@ -42,7 +42,7 @@ class FFTlog(object):
 
     where :math:`F_{q}(x) = G(x)x^{-q}`, :math:`K_{q}(t) = K(t)t^{q}` and :math:`G_{q}(y) = G(y)y^{q}`.
     """
-    def __init__(self, x, kernel, q=0, minfolds=2, lowring=True, xy=1, check_level=0, engine='numpy', **engine_kwargs):
+    def __init__(self, x, kernel, q=0, minfolds=2, lowring=True, xy=1, check_level=0, engine='jax', **engine_kwargs):
         r"""
         Initialize :class:`FFTlog`, which can perform several transforms at once.
 
@@ -72,7 +72,7 @@ class FFTlog(object):
         check_level : int, default=0
             If non-zero run sanity checks on input.
 
-        engine : string, default='numpy'
+        engine : string, default='jax'
             FFT engine. See :meth:`set_fft_engine`.
 
         engine_kwargs : dict
@@ -111,15 +111,15 @@ class FFTlog(object):
         self._setup(kernel, q, minfolds=minfolds, lowring=lowring, xy=xy, check_level=check_level)
         self.set_fft_engine(engine, **engine_kwargs)
 
-    def set_fft_engine(self, engine='numpy', **engine_kwargs):
+    def set_fft_engine(self, engine='jax', **engine_kwargs):
         """
         Set up FFT engine.
         See :func:`get_fft_engine`
 
         Parameters
         ----------
-        engine : BaseEngine, string, default='numpy'
-            FFT engine, or one of ['numpy', 'fftw'].
+        engine : BaseEngine, string, default='jax'
+            FFT engine, or one of ['jax'].
 
         engine_kwargs : dict
             Arguments for FFT engine.
@@ -140,8 +140,11 @@ class FFTlog(object):
         """Set up u funtions."""
         self.delta = jnp.log(self.x[:, -1] / self.x[:, 0]) / (self.size - 1)
 
-        nfolds = (self.size * minfolds - 1).bit_length()
-        self.padded_size = 2**nfolds
+        self.padded_size = self.size
+        if minfolds:
+            nfolds = (self.size * minfolds - 1).bit_length()
+            self.padded_size = 2**nfolds
+
         npad = self.padded_size - self.size
         self.padded_size_in_left, self.padded_size_in_right = npad // 2, npad - npad // 2
         self.padded_size_out_left, self.padded_size_out_right = npad - npad // 2, npad // 2
@@ -155,7 +158,7 @@ class FFTlog(object):
         if lowring:
             self.lnxy = jnp.array([delta / jnp.pi * jnp.angle(kernel(q + 1j * np.pi / delta)) for kernel, delta, q in zip(kernels, self.delta, qs)], dtype=self.x.dtype)
         else:
-            self.lnxy = jnp.log(xy) + self.delta
+            self.lnxy = jnp.log(jnp.array(xy))# + self.delta
 
         self.y = jnp.exp(self.lnxy - self.delta)[:, None] / self.x[:, ::-1]
 
@@ -189,7 +192,7 @@ class FFTlog(object):
         new.x, new.y, new.padded_x, new.padded_y, new.padded_u, new.padded_prefactor, new.padded_postfactor = children
         return new
 
-    def __call__(self, fun, extrap=0, keep_padding=False):
+    def __call__(self, fun, extrap=0, keep_padding=False, ignore_prepostfactor=False):
         """
         Perform the transforms.
 
@@ -198,7 +201,7 @@ class FFTlog(object):
         fun : array_like
             Function to be transformed.
             Last dimensions should match (:attr:`nparallel`, len(x)) where ``len(x)`` is the size of the input x-coordinates.
-            (if :attr:`nparallel` is 1, the only requirement is the last dimension to be (len(x))).
+            (if :attr:`nparallel` is 1, the only requirement is the last dimension to be len(x).
 
         extrap : float, string, default=0
             How to extrapolate function outside of  ``x`` range to fit the integration range.
@@ -221,7 +224,10 @@ class FFTlog(object):
         """
         fun = jnp.asarray(fun)
         padded_fun = pad(fun, (self.padded_size_in_left, self.padded_size_in_right), axis=-1, extrap=extrap)
-        fftloged = self._engine.backward(self._engine.forward(padded_fun * self.padded_prefactor) * self.padded_u) * self.padded_postfactor
+        padded_prefactor, padded_postfactor = self.padded_prefactor,  self.padded_postfactor
+        if ignore_prepostfactor:
+            padded_prefactor = padded_postfactor = 1.
+        fftloged = self._engine.backward(self._engine.forward(padded_fun * padded_prefactor) * self.padded_u) * padded_postfactor
 
         if not keep_padding:
             y = self.y
@@ -523,7 +529,7 @@ class BaseFFTEngine(object):
         self.nthreads = int(os.environ.get('OMP_NUM_THREADS', 1))
 
 
-class NumpyFFTEngine(BaseFFTEngine):
+class JAXFFTEngine(BaseFFTEngine):
 
     """FFT engine based on :mod:`numpy.fft`."""
 
@@ -536,22 +542,6 @@ class NumpyFFTEngine(BaseFFTEngine):
         return jnp.fft.irfft(fun.conj(), n=self.size, axis=-1)
 
 
-def apply_along_last_axes(func, array, naxes=1, toret=None):
-    """Apply callable ``func`` over the last ``naxes`` of ``array``."""
-    # Used by FFTW only so input has to be numpy (not jax)
-    if toret is None:
-        toret = np.empty_like(array)
-    shape_bak = array.shape
-    array.shape = (-1,) + shape_bak[-naxes:]
-    newshape_bak = toret.shape
-    toret.shape = (-1,) + newshape_bak[-naxes:]
-    for iarr, arr in enumerate(array):
-        toret[iarr] = func(arr)
-    array.shape = shape_bak
-    toret.shape = newshape_bak
-    return toret
-
-
 def get_fft_engine(engine, *args, **kwargs):
     """
     Return FFT engine.
@@ -559,7 +549,7 @@ def get_fft_engine(engine, *args, **kwargs):
     Parameters
     ----------
     engine : BaseFFTEngine, string
-        FFT engine, or one of ['numpy', 'fftw'].
+        FFT engine, or one of ['jax'].
 
     args, kwargs : tuple, dict
         Arguments for FFT engine.
@@ -569,8 +559,8 @@ def get_fft_engine(engine, *args, **kwargs):
     engine : BaseFFTEngine
     """
     if isinstance(engine, str):
-        if engine.lower() == 'numpy':
-            return NumpyFFTEngine(*args, **kwargs)
+        if engine.lower() == 'jax':
+            return JAXFFTEngine(*args, **kwargs)
         raise ValueError('FFT engine {} is unknown'.format(engine))
     return engine
 

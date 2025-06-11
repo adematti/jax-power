@@ -212,7 +212,7 @@ def _get_freq_mesh(*freqs, sparse=None, sharding_mesh: jax.sharding.Mesh=None):
 
 @default_sharding_mesh
 def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
-            hermitian: bool=False, spacing: np.ndarray | float=1.,
+            hermitian: bool=False, spacing: np.ndarray | float=1., dtype=None,
             axis_order: tuple=None, sharding_mesh: jax.sharding.Mesh=None):
     r"""
     Return mesh frequencies.
@@ -254,6 +254,7 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
     if axis_order is None:
         axis_order = list(range(ndim))
     toret = [toret[axis] for axis in axis_order]
+    if dtype is not None: toret = [tt.astype(dtype) for tt in toret]
     toret = _get_freq_mesh(*toret, sparse=sparse, sharding_mesh=sharding_mesh)
     return tuple(toret[axis_order.index(axis)] for axis in range(len(toret)))
 
@@ -499,12 +500,17 @@ class MeshAttrs(object):
         if meshsize is not None:  # meshsize may not be provided (e.g. for particles) and it is fine
             meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
             if boxsize is None: boxsize = 1. * meshsize
-        if boxsize is not None: boxsize = _jnp_array_fill(boxsize, ndim, dtype=float)
-        if boxcenter is not None: boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=float)
         dtype = jnp.zeros((), dtype=dtype).dtype  # default dtype is float32, except if config.update('jax_enable_x64', True)
+        self.__dict__.update(dtype=dtype)
+        if boxsize is not None: boxsize = _jnp_array_fill(boxsize, ndim, dtype=self.rdtype)
+        if boxcenter is not None: boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=self.rdtype)
         if fft_engine == 'auto':
             fft_engine = 'jaxdecomp' if ndim == 3 and jaxdecomp is not None else 'jax'
-        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter, dtype=dtype, fft_engine=fft_engine)
+        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter, fft_engine=fft_engine)
+
+    @property
+    def rdtype(self):
+        return jnp.zeros((), dtype=self.dtype).real.dtype
 
     @property
     def sharding_mesh(self):
@@ -581,7 +587,7 @@ class MeshAttrs(object):
         if kind == 'index':
             spacing = 1
             kind = 'position'
-        toret = fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=False, spacing=spacing, sharding_mesh=self.sharding_mesh)
+        toret = fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=False, spacing=spacing, sharding_mesh=self.sharding_mesh, dtype=self.rdtype)
         if offset is not None:
             toret = tuple(tmp + off for off, tmp in zip(offset, toret))
         return toret
@@ -613,7 +619,7 @@ class MeshAttrs(object):
         axis_order = None
         if self.fft_engine == 'jaxdecomp':
             axis_order = tuple(np.roll(np.arange(self.ndim), shift=2))
-        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh)
+        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh, dtype=self.rdtype)
 
     xcoords = rcoords
     kcoords = ccoords
@@ -1284,8 +1290,7 @@ def get_common_mesh_attrs(*particles, **kwargs):
     assert len(particles)
     if not kwargs and not any(p._cache_attrs for p in particles) and all(p._attrs for p in particles):
         return particles[0].attrs
-    attrs = _get_common_mesh_cache_attrs(*[p._cache_attrs for p in particles], **kwargs)
-    return get_mesh_attrs(*[p.positions for p in particles], **attrs)
+    return _get_common_mesh_cache_attrs(*[p._cache_attrs for p in particles], **kwargs)
 
 
 @default_sharding_mesh
@@ -1388,7 +1393,8 @@ class ParticleField(object):
         attrs = kwargs.pop('attrs', None)
         if attrs is None:
             attrs = get_common_mesh_attrs(*others, **kwargs)
-        return tuple(other.clone(**attrs) for other in others)
+        kw = dict(attrs=attrs) if isinstance(attrs, MeshAttrs) else attrs
+        return tuple(other.clone(**kw) for other in others)
 
     @classmethod
     def concatenate(cls, others, weights=None, local=False, **kwargs):
@@ -1510,7 +1516,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
     resampler = getattr(resamplers, resampler, resampler)
     interlacing = max(interlacing, 1)
-    shifts = jnp.arange(interlacing) * 1. / interlacing
+    shifts = jnp.astype(jnp.arange(interlacing) * 1. / interlacing, attrs.rdtype)
 
     sharding_mesh = attrs.sharding_mesh
     with_sharding = bool(sharding_mesh.axis_names)
@@ -1567,7 +1573,8 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
                 kvec = sum(kvec)
                 return value * jnp.exp(shift * 1j * kvec) / interlacing
 
-            carry += ppaint(positions + shift, weights).r2c().apply(kernel_shift, kind='circular')
+            tmp = ppaint(positions + shift, weights).r2c()
+            carry += tmp.apply(kernel_shift, kind='circular')
             return carry, shift
 
         toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=shifts)[0]
@@ -1608,7 +1615,6 @@ def read(mesh: RealMeshField, positions: jax.Array, *args, **kwargs) -> jax.Arra
 
 def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshField:
     return mesh.paint(*args, **kwargs)
-
 
 
 

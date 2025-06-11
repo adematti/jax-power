@@ -122,45 +122,68 @@ def test_mesh2_spectrum(plot=False):
 
 def test_mesh2_correlation(plot=False):
 
-    def pk(k):
-        kp = 0.03
-        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+    from cosmoprimo.fiducial import DESI
 
-    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+    attrs = MeshAttrs(boxsize=500., boxcenter=[1300., 0., 0.], meshsize=32)
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+    ellsin = (0, 2, 4)
+    edgesin = np.arange(0., jnp.sqrt(3.) * attrs.knyq.max() + 0.2, 0.001)
+    edgesin = np.column_stack([edgesin[:-1], edgesin[1:]])
+    kin = (edgesin[..., 0] + edgesin[..., 1]) / 2.
+    f, b = 0.8, 1.5
+    beta = f / b
+
+    def get_pk(k, pk):
+        pk = pk(k)
+        return np.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk,
+                          0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                          8. / 35 * beta ** 2 * pk])
+
+    poles = BinnedStatistic(x=[kin] * len(ellsin), edges=[edgesin] * len(ellsin), value=list(get_pk(kin, pk)), projs=ellsin)
+
+    def pkvec(kvec):
+        from jaxpower.utils import get_legendre
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+        vlos = (1, 0, 0)
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / knorm
+        p = jnp.sum(get_pk(knorm, pk) * jnp.stack([get_legendre(ell)(mu) for ell in ellsin]), axis=0)
+        return jnp.where(knorm == 0., 0., p)
+
+    def get_xi(s, pk):
+        return np.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk.to_xi(fftlog_kwargs={'ell': 0})(s),
+                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk.to_xi(fftlog_kwargs={'ell': 2})(s),
+                        8. / 35 * beta ** 2 * pk.to_xi(fftlog_kwargs={'ell': 4})(s)])
 
     def get_fn(los='x'):
         return dirname / 'tmp_{}.npy'.format(los)
 
-    list_los = ['x', 'endpoint']
+    list_los = ['x', 'local'][:1]
     attrs = MeshAttrs(meshsize=128, boxsize=1000.)
-    bin = BinMesh2Correlation(attrs, edges={'step': 10, 'max': 200}, ells=(0, 2, 4))
+    bin = BinMesh2Correlation(attrs, edges={'step': 4, 'max': 200}, ells=(0, 2, 4))
 
-    @partial(jax.jit, static_argnames=['los'])
+    #@partial(jax.jit, static_argnames=['los'])
     def mock(attrs, bin, seed, los='x'):
-        mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
+        mesh = generate_anisotropic_gaussian_mesh(attrs, poles, los=los, seed=seed, unitary_amplitude=True, order=1)
+        #mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
         return compute_mesh2_correlation(mesh, los=los, bin=bin)
 
     for los in list_los:
-
-        nmock = 5
-        t0 = time.time()
         corr = mock(attrs, bin, random.key(43), los=los)
-        jax.block_until_ready(corr)
-        print(f'time for jit {time.time() - t0:.2f}')
-        t0 = time.time()
-        for i in range(nmock):
-            corr = mock(attrs, bin, random.key(i + 42), los=los)
-            jax.block_until_ready(corr)
-        print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         corr.save(get_fn(los))
-        assert tuple(corr.projs) == (0, 2, 4)
 
     if plot:
         from matplotlib import pyplot as plt
 
         for los in list_los:
             corr = Correlation2Poles.load(get_fn(los=los))
+            corr = corr.select(xlim=(30., 140.))
             ax = corr.plot().axes[0]
+            s = corr.x(projs=0)
+            xi = get_xi(s, pk)
+            for ill, ell in enumerate(corr.projs):
+                ax.plot(s, s**2 * xi[ill], color='C{:d}'.format(ill), linestyle='--')
             ax.set_title(los)
             plt.show()
 
@@ -1064,8 +1087,8 @@ def test_split():
 
 if __name__ == '__main__':
 
-    import warnings
-    warnings.simplefilter("error")
+    #import warnings
+    #warnings.simplefilter("error")
 
     #test_window_timing()
     #test_sympy()

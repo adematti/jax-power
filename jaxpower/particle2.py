@@ -67,9 +67,9 @@ class BinParticle2Spectrum(object):
             edges = np.arange(edges.get('min', 0.), edges['max'], edges['step'])
         boxsize = getattr(mattrs, 'boxsize', None)
         edges = np.asarray(edges)
-        if edges.ndim == 2:
+        if edges.ndim == 2:  # coming from BinnedStatistic
             assert np.allclose(edges[1:, 0], edges[:-1, 1])
-            edges = np.append(edges[:-1, 0], edges[-1, 1])
+            edges = np.append(edges[:, 0], edges[-1, 1])
         edges = np.column_stack([edges[:-1], edges[1:]])
         xavg = 3. / 4. * (edges[..., 1]**4 - edges[..., 0]**4) / (edges[..., 1]**3 - edges[..., 0]**3)
         if selection is None:

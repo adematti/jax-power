@@ -96,10 +96,10 @@ def compute_jaxpower_window(fn, power_fn, data_fn, all_randoms_fn):
     data = ParticleField(*make_particles_from_local(*data), **attrs)
     randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
     mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
-    bin = BinMesh2Spectrum(mesh.attrs, edges=power.edges(projs=0))
+    bin = BinMesh2Spectrum(mesh.attrs, edges=power.edges(projs=0), ells=power.projs)
     ells = power.projs()
     edgesin = np.linspace(bin.edges.min(), bin.edges.max(), 2 * (len(bin.edges) - 1))
-    wmatrix = compute_mesh2_spectrum_window(mesh, edgesin=edgesin, ellsin=(ells, 'local'), bin=bin, ells=ells, pbar=True)
+    wmatrix = compute_mesh2_spectrum_window(mesh, edgesin=edgesin, ellsin=(ells, 'local'), bin=bin, pbar=True)
     wmatrix.save(fn)
 
 

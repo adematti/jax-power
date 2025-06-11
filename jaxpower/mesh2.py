@@ -20,9 +20,9 @@ class Spectrum2Poles(BinnedStatistic):
     _label_x = r'$k$ [$h/\mathrm{Mpc}$]'
     _label_proj = r'$\ell$'
     _label_value = r'$P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{3}$]'
-    _data_fields = BinnedStatistic._data_fields + ['_norm', '_num_shotnoise', '_num_zero']
+    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
     _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero']
-    _sum_fields = BinnedStatistic._sum_fields + ['_norm', '_num_shotnoise', '_num_zero']
+    _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
     _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
 
@@ -36,14 +36,11 @@ class Spectrum2Poles(BinnedStatistic):
                 item = (item,) * len(ells)
             return tuple(item)
 
-        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=tuple(jnp.asarray(p) for p in num_zero))
+        if num_zero is None: num_zero = _tuple(0.)
+        num_zero = tuple(jnp.asarray(p) for p in num_zero)
+        self.__dict__.update(_num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=num_zero)
         super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num,
-                         weights=_tuple(nmodes), name=name, attrs=attrs)
-
-    @property
-    def norm(self):
-        """Power spectrum normalization."""
-        return self._norm
+                         weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
 
     @property
     def shotnoise(self):
@@ -67,13 +64,12 @@ class Spectrum2Poles(BinnedStatistic):
     def value(self):
         """Power spectrum estimate."""
         toret = list(self.num)
-        if 0 in self._projs:
-            ill = self._projs.index(0)
-            toret[ill] = toret[ill] - self._num_shotnoise
         for ill, ell in enumerate(self._projs):
+            toret[ill] = toret[ill] - self._num_shotnoise * (ell == 0)
             mask_zero = (self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.)
-            toret[ill] = toret[ill].at[mask_zero].add(- self._num_zero[ill] / self._weights[ill][mask_zero])
-        return tuple(tmp / self._norm for tmp in toret)
+            tmp = toret[ill] - self._num_zero[ill] / self._weights[ill]
+            toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
+        return tuple(tmp.real / self._norm for tmp in toret)
 
     @plotter
     def plot(self, fig=None):
@@ -119,9 +115,9 @@ class Correlation2Poles(BinnedStatistic):
     _label_x = r'$s$ [$\mathrm{Mpc}/h$]'
     _label_proj = r'$\ell$'
     _label_value = r'$\xi_{\ell}(s)$'
-    _data_fields = BinnedStatistic._data_fields + ['_norm', '_num_shotnoise', '_num_zero']
+    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
     _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero']
-    _sum_fields = BinnedStatistic._sum_fields + ['_norm', '_num_shotnoise', '_num_zero']
+    _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
     _init_fields = {'s': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
 
@@ -135,14 +131,11 @@ class Correlation2Poles(BinnedStatistic):
                 item = (item,) * len(ells)
             return tuple(item)
 
-        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=tuple(jnp.asarray(p) for p in num_zero))
+        if num_zero is None: num_zero = _tuple(0.)
+        num_zero = tuple(jnp.asarray(p) for p in num_zero)
+        self.__dict__.update(_num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=num_zero)
         super().__init__(x=_tuple(s), edges=_tuple(edges), projs=ells, value=num,
-                         weights=_tuple(nmodes), name=name, attrs=attrs)
-
-    @property
-    def norm(self):
-        """Correlation function normalization."""
-        return self._norm
+                         weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
 
     @property
     def shotnoise(self):
@@ -169,11 +162,13 @@ class Correlation2Poles(BinnedStatistic):
         for ill, ell in enumerate(self.ells):
             toret[ill] = toret[ill] - self._num_zero[ill]
             mask_zero = (self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.)
-            toret[ill] = toret[ill] - (2 * ell + 1) * self._num_shotnoise * get_legendre(ell)(0.) * mask_zero
-        return tuple(tmp / self._norm for tmp in toret)
+            tmp = toret[ill] - self._num_shotnoise * (ell == 0)
+            toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
+        return tuple(tmp.real / self._norm for tmp in toret)
 
     def to_power(self, k):
         num = []
+        value = self.view()
         for ill, ell in enumerate(self.ells):
             if isinstance(k, BinnedStatistic):
                 kk = k._x[ill]
@@ -182,7 +177,7 @@ class Correlation2Poles(BinnedStatistic):
             else:
                 kk = k
             def f(kk):
-                return (-1)**(ell // 2) * jnp.sum(self.value[ill] * get_spherical_jn(ell)(kk * self._x[ill]), axis=-1)
+                return (-1)**(ell // 2) * jnp.sum(value[ill] * get_spherical_jn(ell)(kk * self._x[ill]), axis=-1)
 
             num.append(jax.lax.map(f, kk, batch_size=max(min(1000 * 1000 / len(self._x[ill]), len(kk)), 1)))
         num = tuple(num)
@@ -223,6 +218,7 @@ class Correlation2Poles(BinnedStatistic):
             ax = fig.axes[0]
         for ill, ell in enumerate(self.ells):
             ax.plot(self._x[ill], self._x[ill]**2 * self.value[ill].real, label=self._get_label_proj(ell))
+            #ax.plot(self._x[ill], self.value[ill].real, label=self._get_label_proj(ell))
         ax.legend()
         ax.grid(True)
         ax.set_xlabel(self._label_x)
@@ -261,7 +257,7 @@ class BinMesh2Spectrum(object):
                 edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
         if edges.ndim == 2:  # coming from BinnedStatistic
             assert np.allclose(edges[1:, 0], edges[:-1, 1])
-            edges = np.append(edges[:-1, 0], edges[-1, 1])
+            edges = np.append(edges[:, 0], edges[-1, 1])
         shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
         shifts = list(itertools.product(*shifts))
         ibin, nmodes, xsum = [], 0, 0
@@ -325,8 +321,10 @@ class BinMesh2Correlation(object):
         ells = _format_ells(ells)
         self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, ells=ells)
 
-    def __call__(self, mesh):
+    def __call__(self, mesh, remove_zero=False):
         value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
+        if remove_zero:
+            value = value.at[(0,) * value.ndim].set(0.)
         return _bincount(self.ibin, value, weights=None, length=len(self.xavg)) / self.nmodes
 
 
@@ -417,7 +415,7 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
     meshs, autocorr = _format_meshs(*meshs)
     rdtype = meshs[0].real.dtype
     mattrs = meshs[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
+    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
     attrs = dict(los=vlos if vlos is not None else los)
@@ -471,13 +469,13 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
                 Aell = jax.lax.scan(partial(f, Ylms), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=xs)[0] * A0
                 #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
-                num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
+                num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2), remove_zero=True))
                 num_zero.append(4. * jnp.pi * 0.)
                 del Aell
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        num, num_zero = jnp.array(num), jnp.array(num_zero)
-        if swap: num, num_zero = num.conj(), num_zero.conj()
+        num, num_zero = map(jnp.array, (num, num_zero))
+        if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Spectrum2Poles` instance
         return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
                                        num_zero=num_zero, attrs=attrs)
@@ -504,10 +502,10 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
             kvec = Aell.coords(sparse=True)
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
-                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), antisymmetric=bool(ell % 2)))
+                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), antisymmetric=bool(ell % 2), remove_zero=True))
                 num_zero.append(0.)
 
-        num, num_zero = jnp.array(num), jnp.array(num_zero)
+        num, num_zero = map(jnp.array, (num, num_zero))
         return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
@@ -548,7 +546,7 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
     meshs, autocorr = _format_meshs(*meshs)
     rdtype = meshs[0].real.dtype
     mattrs = meshs[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
+    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
     attrs = dict(los=vlos if vlos is not None else los)
@@ -579,8 +577,9 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
                 Aell = _2c(rmesh1) * A0.conj()
-            num.append(bin(Aell.c2r()))
-            num_zero.append(_get_zero(Aell))
+            Aell = Aell.c2r()  # convert to real space
+            num.append(bin(Aell))
+            num_zero.append(Aell.mean())
             del Aell
 
         if nonzeroells:
@@ -599,16 +598,14 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
                 xs = np.arange(len(Ylms))
                 Aell = jax.lax.scan(partial(f, Ylms), init=rmesh1.clone(value=jnp.zeros_like(rmesh1.value)), xs=xs)[0]
-                num.append(4. * jnp.pi * bin(Aell))
+                num.append(4. * jnp.pi * bin(Aell, remove_zero=True))
                 num_zero.append(4. * jnp.pi * 0.)
                 del Aell
 
-        # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        num, num_zero = jnp.array(num), jnp.array(num_zero)
-        if swap: num, num_zero = num.conj(), num_zero.conj()
+        num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
+        if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Correlation2Poles` instance
-        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
-                                             num_zero=num_zero, attrs=attrs)
+        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
 
@@ -618,7 +615,6 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
             Aell = meshs[0].clone(value=meshs[0].real**2 + meshs[0].imag**2)  # saves a bit of memory
         else:
             Aell = meshs[0] * meshs[1].conj()
-        zero = _get_zero(Aell)
         Aell = Aell.c2r()  # convert to real space
         del meshs
 
@@ -628,16 +624,16 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
         num, num_zero = [], []
         if 0 in ells:
             num.append(bin(Aell))
-            num_zero.append(zero)
+            num_zero.append(Aell.mean())
 
         if nonzeroells:
             svec = Aell.coords(kind='separation', sparse=True)
             mu = sum(ss * ll for ss, ll in zip(svec, vlos)) / jnp.sqrt(sum(ss**2 for ss in svec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
-                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu)))
+                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), remove_zero=True))
                 num_zero.append(0.)
 
-        num, num_zero = jnp.array(num), jnp.array(num_zero)
+        num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
         return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
@@ -682,8 +678,11 @@ class FKPField(object):
 
     @staticmethod
     def same_mesh(*others, **kwargs):
-        attrs = get_common_mesh_attrs(*([other.data for other in others] + [other.randoms for other in others]), **kwargs)
-        return tuple(other.clone(**attrs) for other in others)
+        attrs = kwargs.pop('attrs', None)
+        if attrs is None:
+            attrs = get_common_mesh_attrs(*([other.data for other in others] + [other.randoms for other in others]), **kwargs)
+        kw = dict(attrs=attrs) if isinstance(attrs, MeshAttrs) else attrs
+        return tuple(other.clone(**kw) for other in others)
 
 
 def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic', **kwargs) -> jax.Array:
@@ -880,7 +879,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
         rdtype = meshs[0].real.dtype
         mattrs = meshs[0].attrs
 
-    _norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
+    _norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
     if norm is None: norm = _norm
     rnorm = _norm / norm / mattrs.meshsize.prod(dtype=rdtype)
 
@@ -1420,7 +1419,7 @@ def compute_mesh2_spectrum_mean(*meshs: RealMeshField | ComplexMeshField | MeshA
     else:
         rdtype = meshs[0].real.dtype
         mattrs = meshs[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)
+    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
     rnorm = norm / mattrs.meshsize.prod(dtype=rdtype)
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)

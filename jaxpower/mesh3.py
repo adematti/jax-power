@@ -180,10 +180,10 @@ class Spectrum3Poles(BinnedStatistic):
                 item = (item,) * len(ells)
             return tuple(item)
 
-        num = tuple(num)
-        num_zero = tuple(num_zero)
         if num_shotnoise is None:
             num_shotnoise = tuple(jnp.zeros_like(num) for num in num)
+        if num_zero is None: num_zero = _tuple(0.)
+        num_zero = tuple(jnp.asarray(p) for p in num_zero)
 
         kw = dict()
         if 'scoccimarro' in basis:
@@ -191,7 +191,7 @@ class Spectrum3Poles(BinnedStatistic):
         else:
             kw.update(_label_x=r'$k_1, k_2$ [$h/\mathrm{Mpc}$]', _label_proj=r'$\ell_1, \ell_2, \ell_3$', _label_value=r'$B_{\ell_1, \ell_2, \ell_3}(k_1, k_2)$ [$(\mathrm{Mpc}/h)^{6}$]')
 
-        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=tuple(jnp.asarray(p) for p in num_zero), basis=basis, **kw)
+        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=num_shotnoise, _num_zero=num_zero, basis=basis, **kw)
         super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num, weights=_tuple(nmodes), name=name, attrs=attrs)
 
     @property
@@ -220,11 +220,12 @@ class Spectrum3Poles(BinnedStatistic):
     @property
     def value(self):
         """Power spectrum estimate."""
-        toret = []
+        toret = list(self.num)
         for ill, ells in enumerate(self._projs):
-            toret.append(self.num[ill] - self._num_shotnoise[ill])
-            dig_zero = jnp.all((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), axis=1)
-            toret[ill] = toret[ill].at[dig_zero].add(- self._num_zero[ill] / self._weights[ill][dig_zero])
+            toret[ill] = toret[ill] - self._num_shotnoise[ill]
+            mask_zero = jnp.all((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), axis=1)
+            tmp = toret[ill] - self._num_zero[ill] / self._weights[ill]
+            toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
         return tuple(tmp / self._norm for tmp in toret)
 
     @plotter

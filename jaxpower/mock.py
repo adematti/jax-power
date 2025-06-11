@@ -31,14 +31,12 @@ def generate_gaussian_mesh(attrs, power: Callable, seed: int=42,
     return mesh.c2r()
 
 
-def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False):
+def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
 
     """Generate :class:`RealMeshField` with input power spectrum multipoles."""
 
     ells = (0, 2, 4)
     kin = None
-    if isinstance(poles, tuple):
-        kin, poles = poles
     if isinstance(poles, BinnedStatistic):
         kin, poles = jnp.append(poles._edges[0][..., 0], poles._edges[0][-1, 1]), {proj: poles.view(projs=proj) for proj in poles.projs}
     if isinstance(poles, list):
@@ -61,7 +59,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
     is_callable = all(callable(pole) for pole in poles.values())
     if not is_callable:
         from .utils import Interpolator1D
-        interp = Interpolator1D(kin, knorm, edges=len(kin) == len(poles[0]) + 1)
+        interp = Interpolator1D(kin, knorm, edges=len(kin) == len(poles[0]) + 1, **kwargs)
 
     def get_theory(ell=None, pole=None):
         if pole is None:
@@ -126,7 +124,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         return mesh
 
     else:
-        vlos = _get_los_vector(los, ndim=len(attrs.meshsize))
+        vlos = _get_los_vector(los, ndim=attrs.ndim)
         mesh = generate_normal(seed)
 
         def kernel(value, kvec):
@@ -134,7 +132,7 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
             ker = sum(get_theory(ell) / attrs.cellsize.prod() * get_legendre(ell)(mu) for ell in ells)
             ker = jnp.sqrt(ker)
             if unitary_amplitude:
-                ker *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(value)
+                ker *= jnp.sqrt(attrs.meshsize.prod(dtype=value.real.dtype)) / jnp.abs(value)
             return value * ker
 
         mesh = mesh.apply(kernel, kind='wavenumber').c2r()
