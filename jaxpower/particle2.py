@@ -223,7 +223,6 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
         p1 = sorted_particles[0]
         p2 = p1 if autocorr else sorted_particles[1]
         ps = [p1[0][neighbors[0]], p1[1][neighbors[0]], p2[0][neighbor], p2[1][neighbor]]
-        print(ps[0].shape)
         num = jax.lax.scan(f, init=num, xs=ps)[0]
 
     num_zero = jnp.sum(particles[0].weights) if autocorr else jnp.sum(particles[0].weights) * jnp.sum(particles[1].weights)

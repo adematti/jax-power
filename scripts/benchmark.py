@@ -97,8 +97,8 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
     t4 = time.time()
     if True:
         from jaxpower import BinParticle2Correlation, compute_particle2
-        bin = BinParticle2Correlation(mesh.attrs, edges={'step': 1.}, selection={'theta': (0., 0.05)}, ells=ells)
-        corr = compute_particle2(fkp.particles, bin=bin, los=los)
+        bin = BinParticle2Correlation(mesh.attrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
+        corr = compute_particle2(fkp.data, bin=bin, los=los)
         power = power.clone(num=corr.to_power(power).num)
         t5 = time.time()
     
@@ -133,7 +133,10 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, wnorm=1., num_shotnoise=0.)
+    direct_selection_attrs = {'theta': (0., 0.05)}
+    direct_edges = {'min': 0., 'step': 0.1}
+    direct_attrs = {'nthreads': mpicomm.size}
+    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, wnorm=1., shotnoise_nonorm=0., direct_selection_attrs=direct_selection_attrs, direct_edges=direct_edges, direct_attrs=direct_attrs)
     t2 = time.time()
     if mpicomm.rank == 0:
         print(f'reading {t1 - t0:.2f} power {t2 - t1:.2f}')
@@ -152,8 +155,8 @@ if __name__ == '__main__':
     cutsky_args = dict(zrange=(0.8, 2.1), cellsize=cellsize, boxsize=cellsize * meshsize, boxcenter=(193.,  34.,  2806.), ells=(0, 2, 4), los='firstpoint')
     setup_logging()
     t0 = time.time()
-    todo = 'jaxpower'
-    #todo = 'pypower'
+    #todo = 'jaxpower'
+    todo = 'pypower'
 
     ells = (0, 2, 4)
     los = 'firstpoint'
