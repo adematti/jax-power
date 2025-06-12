@@ -184,8 +184,7 @@ class Correlation2Poles(BinnedStatistic):
         if isinstance(k, BinnedStatistic):
             return k.clone(num=num)
         else:
-            return Spectrum2Poles(k=k, num=num, ells=self.ells, norm=self._norm, num_shotnoise=self._num_shotnoise,
-                                            num_zero=self._num_zero, attrs=self.attrs)
+            return Spectrum2Poles(k=k, num=num, ells=self.ells, norm=self._norm, num_shotnoise=self._num_shotnoise, num_zero=self._num_zero, attrs=self.attrs)
 
     @plotter
     def plot(self, fig=None):
@@ -671,10 +670,16 @@ class FKPField(object):
             new = self.clone(data=data, randoms=randoms)
             yield new
 
+    @property
+    def particles(self):
+        particles = getattr(self, '_particles', None)
+        if particles is None:
+            self.__dict__['_particles'] = particles = (self.data - self.data.sum() / self.randoms.sum() * self.randoms).clone(attrs=self.data.attrs)
+        return particles
+    
     def paint(self, resampler: str | Callable='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real', **kwargs):
-        fkp = self.data - self.data.sum() / self.randoms.sum() * self.randoms
-        return fkp.clone(attrs=self.data.attrs).paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
+        return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
 
     @staticmethod
     def same_mesh(*others, **kwargs):

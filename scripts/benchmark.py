@@ -58,8 +58,8 @@ def get_mock_fn(kind='power'):
     return base_dir / '{}.npy'.format(kind)
 
 
-def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4), **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, create_sharding_mesh, make_particles_from_local, BinMesh2Spectrum)
+def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4), los='firstpoint', **attrs):
+    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2Spectrum, get_mesh_attrs)
     t0 = time.time()
     data = get_clustering_positions_weights(data_fn, zrange=zrange)
     randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
@@ -67,22 +67,43 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    data = ParticleField(*make_particles_from_local(*data), **attrs)
-    randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
+
+    attrs = get_mesh_attrs(data[0], randoms[0], **attrs)
+
+    def get_particle_field(positions, weights):
+        positions, weights = make_particles_from_local(positions, weights)
+        #positions, exchange = exchange_particles(attrs, positions)
+        #weights = exchange(weights)
+        return ParticleField(positions, weights, attrs=attrs)
+
+    def get_particle_field(positions, weights):
+        positions, exchange = exchange_particles(attrs, positions, backend='mpi', return_type='jax')
+        weights = exchange(weights)
+        return ParticleField(positions, weights, attrs=attrs)
+    
+    data = get_particle_field(*data)
+    randoms = get_particle_field(*randoms)
     fkp = FKPField(data, randoms)
     t2 = time.time()
-    norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
-    mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    #norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
+    mesh = fkp.paint(resampler='tsc', interlacing=0, compensate=False, out='real', pexchange=False)
     jax.block_until_ready(mesh)
     t3 = time.time()
-    del fkp
+    #del fkp
     bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=ells)
-    power = jitted_compute_mesh2_spectrum(mesh, bin=bin)#.clone(norm=norm, num_shotnoise=num_shotnoise)
-    power.attrs.udpate(mesh=dict(mesh.attrs), zrange=zrange)
+    power = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los)#.clone(norm=norm, num_shotnoise=num_shotnoise)
+    power.attrs.update(mesh=dict(mesh.attrs), zrange=zrange)
     jax.block_until_ready(power)
     t4 = time.time()
+    if True:
+        from jaxpower import BinParticle2Correlation, compute_particle2
+        bin = BinParticle2Correlation(mesh.attrs, edges={'step': 1.}, selection={'theta': (0., 0.05)}, ells=ells)
+        corr = compute_particle2(fkp.particles, bin=bin, los=los)
+        power = power.clone(num=corr.to_power(power).num)
+        t5 = time.time()
+    
     if jax.process_index() == 0:
-        print(f'reading {t1 - t0:.2f} fkp {t2 - t1:.2f} painting {t3 - t2:.2f} power {t4 - t3:.2f}')
+        print(f'reading {t1 - t0:.2f} fkp {t2 - t1:.2f} painting {t3 - t2:.2f} power {t4 - t3:.2f} theta-cut {t5 - t4:.2f}')
     power.save(fn)
 
 
@@ -112,7 +133,7 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **poles_args, **attrs, wnorm=1., num_shotnoise=0.)
+    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, wnorm=1., num_shotnoise=0.)
     t2 = time.time()
     if mpicomm.rank == 0:
         print(f'reading {t1 - t0:.2f} power {t2 - t1:.2f}')
@@ -127,13 +148,15 @@ if __name__ == '__main__':
     cellsize, meshsize = 20., 1024  # 40GB nodes
     #cellsize, meshsize = 20., 950
     #cellsize, meshsize = 20., 750
-    cutsky_args = dict(zrange=(0.8, 2.1), cellsize=cellsize, boxsize=cellsize * meshsize, boxcenter=(193.,  34.,  2806.))
+    cellsize, meshsize = 40., 512
+    cutsky_args = dict(zrange=(0.8, 2.1), cellsize=cellsize, boxsize=cellsize * meshsize, boxcenter=(193.,  34.,  2806.), ells=(0, 2, 4), los='firstpoint')
     setup_logging()
     t0 = time.time()
     todo = 'jaxpower'
     #todo = 'pypower'
 
-    poles_args = dict(ells=(0, 2, 4), los='firstpoint')
+    ells = (0, 2, 4)
+    los = 'firstpoint'
 
     if todo == 'jaxpower':
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
@@ -143,13 +166,12 @@ if __name__ == '__main__':
         from jax import numpy as jnp
         jax.distributed.initialize()
         from jaxpower import compute_mesh2_spectrum, create_sharding_mesh
-        jitted_compute_mesh2_spectrum = jax.jit(partial(compute_mesh2_spectrum, **poles_args), donate_argnums=[0])
-        #jitted_compute_mesh2_spectrum = partial(compute_mesh2_spectrum, **poles_args)
+        jitted_compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'], donate_argnums=[0])
 
     for imock in range(4):
         catalog_dir = Path(f'/dvs_ro/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
         data_fn = catalog_dir / f'{tracer}_{region}_clustering.dat.fits'
-        all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)]
+        all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)][:1]
 
         if todo == 'jaxpower':
             fn = get_mock_fn(f'jaxpower_{imock:d}')

@@ -9,8 +9,8 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-from jaxpower import (compute_mesh2_spectrum, PowerSpectrumMultipoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                      compute_fkp2_spectrum, BinnedStatistic, WindowMatrix, MeshAttrs, BinMesh2Spectrum, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
+from jaxpower import (compute_mesh2_spectrum, Spectrum2Poles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
+                      compute_fkp2_spectrum, BinnedStatistic, WindowMatrix, MeshAttrs, BinMesh2Spectrum, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
 
 
 dirname = Path('_tests')
@@ -41,6 +41,10 @@ def test_sharding():
     meshsize = (64,) * 3
     device_mesh_shape = (4,)
     devices = mesh_utils.create_device_mesh(device_mesh_shape)
+
+    def _identity_fn(x):
+        return x
+
     with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
         attrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
         if False:
@@ -71,122 +75,16 @@ def test_sharding():
             print(jax.process_index(), jax.jit(_identity_fn, out_shardings=array.sharding.with_spec(P()))(array).addressable_data(0))
 
 
-def _identity_fn(x):
-  return x
-
-
-def global_array_from_single_device_arrays(sharding, arrays, return_slices=False, pad=None):
-    if pad is None:
-        pad = np.nan
-    if not callable(pad):
-        constant_values = pad
-        pad = lambda array, pad_width: jnp.pad(array, pad_width, mode='constant', constant_values=constant_values)
-    ndevices = sharding.num_devices
-    per_host_chunks = arrays
-    ndim = per_host_chunks[0].ndim
-    per_host_size = jnp.array([per_host_chunk.shape[0] for per_host_chunk in per_host_chunks])
-    all_size = jax.make_array_from_process_local_data(sharding, per_host_size)
-    all_size = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(all_size).addressable_data(0)
-    max_size = all_size.max().item()
-    if not np.all(all_size == max_size):
-        per_host_chunks = [pad(per_host_chunk, [(0, max_size - per_host_chunk.shape[0])] + [(0, 0)] * (ndim - 1)) for per_host_chunk in per_host_chunks]
-    global_shape = (max_size * ndevices,) + per_host_chunks[0].shape[1:]
-    tmp = jax.make_array_from_single_device_arrays(global_shape, sharding, per_host_chunks)
-    del per_host_chunks
-    slices = [slice(j * max_size, j * max_size + all_size[j].item()) for j in range(ndevices)]
-    if return_slices:
-        return tmp, slices
-    return tmp
-
-
-def allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwargs):
-    tmp, slices = global_array_from_single_device_arrays(sharding, arrays, return_slices=True, **kwargs)
-    tmp = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(tmp).addressable_data(0)  # replicated accross all devices
-    tmp = jnp.concatenate([tmp[sl] for sl in slices], axis=0)
-    if return_slices:
-        sizes = np.cumsum([0] + [sl.stop - sl.start for sl in slices])
-        slices = [slice(start, stop) for start, stop in zip(sizes[:-1], sizes[1:])]
-        return tmp, slices
-    return tmp
-
-
-def exchange_array(array, device, return_indices=False, pad=jnp.nan):
-    # Exchange array along the first (0) axis
-    # TODO: generalize to any axis
-    sharding = array.sharding
-    ndevices = sharding.num_devices
-    per_host_arrays = [_.data for _ in array.addressable_shards]
-    per_host_devices = [_.data for _ in device.addressable_shards]
-    devices = sharding.mesh.devices.ravel().tolist()
-    local_devices = [_.device for _ in per_host_arrays]
-    per_host_final_arrays = [None] * len(local_devices)
-    ndim = array.ndim
-    per_host_indices = [[] for i in range(len(local_devices))]
-    slices = [None] * ndevices
-
-    for idevice in range(ndevices):
-        # single-device arrays
-        per_host_chunks = []
-        for ilocal_device, (per_host_array, per_host_device, local_device) in enumerate(zip(per_host_arrays, per_host_devices, local_devices)):
-            mask_idevice = per_host_device == idevice
-            per_host_chunks.append(jax.device_put(per_host_array[mask_idevice], local_device, donate=True))
-            if return_indices: per_host_indices[ilocal_device].append(jax.device_put(np.flatnonzero(mask_idevice), local_device, donate=True))
-        tmp, slices[idevice] = allgather_single_device_arrays(sharding, per_host_chunks, return_slices=True)
-        del per_host_chunks
-        if devices[idevice] in local_devices:
-            per_host_final_arrays[local_devices.index(devices[idevice])] = jax.device_put(tmp, devices[idevice], donate=True)
-        del tmp
-
-    final = global_array_from_single_device_arrays(sharding, per_host_final_arrays, pad=pad)
-    if return_indices:
-        for ilocal_device, local_device in enumerate(local_devices):
-            per_host_indices[ilocal_device] = jax.device_put(jnp.concatenate(per_host_indices[ilocal_device]), local_device, donate=True)
-        return final, per_host_indices, slices
-    return final
-
-
-def exchange_inverse(array, per_host_indices, slices):
-    sharding = array.sharding
-    ndevices = sharding.num_devices
-    per_host_arrays = [_.data for _ in array.addressable_shards]
-    devices = sharding.mesh.devices.ravel().tolist()
-    local_devices = [_.device for _ in per_host_arrays]
-    per_host_final_arrays = [None] * len(local_devices)
-
-    for idevice in range(ndevices):
-        per_host_chunks = []
-        for ilocal_device, (per_host_array, local_device) in enumerate(zip(per_host_arrays, local_devices)):
-            sl = slices[devices.index(local_device)][idevice]
-            per_host_chunks.append(jax.device_put(per_host_array[sl], local_device, donate=True))
-        tmp = allgather_single_device_arrays(sharding, per_host_chunks, return_slices=False)
-        del per_host_chunks
-        if devices[idevice] in local_devices:
-            ilocal_device = local_devices.index(devices[idevice])
-            indices = per_host_indices[ilocal_device]
-            tmp = jax.device_put(tmp, devices[idevice], donate=True)
-            tmp = jnp.empty_like(tmp).at[indices].set(tmp)
-            per_host_final_arrays[local_devices.index(devices[idevice])] = jax.device_put(tmp, devices[idevice], donate=True)
-        del tmp
-
-    return global_array_from_single_device_arrays(sharding, per_host_final_arrays)
-
-
 def test_exchange_array():
     from jax.experimental import mesh_utils, multihost_utils
     from jax.sharding import PartitionSpec as P
     from jax.experimental.shard_map import shard_map
+    from jaxpower.mesh import _exchange_array_jax, _exchange_inverse_jax
+    from jaxpower.mesh import _exchange_array_mpi, _exchange_inverse_mpi
 
-    def _create_device_index(shape, sharding_mesh=None):
-        shard_shape = jax.sharding.NamedSharding(sharding_mesh, spec=P(sharding_mesh.axis_names,)).shard_shape(shape)
-        def f(idevice):
-            return jnp.full(shard_shape, idevice, dtype='i4')
-        f = shard_map(f, mesh=sharding_mesh, in_specs=P(sharding_mesh.axis_names,), out_specs=P(sharding_mesh.axis_names,))
-        return f(jnp.arange(sharding_mesh.devices.size))
 
-    def _create_index(shape, sharding_mesh=None):
-        sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P(sharding_mesh.axis_names,))
-        index = jnp.arange(shape[0])
-        return jax.device_put(index, sharding)
+    def _identity_fn(x):
+        return x
 
     def allgather(array):
         return jax.jit(_identity_fn, out_shardings=array.sharding.with_spec(P(None)))(array).addressable_data(0)
@@ -196,14 +94,34 @@ def test_exchange_array():
         device_mesh_shape = (4,)
         devices = mesh_utils.create_device_mesh(device_mesh_shape)
         with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
+
             nprocs = sharding_mesh.devices.size
-            array = create_sharded_random(jax.random.uniform, jax.random.key(42), shape=(int(1024),))
-            device = jnp.floor(array * nprocs).astype('i4')
-            exchanged, *indices = exchange_array(array, device, pad=jnp.nan, return_indices=True)
-            tmp = [_.data[~np.isnan(_.data)] for _ in exchanged.addressable_shards]
-            print(jax.process_index(), [(tt.min(), tt.max()) for tt in tmp])
-            array2 = exchange_inverse(exchanged, *indices)
-            assert np.allclose(allgather(array2), allgather(array))
+
+            if False:
+                array = create_sharded_random(jax.random.uniform, jax.random.key(42), shape=(1024,))
+                device = jnp.floor(array * nprocs).astype('i4')
+                exchanged, *indices = _exchange_array_jax(array, device, pad=jnp.nan, return_indices=True)
+                #tmp = [_.data[~np.isnan(_.data)] for _ in exchanged.addressable_shards]
+                #print(jax.process_index(), [(tt.min(), tt.max()) for tt in tmp])
+                array2 = _exchange_inverse_jax(exchanged, *indices)
+                assert np.allclose(allgather(array2), allgather(array))
+
+            if False:
+                from mpi4py import MPI
+                mpicomm = MPI.COMM_WORLD
+                array = np.random.uniform(size=int(1e5))
+                device = np.clip(np.floor(array * nprocs).astype('i4'), 0, mpicomm.size - 1)
+                print(device.min(), device.max())
+                exchanged, *indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
+                array2 = _exchange_inverse_mpi(exchanged, *indices, mpicomm=mpicomm)
+                assert np.allclose(array2, array)
+
+            if True:
+                positions = np.random.uniform(size=(int(1e7), 3))
+                weights = np.random.uniform(size=positions.shape[0])
+                attrs = MeshAttrs(boxsize=1., boxcenter=0.5, meshsize=4)
+                positions, exchange = exchange_particles(attrs, positions, backend='mpi', return_type='jax')
+                weights = exchange(weights)
 
     if test == 2:
         device_mesh_shape = (4,)
@@ -375,12 +293,12 @@ def compute_power_spectrum():
         sl = slice(rank * total_size // size, (rank + 1) * total_size // size)
         return {name: catalog[name][sl] for name in ['positions', 'weights']}
 
-    ref_mesh_power = PowerSpectrumMultipoles.load(get_mock_fn('mesh_power'))
+    ref_mesh_power = Spectrum2Poles.load(get_mock_fn('mesh_power'))
     los = ref_mesh_power.attrs.pop('los')
     ref_mesh_power.attrs.pop('dtype')
     attrs = MeshAttrs(**ref_mesh_power.attrs)
     bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
-    ref_fkp_power = PowerSpectrumMultipoles.load(get_mock_fn('fkp_power'))
+    ref_fkp_power = Spectrum2Poles.load(get_mock_fn('fkp_power'))
 
     with create_sharding_mesh(meshsize=attrs.meshsize) as sharding_mesh:
         #positions, weights = make_particles_from_local(**load(kind='data'))
@@ -471,9 +389,9 @@ if __name__ == '__main__':
     warnings.simplefilter("error")
     #save_reference_mock()
     # Setting up distributed jax
-    #jax.distributed.initialize()
+    jax.distributed.initialize()
     #test_halo()
-    #test_exchange_array()
+    test_exchange_array()
     #test_jaxdecomp()
     #test_mesh_power()
     #test_sharding()
@@ -481,4 +399,4 @@ if __name__ == '__main__':
     #compute_power_spectrum()
     #test_scaling2()
     # Closing distributed jax
-    #jax.distributed.shutdown()
+    jax.distributed.shutdown()

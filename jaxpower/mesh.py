@@ -312,29 +312,47 @@ def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
 
 
 @default_sharding_mesh
-def make_particles_from_local(positions, weights=None, sharding_mesh: jax.sharding.Mesh=None):
-
-    per_host_positions, per_host_weights = positions, weights
+def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0., sharding_mesh: jax.sharding.Mesh=None):
 
     if not len(sharding_mesh.axis_names):
-        if per_host_weights is None:
-            return per_host_positions
-        return per_host_positions, per_host_weights
+        return per_host_array
+
     nlocal = len(jax.local_devices())
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
-    per_host_size = np.repeat(per_host_positions.shape[0], nlocal)
-    sizes = jax.make_array_from_process_local_data(sharding, per_host_size)
-    per_host_sum = np.repeat(per_host_positions.sum(axis=0, keepdims=True), nlocal, axis=0)
-    mean = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0) / sizes.sum()
-    max_size = (sizes.max().item() + nlocal - 1) // nlocal * nlocal
-    pad_width = [(0, max_size - per_host_positions.shape[0])] + [(0, 0)] * (per_host_positions.ndim - 1)
-    per_host_positions = np.append(per_host_positions, np.repeat(mean[None, :], pad_width[0][1], axis=0), axis=0)
-    positions = jax.make_array_from_process_local_data(sharding, per_host_positions)#, global_shape=(global_size,) + per_host_positions.shape[-1:])
-    if per_host_weights is None:
+
+    sizes = None
+    def get_sizes():
+        return jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0], nlocal))
+
+    if not callable(pad):
+        if isinstance(pad, str):
+            if pad == 'global_mean':
+                if sizes is None:
+                    sizes = get_sizes()
+                per_host_sum = np.repeat(per_host_array.sum(axis=0, keepdims=True), nlocal, axis=0)
+                pad = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0) / sizes.sum()[None, ...]
+            elif pad == 'mean':
+                pad = np.mean(per_host_array, axis=0)[None, ...]
+            else:
+                raise ValueError('mean or global_mean supported only')
+        constant_values = pad
+        pad = lambda array, pad_width: np.append(array, np.repeat(constant_values, pad_width[0][1], axis=0), axis=0)
+
+    if per_host_size is None:
+        if sizes is None: sizes = get_sizes()
+        per_host_size = (sizes.max().item() + nlocal - 1) // nlocal * nlocal
+
+    pad_width = [(0, per_host_size - per_host_array.shape[0])] + [(0, 0)] * (per_host_array.ndim - 1)
+    per_host_array = pad(per_host_array, pad_width=pad_width)
+    return jax.make_array_from_process_local_data(sharding, per_host_array)
+
+
+@default_sharding_mesh
+def make_particles_from_local(positions, weights=None, sharding_mesh: jax.sharding.Mesh=None):
+    positions = make_array_from_process_local_data(positions, pad='mean', sharding_mesh=sharding_mesh)
+    if weights is None:
         return positions
-    pad_width = [(0, max_size - per_host_weights.shape[0])] + [(0, 0)] * (per_host_weights.ndim - 1)
-    per_host_weights = jnp.pad(per_host_weights, pad_width=pad_width, mode='constant', constant_values=0.)
-    weights = jax.make_array_from_process_local_data(sharding, per_host_weights)
+    weights = make_array_from_process_local_data(weights, pad=0., sharding_mesh=sharding_mesh)
     return positions, weights
 
 
@@ -377,7 +395,7 @@ def allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwar
     return tmp
 
 
-def exchange_array(array, device, pad=jnp.nan, return_indices=False):
+def _exchange_array_jax(array, device, pad=jnp.nan, return_indices=False):
     # Exchange array along the first (0) axis
     # TODO: generalize to any axis
     sharding = array.sharding
@@ -387,7 +405,6 @@ def exchange_array(array, device, pad=jnp.nan, return_indices=False):
     devices = sharding.mesh.devices.ravel().tolist()
     local_devices = [_.device for _ in per_host_arrays]
     per_host_final_arrays = [None] * len(local_devices)
-    ndim = array.ndim
     per_host_indices = [[] for i in range(len(local_devices))]
     slices = [None] * ndevices
 
@@ -412,7 +429,7 @@ def exchange_array(array, device, pad=jnp.nan, return_indices=False):
     return final
 
 
-def exchange_inverse(array, indices):
+def _exchange_inverse_jax(array, indices):
     # Reciprocal exchange
     per_host_indices, slices = indices
     sharding = array.sharding
@@ -441,7 +458,7 @@ def exchange_inverse(array, indices):
 
 
 @default_sharding_mesh
-def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, sharding_mesh=None):
+def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None):
 
     if not len(sharding_mesh.axis_names):
 
@@ -465,7 +482,9 @@ def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, s
 
     mean = positions.mean(axis=0)
     pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, :], pad_width[0][1], axis=0), axis=0)
-    positions = exchange_array(positions, idx_out_devices, pad=pad, return_indices=return_inverse)
+    positions = _exchange_array_jax(positions, idx_out_devices, pad=pad, return_indices=return_inverse)
+    if return_inverse:
+        positions, indices = positions
 
     def f(positions, idevice):
         return positions - shifts[idevice[0]]
@@ -473,16 +492,262 @@ def exchange_particles(attrs, positions: jax.Array=None, return_inverse=False, s
     positions = shard_map(f, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
     def exchange(values, pad=0.):
-        return exchange_array(values, idx_out_devices, pad=pad, return_indices=False)
+        return _exchange_array_jax(values, idx_out_devices, pad=pad, return_indices=False)
+
+    if return_inverse:
+
+        def inverse(values):
+            return _exchange_inverse_jax(values, indices)
+
+        return positions, exchange, inverse
+    return positions, exchange
+
+
+
+def _send_mpi(data, dest, tag=0, mpicomm=None):
+    """
+    Send input array ``data`` to process ``dest``.
+
+    Parameters
+    ----------
+    data : array
+        Array to send.
+
+    dest : int
+        Rank of process to send array to.
+
+    tag : int, default=0
+        Message identifier.
+
+    mpicomm : MPI communicator, default=None
+        Communicator. Defaults to current communicator.
+    """
+    from mpi4py import MPI
+
+    data = np.asarray(data)
+    shape, dtype = (data.shape, data.dtype)
+    data = np.ascontiguousarray(data)
+
+    fail = False
+    if dtype.char == 'V':
+        fail = any(dtype[name] == 'O' for name in dtype.names)
+    else:
+        fail = dtype == 'O'
+    if fail:
+        raise ValueError('"object" data type not supported in send; please specify specific data type')
+
+    duplicity = np.prod(shape[1:], dtype='intp')
+    itemsize = duplicity * dtype.itemsize
+    dt = MPI.BYTE.Create_contiguous(itemsize)
+    dt.Commit()
+
+    mpicomm.send((shape, dtype), dest=dest, tag=tag)
+    mpicomm.Send([data, dt], dest=dest, tag=tag)
+    dt.Free()
+
+
+def _recv_mpi(source=None, tag=None, mpicomm=None):
+    """
+    Receive array from process ``source``.
+
+    Parameters
+    ----------
+    source : int, default=MPI.ANY_SOURCE
+        Rank of process to receive array from.
+
+    tag : int, default=MPI.ANY_TAG
+        Message identifier.
+
+    mpicomm : MPI communicator, default=None
+        Communicator. Defaults to current communicator.
+
+    Returns
+    -------
+    data : array
+    """
+    from mpi4py import MPI
+    if source is None: source = MPI.ANY_SOURCE
+    if tag is None: tag = MPI.ANY_TAG
+
+    shape, dtype = mpicomm.recv(source=source, tag=tag)
+    data = np.zeros(shape, dtype=dtype)
+
+    duplicity = np.prod(shape[1:], dtype='intp')
+    itemsize = duplicity * dtype.itemsize
+    dt = MPI.BYTE.Create_contiguous(itemsize)
+    dt.Commit()
+
+    mpicomm.Recv([data, dt], source=source, tag=tag)
+    dt.Free()
+    return data
+
+
+def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
+    # Exchange array along the first (0) axis
+    # TODO: generalize to any axis
+    per_host_indices, per_host_final_arrays, slices = [], [], []
+    tag = 42
+    start = 0
+    for irank in range(mpicomm.size):
+        mask_irank = process == irank
+        tmp = array[mask_irank]
+        if mpicomm.rank != irank:
+            _send_mpi(tmp, dest=irank, tag=tag, mpicomm=mpicomm)
+            tmp = _recv_mpi(source=irank, tag=tag, mpicomm=mpicomm)
+        per_host_final_arrays.append(tmp)
+        if return_indices:
+            per_host_indices.append(np.flatnonzero(mask_irank))
+            slices.append(slice(start, start + tmp.shape[0]))
+            start += tmp.shape[0]
+    final = np.concatenate(per_host_final_arrays, axis=0)
+    del per_host_final_arrays
+    if return_indices:
+        per_host_indices = np.concatenate(per_host_indices, axis=0)
+        return final, (per_host_indices, slices)
+    return final
+
+
+
+def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
+    # Exchange array along the first (0) axis
+    # TODO: generalize to any axis
+    per_host_indices, per_host_final_arrays, slices = [], [], []
+    tag = 42
+
+    for irank in range(mpicomm.size):
+        mask_irank = process == irank
+        if return_indices:
+            per_host_indices.append(np.flatnonzero(mask_irank))
+        tmp = array[mask_irank]
+        if mpicomm.rank != irank:
+            _send_mpi(tmp, dest=irank, tag=tag, mpicomm=mpicomm)
+        if mpicomm.rank == irank:
+            start = 0
+            for source in range(mpicomm.size):
+                if source == irank:
+                    per_host_final_arrays.append(tmp)
+                else:
+                    per_host_final_arrays.append(_recv_mpi(source=source, tag=tag, mpicomm=mpicomm))
+                if return_indices:
+                    slices.append(slice(start, start + per_host_final_arrays[-1].shape[0]))
+                    start += per_host_final_arrays[-1].shape[0]
+    final = np.concatenate(per_host_final_arrays, axis=0)
+    del per_host_final_arrays
+    if return_indices:
+        per_host_indices = np.concatenate(per_host_indices, axis=0)
+        return final, (per_host_indices, slices)
+    return final
+
+
+def _exchange_inverse_mpi(array, indices, mpicomm=None):
+    # Reciprocal exchange
+    per_host_indices, slices = indices
+
+    def reorder(array, indices):
+        toret = np.empty_like(array)
+        toret[indices] = array
+        return toret
+
+    per_host_final_arrays = []
+    tag = 42
+    for irank in range(mpicomm.size):
+        tmp = array[slices[irank]]
+        if mpicomm.rank != irank:
+            _send_mpi(tmp, dest=irank, tag=tag, mpicomm=mpicomm)
+        if mpicomm.rank == irank:
+            for source in range(mpicomm.size):
+                if source == irank:
+                    per_host_final_arrays.append(tmp)
+                else:
+                    per_host_final_arrays.append(_recv_mpi(source=source, tag=tag, mpicomm=mpicomm))
+    final = reorder(np.concatenate(per_host_final_arrays, axis=0), per_host_indices)
+    return final
+
+
+@default_sharding_mesh
+def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None, return_type='nparray', mpicomm=None):
+
+    shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
+    idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
+    idx_out_devices = np.ravel_multi_index(tuple(np.floor(idx_out_devices).astype('i4').T), tuple(shape_devices))
+    shifts = np.meshgrid(*[np.arange(s) * attrs.boxsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
+    shifts = np.stack(shifts, axis=-1).reshape(-1, len(shifts))
+
+    positions = _exchange_array_mpi(positions, idx_out_devices, return_indices=return_inverse, mpicomm=mpicomm)
+
+    if return_inverse:
+        positions, indices = positions
+
+    def f(positions, idevice):
+        return positions - shifts[idevice[0]]
+
+    local_device = jax.local_devices()
+    assert len(local_device) == 1
+    local_device = local_device[0]
+    idevice = list(sharding_mesh.devices.ravel()).index(local_device)
+    positions = f(positions, [idevice])
+
+    if return_type == 'jax':
+        positions = make_array_from_process_local_data(positions, pad='mean', sharding_mesh=sharding_mesh)
+
+    def exchange(values, pad=0.):
+        per_host_array = _exchange_array_mpi(values, idx_out_devices, return_indices=False, mpicomm=mpicomm)
+        if return_type == 'jax':
+            return make_array_from_process_local_data(per_host_array, pad=pad, sharding_mesh=sharding_mesh)
+        return per_host_array
 
     if return_inverse:
         positions, indices = positions
 
         def inverse(values):
-            return exchange_inverse(values, indices)
+            return _exchange_inverse_mpi(values, indices, mpicomm=mpicomm)
 
         return positions, exchange, inverse
     return positions, exchange
+
+
+def _get_distributed_backend(array, backend='auto', **kwargs):
+
+    def get_mpicomm():
+        mpicomm = None
+        try: from mpi4py import MPI
+        except: MPI = None
+        if MPI is not None:
+            mpicomm = MPI.COMM_WORLD
+        return mpicomm
+    
+    if backend == 'auto' and isinstance(array, np.ndarray):
+        if jax.distributed.is_initialized():
+            mpicomm = get_mpicomm()
+            if mpicomm is not None and mpicomm.size == sharding.num_devices:
+                backend = 'mpi'
+                kwargs.setdefault('mpicomm', mpicomm)
+    if backend == 'auto':
+        backend = 'jax'
+    if backend == 'mpi':
+        kwargs.setdefault('mpicomm', get_mpicomm())
+    return backend, kwargs
+
+
+@default_sharding_mesh
+def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None, backend='auto', **kwargs):
+
+    if not len(sharding_mesh.axis_names):
+
+        def exchange(values, pad=0.):
+            return values
+
+        def inverse(values):
+            return values
+
+        if return_inverse:
+            return positions, exchange, inverse
+        return positions, exchange
+
+    backend, kwargs = _get_distributed_backend(positions, backend=backend, **kwargs)
+    if backend == 'jax':
+        return _exchange_particles_jax(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
+    return _exchange_particles_mpi(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -1169,8 +1434,15 @@ def _get_extent(*positions):
     if not nonempty_positions:
         raise ValueError('<= 1 particles found; cannot infer boxsize')
     axis = tuple(range(len(nonempty_positions[0].shape[:-1])))
-    pos_min = jnp.array([jnp.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
-    pos_max = jnp.array([jnp.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+    backend, kw = _get_distributed_backend(nonempty_positions[0])
+    if backend == 'jax':
+        pos_min = jnp.array([jnp.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
+        pos_max = jnp.array([jnp.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+    else:
+        pos_min = np.array([np.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
+        pos_max = np.array([np.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+        mpicomm = kw['mpicomm']
+        pos_min, pos_max = np.min(mpicomm.allgather(pos_min), axis=0), np.max(mpicomm.allgather(pos_max), axis=0)
     return pos_min, pos_max
 
 
@@ -1325,10 +1597,8 @@ class ParticleField(object):
     _attrs: MeshAttrs | None = field(init=False, repr=False)
     _cache_attrs: dict = field(init=True, repr=False)
 
-    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, make_from=None, **kwargs):
+    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, **kwargs):
         weights = jnp.ones_like(positions, shape=positions.shape[:-1]) if weights is None else weights
-        if make_from == 'local':
-            positions, weights = make_particles_from_local(positions, weights)
         assert '_cache_attrs' not in kwargs
         _attrs = kwargs.pop('attrs', None)
         _cache_attrs = dict(kwargs)
@@ -1501,7 +1771,6 @@ class ParticleField(object):
             weights = exchange(weights)
             #t1 = time.time()
         # jit is fast enough that it is not worth padding to fixed size
-        #size = 2**24
         #size = 2**22
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
