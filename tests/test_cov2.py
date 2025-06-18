@@ -460,6 +460,35 @@ def test_fftlog2():
     #plt.show()
 
 
+def test_from_pypower():
+    attrs = MeshAttrs(boxsize=2000., boxcenter=[0., 0., 1200], meshsize=128)
+    theory = get_theory(kmax=np.sqrt(3) * attrs.knyq.max()).clone(num_shotnoise=0.)
+    bin = BinMesh2Spectrum(attrs, edges=theory.select(xlim=(0., attrs.knyq.max())).edges(projs=0), ells=(0, 2, 4))
+    los = 'local'
+
+    size = int(1e-4 * attrs.boxsize.prod())
+    seed = 42
+    mesh = generate_anisotropic_gaussian_mesh(attrs, poles=theory, los=los, seed=seed)
+    data = generate_uniform_particles(attrs, size, seed=seed).clone(attrs=attrs)
+    data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+    randoms = generate_uniform_particles(attrs, 5 * size, seed=42).clone(attrs=attrs)
+
+
+    from pypower import CatalogFFTPower
+    power = CatalogFFTPower(data_positions1=data.positions, data_weights1=data.weights,
+                            randoms_positions1=randoms.positions, randoms_weights1=randoms.weights,
+                            position_type='pos', edges=np.linspace(0., 0.2, 21), ells=(0, 2, 4), los='firstpoint',
+                            nmesh=64, interlacing=2, resampler='tsc')
+
+    def from_pypower(poles):
+        return Spectrum2Poles(k=poles.k, num=poles.power_nonorm, edges=np.array(list(zip(poles.edges[0][:-1], poles.edges[0][1:]))),
+                              ells=poles.ells, nmodes=poles.nmodes, num_shotnoise=poles.shotnoise_nonorm, num_zero=poles.power_zero_nonorm, norm=poles.wnorm)
+
+    poles = from_pypower(power.poles)
+    poles.slice(slice(0, None, 2))
+    assert np.allclose(poles.view(), np.concatenate(power.poles()), equal_nan=True)
+
+
 if __name__ == '__main__':
 
     #from jax import config
@@ -474,7 +503,8 @@ if __name__ == '__main__':
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
-    test_cutsky2_covariance(plot=True)
+    #test_cutsky2_covariance(plot=True)
     #test_cutsky2_covariance_fftlog(plot=True)
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)
+    test_from_pypower()
