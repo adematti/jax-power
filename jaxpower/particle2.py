@@ -215,6 +215,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
     neighbors, *sorted_particles = _sort_particles(*particles)
     num = jnp.zeros((len(ells), len(bin.edges)), dtype=particles[0].positions.dtype)
 
+    #@jax.jit
     def f(carry, particles):
         carry += bin(*particles, los=los)
         return carry, None

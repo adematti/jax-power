@@ -9,7 +9,7 @@ requires = [
 [project]
 name = "jax-power"
 authors = [{name = "Arnaud de Mattia"}]
-description = "JAX-power power spectrum"
+description = "JAX-powered power spectrum"
 version = "0.1.0"
 dependencies = ["jax"]
 readme = "README.md"
