@@ -2,5 +2,7 @@
 
 Because that's faster... and useful ;).
 
-# TODO
-Carefully check mode counting in Fourier space.
+
+# Acknowledgments
+
+- Multi-GPU 3D FFT with [jaxdecomp](https://github.com/DifferentiableUniverseInitiative/jaxDecomp).
