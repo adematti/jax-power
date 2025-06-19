@@ -676,7 +676,7 @@ class FKPField(object):
         if particles is None:
             self.__dict__['_particles'] = particles = (self.data - self.data.sum() / self.randoms.sum() * self.randoms).clone(attrs=self.data.attrs)
         return particles
-    
+
     def paint(self, resampler: str | Callable='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real', **kwargs):
         return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
@@ -945,7 +945,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 leg = get_legendre(ell)(mu)
                 odd = ell % 2
                 if odd: leg += get_legendre(ell)(-mu)
-                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=ell == 0))
+                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=True))
             return jnp.concatenate(power)
 
         def my_map(f, xs):
@@ -1019,9 +1019,8 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 legin = get_legendre(ellin)(mu)
 
                 def f(kin):
-                    Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * legin)
+                    Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * rnorm *  mattrs.meshsize.prod(dtype=rdtype))
                     if Q is not None: Aell = _2c(Q * _2r(Aell))
-                    else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
                     power = _bin(Aell)
                     if pbar:
                         t.update(n=round(1 / len(ellsin)))
@@ -1368,7 +1367,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
     observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells), projs=ells)
     xin = np.mean(kin, axis=-1)
-    theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[edgesin] * len(ellsin) if edgesin is not None else None, projs=ellsin)
+    theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[kin] * len(ellsin), projs=ellsin)
     wmat = WindowMatrix(observable, theory, wmat, attrs={'norm': norm})
     return wmat
 

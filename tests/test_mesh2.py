@@ -780,6 +780,60 @@ def test_power_to_correlation3():
         plt.show()
 
 
+
+def test_window_box(plot=False):
+
+    from jaxpower.mesh2 import compute_normalization
+
+    def get_theory(kmax=0.3, dk=0.005):
+        # Return theory power spectrum
+        from cosmoprimo.fiducial import DESI
+        cosmo = DESI(engine='eisenstein_hu')
+        z = 1.
+        pk1d = cosmo.get_fourier().pk_interpolator().to_1d(z=z)
+        ellsin = (0, 2, 4)
+        edgesin = jnp.arange(0., kmax, dk)
+        edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+        kin = (edgesin[..., 0] + edgesin[..., 1]) / 2.
+        f, b = cosmo.growth_rate(z), 1.5
+        beta = f / b
+        shotnoise = (1e-3)**(-1)
+        pk = pk1d(kin)
+        poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
+                            (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                            8. / 35 * beta ** 2 * pk])
+        return Spectrum2Poles(k=[kin] * len(ellsin), edges=[edgesin] * len(ellsin), num=list(poles), num_shotnoise=shotnoise, ells=ellsin)
+
+    mattrs = MeshAttrs(boxsize=1000., meshsize=64)
+    bin = BinMesh2Spectrum(mattrs, edges={'min': 0, 'step': 0.01}, ells=(0, 2, 4))
+    seed = random.key(42)
+    los = 'z'
+    theory = get_theory(kmax=mattrs.knyq.max())
+    # Setting unitary_amplitude = True to reduce noise (actually, there is no noise at all, so no need for multiple realizations)
+    mesh = generate_anisotropic_gaussian_mesh(mattrs, poles=theory, los=los, seed=seed, unitary_amplitude=True)
+    mean = compute_mesh2_spectrum(mesh, bin=bin, los=los)
+
+    # edges and ells for input theory
+    edgesin = theory.edges(projs=0)
+    ellsin = (0, 2, 4)
+    # bin is still the binning operator
+    wmat = compute_mesh2_spectrum_window(mattrs, edgesin=edgesin, ellsin=ellsin, bin=bin, los=los, pbar=True)
+    test = wmat.dot(theory, return_type=None)
+    wmat_rebin = wmat.slice(slice(0, None, 2), axis='t').slice(slice(0, -1), axis='t')
+    test_rebin = wmat_rebin.dot(theory.slice(slice(0, None, 2)).slice(slice(0, -1)), return_type=None)
+    #test_rebin = wmat_rebin.dot(get_theory(kmax=wmat_rebin.theory.edges()[0].max() + 1e-4, dk=0.01), return_type=None)
+
+    if plot:
+        from matplotlib import pyplot as plt
+        ax = plt.gca()
+        for ill, ell in enumerate(test.projs):
+            color = 'C{:d}'.format(ill)
+            ax.plot(mean.x(ell), mean.x(ell) * mean.view(projs=ell), color=color, linestyle='-')
+            ax.plot(test.x(ell), test.x(ell) * test.view(projs=ell), color=color, linestyle='--')
+            ax.plot(test_rebin.x(ell), test_rebin.x(ell) * test_rebin.view(projs=ell), color=color, linestyle=':')
+        plt.show()
+
+
 def test_window(plot=False):
 
     from jaxpower.mesh2 import compute_normalization
@@ -981,7 +1035,9 @@ def test_wmatrix(plot=False):
     wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
     if plot: wmatrix.plot(show=True)
 
-    wmatrix1 = wmatrix.select(axis='o', xlim=(0., 0.081))
+    wmatrix1 = wmatrix.slice(slice(0, -1), axis='o')
+    assert wmatrix1.shape[0] == wmatrix.shape[0] - 1 * len(ellsin)
+    wmatrix1 = wmatrix1.select(axis='o', xlim=(0., 0.081))
     wmatrix2 = wmatrix.select(axis='o', xlim=(0.081, 0.5))
     wmatrixc = wmatrix.concatenate([wmatrix1, wmatrix2], axis='o')
 
@@ -1089,7 +1145,6 @@ if __name__ == '__main__':
 
     #import warnings
     #warnings.simplefilter("error")
-
     #test_window_timing()
     #test_sympy()
     #test_window()
@@ -1102,6 +1157,7 @@ if __name__ == '__main__':
     #test_power_to_correlation()
     #test_power_to_correlation2()
     #test_gaunt()
+    test_window_box(plot=False)
     test_binned_statistic()
     test_wmatrix()
     test_mesh2_spectrum(plot=False)

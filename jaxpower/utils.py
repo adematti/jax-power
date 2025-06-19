@@ -196,7 +196,9 @@ def _format_slice(sl, size):
     # To handle slice(0, None, 1)
     if start is None: start = 0
     if step is None: step = 1
-    stop = min((size - start) // step * step, stop if stop is not None else size)
+    if stop is None: stop = size
+    if stop < 0: stop = stop + size
+    stop = min((size - start) // step * step, stop)
     #start, stop, step = sl.indices(len(self._x[iproj]))
     if step < 0:
         raise IndexError('positive slicing step only supported')
@@ -1001,7 +1003,7 @@ class WindowMatrix(object):
             return 1, 'theory', self._theory
         raise ValueError('axis must be in {} or {}'.format(observable_names, theory_names))
 
-    def _slice_matrix(self, edges, axis='o', projs=Ellipsis, normalize=True):
+    def _slice_matrix(self, edges, axis='o', projs=Ellipsis, weighted=True, normalize=True):
         # Return, for a given slice, the corresponding matrix to apply to the data arrays
         axis, _, observable = self._axis_index(axis=axis)
         if projs is not Ellipsis and not isinstance(projs, list): projs = [projs]
@@ -1021,7 +1023,7 @@ class WindowMatrix(object):
             else:
                 iedges = slice(None)
             list_edges.append(iedges)
-        matrix = observable._slice_matrix(list_edges, projs=list_projs, normalize=normalize)
+        matrix = observable._slice_matrix(list_edges, projs=list_projs, weighted=weighted, normalize=normalize)
         import scipy
         return scipy.linalg.block_diag(*matrix)
 
@@ -1109,7 +1111,7 @@ class WindowMatrix(object):
         new = self.select(axis=axis, projs=projs, select_projs=select_projs)
         axis, name, observable = new._axis_index(axis=axis)
         observable = observable.slice(edges, projs=projs)
-        matrix = new._slice_matrix(edges, axis=axis, projs=projs, normalize=axis == 0)
+        matrix = new._slice_matrix(edges, axis=axis, projs=projs, weighted=axis == 0, normalize=axis == 0)
         masks = [jnp.concatenate([weight for weight in observable._weights]) == 0 for observable in (new._observable, new._theory)]
         value = jnp.where(masks[0][..., None] | masks[1], 0., new._value)
         value = matrix.dot(value) if axis == 0 else value.dot(matrix.T)
