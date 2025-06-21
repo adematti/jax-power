@@ -147,7 +147,7 @@ def generate_uniform_particles(attrs, size, seed: int=42):
         seed = random.key(seed)
 
     def sample(key, shape):
-        return attrs.boxsize * random.uniform(seed, shape + (len(attrs.boxsize),), dtype=attrs.dtype) - attrs.boxsize / 2. + attrs.boxcenter
+        return attrs.boxsize * random.uniform(key, shape + (len(attrs.boxsize),), dtype=attrs.dtype) - attrs.boxsize / 2. + attrs.boxcenter
 
     positions = create_sharded_random(sample, seed, shape=size, out_specs=0)
     positions = exchange_particles(attrs, positions=positions, return_inverse=False)[0]
