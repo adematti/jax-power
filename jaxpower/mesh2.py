@@ -1,6 +1,6 @@
 import os
 from functools import partial
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from collections.abc import Callable
 import itertools
 from pathlib import Path
@@ -11,7 +11,7 @@ import jax
 from jax import numpy as jnp
 
 from .utils import get_legendre, get_spherical_jn, get_real_Ylm, real_gaunt, plotter, BinnedStatistic, WindowMatrix, register_pytree_dataclass
-from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, get_sharding_mesh, get_common_mesh_attrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount
+from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
 
 
 @jax.tree_util.register_pytree_node_class
@@ -649,13 +649,15 @@ class FKPField(object):
     data: ParticleField
     randoms: ParticleField
 
-    def __init__(self, data, randoms, **kwargs):
-        data, randoms = ParticleField.same_mesh(data, randoms, **kwargs)
+    def __init__(self, data, randoms, attrs=None):
+        if attrs is not None:
+            data = data.clone(attrs=attrs)
+            randoms = randoms.clone(attrs=attrs)
         self.__dict__.update(data=data, randoms=randoms)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
+        state = asdict(self) | kwargs
         return self.__class__(**state)
 
     @property
@@ -681,14 +683,6 @@ class FKPField(object):
               compensate: bool=False, dtype=None, out: str='real', **kwargs):
         return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
 
-    @staticmethod
-    def same_mesh(*others, **kwargs):
-        attrs = kwargs.pop('attrs', None)
-        if attrs is None:
-            attrs = get_common_mesh_attrs(*([other.data for other in others] + [other.randoms for other in others]), **kwargs)
-        kw = dict(attrs=attrs) if isinstance(attrs, MeshAttrs) else attrs
-        return tuple(other.clone(**kw) for other in others)
-
 
 def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic', **kwargs) -> jax.Array:
     """
@@ -706,7 +700,11 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
             attrs = {name: getattr(inp, name) for name in ['boxsize', 'boxcenter', 'meshsize']}
         else:
             particles.append(inp)
-    if particles: particles = ParticleField.same_mesh(*particles, **attrs)
+    if particles:
+        cattrs = dict(particles[0].attrs)
+        if 'cellsize' in attrs: cattrs.pop('meshsize')
+        attrs = particles[0].attrs.clone(**get_mesh_attrs(**(cattrs | attrs)))
+        particles = [particle.clone(attrs=attrs) for particle in particles]
     normalization = 1
     for mesh in meshs:
         normalization *= mesh
@@ -747,55 +745,6 @@ def compute_fkp2_spectrum_shotnoise(*fkps):
     else:
         shotnoise = 0.
     return shotnoise
-
-
-def compute_fkp2_spectrum(*fkps: FKPField, bin: BinMesh2Spectrum=None, resampler='tsc', interlacing=3, los: str | np.ndarray='x', mode_oversampling: int=0) -> Spectrum2Poles:
-    r"""
-    Compute power spectrum from FKP field.
-
-    Parameters
-    ----------
-    meshs : FKPField
-        Input FKP fields.
-
-    edges : np.ndarray, dict, default=None
-        ``edges`` may be:
-        - a numpy array containing the :math:`k`-edges.
-        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
-            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
-        - ``None``, defaults to empty dictionary.
-
-    resampler : str, callable
-        Resampler to read particule weights from mesh.
-        One of ['ngp', 'cic', 'tsc', 'pcs'].
-
-    interlacing : int, default=1
-        If 1, no interlacing correction.
-        If > 1, order of interlacing correction.
-        Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
-
-    ells : tuple, default=0
-        Multiple orders to compute.
-
-    los : str, array, default=None
-        If ``los`` is 'firstpoint' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
-        Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector.
-
-    mode_oversampling : int, default=0
-        If > 0, artificially increase the resolution of the input mesh by a factor ``2 * mode_oversampling + 1``.
-        In practice, shift the coordinates of the coordinates of the input grid by ``np.arange(-mode_oversampling, mode_oversampling + 1)``
-        along each of x, y, z axes.
-        This reduces "discrete grid binning effects".
-
-    Returns
-    -------
-    power : Spectrum2Poles
-    """
-    fkps = FKPField.same_mesh(*fkps)
-    norm = compute_fkp2_spectrum_normalization(*fkps)
-    num_shotnoise = compute_fkp2_spectrum_shotnoise(*fkps)
-    return compute_mesh2_spectrum(*[fkp.paint(resampler=resampler, interlacing=interlacing, compensate=True, out='complex') for fkp in fkps], bin=bin, los=los, mode_oversampling=mode_oversampling).clone(norm=norm, num_shotnoise=num_shotnoise)
 
 
 def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):

@@ -7,7 +7,7 @@ from jax import numpy as jnp
 from jax import random
 
 from jaxpower import resamplers
-from jaxpower.mesh import staticarray, MeshAttrs, BaseMeshField, RealMeshField, ParticleField
+from jaxpower.mesh import staticarray, MeshAttrs, BaseMeshField, RealMeshField, ParticleField, get_mesh_attrs
 
 
 dirname = Path('_tests')
@@ -20,6 +20,7 @@ def test_static_array():
 
 
 def test_mesh_attrs():
+    attrs = get_mesh_attrs(boxsize=1000., boxcenter=0., cellsize=10.)
     attrs = MeshAttrs(meshsize=100, boxsize=100.)
     dict(**attrs)
     attrs.create()
@@ -113,7 +114,7 @@ def test_jit():
         jax.block_until_ready(mesh)
     print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
 
-    positions = ParticleField(positions, meshsize=mesh.shape, boxsize=1., boxcenter=0.5)
+    positions = ParticleField(positions, attrs=dict(meshsize=mesh.shape, boxsize=1., boxcenter=0.5))
     t0 = time.time()
     positions.paint(resampler='tsc')
     print(f'time for jit {time.time() - t0:.2f}')
@@ -129,7 +130,8 @@ def test_particle_field():
     boxsize = 100.
     positions = boxsize * random.uniform(random.key(42), shape=(10, 3))
     weights = 1. + random.uniform(random.key(42), shape=(10,))
-    particle = ParticleField(positions, weights=weights, cellsize=10)
+    attrs = get_mesh_attrs(positions, cellsize=10)
+    particle = ParticleField(positions, weights=weights, attrs=attrs)
     particle = particle + particle
     assert np.allclose(particle.cellsize, 10.)
     assert particle.positions.shape[0] == positions.shape[0] * 2

@@ -28,7 +28,7 @@ def get_clustering_positions_weights(*fns, zrange=None):
             catalogs[ifn] = (irank, catalog)
 
     positions, weights = [], []
-    for irank, catalog in catalogs:    
+    for irank, catalog in catalogs:
         catalog = Catalog.scatter(catalog, mpicomm=mpicomm, mpiroot=irank)
         weight = catalog['WEIGHT'] * catalog['WEIGHT_FKP']
         dist = fiducial.comoving_radial_distance(catalog['Z'])
@@ -74,20 +74,8 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
     t1 = time.time()
 
     attrs = get_mesh_attrs(data[0], randoms[0], **attrs)
-
-    def get_particle_field(positions, weights):
-        positions, weights = make_particles_from_local(positions, weights)
-        #positions, exchange = exchange_particles(attrs, positions)
-        #weights = exchange(weights)
-        return ParticleField(positions, weights, attrs=attrs)
-
-    def get_particle_field(positions, weights):
-        positions, exchange = exchange_particles(attrs, positions, backend='mpi', return_type='jax')
-        weights = exchange(weights)
-        return ParticleField(positions, weights, attrs=attrs)
-    
-    data = get_particle_field(*data)
-    randoms = get_particle_field(*randoms)
+    data = ParticleField(*data, attrs=attrs, exchange=True, backend='mpi')
+    randoms = ParticleField(*randoms, attrs=attrs,  exchange=True, backend='mpi')
     fkp = FKPField(data, randoms)
     t2 = time.time()
     #norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
@@ -106,7 +94,7 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
         corr = compute_particle2(data, bin=bin, los=los)
         power = power.clone(num=corr.to_power(power).num)
     t5 = time.time()
-    
+
     if jax.process_index() == 0:
         print(f'reading {t1 - t0:.2f} fkp {t2 - t1:.2f} painting {t3 - t2:.2f} power {t4 - t3:.2f} theta-cut {t5 - t4:.2f}')
     power.save(fn)

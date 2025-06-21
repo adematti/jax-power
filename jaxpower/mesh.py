@@ -755,6 +755,7 @@ def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inv
 
     backend, kwargs = _get_distributed_backend(positions, backend=backend, **kwargs)
     if backend == 'jax':
+        kwargs.pop('return_type', None)
         return _exchange_particles_jax(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
     return _exchange_particles_mpi(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
 
@@ -1288,7 +1289,7 @@ class RealMeshField(BaseMeshField):
         assert value.shape == self.shape, f'kernel does not return correct shape: {value.shape} vs expected {self.shape}'
         return self.clone(value=value)
 
-    def read(self, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False, pexchange: bool=True, **kwargs):
+    def read(self, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False, exchange: bool=False, **kwargs):
         """
         Read mesh, at input ``positions``.
 
@@ -1311,8 +1312,8 @@ class RealMeshField(BaseMeshField):
         sharding_mesh = self.attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         inverse = None
-        if with_sharding and pexchange:
-            positions, exchange, inverse = exchange_particles(self.attrs, positions, return_inverse=True)
+        if with_sharding and exchange:
+            positions, exchange, inverse = exchange_particles(self.attrs, positions, return_inverse=True, return_type='jax')
         toret = _read(self, positions, resampler=resampler, compensate=compensate, **kwargs)
         if inverse is not None:
             toret = inverse(toret)
@@ -1516,8 +1517,8 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if check and (boxsize < delta).any():
             raise ValueError('boxsize {} too small to contain all data (max {})'.format(boxsize, delta))
 
-    ndim = None
-    if positions is not None:
+    ndim = 3
+    if positions:
         if dtype is None:
             dtype = positions[0].dtype
         if ndim is None:
@@ -1550,30 +1551,6 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
     return MeshAttrs(**toret, dtype=dtype, **kwargs)
 
 
-def _get_common_mesh_cache_attrs(*attrs, **kwargs):
-    gather = {}
-    for attr in attrs:
-         for name, value in attr.items():
-            if name in gather:
-                if not np.all(value == gather[name]):
-                    raise RuntimeError("Not same {}, {} vs {}".format(value, gather[name]))
-            else:
-                gather[name] = value
-    for name, value in kwargs.items():
-        if name == 'cellsize' and 'boxsize' in gather:
-            gather.pop('meshsize')
-        gather[name] = value
-    return gather
-
-
-def get_common_mesh_attrs(*particles, **kwargs):
-    """Get common mesh attributes for multiple :class:`ParticleField`."""
-    assert len(particles)
-    if not kwargs and not any(p._cache_attrs for p in particles) and all(p._attrs for p in particles):
-        return particles[0].attrs
-    return _get_common_mesh_cache_attrs(*[p._cache_attrs for p in particles], **kwargs)
-
-
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=['axis', 'sharding_mesh'])
 def _local_concatenate(arrays, axis=0, sharding_mesh: jax.sharding.Mesh=None):
@@ -1603,60 +1580,35 @@ class ParticleField(object):
 
     positions: jax.Array = field(repr=False)
     weights: jax.Array = field(repr=False)
-    _attrs: MeshAttrs | None = field(init=False, repr=False)
-    _cache_attrs: dict = field(init=True, repr=False)
+    attrs: MeshAttrs | None = field(init=False, repr=False)
 
-    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, **kwargs):
+    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, **kwargs):
         positions = jnp.asarray(positions)
         if weights is None:
             weights = jnp.ones_like(positions, shape=positions.shape[:-1], device=positions.sharding)
         else:
             weights = jnp.asarray(weights)
-        assert '_cache_attrs' not in kwargs
-        _attrs = kwargs.pop('attrs', None)
-        _cache_attrs = dict(kwargs)
-        if _attrs is not None:
-            if _cache_attrs:
-                raise ValueError('cannot provide "attrs" and {}'.format(list(kwargs)))
-            if not isinstance(_attrs, MeshAttrs): _attrs = MeshAttrs(**_attrs)
-        self.__dict__.update(positions=positions, weights=weights, _attrs=_attrs, _cache_attrs=_cache_attrs)
+        if attrs is None: raise ValueError('attrs must be provided')
+        if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
+        sharding_mesh = attrs.sharding_mesh
+        with_sharding = bool(sharding_mesh.axis_names)
+        if with_sharding and exchange:
+            positions, exchange = exchange_particles(attrs, positions, return_type='jax', **kwargs)
+            weights = exchange(weights)
+        self.__dict__.update(positions=positions, weights=weights, attrs=attrs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        state = asdict(self)
-        state.pop('_cache_attrs')
-        current_attrs = state.pop('_attrs')
-        if self._cache_attrs and 'positions' in kwargs:
-            current_attrs = None  # remove already-computed _attrs
-
-        for name in ['positions', 'weights']:
-            if name in kwargs:
-                state[name] = kwargs.pop(name)
-
-        input_attrs = kwargs.pop('attrs', {})
-        if input_attrs:
-            state['attrs'] = input_attrs
-        elif current_attrs:
-            state['attrs'] = current_attrs
-        else:
-            attrs = dict(self._cache_attrs)
-            attrs.update(kwargs)
-            state.update(attrs)
+        state = asdict(self) | kwargs
         return self.__class__(**state)
 
-    @property
-    def attrs(self):
-        if self._attrs is None:
-            self.__dict__.update(_attrs=get_mesh_attrs(self.positions, **self._cache_attrs))
-        return self._attrs
-
     def tree_flatten(self):
-        return tuple(getattr(self, name) for name in ['positions', 'weights', '_attrs', '_cache_attrs']), {}
+        return tuple(getattr(self, name) for name in ['positions', 'weights', 'attrs']), {}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update({name: value for name, value in zip(['positions', 'weights', '_attrs', '_cache_attrs'], children)})
+        new.__dict__.update({name: value for name, value in zip(['positions', 'weights', 'attrs'], children)})
         return new
 
     def __getitem__(self, name):
@@ -1671,14 +1623,6 @@ class ParticleField(object):
         """Sum of :attr:`weights`."""
         return self.weights.sum(*args, **kwargs)
 
-    @staticmethod
-    def same_mesh(*others, **kwargs):
-        attrs = kwargs.pop('attrs', None)
-        if attrs is None:
-            attrs = get_common_mesh_attrs(*others, **kwargs)
-        kw = dict(attrs=attrs) if isinstance(attrs, MeshAttrs) else attrs
-        return tuple(other.clone(**kw) for other in others)
-
     @classmethod
     def concatenate(cls, others, weights=None, local=False, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
@@ -1692,12 +1636,11 @@ class ParticleField(object):
                 raise RuntimeError("Type of `other` not understood.")
             gather['positions'].append(other.positions)
             gather['weights'].append(factor * other.weights)
-        cache_attrs = _get_common_mesh_cache_attrs(*[other._cache_attrs for other in others], **kwargs)
         for name, value in gather.items():
             if local: value = _local_concatenate(value, axis=0)
             else: value = jnp.concatenate(value, axis=0)
             gather[name] = value
-        return cls(**gather, **cache_attrs)
+        return cls(**gather, attrs=others[0].attrs)
 
     def __add__(self, other):
         if isinstance(other, ParticleField):
@@ -1735,15 +1678,14 @@ class ParticleField(object):
         def split_particles(isplit):
             isplit = np.array(isplit)
             mask = jnp.all((self.positions >= isplit * extent_boxsize + extent_offset) & (self.positions <= (isplit + 1) * extent_boxsize + extent_offset), axis=-1)
-            return self.clone(positions=self.positions[mask], weights=self.weights[mask],
-                              boxsize=split_boxsize, boxcenter=(isplit + 0.5) * extent_boxsize + extent_offset,
-                              meshsize=attrs.meshsize)
+            attrs = self.attrs.clone(boxsize=split_boxsize, boxcenter=(isplit + 0.5) * extent_boxsize + extent_offset, meshsize=attrs.meshsize)
+            return self.clone(positions=self.positions[mask], weights=self.weights[mask], attrs=attrs)
 
         for isplit in itertools.product(*(range(nsplit) for nsplit in nsplits)):
             yield split_particles(isplit)
 
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
-              compensate: bool=False, out: str='real', dtype=None, pexchange=True, **kwargs):
+              compensate: bool=False, out: str='real', dtype=None, **kwargs):
         r"""
         Paint particles to mesh.
 
@@ -1774,20 +1716,15 @@ class ParticleField(object):
         """
         attrs = self.attrs
         if dtype is not None: attrs = attrs.clone(dtype=dtype)
-        sharding_mesh = attrs.sharding_mesh
-        with_sharding = bool(sharding_mesh.axis_names)
         positions, weights = self.positions, self.weights
         #import time
         #t0 = time.time()
-        if with_sharding and pexchange:
-            positions, exchange = exchange_particles(attrs, positions)
-            weights = exchange(weights)
-            #t1 = time.time()
+        #t1 = time.time()
         # jit is fast enough that it is not worth padding to fixed size
         #size = 2**22
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
-        return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out)
+        return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out, **kwargs)
         #jax.block_until_ready(toret)
         #print(f'exchange {t1 - t0:.2f} painting {time.time() - t1:.2f}', positions.shape[0] / size, _paint._cache_size())
 

@@ -7,7 +7,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (BinMesh2Spectrum, compute_mesh2_spectrum, compute_fkp2_spectrum, Spectrum2Poles,
+from jaxpower import (BinMesh2Spectrum, compute_mesh2_spectrum, Spectrum2Poles,
                       BinMesh2Correlation, compute_mesh2_correlation, Correlation2Poles,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
                       BinnedStatistic, WindowMatrix, MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_spectrum_normalization, utils)
@@ -721,7 +721,7 @@ def test_power_to_correlation3():
         bscale = scale  # cut at 1 sigmas
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
         positions = positions * attrs.boxsize + attrs.boxcenter
-        toret = ParticleField(positions, weights=1. * mask, boxcenter=attrs.boxcenter, boxsize=attrs.boxsize, meshsize=attrs.meshsize)
+        toret = ParticleField(positions, weights=1. * mask, attrs=dict(boxcenter=attrs.boxcenter, boxsize=attrs.boxsize, meshsize=attrs.meshsize))
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
@@ -1132,7 +1132,7 @@ def test_split():
     mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=random.key(42), los='local', unitary_amplitude=True)
     data = data.clone(weights=1. + mesh.read(data.positions))
 
-    fkp = FKPField(data, randoms, **attrs.clone(boxsize=2. * attrs.boxsize))  # x2 padding
+    fkp = FKPField(data, randoms, attrs=attrs.clone(boxsize=2. * attrs.boxsize))  # x2 padding
     from jaxpower.mesh import _paint
     for split_fkp in fkp.split(nsplits=2):
         t0 = time.time()

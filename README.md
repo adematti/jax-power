@@ -16,15 +16,9 @@ with create_sharding_mesh() as sharding_mesh:  # specify how to spatially distri
 
     # Create MeshAttrs
     attrs = get_mesh_attrs(data_positions, randoms_positions, boxpad=2., meshsize=128)
-
-    def get_particle_field(positions, weights):
-        positions, exchange = exchange_particles(attrs, positions, return_type='jax')
-        weights = exchange(weights)
-        return ParticleField(positions, weights, attrs=attrs)
-
     # Input ``data_positions``, ``data_weights``, ``randoms_positions``, ``randoms_weights`` are assumed scattered over the different processes.
-    data = get_particle_field(data_positions, data_weights)
-    randoms = get_particle_field(randoms_positions, randoms_weights)
+    data = ParticleField(data_positions, data_weights, attrs=attrs, exchange=True)
+    randoms = ParticleField(randoms_positions, randoms_weights, attrs=attrs, exchange=True)
     fkp = FKPField(data, randoms)
     norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
     # particles are already exchanged in ``get_particle_field``
