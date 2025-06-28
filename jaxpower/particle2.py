@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 
 import numpy as np
-import healpy as hp
 import jax
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as P
 
-from .mesh import MeshAttrs, staticarray, ParticleField
+from .mesh import MeshAttrs, staticarray, ParticleField, _identity_fn
 from .mesh2 import _format_ells, Spectrum2Poles, Correlation2Poles
 from .utils import get_legendre, get_spherical_jn, BinnedStatistic, plotter
 
@@ -48,114 +48,7 @@ def _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selectio
     return dist, mu, weight
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclass(init=False, frozen=True)
-class BinParticle2Spectrum(object):
-
-    edges: jax.Array = None
-    xavg: jax.Array = None
-    boxsize: jax.Array = None
-    selection: dict = None
-
-    def __init__(self, mattrs=None, edges: staticarray | dict | None=None, selection: dict | None=None, ells=0):
-        if edges is None:
-            edges = {}
-        if isinstance(edges, dict):
-            edges = dict(edges)
-            if mattrs is not None:
-                edges.setdefault('max', mattrs.knyq.max())
-            edges = np.arange(edges.get('min', 0.), edges['max'], edges['step'])
-        boxsize = getattr(mattrs, 'boxsize', None)
-        edges = np.asarray(edges)
-        if edges.ndim == 2:  # coming from BinnedStatistic
-            assert np.allclose(edges[1:, 0], edges[:-1, 1])
-            edges = np.append(edges[:, 0], edges[-1, 1])
-        edges = np.column_stack([edges[:-1], edges[1:]])
-        xavg = 3. / 4. * (edges[..., 1]**4 - edges[..., 0]**4) / (edges[..., 1]**3 - edges[..., 0]**3)
-        if selection is None:
-            selection = {}
-        ells = _format_ells(ells)
-        self.__dict__.update(edges=edges, xavg=xavg, selection=selection, boxsize=boxsize, ells=ells)
-
-    def __call__(self, positions1, weights1, positions2, weights2, los='firstpoint'):
-        dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
-        toret = []
-        for ell in self.ells:
-            wleg = (-1)**(ell // 2) * (2 * ell + 1) * get_legendre(ell)(mu) * weight
-            tmp = jax.lax.map(lambda x: jnp.sum(get_spherical_jn(ell)(x * dist) * wleg), self.xavg, batch_size=max(min(1000 * 1000 / dist.size, 1), len(self.xavg), 1))
-            toret.append(tmp)
-        return jnp.stack(toret)
-
-    def tree_flatten(self):
-        state = {name: getattr(self, name) for name in self.__annotations__.keys()}
-        meta_fields = ['selection'] + (['boxsize'] if self.boxsize is None else [])
-        return tuple(state[name] for name in state if name not in meta_fields), {name: state[name] for name in meta_fields}
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        new = cls.__new__(cls)
-        new.__dict__.update(zip(cls.__annotations__.keys(), children))
-        new.__dict__.update(aux_data)
-        return new
-
-
-@jax.tree_util.register_pytree_node_class
-@dataclass(init=False, frozen=True)
-class BinParticle2Correlation(object):
-
-    edges: jax.Array = None
-    xavg: jax.Array = None
-    boxsize: jax.Array = None
-    selection: dict = None
-    linear: bool = False
-
-    def __init__(self, mattrs=None, edges: staticarray | dict | None=None, selection: dict | None=None, ells=0):
-        if edges is None:
-            edges = {}
-        if isinstance(edges, dict):
-            edges = dict(edges)
-            if mattrs is not None:
-                edges.setdefault('max', jnp.sqrt(jnp.sum(mattrs.boxsize**2)))
-            edges = np.arange(edges.get('min', 0.), edges['max'], edges['step'])
-        boxsize = getattr(mattrs, 'boxsize', None)
-        edges = np.asarray(edges)
-        if edges.ndim == 2:
-            assert np.allclose(edges[1:, 0], edges[:-1, 1])
-            edges = np.append(edges[:-1, 0], edges[-1, 1])
-        linear = np.allclose(np.diff(edges), edges[1] - edges[0])
-        edges = np.column_stack([edges[:-1], edges[1:]])
-        xavg = 3. / 4. * (edges[..., 1]**4 - edges[..., 0]**4) / (edges[..., 1]**3 - edges[..., 0]**3)
-        if selection is None:
-            selection = {}
-        ells = _format_ells(ells)
-        self.__dict__.update(edges=edges, xavg=xavg, selection=selection, linear=linear, boxsize=boxsize, ells=ells)
-
-    def __call__(self, positions1, weights1, positions2, weights2, los='firstpoint'):
-        dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
-        if self.linear:
-            idx = jnp.floor((dist - self.edges[0, 0]) / (self.edges[0, 1] - self.edges[0, 0])).astype(jnp.int16)
-        else:
-            bins = jnp.append(self.edges[:-1, 0], self.edges[-1, 1])
-            idx = jnp.digitize(bins, dist, right=False) - 1
-        mask = (idx >= 0) & (idx < len(self.edges))
-        weight *= mask
-        idx = jnp.where(mask, idx, 0)
-        return jnp.stack([jnp.zeros(len(self.edges)).at[idx].add((2 * ell + 1) * get_legendre(ell)(mu) * weight) for ell in self.ells])
-
-    def tree_flatten(self):
-        state = {name: getattr(self, name) for name in self.__annotations__.keys()}
-        meta_fields = ['selection', 'linear'] + (['boxsize'] if self.boxsize is None else [])
-        return tuple(state[name] for name in state if name not in meta_fields), {name: state[name] for name in meta_fields}
-
-    @classmethod
-    def tree_unflatten(cls, aux_data, children):
-        new = cls.__new__(cls)
-        new.__dict__.update(zip(cls.__annotations__.keys(), children))
-        new.__dict__.update(aux_data)
-        return new
-
-
-def sort_array(target, array, minlength=None):
+def _sort_array(target, array, minlength=None):
     if minlength is None:
         minlength = np.bincount(array, minlength=target.max() + 1).max()
     indices = np.full((len(target), minlength), -1, dtype=array.dtype)
@@ -167,16 +60,17 @@ def sort_array(target, array, minlength=None):
 
 try:
     from numba import njit
-    sort_array = njit(sort_array)
+    _sort_array = njit(_sort_array)
 except ImportError:
     pass
 
 
-def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | BinParticle2Correlation=None, los='firstpoint'):
-
+def _scan(bin, *particles, los='firstpoint'):
     ells = bin.ells
 
     if 'theta' in bin.selection:
+
+        import healpy as hp
 
         theta_max = np.max(bin.selection['theta'])
         nsides = 2**np.arange(10)
@@ -198,7 +92,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
 
             toret = [neighbors_all]
             for i, particle in enumerate(particles):
-                indices = sort_array(ipix_all, ipix[i], minlength=ipix_count_max)
+                indices = _sort_array(ipix_all, ipix[i], minlength=ipix_count_max)
                 mask = indices >= 0
                 indices = np.where(mask, indices, 0)
                 positions = particle.positions[indices] #* jnp.where(mask, 1., jnp.nan)[..., None]
@@ -217,7 +111,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
 
     #@jax.jit
     def f(carry, particles):
-        carry += bin(*particles, los=los)
+        carry += bin._slab(*particles, los=los)
         return carry, None
 
     for neighbor in neighbors:
@@ -226,11 +120,174 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
         ps = [p1[0][neighbors[0]], p1[1][neighbors[0]], p2[0][neighbor], p2[1][neighbor]]
         num = jax.lax.scan(f, init=num, xs=ps)[0]
 
+    return num
+
+
+def get_engine(engine='auto'):
+    assert engine in ['auto', 'jax', 'cucount']
+    if engine == 'auto':
+        try:
+            from cucountlib import cucount
+        except ImportError:
+            engine = 'jax'
+        else:
+            engine = 'cucount'
+    return engine
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
+class BinParticle2Spectrum(object):
+
+    edges: jax.Array = None
+    xavg: jax.Array = None
+    boxsize: jax.Array = None
+    selection: dict = None
+    engine: str = None
+
+    def __init__(self, mattrs=None, edges: staticarray | dict | None=None, selection: dict | None=None, ells=0, engine='auto'):
+        if edges is None:
+            edges = {}
+        if isinstance(edges, dict):
+            edges = dict(edges)
+            if mattrs is not None:
+                edges.setdefault('max', mattrs.knyq.max())
+            edges = np.arange(edges.get('min', 0.), edges['max'], edges['step'])
+        boxsize = getattr(mattrs, 'boxsize', None)
+        edges = np.asarray(edges)
+        if edges.ndim == 2:  # coming from BinnedStatistic
+            assert np.allclose(edges[1:, 0], edges[:-1, 1])
+            edges = np.append(edges[:, 0], edges[-1, 1])
+        edges = np.column_stack([edges[:-1], edges[1:]])
+        xavg = 3. / 4. * (edges[..., 1]**4 - edges[..., 0]**4) / (edges[..., 1]**3 - edges[..., 0]**3)
+        if selection is None:
+            selection = {}
+        ells = _format_ells(ells)
+        engine = get_engine(engine)
+        self.__dict__.update(edges=edges, xavg=xavg, selection=selection, boxsize=boxsize, ells=ells, engine=engine)
+
+    def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
+        dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
+        toret = []
+        for ell in self.ells:
+            wleg = (-1)**(ell // 2) * (2 * ell + 1) * get_legendre(ell)(mu) * weight
+            tmp = jax.lax.map(lambda x: jnp.sum(get_spherical_jn(ell)(x * dist) * wleg), self.xavg, batch_size=max(min(1000 * 1000 / dist.size, 1), len(self.xavg), 1))
+            toret.append(tmp)
+        return jnp.stack(toret)
+
+    def __call__(self, *particles, los='firstpoint'):
+        if self.engine == 'cucount':
+            from cucountlib import cucount
+            if len(particles) == 1:
+                particles = particles * 2
+            cparticles = [cucount.Particles(p.positions, p.weights) for p in particles]
+            battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
+            sattrs = cucount.SelectionAttrs(**self.selection)
+            return cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs)
+        else:
+            return _scan(self, *particles, los=los)
+
+    def tree_flatten(self):
+        state = {name: getattr(self, name) for name in self.__annotations__.keys()}
+        meta_fields = ['selection', 'engine'] + (['boxsize'] if self.boxsize is None else [])
+        return tuple(state[name] for name in state if name not in meta_fields), {name: state[name] for name in meta_fields}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(zip(cls.__annotations__.keys(), children))
+        new.__dict__.update(aux_data)
+        return new
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclass(init=False, frozen=True)
+class BinParticle2Correlation(object):
+
+    edges: jax.Array = None
+    xavg: jax.Array = None
+    boxsize: jax.Array = None
+    selection: dict = None
+    linear: bool = False
+
+    def __init__(self, mattrs=None, edges: staticarray | dict | None=None, selection: dict | None=None, ells=0, engine='auto'):
+        if edges is None:
+            edges = {}
+        if isinstance(edges, dict):
+            edges = dict(edges)
+            if mattrs is not None:
+                edges.setdefault('max', jnp.sqrt(jnp.sum(mattrs.boxsize**2)))
+            edges = np.arange(edges.get('min', 0.), edges['max'], edges['step'])
+        boxsize = getattr(mattrs, 'boxsize', None)
+        edges = np.asarray(edges)
+        if edges.ndim == 2:
+            assert np.allclose(edges[1:, 0], edges[:-1, 1])
+            edges = np.append(edges[:-1, 0], edges[-1, 1])
+        linear = np.allclose(np.diff(edges), edges[1] - edges[0])
+        edges = np.column_stack([edges[:-1], edges[1:]])
+        xavg = 3. / 4. * (edges[..., 1]**4 - edges[..., 0]**4) / (edges[..., 1]**3 - edges[..., 0]**3)
+        if selection is None:
+            selection = {}
+        ells = _format_ells(ells)
+        engine = get_engine(engine)
+        self.__dict__.update(edges=edges, xavg=xavg, selection=selection, linear=linear, boxsize=boxsize, ells=ells, engine=engine)
+
+    def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
+        dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
+        if self.linear:
+            idx = jnp.floor((dist - self.edges[0, 0]) / (self.edges[0, 1] - self.edges[0, 0])).astype(jnp.int16)
+        else:
+            bins = jnp.append(self.edges[:-1, 0], self.edges[-1, 1])
+            idx = jnp.digitize(bins, dist, right=False) - 1
+        mask = (idx >= 0) & (idx < len(self.edges))
+        weight *= mask
+        idx = jnp.where(mask, idx, 0)
+        return jnp.stack([jnp.zeros(len(self.edges)).at[idx].add((2 * ell + 1) * get_legendre(ell)(mu) * weight) for ell in self.ells])
+
+    def __call__(self, *particles, los='firstpoint'):
+        if self.engine == 'cucount':
+            from cucountlib import cucount
+            if len(particles) == 1:
+                particles = particles * 2
+            cparticles = [cucount.Particles(p.positions, p.weights) for p in particles]
+            battrs = cucount.BinAttrs(s=self.edges, pole=(np.array(self.ells), los))
+            sattrs = cucount.SelectionAttrs(**self.selection)
+            return cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs)
+        else:
+            return _scan(self, *particles, los=los)
+
+    def tree_flatten(self):
+        state = {name: getattr(self, name) for name in self.__annotations__.keys()}
+        meta_fields = ['selection', 'linear'] + (['boxsize'] if self.boxsize is None else [])
+        return tuple(state[name] for name in state if name not in meta_fields), {name: state[name] for name in meta_fields}
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(zip(cls.__annotations__.keys(), children))
+        new.__dict__.update(aux_data)
+        return new
+
+
+def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | BinParticle2Correlation=None, los='firstpoint'):
+
+    ells = bin.ells
+    autocorr = len(particles) == 1
     num_zero = jnp.sum(particles[0].weights) if autocorr else jnp.sum(particles[0].weights) * jnp.sum(particles[1].weights)
-    num_zero = jnp.zeros_like(num[..., 0]).at[0].set(num_zero)
     num_shotnoise = 0.
     if autocorr:
         num_shotnoise = jnp.sum(particles[0].weights**2)
+    particles = list(particles)
+    is_distributed = jax.distributed.is_initialized()
+    if is_distributed:
+        if autocorr: particles = particles * 2
+        p = particles[0]
+        sharding = jax.sharding.NamedSharding(p.attrs.sharding_mesh, spec=P())
+        p = jax.jit(_identity_fn, out_shardings=sharding)((p.positions, p.weights)).addressable_data(0)
+        particles[0] = ParticleField(*p, attrs=particles[0].attrs)
+
+    num = bin(*particles, los=los)
+    num_zero = jnp.zeros_like(num[..., 0]).at[0].set(num_zero)
 
     if isinstance(bin, BinParticle2Correlation):
         return Correlation2Poles(s=bin.xavg, num=num, ells=ells, edges=bin.edges,

@@ -10,7 +10,7 @@ from .utils import CovarianceMatrix, legendre_product, BinnedStatistic
 from .utils import get_spherical_jn
 
 
-class Correlation2Power(object):
+class Correlation2Spectrum(object):
 
     def __init__(self, k, ells):
         from .fftlog import PowerToCorrelation
@@ -217,7 +217,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             s = ww.x()[0]
 
             if 'fftlog' in flags:
-                fftlog = Correlation2Power(np.logspace(-6, 2, num=3645, endpoint=False), (q1, q2))
+                fftlog = Correlation2Spectrum(np.logspace(-6, 2, num=3645, endpoint=False), (q1, q2))
                 from scipy.interpolate import UnivariateSpline, RectBivariateSpline
                 if s[0] > 0: s, w = np.insert(s, 0, 0.), np.insert(w, 0, w[0])
                 w = UnivariateSpline(s, w, k=1, s=0, ext='zeros')(fftlog.s)

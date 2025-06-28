@@ -2185,15 +2185,13 @@ def get_spherical_jn_scipy(ell):
     return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x)
 
 
-def compute_sympy_correlation_function_derivative(ell, n=11):
+def compute_sympy_bessel_tophat_integral(ell, n=11):
     import sympy as sp
-    k, s, a = sp.symbols('k s a', real=True, positive=True)
-    integrand = sp.simplify(k**2 * sp.expand_func(sp.jn(ell, k * s)))
-    # i^ell; we take in the imaginary part of the odd power spectrum multipoles
-    expr = (-1)**(ell // 2) / (2 * sp.pi**2) * sp.integrate(integrand, (k, 0, a))
-    #expr = sp.integrate(integrand, (k, 0, a))
-    expr_lows = sp.series(expr, x=a, x0=0, n=n).removeO()
-    return expr, expr_lows
+    k, x = sp.symbols('k x', real=True, positive=True)
+    integrand = sp.simplify(k**2 * sp.expand_func(sp.jn(ell, k * x)))
+    expr = sp.integrate(integrand, (k, 0, 1))
+    expr_lowx = sp.series(expr, x=x, x0=0, n=n).removeO()
+    return expr, expr_lowx
 
 
 def compute_sympy_legendre(ell):
@@ -2211,28 +2209,22 @@ def compute_sympy_bessel(ell, n=11):
     return expr, expr_lowx
 
 
-# Derivative of correlation function w.r.t. k-bins, precomputed with sympy; full, low-s or low-a limit
-_registered_correlation_function_tophat_derivatives = {}
-_registered_correlation_function_tophat_derivatives[0] = (lambda s, a: (-a * jnp.cos(a * s) / s + jnp.sin(a * s) / s**2) / (2 * jnp.pi**2 * s),
-                                                          lambda s, a: -a**9 * s**6 / (90720 * jnp.pi**2) + a**7 * s**4 / (1680 * jnp.pi**2) - a**5 * s**2 / (60 * jnp.pi**2) + a**3 / (6 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[1] = (lambda s, a: ((-a * jnp.sin(a * s) - 2 * jnp.cos(a * s) / s) / s**2 + 2 / s**3) / (2 * jnp.pi**2),
-                                                          lambda s, a: -a**10 * s**7 / (907200 * jnp.pi**2) + a**8 * s**5 / (13440 * jnp.pi**2) - a**6 * s**3 / (360 * jnp.pi**2) + a**4 * s / (24 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[2] = (lambda s, a: -(a * s * jnp.cos(a * s) - 4 * jnp.sin(a * s) + 3 * Si_scipy(a * s)) / (2 * jnp.pi**2 * s**3),
-                                                          lambda s, a: -a**9 * s**6 / (136080 * jnp.pi**2) + a**7 * s**4 / (2940 * jnp.pi**2) - a**5 * s**2 / (150 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[3] = (lambda s, a: -(8 / s**3 + (a * s**2 * jnp.sin(a * s) + 7 * s * jnp.cos(a * s) - 15 * jnp.sin(a * s) / a) / s**4) / (2 * jnp.pi**2),
-                                                          lambda s, a: -a**10 * s**7 / (1663200 * jnp.pi**2) + a**8 * s**5 / (30240 * jnp.pi**2) - a**6 * s**3 / (1260 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[4] = (lambda s, a: (-a * s**3 * jnp.cos(a * s) + 11 * s**2 * jnp.sin(a * s) + 15 * s**2 * Si_scipy(a * s) / 2 + 105 * s * jnp.cos(a * s) / (2 * a) - 105 * jnp.sin(a * s) / (2 * a**2)) / (2 * jnp.pi**2 * s**5),
-                                                          lambda s, a: -a**9 * s**6 / (374220 * jnp.pi**2) + a**7 * s**4 / (13230 * jnp.pi**2))
-_registered_correlation_function_tophat_derivatives[5] = (lambda s, a: (16 / s**3 + (-a * s**4 * jnp.sin(a * s) - 16 * s**3 * jnp.cos(a * s) + 105 * s**2 * jnp.sin(a * s) / a + 315 * s * jnp.cos(a * s) / a**2 - 315 * jnp.sin(a * s) / a**3) / s**6) / (2 * jnp.pi**2),
-                                                          lambda s, a: -a**10 * s**7 / (5405400 * jnp.pi**2) + a**8 * s**5 / (166320 * jnp.pi**2))
+_registered_bessel_tophat_integral = {}
+_registered_bessel_tophat_integral[0] = (lambda x: (-jnp.cos(x)/x + jnp.sin(x)/x**2)/x,
+                                         lambda x: -x**10/518918400 + x**8/3991680 - x**6/45360 + x**4/840 - x**2/30 + 1/3)
+_registered_bessel_tophat_integral[1] = (lambda x: (-jnp.sin(x) - 2*jnp.cos(x)/x)/x**2 + 2/x**3,
+                                         lambda x: x**9/47900160 - x**7/453600 + x**5/6720 - x**3/180 + x/12)
+_registered_bessel_tophat_integral[2] = (lambda x: (x*jnp.cos(x) - 4*jnp.sin(x) + 3*Si_scipy(x))/x**3,
+                                         lambda x: x**10/674593920 - x**8/5488560 + x**6/68040 - x**4/1470 + x**2/75)
+_registered_bessel_tophat_integral[3] = (lambda x: 8/x**3 + (x**2*jnp.sin(x) + 7*x*jnp.cos(x) - 15*jnp.sin(x))/x**4,
+                                         lambda x: -x**9/77837760 + x**7/831600 - x**5/15120 + x**3/630)
+_registered_bessel_tophat_integral[4] = (lambda x: (-x**3*jnp.cos(x) + 11*x**2*jnp.sin(x) + 15*x**2*Si_scipy(x)/2 + 105*x*jnp.cos(x)/2 - 105*jnp.sin(x)/2)/x**5,
+                                         lambda x: -x**10/1264863600 + x**8/11891880 - x**6/187110 + x**4/6615)
+_registered_bessel_tophat_integral[5] = (lambda x: 16/x**3 + (-x**4*jnp.sin(x) - 16*x**3*jnp.cos(x) + 105*x**2*jnp.sin(x) + 315*x*jnp.cos(x) - 315*jnp.sin(x))/x**6,
+                                         lambda x: x**9/194594400 - x**7/2702700 + x**5/83160)
 
 
 _registered_bessel = {}
-_registered_bessel[0] = (lambda x: jnp.sin(x) / x, lambda x: -x**6/5040 + x**4/120 - x**2/6 + 1)
-_registered_bessel[2] = (lambda x: (-3*x*jnp.cos(x) + (3 - x**2)*jnp.sin(x))/x**3, lambda x: x**6/7560 - x**4/210 + x**2/15)
-_registered_bessel[4] = (lambda x: (5*x*(2*x**2 - 21)*jnp.cos(x) + (x**4 - 45*x**2 + 105)*jnp.sin(x))/x**5, lambda x: -x**6/20790 + x**4/945)
-
-
 _registered_bessel[0] = (lambda x: jnp.sin(x)/x,
                          lambda x: -x**10/39916800 + x**8/362880 - x**6/5040 + x**4/120 - x**2/6 + 1)
 _registered_bessel[1] = (lambda x: -jnp.cos(x)/x + jnp.sin(x)/x**2,
@@ -2272,51 +2264,43 @@ def weights_trapz(x):
     return jnp.concatenate([[x[1] - x[0]], x[2:] - x[:-2], [x[-1] - x[-2]]]) / 2.
 
 
-class TophatPowerToCorrelation(object):
+class BesselIntegral(object):
 
-    def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False, method='exact'):
-        if edges: edges = k
-        else: edges = jnp.concatenate([k[:1], (k[1:] + k[:-1]) / 2., k[-1:]], axis=0)
-        seval = seval[..., None]
-        if method == 'rectangle':
-            w = (-1)**(ell // 2) / (2 * np.pi**2) * (edges[1:]**3 - edges[:-1]**3) / 3.
-            x = seval * (edges[1:] + edges[:-1]) / 2.
-            mask = seval * edges > 0.01
-            bessel = _registered_bessel[ell]
-            self.w = w * jnp.where(mask, bessel[0](x), bessel[1](x))
-        else:
-            mask = seval * edges > 0.01
-            tophat = _registered_correlation_function_tophat_derivatives[ell]
-            self.w = jnp.diff(jnp.where(mask, tophat[0](seval, edges), tophat[1](seval, edges)), axis=-1)
-
-    def __call__(self, fun: jax.Array):
-        return jnp.sum(self.w * fun, axis=-1)
-
-
-class TophatCorrelationToPower(object):
-
-    def __init__(self, s: np.ndarray, keval: np.ndarray, ell=0, edges=False):
-        if edges: edges = s
-        else: edges = jnp.concatenate([s[:1], (s[1:] + s[:-1]) / 2., s[-1:]], axis=0)
-        tophat = _registered_correlation_function_tophat_derivatives[ell]
-        keval = keval[..., None]
-        mask = keval * edges > 0.01
-        self.w = (-1)**(ell // 2) * (2. * jnp.pi)**3 * jnp.diff(jnp.where(mask, tophat[0](keval, edges), tophat[1](keval, edges)), axis=-1)
-
-    def __call__(self, fun: jax.Array):
-        return jnp.sum(self.w * fun, axis=-1)
-
-
-class BesselPowerToCorrelation(object):
-
-    def __init__(self, k: np.ndarray, seval: np.ndarray, ell=0, edges=False, volume=None):
+    def __init__(self, xp, xeval, ell=0, edges=True, method='exact', mode='forward', volume=True):
         if edges:
-            edges = k
-            if volume is None: volume = 4. / 3. * np.pi * (edges[1:]**3 - edges[:-1]**3)
-            k = (edges[:-1] + edges[1:]) / 2.
+            edges = xp
         else:
-            if volume is None: volume = 4. / 3. * np.pi * weights_trapz(k**3)
-        self.w = (-1)**(ell // 2) / (2. * np.pi)**3 * volume * get_spherical_jn_scipy(ell)(seval[..., None] * k)
+            edges = jnp.concatenate([xp[:1], (xp[1:] + xp[:-1]) / 2., xp[-1:]], axis=0)
+        if edges.ndim == 1:
+            edges = np.stack([edges[:-1], edges[1:]])
+        xeval = xeval[..., None]
+        assert mode in ['forward', 'backward']
+        if mode == 'forward':
+            norm = (-1)**(ell // 2)
+        else:
+            norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
+        method = 'exact'
+        if method == 'rect':
+            w = norm
+            x = xeval * jnp.mean(edges, axis=-1)
+            mask = x > 0.01
+            bessel = _registered_bessel[ell]
+            self.w = norm * jnp.where(mask, bessel[0](x), bessel[1](x))
+            if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
+        elif method == 'trapz':
+            x = xeval[..., None] * edges
+            mask = x > 0.01
+            bessel = _registered_bessel[ell]
+            self.w = norm * jnp.sum(jnp.where(mask, bessel[0](x), bessel[1](x)), axis=-1) / 2.
+            if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
+        else:  # exact
+            x = xeval[..., None] * edges
+            mask = x > 0.01
+            tophat = _registered_bessel_tophat_integral[ell]
+            w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3
+            self.w =  norm * (w[..., 1] - w[..., 0])
+            if volume: self.w *= (4. * np.pi)
+            else: self.w /= (edges[:, 1]**3 - edges[:, 0]**3) / 3.
 
     def __call__(self, fun: jax.Array):
         return jnp.sum(self.w * fun, axis=-1)

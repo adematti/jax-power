@@ -166,9 +166,9 @@ class Correlation2Poles(BinnedStatistic):
             toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
         return tuple(tmp.real / self._norm for tmp in toret)
 
-    def to_power(self, k):
+    def to_spectrum(self, k):
+        from .utils import BesselIntegral
         num = []
-        value = self.view()
         for ill, ell in enumerate(self.ells):
             if isinstance(k, BinnedStatistic):
                 kk = k._x[ill]
@@ -176,10 +176,8 @@ class Correlation2Poles(BinnedStatistic):
                 kk = k[ill]
             else:
                 kk = k
-            def f(kk):
-                return (-1)**(ell // 2) * jnp.sum(value[ill] * get_spherical_jn(ell)(kk * self._x[ill]), axis=-1)
-
-            num.append(jax.lax.map(f, kk, batch_size=max(min(1000 * 1000 / len(self._x[ill]), len(kk)), 1)))
+            integ = BesselIntegral(self.edges(projs=ell), kk, ell=ell, method='rect', mode='backward', edges=True, volume=False)
+            num.append(integ(self.view(projs=ell)))
         num = tuple(num)
         if isinstance(k, BinnedStatistic):
             return k.clone(num=num)
@@ -821,7 +819,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
     """
     tophat_method = 'rectangle'
 
-    from .utils import TophatPowerToCorrelation
+    from .utils import BesselIntegral
 
     meshs, autocorr = _format_meshs(*meshs)
     periodic = isinstance(meshs[0], MeshAttrs)
@@ -928,7 +926,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                     del snorm
 
                     def f(kin):
-                        tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ellin, edges=True, method=tophat_method).w[..., 0] * rnorm * mattrs.cellsize.prod() * Qs
+                        tophat_Qs = BesselIntegral(kin, savg, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * rnorm * mattrs.cellsize.prod() * Qs
 
                         def f2(args):
                             kout, nout = args
@@ -952,7 +950,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 legin = get_legendre(ellin)(smu)
 
                 def f(kin):
-                    Aell = TophatPowerToCorrelation(kin, seval=snorm, ell=ellin, edges=True, method=tophat_method).w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
+                    Aell = BesselIntegral(kin, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
                     Aell = mattrs.create(kind='real', fill=Aell)
                     if Q is not None: Aell *= Q
                     power = _bin(_2c(Aell))
@@ -1070,7 +1068,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                         del xnorm, snorm
 
                         def f(kin):
-                            tophat_Qs = TophatPowerToCorrelation(kin, seval=savg, ell=ell1, edges=True, method=tophat_method).w[..., 0] * Qs
+                            tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
 
                             def f2(args):
                                 kout, nout = args
@@ -1100,7 +1098,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                             del xnorm
 
                             def f(kin):
-                                tophat_Qs = TophatPowerToCorrelation(kin, seval=snorm, ell=ell1, edges=True, method=tophat_method).w[..., 0] * Qs
+                                tophat_Qs = BesselIntegral(kin, snorm, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
                                 power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
                                 if pbar:
                                     t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
@@ -1204,7 +1202,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                             snmodes = sbin.nmodes
 
                             def f(kin):
-                                tophat_Q = TophatPowerToCorrelation(kin, seval=savg, ell=p, edges=True, method=tophat_method).w[..., 0] * Q
+                                tophat_Q = BesselIntegral(kin, savg, ell=p, edges=True, method=tophat_method, mode='backward').w[..., 0] * Q
 
                                 def f2(args):
                                     kout, nout = args
@@ -1240,7 +1238,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                             def f(kin):
                                 xi = 0.
                                 for p in ps:
-                                    tophat = TophatPowerToCorrelation(kin, seval=snorm, ell=p, edges=True, method=tophat_method).w[..., 0]
+                                    tophat = BesselIntegral(kin, snorm, ell=p, edges=True, method=tophat_method, mode='backward').w[..., 0]
                                     Q = load_from_buffer(Qs[p])
                                     xi += tophat * Q
                                 power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0)

@@ -41,12 +41,12 @@ def test_covmatrix(plot=False):
 
 def export_sympy():
     import itertools
-    from jaxpower.utils import export_legendre_product, compute_sympy_correlation_function_derivative, compute_sympy_bessel, compute_sympy_legendre
+    from jaxpower.utils import export_legendre_product, compute_sympy_bessel_tophat_integral, compute_sympy_bessel, compute_sympy_legendre
 
     #print(export_sympy_legendre_product(ellmax=8, n=3))
-    #for ell in range(6): print(ell, compute_sympy_correlation_function_derivative(ell))
-    for ell in range(11): print('_registered_bessel[{:d}] = (lambda x: {},\nlambda x: {})'.format(ell, *compute_sympy_bessel(ell)))
-    for ell in range(11): print('_registered_legendre[{:d}] = lambda x: {}'.format(ell, compute_sympy_legendre(ell)))
+    for ell in range(6): print('_registered_bessel_tophat_integral[{:d}] = (lambda x: {},\nlambda x: {})'.format(ell, *compute_sympy_bessel_tophat_integral(ell)))
+    #for ell in range(11): print('_registered_bessel[{:d}] = (lambda x: {},\nlambda x: {})'.format(ell, *compute_sympy_bessel(ell)))
+    #for ell in range(11): print('_registered_legendre[{:d}] = lambda x: {}'.format(ell, compute_sympy_legendre(ell)))
 
 
 def get_theory(kmax=0.3, dk=0.005):
@@ -495,7 +495,7 @@ if __name__ == '__main__':
     #config.update('jax_enable_x64', True)
     #test_fftlog2()
 
-    #export_sympy()
+    export_sympy()
     #from jax import config
     #config.update('jax_enable_x64', True)
 
@@ -507,4 +507,4 @@ if __name__ == '__main__':
     #test_cutsky2_covariance_fftlog(plot=True)
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)
-    test_from_pypower()
+    #test_from_pypower()

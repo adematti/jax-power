@@ -280,7 +280,7 @@ class HankelTransform(FFTlog):
 
 
 @jax.tree_util.register_pytree_node_class
-class PowerToCorrelation(FFTlog):
+class SpectrumToCorrelation(FFTlog):
     r"""
     Power spectrum to correlation function transform, defined as:
 
@@ -330,7 +330,7 @@ class PowerToCorrelation(FFTlog):
 
 
 @jax.tree_util.register_pytree_node_class
-class CorrelationToPower(FFTlog):
+class CorrelationToSpectrum(FFTlog):
     r"""
     Correlation function to power spectrum transform, defined as:
 

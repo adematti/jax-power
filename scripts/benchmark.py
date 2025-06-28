@@ -117,12 +117,7 @@ def compute_thetacut(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
     #smax = np.sqrt(3) * 2e4
     smax = 35472.400001
 
-    import sys
-    sys.path.insert(0, '/global/u2/a/adematti/cosmodesi/cucount/build')
-    try:
-        from cucount import count2, Particles, BinAttrs, SelectionAttrs
-    except ImportError:
-        raise
+    from cucountlib.cucount import count2, Particles, BinAttrs, SelectionAttrs
     particles1 = Particles(positions, weights)
     particles2 = Particles(positions, weights)
     print(particles1.size)
