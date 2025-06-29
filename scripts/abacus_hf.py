@@ -1,0 +1,2 @@
+def catalog_fn():
+    catalog_dir = Path('/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph000/CutSky/ELG_v5/z0.950/forclustering/cutsky_abacusHF_DR2_ELG_LOP_z0p950_zcut_0p8to1p6_clustering.dat.fits')

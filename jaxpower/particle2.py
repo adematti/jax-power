@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+import os
 import numpy as np
 import jax
 from jax import numpy as jnp
@@ -7,7 +8,7 @@ from jax.sharding import PartitionSpec as P
 
 from .mesh import MeshAttrs, staticarray, ParticleField, _identity_fn
 from .mesh2 import _format_ells, Spectrum2Poles, Correlation2Poles
-from .utils import get_legendre, get_spherical_jn, BinnedStatistic, plotter
+from .utils import get_legendre, get_spherical_jn, BinnedStatistic, plotter, set_env
 
 
 def _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=None, boxsize=None, los='x'):
@@ -177,15 +178,21 @@ class BinParticle2Spectrum(object):
 
     def __call__(self, *particles, los='firstpoint'):
         if self.engine == 'cucount':
-            from cucountlib import cucount
-            if len(particles) == 1:
-                particles = particles * 2
-            cparticles = [cucount.Particles(p.positions, p.weights) for p in particles]
-            battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
-            sattrs = cucount.SelectionAttrs(**self.selection)
-            return cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs)
+            with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
+                from cucountlib import cucount
+                if len(particles) == 1:
+                    particles = particles * 2
+    
+                def get(array):
+                    return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
+    
+                cparticles = [cucount.Particles(get(p.positions), get(p.weights)) for p in particles]
+                battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
+                sattrs = cucount.SelectionAttrs(**self.selection)
+                toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
         else:
-            return _scan(self, *particles, los=los)
+            toret = _scan(self, *particles, los=los)
+        return toret
 
     def tree_flatten(self):
         state = {name: getattr(self, name) for name in self.__annotations__.keys()}
@@ -237,24 +244,31 @@ class BinParticle2Correlation(object):
         if self.linear:
             idx = jnp.floor((dist - self.edges[0, 0]) / (self.edges[0, 1] - self.edges[0, 0])).astype(jnp.int16)
         else:
-            bins = jnp.append(self.edges[:-1, 0], self.edges[-1, 1])
+            bins = jnp.append(self.edges[:, 0], self.edges[-1, 1])
             idx = jnp.digitize(bins, dist, right=False) - 1
         mask = (idx >= 0) & (idx < len(self.edges))
         weight *= mask
         idx = jnp.where(mask, idx, 0)
         return jnp.stack([jnp.zeros(len(self.edges)).at[idx].add((2 * ell + 1) * get_legendre(ell)(mu) * weight) for ell in self.ells])
-
+    
     def __call__(self, *particles, los='firstpoint'):
         if self.engine == 'cucount':
-            from cucountlib import cucount
-            if len(particles) == 1:
-                particles = particles * 2
-            cparticles = [cucount.Particles(p.positions, p.weights) for p in particles]
-            battrs = cucount.BinAttrs(s=self.edges, pole=(np.array(self.ells), los))
-            sattrs = cucount.SelectionAttrs(**self.selection)
-            return cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs)
+            with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
+                from cucountlib import cucount
+                if len(particles) == 1:
+                    particles = particles * 2
+    
+                def get(array):
+                    return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
+    
+                cparticles = [cucount.Particles(get(p.positions), get(p.weights)) for p in particles]
+                bins = np.append(self.edges[:, 0], self.edges[-1, 1])
+                battrs = cucount.BinAttrs(s=bins, pole=(self.ells[0], self.ells[-1], 2, los))
+                sattrs = cucount.SelectionAttrs(**self.selection)
+                toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
         else:
-            return _scan(self, *particles, los=los)
+            toret = _scan(self, *particles, los=los)
+        return toret
 
     def tree_flatten(self):
         state = {name: getattr(self, name) for name in self.__annotations__.keys()}
@@ -279,15 +293,22 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
     if autocorr:
         num_shotnoise = jnp.sum(particles[0].weights**2)
     particles = list(particles)
-    is_distributed = jax.distributed.is_initialized()
+    is_distributed = jax.distributed.is_initialized() and (jax.process_count() > 1)
+    sharding_mesh = particles[0].attrs.sharding_mesh
     if is_distributed:
         if autocorr: particles = particles * 2
-        p = particles[0]
-        sharding = jax.sharding.NamedSharding(p.attrs.sharding_mesh, spec=P())
-        p = jax.jit(_identity_fn, out_shardings=sharding)((p.positions, p.weights)).addressable_data(0)
-        particles[0] = ParticleField(*p, attrs=particles[0].attrs)
+        particle = particles[0]
+        sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P())
+        p = jax.lax.with_sharding_constraint(particle.positions, sharding)
+        w = jax.lax.with_sharding_constraint(particle.weights, sharding)
+        particles[0] = ParticleField(p, w, attrs=particle.attrs)
 
     num = bin(*particles, los=los)
+    if is_distributed:
+        sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+        num = jax.make_array_from_process_local_data(sharding, num[None, ...])
+        num = num.sum(axis=0)
+
     num_zero = jnp.zeros_like(num[..., 0]).at[0].set(num_zero)
 
     if isinstance(bin, BinParticle2Correlation):

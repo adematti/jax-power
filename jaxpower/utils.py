@@ -6,6 +6,7 @@ import traceback
 from collections.abc import Callable
 import itertools
 from functools import partial, lru_cache
+from contextlib import contextmanager
 
 import numpy as np
 import jax
@@ -116,6 +117,25 @@ def setup_logging(level=logging.INFO, stream=sys.stdout, filename=None, filemode
     handler.setFormatter(fmt)
     logging.basicConfig(level=level, handlers=[handler], **kwargs)
     sys.excepthook = exception_handler
+
+
+@contextmanager
+def set_env(**environ):
+    """
+    Temporarily set environment variables inside the context.
+    
+    Example:
+        with set_env(MY_VAR='value'):
+            # MY_VAR is set to 'value' here
+        # MY_VAR is restored to its original state here
+    """
+    original_env = os.environ.copy()
+    os.environ.update({k: str(v) for k, v in environ.items()})
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
 
 
 class MemoryMonitor(object):

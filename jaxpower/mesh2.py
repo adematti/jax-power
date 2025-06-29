@@ -681,6 +681,9 @@ class FKPField(object):
         state = asdict(self) | kwargs
         return self.__class__(**state)
 
+    def exchange(self, **kwargs):
+        return self.clone(data=self.data.clone(exchange=True, **kwargs), randoms=self.randoms.clone(exchange=True, **kwargs), attrs=self.attrs)
+
     @property
     def attrs(self):
         return self.data.attrs

@@ -486,19 +486,12 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
 
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
-    shifts = jnp.meshgrid(*[np.arange(s) * attrs.boxsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
-    shifts = jnp.stack(shifts, axis=-1).reshape(-1, len(shifts))
 
     mean = positions.mean(axis=0)
     pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, :], pad_width[0][1], axis=0), axis=0)
     positions = _exchange_array_jax(positions, idx_out_devices, pad=pad, return_indices=return_inverse)
     if return_inverse:
         positions, indices = positions
-
-    def f(positions, idevice):
-        return positions - shifts[idevice[0]]
-
-    positions = shard_map(f, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
     def exchange(values, pad=0.):
         return _exchange_array_jax(values, idx_out_devices, pad=pad, return_indices=False)
@@ -687,15 +680,6 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     if return_inverse:
         positions, indices = positions
 
-    def f(positions, idevice):
-        return positions - shifts[idevice[0]]
-
-    local_device = jax.local_devices()
-    assert len(local_device) == 1
-    local_device = local_device[0]
-    idevice = list(sharding_mesh.devices.ravel()).index(local_device)
-    positions = f(positions, [idevice])
-
     if return_type == 'jax':
         positions = make_array_from_process_local_data(positions, pad='mean', sharding_mesh=sharding_mesh)
 
@@ -714,7 +698,6 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
         return positions, exchange, inverse
     return positions, exchange
 
-
 def _get_distributed_backend(array, backend='auto', **kwargs):
 
     def get_mpicomm():
@@ -728,7 +711,7 @@ def _get_distributed_backend(array, backend='auto', **kwargs):
     if backend == 'auto' and isinstance(array, np.ndarray):
         if jax.distributed.is_initialized():
             mpicomm = get_mpicomm()
-            if mpicomm is not None and mpicomm.size == sharding.num_devices:
+            if mpicomm is not None and mpicomm.size == len(jax.devices()):
                 backend = 'mpi'
                 kwargs.setdefault('mpicomm', mpicomm)
     if backend == 'auto':
@@ -1346,6 +1329,16 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
     positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
 
     if with_sharding:
+        shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
+        size_devices = shape_devices.prod(dtype='i4')
+        shard_shifts = jnp.meshgrid(*[np.arange(s) * attrs.meshsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
+        shard_shifts = jnp.stack(shard_shifts, axis=-1).reshape(-1, len(shard_shifts))
+
+        def s(positions, idevice):
+            return positions - shard_shifts[idevice[0]]
+    
+        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
+
         kw_sharding = kwargs | dict(halo_size=resampler.order, sharding_mesh=sharding_mesh)
         value, offset = pad_halo(value, **kw_sharding)
         value = exchange_halo(value, **kw_sharding)
@@ -1582,18 +1575,33 @@ class ParticleField(object):
     weights: jax.Array = field(repr=False)
     attrs: MeshAttrs | None = field(init=False, repr=False)
 
-    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, **kwargs):
+    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, backend='auto', **kwargs):
+        if attrs is None: raise ValueError('attrs must be provided')
+        if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
+        sharding_mesh = attrs.sharding_mesh
+        with_sharding = bool(sharding_mesh.axis_names)
+        if with_sharding:
+            backend, kwargs = _get_distributed_backend(positions, backend=backend, **kwargs)
+
         positions = jnp.asarray(positions)
         if weights is None:
             weights = jnp.ones_like(positions, shape=positions.shape[:-1], device=positions.sharding)
         else:
             weights = jnp.asarray(weights)
-        if attrs is None: raise ValueError('attrs must be provided')
-        if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
-        sharding_mesh = attrs.sharding_mesh
-        with_sharding = bool(sharding_mesh.axis_names)
+
+        if with_sharding and getattr(positions.sharding, 'mesh', None) is None and (not exchange or backend == 'jax'):
+            positions, weights = make_particles_from_local(positions, weights)
+
         if with_sharding and exchange:
-            positions, exchange = exchange_particles(attrs, positions, return_type='jax', **kwargs)
+            if getattr(positions.sharding, 'mesh', None) is not None and backend == 'mpi':
+
+                def get(array):
+                    return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
+
+                positions = get(positions)
+                weights = get(weights)
+
+            positions, exchange = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
             weights = exchange(weights)
         self.__dict__.update(positions=positions, weights=weights, attrs=attrs)
 
@@ -1601,6 +1609,9 @@ class ParticleField(object):
         """Create a new instance, updating some attributes."""
         state = asdict(self) | kwargs
         return self.__class__(**state)
+
+    def exchange(self, **kwargs):
+        return self.clone(exchange=True, **kwargs)
 
     def tree_flatten(self):
         return tuple(getattr(self, name) for name in ['positions', 'weights', 'attrs']), {}
@@ -1624,7 +1635,7 @@ class ParticleField(object):
         return self.weights.sum(*args, **kwargs)
 
     @classmethod
-    def concatenate(cls, others, weights=None, local=False, **kwargs):
+    def concatenate(cls, others, weights=None, local=True, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
             weights = [1] * len(weights)
@@ -1735,12 +1746,14 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
     resampler = getattr(resamplers, resampler, resampler)
     interlacing = max(interlacing, 1)
-    shifts = jnp.astype(jnp.arange(interlacing) * 1. / interlacing, attrs.rdtype)
+    interlacing_shifts = jnp.astype(jnp.arange(interlacing) * 1. / interlacing, attrs.rdtype)
 
     sharding_mesh = attrs.sharding_mesh
     with_sharding = bool(sharding_mesh.axis_names)
 
     positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
+    #mask = jnp.where(weights == 0., jnp.nan, 1.)[..., None]
+    #print(jnp.nanmin(positions * mask, axis=0), jnp.nanmax(positions * mask, axis=0), attrs.boxsize, attrs.boxcenter, attrs.meshsize)
 
     if isinstance(compensate, bool):
         if compensate:
@@ -1752,6 +1765,16 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
     _paint = resampler.paint
     if with_sharding:
+        shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
+        size_devices = shape_devices.prod(dtype='i4')
+        shard_shifts = jnp.meshgrid(*[np.arange(s) * attrs.meshsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
+        shard_shifts = jnp.stack(shard_shifts, axis=-1).reshape(-1, len(shard_shifts))
+
+        def s(positions, idevice):
+            return positions - shard_shifts[idevice[0]]
+    
+        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
+
         _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))
 
     def ppaint(positions, weights=None):
@@ -1760,7 +1783,6 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         w = None
         if weights is not None:
             w = weights.astype(value.dtype)
-        positions = positions % attrs.meshsize
         if with_sharding:
             kw_sharding = kwargs | dict(halo_size=resampler.order + interlacing, sharding_mesh=sharding_mesh)
             #print(value.shape)
@@ -1796,9 +1818,9 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
             carry += tmp.apply(kernel_shift, kind='circular')
             return carry, shift
 
-        toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=shifts)[0]
+        toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=interlacing_shifts)[0]
         #toret = attrs.create(kind='complex', fill=0.)
-        #for shift in shifts: toret, _ = f(toret, shift)
+        #for shift in interlacing_shifts: toret, _ = f(toret, shift)
         if kernel_compensate is not None:
             toret = toret.apply(kernel_compensate)
         if out == 'real': toret = toret.c2r()
