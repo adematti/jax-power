@@ -2269,33 +2269,37 @@ class BesselIntegral(object):
     def __init__(self, xp, xeval, ell=0, edges=True, method='exact', mode='forward', volume=True):
         if edges:
             edges = xp
+            xp = None
         else:
             edges = jnp.concatenate([xp[:1], (xp[1:] + xp[:-1]) / 2., xp[-1:]], axis=0)
         if edges.ndim == 1:
-            edges = np.stack([edges[:-1], edges[1:]])
+            edges = jnp.column_stack([edges[:-1], edges[1:]])
+        if xp is None:
+            xp = jnp.mean(edges, axis=-1)
         xeval = xeval[..., None]
         assert mode in ['forward', 'backward']
         if mode == 'forward':
             norm = (-1)**(ell // 2)
         else:
             norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
-        method = 'exact'
+        xmin = 0.01
         if method == 'rect':
             w = norm
-            x = xeval * jnp.mean(edges, axis=-1)
-            mask = x > 0.01
+            x = xeval * xp
+            mask = x > xmin
             bessel = _registered_bessel[ell]
             self.w = norm * jnp.where(mask, bessel[0](x), bessel[1](x))
+            #self.w = norm * get_spherical_jn(ell)(x)
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         elif method == 'trapz':
             x = xeval[..., None] * edges
-            mask = x > 0.01
+            mask = x > xmin
             bessel = _registered_bessel[ell]
             self.w = norm * jnp.sum(jnp.where(mask, bessel[0](x), bessel[1](x)), axis=-1) / 2.
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         else:  # exact
             x = xeval[..., None] * edges
-            mask = x > 0.01
+            mask = x > xmin
             tophat = _registered_bessel_tophat_integral[ell]
             w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3
             self.w =  norm * (w[..., 1] - w[..., 0])

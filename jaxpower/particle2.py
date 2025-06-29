@@ -273,7 +273,8 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
 
     ells = bin.ells
     autocorr = len(particles) == 1
-    num_zero = jnp.sum(particles[0].weights) if autocorr else jnp.sum(particles[0].weights) * jnp.sum(particles[1].weights)
+    # Can't be computed easily in general because of the selection
+    num_zero = 0.  #jnp.sum(particles[0].weights)**2 if autocorr else jnp.sum(particles[0].weights) * jnp.sum(particles[1].weights)
     num_shotnoise = 0.
     if autocorr:
         num_shotnoise = jnp.sum(particles[0].weights**2)

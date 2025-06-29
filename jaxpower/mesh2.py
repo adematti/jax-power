@@ -20,13 +20,13 @@ class Spectrum2Poles(BinnedStatistic):
     _label_x = r'$k$ [$h/\mathrm{Mpc}$]'
     _label_proj = r'$\ell$'
     _label_value = r'$P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{3}$]'
-    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero']
+    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero', '_volume']
+    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero', '_volume']
     _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
     _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
 
-    def __init__(self, k: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, norm: jax.Array=1.,
+    def __init__(self, k: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, volume: np.ndarray=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=0., num_zero: jax.Array=None, name: str=None, attrs: dict=None):
 
         def _tuple(item):
@@ -41,6 +41,9 @@ class Spectrum2Poles(BinnedStatistic):
         self.__dict__.update(_num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=num_zero)
         super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num,
                          weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
+        if volume is None: volume = tuple(nmodes.copy() for nmodes in self.nmodes())
+        else: volume = _tuple(volume)
+        self.__dict__.update(_volume=volume)
 
     @property
     def shotnoise(self):
@@ -55,6 +58,13 @@ class Spectrum2Poles(BinnedStatistic):
     k = BinnedStatistic.x
     kavg = BinnedStatistic.xavg
     nmodes = BinnedStatistic.weights
+
+    def volume(self, projs=Ellipsis):
+        """Volume (optionally restricted to input projs)."""
+        iprojs = self._index_projs(projs)
+        isscalar = not isinstance(iprojs, list)
+        if isscalar: return self._volume[iprojs]
+        return [self._volume[iproj] for iproj in iprojs]
 
     @property
     def ells(self):
@@ -115,13 +125,13 @@ class Correlation2Poles(BinnedStatistic):
     _label_x = r'$s$ [$\mathrm{Mpc}/h$]'
     _label_proj = r'$\ell$'
     _label_value = r'$\xi_{\ell}(s)$'
-    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero']
+    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero', '_volume']
+    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero', '_volume']
     _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
-    _init_fields = {'s': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
+    _init_fields = {'s': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'volume': '_volume', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
 
-    def __init__(self, s: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, norm: jax.Array=1.,
+    def __init__(self, s: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, volume: np.ndarray=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=0., num_zero: jax.Array=None, name: str=None, attrs: dict=None):
 
         def _tuple(item):
@@ -136,6 +146,9 @@ class Correlation2Poles(BinnedStatistic):
         self.__dict__.update(_num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=num_zero)
         super().__init__(x=_tuple(s), edges=_tuple(edges), projs=ells, value=num,
                          weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
+        if volume is None: volume = tuple(nmodes.copy() for nmodes in self.nmodes())
+        else: volume = _tuple(volume)
+        self.__dict__.update(_volume=volume)
 
     @property
     def shotnoise(self):
@@ -150,6 +163,13 @@ class Correlation2Poles(BinnedStatistic):
     s = BinnedStatistic.x
     savg = BinnedStatistic.xavg
     nmodes = BinnedStatistic.weights
+
+    def volume(self, projs=Ellipsis):
+        """Volume (optionally restricted to input projs)."""
+        iprojs = self._index_projs(projs)
+        isscalar = not isinstance(iprojs, list)
+        if isscalar: return self._volume[iprojs]
+        return [self._volume[iproj] for iproj in iprojs]
 
     @property
     def ells(self):
@@ -176,8 +196,11 @@ class Correlation2Poles(BinnedStatistic):
                 kk = k[ill]
             else:
                 kk = k
-            integ = BesselIntegral(self.edges(projs=ell), kk, ell=ell, method='rect', mode='backward', edges=True, volume=False)
-            num.append(integ(self.view(projs=ell)))
+            #integ = BesselIntegral(self.edges(projs=ell), kk, ell=ell, method='trapz', mode='forward', edges=True, volume=False)
+            integ = BesselIntegral(self.x(projs=ell), kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
+            #num.append(integ(self._value[ill]))
+            # self.weights = volume factor
+            num.append(integ(self.volume(projs=ell) * self.view(projs=ell)))
         num = tuple(num)
         if isinstance(k, BinnedStatistic):
             return k.clone(num=num)
@@ -474,7 +497,7 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
         num, num_zero = map(jnp.array, (num, num_zero))
         if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Spectrum2Poles` instance
-        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
+        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
                                        num_zero=num_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
@@ -503,7 +526,7 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
                 num_zero.append(0.)
 
         num, num_zero = map(jnp.array, (num, num_zero))
-        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
 def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Correlation=None, los: str | np.ndarray='x') -> Correlation2Poles:
@@ -602,7 +625,7 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
         num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
         if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Correlation2Poles` instance
-        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.cellsize.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
 
@@ -631,7 +654,7 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
                 num_zero.append(0.)
 
         num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
-        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.cellsize.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
@@ -780,6 +803,61 @@ def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
     return toret
 
 
+def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2Spectrum=None) -> WindowMatrix:
+
+    r"""Compute "smooth" power spectrum window matrix given input configuration-space window function."""
+
+    from .utils import legendre_product, BesselIntegral
+    tophat_method = 'rect'
+    ells = bin.ells
+
+    if isinstance(edgesin, BinnedStatistic):
+        kin = edgesin._edges[0]
+        ellsin = edgesin.projs
+
+    if edgesin.ndim == 2:
+        kin = edgesin
+        edgesin = None
+    else:
+        kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+
+    kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
+    window = window.clone(num_zero=None)
+
+    wmat_tmp = {}
+    spherical_jn = {ell: get_spherical_jn(ell) for ell in set(ells)}
+
+    for ell1 in ellsin:
+        wmat_tmp[ell1] = 0
+        for ill, ell in enumerate(ells):
+            Qs = sum(legendre_product(ell, ell1, q) * window.view(projs=q).real if q in window.projs else jnp.zeros(()) for q in list(range(abs(ell - ell1), ell + ell1 + 1)))
+            snmodes = window.volume()[0]
+            savg = jnp.where(snmodes == 0, 0., window.x()[0])
+            #integ = BesselIntegral(window.edges(projs=0), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
+            integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
+
+            def f(kin):
+                tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
+                #def f2(kout):
+                #    return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
+                #batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
+                #power = (2 * ell + 1) * jax.lax.map(f2, kout, batch_size=batch_size)
+                power = (2 * ell + 1) * integ(snmodes * tophat_Qs)
+                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
+                return power.ravel()
+
+            batch_size = int(min(max(1e7 / (kout.size * savg.size), 1), kin.shape[0]))
+            wmat_tmp[ell1] += jax.lax.map(f, xs=kin, batch_size=batch_size)
+
+    wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
+
+    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells), projs=ells)
+    xin = np.mean(kin, axis=-1)
+    theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[kin] * len(ellsin), projs=ellsin)
+    wmat = WindowMatrix(observable, theory, wmat)
+    return wmat
+
+
 def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
                                   bin: BinMesh2Spectrum=None, los: str | np.ndarray='x',
                                   buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
@@ -817,7 +895,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
     -------
     wmat : WindowMatrix
     """
-    tophat_method = 'rectangle'
+    tophat_method = 'exact'
 
     from .utils import BesselIntegral
 
@@ -848,11 +926,15 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
             mesh = mesh.r2c()
         return mesh
 
+    if isinstance(edgesin, BinnedStatistic):
+        kin = edgesin._edges[0]
+        ellsin = edgesin.projs
+
     if edgesin.ndim == 2:
         kin = edgesin
         edgesin = None
     else:
-        kin = jnp.array([edgesin[:-1], edgesin[1:]]).T
+        kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
 
     def np_map(f, xs):
         return jnp.array(list(map(f, xs)))
@@ -878,7 +960,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
             if autocorr:
                 meshs[1] = meshs[0]
 
-            Q = _2r(meshs[0] * meshs[1].conj())
+            Q = _2r(meshs[0] * meshs[1].conj()) / mattrs.meshsize.prod(dtype=rdtype)
         else:
             Q = None
 
@@ -908,8 +990,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
             sedges = None
             #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
             sbin = BinMesh2Correlation(mattrs, edges=sedges)
-            kout, koutnmodes = bin.xavg, bin.nmodes
-            kout = jnp.where(koutnmodes == 0, 0., kout)
+            kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
             for ellin in ellsin:
 
@@ -926,14 +1007,13 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                     del snorm
 
                     def f(kin):
-                        tophat_Qs = BesselIntegral(kin, savg, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * rnorm * mattrs.cellsize.prod() * Qs
+                        tophat_Qs = BesselIntegral(kin, savg, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * rnorm * mattrs.boxsize.prod() * Qs
 
-                        def f2(args):
-                            kout, nout = args
-                            return (-1)**(ell // 2) * jnp.sum(nout * snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
+                        def f2(kout):
+                            return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
 
-                        batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.shape[0]))
-                        power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
+                        batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
+                        power = jax.lax.map(f2, kout, batch_size=batch_size)
 
                         if pbar:
                             t.update(n=round(1 / len(ells) / len(ellsin)))
@@ -950,7 +1030,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 legin = get_legendre(ellin)(smu)
 
                 def f(kin):
-                    Aell = BesselIntegral(kin, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * legin * rnorm * mattrs.cellsize.prod()
+                    Aell = BesselIntegral(kin, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * legin * rnorm * mattrs.boxsize.prod(dtype=rdtype)
                     Aell = mattrs.create(kind='real', fill=Aell)
                     if Q is not None: Aell *= Q
                     power = _bin(_2c(Aell))
@@ -966,7 +1046,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 legin = get_legendre(ellin)(mu)
 
                 def f(kin):
-                    Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * rnorm *  mattrs.meshsize.prod(dtype=rdtype))
+                    Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * rnorm * mattrs.meshsize.prod(dtype=rdtype))
                     if Q is not None: Aell = _2c(Q * _2r(Aell))
                     power = _bin(Aell)
                     if pbar:
@@ -1046,8 +1126,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 sedges = None
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
                 sbin = BinMesh2Correlation(rmesh1, edges=sedges)
-                kout, koutnmodes = bin.xavg, bin.nmodes
-                kout = jnp.where(koutnmodes == 0, 0., kout)
+                kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
                 for ell1, wa1 in ellsin:
                     wmat_tmp[ell1, wa1] = 0
@@ -1070,12 +1149,11 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                         def f(kin):
                             tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
 
-                            def f2(args):
-                                kout, nout = args
-                                return (-1)**(ell // 2) * jnp.sum(nout * snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
+                            def f2(kout):
+                                return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
 
-                            batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.shape[0]))
-                            power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
+                            batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
+                            power = jax.lax.map(f2, kout, batch_size=batch_size)
 
                             if pbar:
                                 t.update(n=round(1 / len(ells) / len(ellsin)))
@@ -1172,8 +1250,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                 sedges = None
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
                 sbin = BinMesh2Correlation(rmesh1, edges=sedges)
-                kout, koutnmodes = bin.xavg, bin.nmodes
-                kout = jnp.where(koutnmodes == 0, 0., kout)
+                kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
                 for ell1, ell2 in itertools.product((2, 0), (2, 0)):
                     wmat_tmp[ell1, ell2] = 0
@@ -1204,12 +1281,11 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
                             def f(kin):
                                 tophat_Q = BesselIntegral(kin, savg, ell=p, edges=True, method=tophat_method, mode='backward').w[..., 0] * Q
 
-                                def f2(args):
-                                    kout, nout = args
-                                    return (-1)**(ell // 2) * jnp.sum(nout[..., None] * snmodes * spherical_jn[ell](kout * savg) * tophat_Q)
+                                def f2(kout):
+                                    return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Q)
 
-                                batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.shape[0]))
-                                power = jax.lax.map(f2, (kout, koutnmodes), batch_size=batch_size)
+                                batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
+                                power = jax.lax.map(f2, kout, batch_size=batch_size)
                                 if pbar:
                                     t.update(n=round(1 / len(ells) / 6))
                                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)

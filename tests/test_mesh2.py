@@ -10,7 +10,7 @@ from jax import numpy as jnp
 from jaxpower import (BinMesh2Spectrum, compute_mesh2_spectrum, Spectrum2Poles,
                       BinMesh2Correlation, compute_mesh2_correlation, Correlation2Poles,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
-                      BinnedStatistic, WindowMatrix, MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_spectrum_normalization, utils)
+                      BinnedStatistic, WindowMatrix, MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window, compute_fkp2_spectrum_normalization, compute_normalization, utils)
 
 
 dirname = Path('_tests')
@@ -605,9 +605,9 @@ def test_smooth_window():
 
     attrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
     ells = (0, 2, 4)
-    bin = BinMesh2Spectrum(attrs, edges={'step': 0.005}, ells=ells)
+    bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=ells)
     #edgesin = np.arange(0., 1.1 * attrs.knyq.max(), 0.002)
-    edgesin = np.arange(0., attrs.knyq.max(), 0.002)
+    edgesin = np.arange(0., attrs.knyq.max(), 0.005)
     kin = (edgesin[:-1] + edgesin[1:]) / 2.
     ellsin = (0, 2, 4)
     f, b = 0.8, 1.5
@@ -646,22 +646,49 @@ def test_smooth_window():
         plt.show()
 
     selection = gaussian_survey(attrs, paint=True)
-    norm = compute_fkp2_spectrum_normalization(selection, selection)
+    norm = compute_normalization(selection, selection)
+    #selection = selection.clone(value=selection.value.at[...].set(1.))
+    #sbin = BinMesh2Correlation(selection, edges={'step': selection.attrs.cellsize.min()}, ells=(0,))
+    sbin = BinMesh2Correlation(selection, edges={}, ells=(0, 2, 4))
 
-    for thlos in ['firstpoint', 'local'][:1]:
-        mean = compute_mesh2_spectrum_mean(selection, theory=(edgesin, list(poles), thlos),
-                                           bin=bin, los='firstpoint').clone(norm=norm)
-        wmatrix = compute_mesh2_spectrum_window(selection, edgesin=edgesin, ellsin=(ellsin, thlos),
-                                            bin=bin, los='firstpoint', norm=norm, flags=('smooth',), pbar=True)
+    from jaxpower.utils import plotter
+
+    @plotter
+    def plot(self, fig=None):
+        from matplotlib import pyplot as plt
+        if fig is None:
+            fig, ax = plt.subplots()
+        else:
+            ax = fig.axes[0]
+        for ill, ell in enumerate(self.ells):
+            ax.plot(self._x[ill], self.value[ill].real, label=self._get_label_proj(ell))
+        ax.legend()
+        ax.grid(True)
+        ax.set_xlabel(self._label_x)
+        #ax.set_xscale('log')
+        return fig
+
+    for (los, thlos) in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')][1:2]:
+        mean = compute_mesh2_spectrum_mean(selection, theory=(edgesin, list(poles)) if thlos is None else (edgesin, list(poles), thlos),
+                                           bin=bin, los=los).clone(norm=norm)
+        wmatrix = compute_mesh2_spectrum_window(selection, edgesin=edgesin, ellsin=ellsin if thlos is None else (ellsin, thlos),
+                                                bin=bin, los=los, norm=norm, flags=['smooth'])
+        xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=norm, num_zero=None)
+        #plot(xi, show=True)
+        xi = xi.clone(norm=norm)
+
+        wmatrix2 = compute_smooth2_spectrum_window(xi, edgesin=edgesin, ellsin=ellsin, bin=bin)
+        #wmatrix2.plot(show=True)
         wpoles = wmatrix.dot(poles, return_type=None)
+        wpoles2 = wmatrix2.dot(poles, return_type=None)
         ax = plt.gca()
-        for iproj, proj in enumerate(mean.projs):
+        for iproj, proj in enumerate(wpoles2.projs):
             ax.plot(kin, kin * poles[iproj], color='k')
-            k = mean.x(projs=proj)
+            k = wpoles2.x(projs=proj)
             ax.plot(k, k * mean.view(projs=proj), color='C0')
             ax.plot(k, k * wpoles.view(projs=proj), color='C1')
+            ax.plot(k, k * wpoles2.view(projs=proj), color='C2')
         plt.show()
-
 
 
 def test_wmatrix(plot=False):
@@ -791,6 +818,9 @@ def test_split():
 
 if __name__ == '__main__':
 
+    from jax import config
+    config.update('jax_enable_x64', True)
+
     #import warnings
     #warnings.simplefilter("error")
     #test_window_timing()
@@ -798,7 +828,8 @@ if __name__ == '__main__':
     #test_window()
     #test_wmatrix()
     #test_gaunt()
-    #test_smooth_window()
+    test_smooth_window()
+    exit()
     #test_checkpoint()
     #test_gaunt()
     test_window_box(plot=False)

@@ -141,7 +141,7 @@ def survey_selection(size=int(1e7), seed=random.key(42), scale=0.25, paint=True)
     bscale = scale  # cut at 1 sigmas
     mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
     positions = positions * attrs.boxsize + attrs.boxcenter
-    toret = ParticleField(positions, weights=1. * mask, boxcenter=attrs.boxcenter, boxsize=attrs.boxsize, meshsize=attrs.meshsize)
+    toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
     if paint: toret = toret.paint(resampler='ngp', interlacing=1, compensate=False)
     return toret
 
@@ -494,16 +494,12 @@ if __name__ == '__main__':
     #from jax import config
     #config.update('jax_enable_x64', True)
     #test_fftlog2()
-
-    export_sympy()
-    #from jax import config
-    #config.update('jax_enable_x64', True)
-
+    #export_sympy()
     #test_covmatrix(plot=True)
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
-    #test_cutsky2_covariance(plot=True)
+    test_cutsky2_covariance(plot=True)
     #test_cutsky2_covariance_fftlog(plot=True)
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)

@@ -6,17 +6,16 @@ from jax import numpy as jnp
 
 from .mesh import MeshAttrs, RealMeshField
 from .mesh2 import BinMesh2Spectrum, BinMesh2Correlation, compute_mesh2, FKPField
-from .utils import CovarianceMatrix, legendre_product, BinnedStatistic
-from .utils import get_spherical_jn
+from .utils import CovarianceMatrix, BinnedStatistic, legendre_product, get_spherical_jn
 
 
 class Correlation2Spectrum(object):
 
     def __init__(self, k, ells):
-        from .fftlog import PowerToCorrelation
-        fftlog = PowerToCorrelation(k, ell=ells[0], lowring=False, minfolds=False)
+        from .fftlog import SpectrumToCorrelation
+        fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False)
         self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-        self._fftlog = PowerToCorrelation(k, ell=ells[1], lowring=False, minfolds=False)
+        self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False)
         dlnk = jnp.diff(jnp.log(k)).mean()
         self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
         self.k = k
@@ -233,7 +232,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                     kmask = np.abs(k2 - k1) <= delta
                     k1, k2 = k1[kmask], k2[kmask]
 
-                vol = ww.weights()[0] * np.prod(ww.attrs['mattrs']['boxsize'] / ww.attrs['mattrs']['meshsize'])
+                vol = ww.volume()[0]
                 #vol = 4. / 3. * np.pi * np.diff(ww.edges(projs=q1)**3, axis=-1)[..., 0]
                 w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
                 w *= vol

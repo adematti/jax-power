@@ -229,14 +229,14 @@ def test_particle2(plot=False):
     data = generate_uniform_particles(attrs, size + 1, seed=42)
     ells = (0, 2, 4)
     kw = dict(ells=ells, selection={'theta': (0., 0.05)})
-    bin = BinParticle2Correlation(attrs, edges={'step': 0.2}, **kw)
+    bin = BinParticle2Correlation(attrs, edges={'step': 0.1, 'max': 100.}, **kw)
     #with jax.disable_jit():
     t0 = time.time()
     pcount = compute_particle2(data, bin=bin)
     pcount = jax.block_until_ready(pcount)
     print(time.time() - t0)
     assert isinstance(pcount, Correlation2Poles)
-    #pcount.to_spectrum(jnp.linspace(0.01, 0.1, 20))
+    pcount.to_spectrum(jnp.linspace(0.01, 0.1, 20))
     bin = BinParticle2Spectrum(attrs, edges={'step': 0.01, 'max': 0.2}, **kw)
     power = compute_particle2(data, bin=bin)
     assert isinstance(power, Spectrum2Poles)
@@ -247,7 +247,7 @@ def test_particle2(plot=False):
         ax = plt.gca()
         for ill, ell in enumerate(power.ells):
             color = f'C{ill}'
-            k = power.x(projs=ell)
+            k = power.x(ell)
             ax.plot(k, k * power.view(projs=ell).real, color=color, linestyle='--')
             ax.plot(k, k * power2.view(projs=ell).real, color=color, linestyle='-', label=rf'$\ell = {ell:d}$')
         ax.plot([], [], color='k', linestyle='--', label='real')
@@ -255,6 +255,9 @@ def test_particle2(plot=False):
         plt.show()
 
 
+
 if __name__ == '__main__':
 
+    from jax import config
+    config.update('jax_enable_x64', True)
     test_particle2(plot=True)
