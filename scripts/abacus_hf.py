@@ -90,14 +90,14 @@ def get_randoms_fn(iran=0):
     return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_{iran:d}.fits'
 
 
-def get_measurement_fn(zsnap=0.950, imock=0, kind='mesh2spectrum'):
+def get_measurement_fn(zsnap=0.950, imock=0, region='NGC', kind='mesh2spectrum'):
     sznap = f'{zsnap:.3f}'.replace('.', 'p')
     szrange = '0p8to1p6'
-    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph{imock:03d}/CutSky/ELG_v5/{kind}_abacusHF_DR2_ELG_LOP_z{sznap}_zcut_{szrange}.npy'
+    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph{imock:03d}/CutSky/ELG_v5/{kind}_abacusHF_DR2_ELG_LOP_z{sznap}_zcut_{szrange}_{region}.npy'
 
 
 def compute_jaxpower(output_fn, data_fn, all_randoms_fn, tracer='ELG_LOP', region='NGC', zrange=(0.8, 1.1), ells=(0, 2, 4), los='firstpoint', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, BinMesh2Spectrum, get_mesh_attrs)
+    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, BinMesh2Spectrum, get_mesh_attrs, compute_mesh2_spectrum)
     t0 = time.time()
     data = get_clustering_positions_weights(data_fn, zrange=zrange, tracer=tracer, region=region)
     randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange, tracer=tracer, region=region)
@@ -109,6 +109,7 @@ def compute_jaxpower(output_fn, data_fn, all_randoms_fn, tracer='ELG_LOP', regio
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     del fkp
     bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=ells)
+    jitted_compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'], donate_argnums=[0])
     power = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
     power.attrs.update(mesh=dict(mesh.attrs), zrange=zrange)
     jax.block_until_ready(power)
@@ -161,8 +162,8 @@ if __name__ == '__main__':
     setup_logging()
     t0 = time.time()
     #todo = 'jaxpower'
-    #todo = 'thetacut'
-    todo = 'pypower'
+    todo = 'thetacut'
+    #todo = 'pypower'
 
     ells = (0, 2, 4)
     los = 'firstpoint'
@@ -174,31 +175,27 @@ if __name__ == '__main__':
         import jax
         from jax import config
         config.update('jax_enable_x64', True)
-        from jax import numpy as jnp
         jax.distributed.initialize()
-        from jaxpower import compute_mesh2_spectrum, create_sharding_mesh
-        jitted_compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'], donate_argnums=[0])
+    from jaxpower.mesh import create_sharding_mesh
 
     for imock in range(1):
         data_fn = get_data_fn(imock=imock)
         all_randoms_fn = [get_randoms_fn(iran=iran) for iran in range(4)]
 
         if todo == 'jaxpower':
-            output_fn = get_measurement_fn(imock=imock, kind='mesh2spectrum')
-            if jax.process_count() > 1:
-                with create_sharding_mesh() as sharding_mesh:
-                    compute_jaxpower(output_fn, data_fn, all_randoms_fn, **cutsky_args)
-            else:
-                compute_jaxpower(fn, data_fn, all_randoms_fn, **cutsky_args)
-
+            output_fn = get_measurement_fn(imock=imock, region=region, kind='mesh2spectrum')
+            with create_sharding_mesh() as sharding_mesh:
+                compute_jaxpower(output_fn, data_fn, all_randoms_fn, **cutsky_args)
+    
         if todo == 'thetacut':
-            power_fn = get_measurement_fn(imock=imock, kind='mesh2spectrum')
-            output_power_fn = get_measurement_fn(imock=imock, kind='mesh2spectrum_thetacut')
-            output_fn = get_measurement_fn(imock=imock, kind='thetacut')
-            compute_thetacut(output_fn, data_fn, all_randoms_fn, power_fn=power_fn, output_power_fn=output_power_fn, **cutsky_args)
+            power_fn = get_measurement_fn(imock=imock, region=region, kind='mesh2spectrum')
+            output_power_fn = get_measurement_fn(imock=imock, region=region, kind='mesh2spectrum_thetacut')
+            output_fn = get_measurement_fn(imock=imock, region=region, kind='thetacut')
+            with create_sharding_mesh() as sharding_mesh:
+                compute_thetacut(output_fn, data_fn, all_randoms_fn, power_fn=power_fn, output_power_fn=output_power_fn, **cutsky_args)
 
         if todo == 'pypower':
-            output_fn = get_measurement_fn(imock=imock, kind='pypower')
+            output_fn = get_measurement_fn(imock=imock, region=region, kind='pypower')
             compute_pypower(output_fn, data_fn, all_randoms_fn, **cutsky_args)
 
     if todo in ['jaxpower']: jax.distributed.shutdown()
