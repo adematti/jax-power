@@ -213,4 +213,4 @@ if __name__ == '__main__':
 
     print('Elapsed time: {:.2f}'.format(time.time() - t0))
 
-    if todo == 'jaxpower': jax.distributed.shutdown()
+    if todo in ['jaxpower']: jax.distributed.shutdown()
