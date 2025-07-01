@@ -675,7 +675,6 @@ def test_smooth_window():
                                                 bin=bin, los=los, norm=norm, flags=['smooth'])
         xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=norm, num_zero=None)
         #plot(xi, show=True)
-        xi = xi.clone(norm=norm)
 
         wmatrix2 = compute_smooth2_spectrum_window(xi, edgesin=edgesin, ellsin=ellsin, bin=bin)
         #wmatrix2.plot(show=True)

@@ -49,7 +49,7 @@ class BinMesh3Spectrum(object):
         if isinstance(edges, dict):
             step = edges.get('step', None)
             if step is None:
-                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
+                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
             else:
                 edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
 

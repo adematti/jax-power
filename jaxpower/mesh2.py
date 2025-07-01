@@ -272,7 +272,7 @@ class BinMesh2Spectrum(object):
         if isinstance(edges, dict):
             step = edges.get('step', None)
             if step is None:
-                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
+                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
             else:
                 edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
         if edges.ndim == 2:  # coming from BinnedStatistic
@@ -321,7 +321,7 @@ class BinMesh2Correlation(object):
         if isinstance(edges, dict):
             step = edges.get('step', None)
             if step is None:
-                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))[0]
+                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
             else:
                 edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
         if edges.ndim == 2:  # coming from BinnedStatistic
@@ -837,15 +837,16 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
             snmodes = window.volume()[0]
             savg = jnp.where(snmodes == 0, 0., window.x()[0])
             #integ = BesselIntegral(window.edges(projs=0), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
-            integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
 
             def f(kin):
                 tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
-                #def f2(kout):
+                def f2(kout):
+                    integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
+                    return integ(snmodes * tophat_Qs)
                 #    return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
-                #batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
-                #power = (2 * ell + 1) * jax.lax.map(f2, kout, batch_size=batch_size)
-                power = (2 * ell + 1) * integ(snmodes * tophat_Qs)
+                batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
+                power = (2 * ell + 1) * jax.lax.map(f2, kout, batch_size=batch_size)
+                #power = (2 * ell + 1) * integ(snmodes * tophat_Qs)
                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
                 return power.ravel()
 

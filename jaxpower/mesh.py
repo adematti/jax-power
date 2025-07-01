@@ -1858,15 +1858,26 @@ def paint(mesh: ParticleField, *args, **kwargs) -> RealMeshField | ComplexMeshFi
     return mesh.paint(*args, **kwargs)
 
 
-
-def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf):
+@default_sharding_mesh
+def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf, sharding_mesh=None):
     x2 = sum(xx**2 for xx in xvec).ravel()
-    x2 = x2[(x2 >= xmin**2) & (x2 <= xmax**2)]
-    _, index, counts = jnp.unique(np.int64(x2 / (0.5 * x0)**2 + 0.5), return_index=True, return_counts=True)
-    x = jnp.sqrt(x2[index])
+
+    def get_x(x2):
+        x2 = x2[(x2 >= xmin**2) & (x2 <= xmax**2)]
+        _, index, counts = jnp.unique(np.int64(x2 / (0.5 * x0)**2 + 0.5), return_index=True, return_counts=True)
+        return jnp.sqrt(x2[index])
+
+    if sharding_mesh.axis_names:
+        x2 = np.concatenate([_.data for _ in x2.addressable_shards], axis=0)
+        x = get_x(x2)
+        x = make_array_from_process_local_data(x, pad=-1, sharding_mesh=sharding_mesh)
+        x = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding_mesh, spec=P(None)))(x)
+        x = x[x > -1]
+    else:
+        x = get_x(x2)
     tmp = (x[:-1] + x[1:]) / 2.
     edges = jnp.insert(tmp, jnp.array([0, len(tmp)]), jnp.array([tmp[0] - (x[1] - x[0]), tmp[-1] + (x[-1] - x[-2])]))
-    return edges, x, counts
+    return edges
 
 
 @default_sharding_mesh

@@ -120,23 +120,6 @@ def compute_thetacut(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
     cut.save(fn)
 
 
-def compute_jaxpower_window(fn, power_fn, data_fn, all_randoms_fn):
-    from jaxpower import (ParticleField, FKPField, compute_mesh2_spectrum_window, create_sharding_mesh, make_particles_from_local, BinMesh2Spectrum, BinnedStatistic, MeshAttrs)
-    power = BinnedStatistic.load(power_fn)
-    zrange = power.attrs['zrange']
-    attrs = MeshAttrs(**power.attrs['mesh'])
-    data = get_clustering_positions_weights(data_fn, zrange=zrange)
-    randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
-    data = ParticleField(*make_particles_from_local(*data), **attrs)
-    randoms = ParticleField(*make_particles_from_local(*randoms), **attrs)
-    mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
-    bin = BinMesh2Spectrum(mesh.attrs, edges=power.edges(projs=0), ells=power.projs)
-    ells = power.projs()
-    edgesin = np.linspace(bin.edges.min(), bin.edges.max(), 2 * (len(bin.edges) - 1))
-    wmatrix = compute_mesh2_spectrum_window(mesh, edgesin=edgesin, ellsin=(ells, 'local'), bin=bin, pbar=True)
-    wmatrix.save(fn)
-
-
 def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     from pypower import CatalogFFTPower
     t0 = time.time()
