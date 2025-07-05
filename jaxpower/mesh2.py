@@ -200,7 +200,9 @@ class Correlation2Poles(BinnedStatistic):
             integ = BesselIntegral(self.x(projs=ell), kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
             #num.append(integ(self._value[ill]))
             # self.weights = volume factor
-            num.append(integ(self.volume(projs=ell) * self.view(projs=ell)))
+            volume = self.volume(projs=ell)
+            xi = jnp.where(volume == 0., 0., self.view(projs=ell))
+            num.append(integ(volume * xi))
         num = tuple(num)
         if isinstance(k, BinnedStatistic):
             return k.clone(num=num)
@@ -498,7 +500,7 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
         if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Spectrum2Poles` instance
         return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
-                                       num_zero=num_zero, attrs=attrs)
+                              num_zero=num_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
 
@@ -836,6 +838,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
             Qs = sum(legendre_product(ell, ell1, q) * window.view(projs=q).real if q in window.projs else jnp.zeros(()) for q in list(range(abs(ell - ell1), ell + ell1 + 1)))
             snmodes = window.volume()[0]
             savg = jnp.where(snmodes == 0, 0., window.x()[0])
+            Qs = jnp.where(snmodes == 0, 0., Qs)
             #integ = BesselIntegral(window.edges(projs=0), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
 
             def f(kin):
@@ -1044,7 +1047,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
                 wmat.append(my_map(f, kin))
 
-        else:
+        else:   
 
             for ellin in ellsin:
                 legin = get_legendre(ellin)(mu)
@@ -1392,7 +1395,8 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
         else:
             raise NotImplementedError(f'theory los {theory_los} not implemented')
 
-    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells), projs=ells)
+    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells),
+                                 weights=[bin.nmodes] * len(ells), projs=ells)
     xin = np.mean(kin, axis=-1)
     theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[kin] * len(ellsin), projs=ellsin)
     wmat = WindowMatrix(observable, theory, wmat, attrs={'norm': norm})

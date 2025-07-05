@@ -439,8 +439,8 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         nprojs = len(state['_projs'])
         if x is None:
             if edges is not None:
-                edges = [jnp.atleast_1d(xx) for xx in edges]
-                state['_x'] = [(edges[:-1] + edges[1:]) / 2. for edges in edges]
+                edges = [jnp.atleast_2d(xx) for xx in edges]
+                state['_x'] = [jnp.mean(edges, axis=-1) for edges in edges]
             else:
                 state['_x'] = [jnp.full(1, np.nan) for xx in range(nprojs)]
         else:
@@ -1869,10 +1869,11 @@ class CovarianceMatrix(object):
         return fig
 
     @plotter
-    def plot_slice(self, index, axis='o', color='C0', label=None, xscale='linear', yscale='log', fig=None):
+    def plot_slice(self, indices, axis='o', color='C0', label=None, xscale='linear', yscale='log', fig=None):
         from matplotlib import pyplot as plt
-        index = np.atleast_1d(index)
-        alphas = np.linspace(1, 0.2, len(index))
+        if np.ndim(indices) == 0: indices = [indices]
+        indices = np.array(indices)
+        alphas = np.linspace(1, 0.2, len(indices))
         fshape = len(self.observable.projs), len(self.theory.projs)
         if fig is None:
             fig, lax = plt.subplots(*fshape, sharey=True, figsize=(8, 6), squeeze=False)
@@ -1884,7 +1885,7 @@ class CovarianceMatrix(object):
         for it, pt in enumerate(self.theory.projs):
             for io, po in enumerate(self.observable.projs):
                 ax = lax[io][it]
-                for ix, idx in enumerate(index):
+                for ix, idx in enumerate(indices):
                     ii = [io, it][axis]
                     plotted_ii = [io, it][axis - 1]
                     if np.issubdtype(idx.dtype, np.floating):

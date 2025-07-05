@@ -80,9 +80,40 @@ def get_clustering_positions_weights(*fns, **kwargs):
     return positions, weights
 
 
+def get_box_clustering_positions(fn, los='x', **kwargs):
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
+
+    catalog = None
+    mpiroot = 0
+    boxsize, scalev = None, None
+
+    if mpicomm.rank == mpiroot:  # Faster to read catalogs from one rank
+        catalog = Catalog.read(fn, mpicomm=MPI.COMM_SELF)
+        catalog.get(catalog.columns())  # Faster to read all columns at once
+        boxsize = catalog.header['BOXSIZE']
+        scalev = catalog.header['VELZ2KMS']
+    boxsize, scalev = mpicomm.bcast((boxsize, scalev), root=mpiroot)
+
+    if mpicomm.size > 1:
+        catalog = Catalog.scatter(catalog, mpicomm=mpicomm, mpiroot=mpiroot)
+    
+    positions = np.column_stack([catalog['X'], catalog['Y'], catalog['Z']])
+    velocities = np.column_stack([catalog['VX'], catalog['VY'], catalog['VZ']]) / scalev
+    vlos = los
+    if isinstance(los, str):
+        vlos = [0.] * 3
+        vlos['xyz'.index(los)] = 1.
+    vlos = np.array(vlos)
+    positions = positions + np.sum(velocities * vlos, axis=-1)[..., None] * vlos[None, :]
+    return (positions + boxsize / 2.) % boxsize - boxsize / 2.
+
+
 def get_data_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, **kwargs):
     sznap = f'{zsnap:.3f}'.replace('.', 'p')
     dirname = tracer
+    if tracer == 'QSO':
+        szrange = '0p8to3p5'
     if tracer == 'ELG_LOP':
         szrange = '0p8to1p6'
         dirname = 'ELG_v5'
@@ -92,18 +123,15 @@ def get_data_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, **kwargs):
 
 
 def get_randoms_fn(iran=0, **kwargs):
-    return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_{iran:d}.fits'
+    return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_{iran:d}_v2.fits'
 
 
-def get_measurement_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, region='NGC', kind='mesh2spectrum', **kwargs):
+def get_measurement_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), **kwargs):
     sznap = f'{zsnap:.3f}'.replace('.', 'p')
     dirname = tracer
     if tracer == 'ELG_LOP':
-        szrange = '0p8to1p6'
         dirname = 'ELG_v5'
-    if tracer == 'LRG':
-        szrange = '0p4to1p1'
-    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph{imock:03d}/CutSky/{dirname}/{kind}_abacusHF_DR2_{tracer}_z{sznap}_zcut_{szrange}_{region}.npy'
+    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph{imock:03d}/CutSky/{dirname}/{kind}_abacusHF_DR2_{tracer}_z{sznap}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
 
 
 def compute_spectrum(output_fn, get_data, get_randoms, ells=(0, 2, 4), los='firstpoint', **attrs):
@@ -130,20 +158,25 @@ def compute_spectrum(output_fn, get_data, get_randoms, ells=(0, 2, 4), los='firs
 
 
 def compute_spectrum_window(output_fn, get_randoms, spectrum_fn=None, kind='smooth'):
+    from jax import numpy as jnp
     from jaxpower import (ParticleField, compute_mesh2_spectrum_window, BinMesh2Spectrum, BinMesh2Correlation, compute_mesh2_correlation, compute_smooth2_spectrum_window, BinnedStatistic, MeshAttrs)
     spectrum = BinnedStatistic.load(spectrum_fn)
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
-    #attrs = attrs.clone(meshsize=attrs.meshsize // 4)
     randoms = ParticleField(*get_randoms(), attrs=attrs, exchange=True, backend='jax')
-    mesh = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    randoms = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms
+    num_shotnoise = jnp.sum(randoms.weights**2)
+    mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     del randoms
     ells, norm = spectrum.projs, spectrum.norm
-    bin = BinMesh2Spectrum(mesh.attrs, edges=spectrum.edges(projs=0), ells=ells)
-    edgesin = np.linspace(bin.edges.min(), bin.edges.max(), 2 * (len(bin.edges) - 1))
+    edges = spectrum.edges(projs=0)
+    bin = BinMesh2Spectrum(attrs, edges=edges, ells=ells)
+    edgesin = bin.edges
+    output_fn = str(output_fn)
 
     if kind == 'smooth':
-        sbin = BinMesh2Correlation(mesh, edges={}, ells=list(range(0, 9, 2)))
-        xi = compute_mesh2_correlation(mesh, bin=sbin, los=los).clone(norm=norm, num_zero=None)
+        sbin = BinMesh2Correlation(attrs, edges={}, ells=list(range(0, 9, 2)))
+        xi = compute_mesh2_correlation(mesh, bin=sbin, los=los).clone(norm=norm, num_zero=None, num_shotnoise=num_shotnoise / attrs.cellsize.prod())
+        xi.save(output_fn.replace('window_mesh2spectrum', 'window_xi_mesh2spectrum'))
         del mesh
         wmatrix = compute_smooth2_spectrum_window(xi, edgesin=edgesin, ellsin=ells, bin=bin)
     else:
@@ -171,21 +204,29 @@ def compute_thetacut(output_fn, get_data, get_randoms, spectrum_fn=None, output_
 
 
 def compute_thetacut_window(output_fn, get_randoms, spectrum_fn=None, window_fn=None, output_window_fn=None, **attrs):
-    from jaxpower import MeshAttrs, ParticleField, FKPField, BinParticle2Correlation, BinMesh2Spectrum, compute_particle2, Spectrum2Poles, WindowMatrix, compute_smooth2_spectrum_window
-    randoms = get_randoms()
+    from jax import numpy as jnp
+    from jaxpower import MeshAttrs, ParticleField, FKPField, BinParticle2Correlation, BinMesh2Spectrum, compute_particle2, Spectrum2Poles, WindowMatrix, compute_smooth2_spectrum_window, BinnedStatistic
     spectrum = Spectrum2Poles.load(spectrum_fn)
     ells, norm = spectrum.projs, spectrum.norm
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
+
+    wmatrix = WindowMatrix.load(window_fn)
+    edgesin = wmatrix.theory.edges(projs=0)
+    edgesin = jnp.arange(edgesin.min(), 4. * edgesin.max(), edgesin[0, 1] - edgesin[0, 0])
+    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+    theory = BinnedStatistic(value=[jnp.zeros_like(edgesin[:, 0])] * len(wmatrix.theory.projs),
+                             edges=[edgesin] * len(wmatrix.theory.projs), projs=wmatrix.theory.projs)
+    wmatrix = wmatrix.interp(theory, axis='t', extrap=True)
+    edgesin = wmatrix.theory.edges(projs=0)
+    ellsin = wmatrix.theory.projs
+
+    randoms = get_randoms()
     randoms = ParticleField(*randoms, attrs=attrs)
     particles = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms
     del randoms
 
     bin = BinParticle2Correlation(attrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=list(range(0, 9, 2)))
     cut = compute_particle2(particles, bin=bin, los=los).clone(norm=norm, num_zero=None)
-    wmatrix = WindowMatrix.load(window_fn)
-    norm = wmatrix.attrs['norm']
-    edgesin = wmatrix.theory.edges(projs=0)
-    ellsin = wmatrix.theory.projs
 
     bin = BinMesh2Spectrum(attrs, edges=spectrum.edges(projs=0), ells=ells)
     cut = compute_smooth2_spectrum_window(cut, edgesin=edgesin, ellsin=ellsin, bin=bin)
@@ -195,7 +236,7 @@ def compute_thetacut_window(output_fn, get_randoms, spectrum_fn=None, window_fn=
         wmatrix.save(output_window_fn)
 
 
-def compute_pypower(fn, get_data, get_randoms, **attrs):
+def compute_pypower(output_fn, get_data, get_randoms, **attrs):
     from pypower import CatalogFFTPower
     data_positions, data_weights = get_data()
     randoms_positions, randoms_weights = get_randoms()
@@ -206,8 +247,12 @@ def compute_pypower(fn, get_data, get_randoms, **attrs):
     direct_attrs = {'nthreads': mpicomm.size}
     direct_selection_attrs = direct_edges = direct_attrs = None
     power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, direct_selection_attrs=direct_selection_attrs, direct_edges=direct_edges, direct_attrs=direct_attrs)
-    power.save(fn)
-        
+    power.save(output_fn)
+
+
+def compute_pypower_window(fn, get_randoms, spectrum_fn=None, **attrs):
+    raise NotImplementedError
+
 
 def get_proposal_boxsize(tracer):
     if 'BGS' in tracer:
@@ -223,33 +268,85 @@ def get_proposal_boxsize(tracer):
     raise NotImplementedError(f'tracer {tracer} is unknown')
 
 
+
+def get_box_data_fn(tracer='ELG', zsnap=0.950, imock=0, **kwargs):
+    tracer = tracer[:3]
+    sznap = f'{zsnap:.3f}'.replace('.', 'p')
+    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph{imock:03d}/Boxes/{tracer}/abacus_HF_{tracer}_{sznap}_DR2_v1.0_AbacusSummit_base_c000_ph{imock:03d}_clustering.dat.fits'
+
+
+def get_box_measurement_fn(tracer='ELG', zsnap=0.950, imock=0, kind='mesh2spectrum', los='x', **kwargs):
+    tracer = tracer[:3]
+    sznap = f'{zsnap:.3f}'.replace('.', 'p')
+    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph{imock:03d}/Boxes/{tracer}/{kind}_abacusHF_DR2_v1.0_{tracer}_z{sznap}_los-{los}.npy'
+
+
+def compute_box_spectrum(output_fn, get_data, ells=(0, 2, 4), los='x', **attrs):
+    from jaxpower import (MeshAttrs, ParticleField, FKPField, BinMesh2Spectrum, get_mesh_attrs, compute_mesh2_spectrum)
+    t0 = time.time()
+    data = get_data()
+    attrs = MeshAttrs(**attrs)
+    data = ParticleField(data, attrs=attrs, exchange=True, backend='jax')
+    mesh = data.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    shotnoise = attrs.boxsize.prod() / data.sum()
+    mesh = mesh / mesh.mean()
+    bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=ells)
+    jitted_compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'], donate_argnums=[0])
+    spectrum = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los)
+    spectrum = spectrum.clone(num_shotnoise=shotnoise * spectrum.norm)
+    spectrum.attrs.update(mesh=dict(mesh.attrs), los=los)
+    jax.block_until_ready(spectrum)
+    t1 = time.time()
+    if jax.process_index() == 0:
+        print(f'Done in {t1 - t0:.2f}')
+    spectrum.save(output_fn)
+
+
+def compute_box_spectrum_window(output_fn, spectrum_fn=None):
+    from jaxpower import (ParticleField, compute_mesh2_spectrum_window, BinMesh2Spectrum, BinnedStatistic, MeshAttrs)
+    spectrum = BinnedStatistic.load(spectrum_fn)
+    attrs = MeshAttrs(**spectrum.attrs['mesh'])
+    ells = spectrum.projs
+    bin = BinMesh2Spectrum(attrs, edges=spectrum.edges(projs=0), ells=ells)
+    #edgesin = np.linspace(bin.edges.min(), bin.edges.max(), 2 * (len(bin.edges) - 1))
+    edgesin = bin.edges
+    wmatrix = compute_mesh2_spectrum_window(attrs, edgesin=edgesin, ellsin=ells, los=spectrum.attrs['los'], bin=bin)
+    wmatrix.save(output_fn)
+
+
 if __name__ == '__main__':
 
-    catalog_args = dict(tracer='ELG_LOP', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
+    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
+    #catalog_args = dict(tracer='QSO', region='NGC', zsnap=1.400, zrange=(0.8, 2.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4), los='firstpoint')
+    box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
-    t0 = time.time()
+
     todo = []
-    #todo = ['spectrum', 'window-spectrum']
+    #todo = ['spectrum-box']
+    #todo = ['window-spectrum-box']
+    #todo = ['spectrum', 'window-spectrum'][1:]
     todo = ['thetacut', 'window-thetacut'][1:]
     #todo = ['pypower']
 
+    nmocks = 25
     ells = (0, 2, 4)
     los = 'firstpoint'
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 
-    is_distributed = any(td in ['spectrum', 'window-spectrum'] for td in todo)
+    is_distributed = any(td in ['spectrum', 'window-spectrum', 'spectrum-box', 'window-spectrum-box'] for td in todo)
     if is_distributed:
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
         import jax
-        from jax import config
-        config.update('jax_enable_x64', True)
         jax.distributed.initialize()
+    from jax import config
+    config.update('jax_enable_x64', True)
+
     from jaxpower.mesh import create_sharding_mesh
 
-    for imock in range(1):
+    for imock in range(nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
         all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
@@ -271,20 +368,35 @@ if __name__ == '__main__':
             output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='pypower')
             compute_pypower(output_fn, data, randoms, **cutsky_args)
 
-    imock = 0  # any mock as input
-    if 'window-spectrum' in todo:
-        spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
-        output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
-        with create_sharding_mesh() as sharding_mesh:
-            compute_spectrum_window(output_fn, get_randoms, spectrum_fn=spectrum_fn)
+        if imock == 0:  # any mock as input
+            if 'window-spectrum' in todo:
+                spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
+                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
+                with create_sharding_mesh() as sharding_mesh:
+                    compute_spectrum_window(output_fn, get_randoms, spectrum_fn=spectrum_fn)
+        
+            if 'window-thetacut' in todo:
+                spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
+                window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
+                output_window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_thetacut')
+                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_thetacut')
+                with create_sharding_mesh() as sharding_mesh:
+                    compute_thetacut_window(output_fn, get_randoms, spectrum_fn=spectrum_fn, window_fn=window_fn, output_window_fn=output_window_fn)
 
-    if 'window-thetacut' in todo:
-        spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
-        window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
-        output_window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_thetacut')
-        output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_thetacut')
-        with create_sharding_mesh() as sharding_mesh:
-            compute_thetacut_window(output_fn, get_randoms, spectrum_fn=spectrum_fn, window_fn=window_fn, output_window_fn=output_window_fn)
+    for imock in range(nmocks):
+        data_fn = get_box_data_fn(imock=imock, **catalog_args)
+        get_data = lambda: get_box_clustering_positions(data_fn, **catalog_args, **box_args)
+        output_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh2spectrum')
+        if 'spectrum-box' in todo:
+            with create_sharding_mesh() as sharding_mesh:
+                compute_box_spectrum(output_fn, get_data, **box_args)
+
+        if imock == 0:
+            if 'window-spectrum-box' in todo:
+                spectrum_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh2spectrum')
+                output_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='window_mesh2spectrum')
+                with create_sharding_mesh() as sharding_mesh:
+                    compute_box_spectrum_window(output_fn, spectrum_fn=spectrum_fn)
     
     if is_distributed:
         jax.distributed.shutdown()
