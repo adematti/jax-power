@@ -163,7 +163,7 @@ class BinMesh3Spectrum(object):
 class Spectrum3Poles(BinnedStatistic):
 
     _data_fields = BinnedStatistic._data_fields + ['_norm', '_num_shotnoise', '_num_zero']
-    _select_x_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise']
+    _select_x_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero']
     _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero']
     _sum_fields = BinnedStatistic._sum_fields + ['_norm', '_num_shotnoise', '_num_zero']
     _meta_fields = BinnedStatistic._meta_fields + ['basis']
@@ -180,29 +180,25 @@ class Spectrum3Poles(BinnedStatistic):
                 item = (item,) * len(ells)
             return tuple(item)
 
-        if num_shotnoise is None:
-            num_shotnoise = tuple(jnp.zeros_like(num) for num in num)
-        if num_zero is None: num_zero = _tuple(0.)
-        num_zero = tuple(jnp.asarray(p) for p in num_zero)
-
         kw = dict()
         if 'scoccimarro' in basis:
             kw.update(_label_x=r'$k_1, k_2, k_3$ [$h/\mathrm{Mpc}$]', _label_proj=r'$\ell_3$', _label_value=r'$B_{\ell_3}(k_3)$ [$(\mathrm{Mpc}/h)^{6}$]')
         else:
             kw.update(_label_x=r'$k_1, k_2$ [$h/\mathrm{Mpc}$]', _label_proj=r'$\ell_1, \ell_2, \ell_3$', _label_value=r'$B_{\ell_1, \ell_2, \ell_3}(k_1, k_2)$ [$(\mathrm{Mpc}/h)^{6}$]')
 
-        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=num_shotnoise, _num_zero=num_zero, basis=basis, **kw)
         super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num, weights=_tuple(nmodes), name=name, attrs=attrs)
+        if num_shotnoise is None: num_shotnoise = tuple(jnp.zeros_like(num) for num in num)
+        if num_zero is None: num_zero = _tuple(0.)
+        num_zero = list(num_zero)
+        for ill, value in enumerate(num_zero):
+            if jnp.size(value) <= 1: num_zero[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
+        num_zero = tuple(num_zero)
+        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=num_shotnoise, _num_zero=num_zero, basis=basis, **kw)
 
     @property
     def norm(self):
         """Power spectrum normalization."""
         return self._norm
-
-    @property
-    def shotnoise(self):
-        """Shot noise."""
-        return self._num_shotnoise / self._norm
 
     @property
     def num(self):
@@ -217,16 +213,21 @@ class Spectrum3Poles(BinnedStatistic):
     def ells(self):
         return self._projs
 
+    def shotnoise(self, projs=Ellipsis):
+        """Shot noise."""
+        iprojs = self._index_projs(projs)
+        isscalar = not isinstance(iprojs, list)
+        num_shotnoise = [s / self._norm for s in self._num_shotnoise]
+        if isscalar: return num_shotnoise[iprojs]
+        return [num_shotnoise[iproj] for iproj in iprojs]
+    
     @property
     def value(self):
         """Power spectrum estimate."""
         toret = list(self.num)
         for ill, ells in enumerate(self._projs):
-            toret[ill] = toret[ill] - self._num_shotnoise[ill]
-            mask_zero = jnp.all((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), axis=1)
-            tmp = toret[ill] - self._num_zero[ill] / self._weights[ill]
-            toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
-        return tuple(tmp / self._norm for tmp in toret)
+            toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]) / self.norm
+        return tuple(toret)
 
     @plotter
     def plot(self, fig=None):

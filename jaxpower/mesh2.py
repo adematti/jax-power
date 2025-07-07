@@ -21,7 +21,8 @@ class Spectrum2Poles(BinnedStatistic):
     _label_proj = r'$\ell$'
     _label_value = r'$P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{3}$]'
     _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero', '_volume']
+    _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero', '_volume']
+    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero', '_volume']
     _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
     _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
@@ -35,20 +36,22 @@ class Spectrum2Poles(BinnedStatistic):
             if not isinstance(item, (tuple, list)):
                 item = (item,) * len(ells)
             return tuple(item)
-
-        if num_zero is None: num_zero = _tuple(0.)
-        num_zero = tuple(jnp.asarray(p) for p in num_zero)
-        self.__dict__.update(_num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=num_zero)
         super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num,
                          weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
         if volume is None: volume = tuple(nmodes.copy() for nmodes in self.nmodes())
         else: volume = _tuple(volume)
-        self.__dict__.update(_volume=volume)
-
-    @property
-    def shotnoise(self):
-        """Shot noise."""
-        return self._num_shotnoise / self._norm
+        if num_zero is None: num_zero = _tuple(0.)
+        num_zero = list(num_zero)
+        for ill, value in enumerate(num_zero):
+            if jnp.size(value) <= 1: num_zero[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
+        num_zero = tuple(num_zero)
+        if not isinstance(num_shotnoise, (tuple, list)):
+             num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
+        num_shotnoise = list(num_shotnoise)
+        for ill, value in enumerate(num_shotnoise):
+            if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.zeros_like(self._value[ill]).at[...].set(value)
+        num_shotnoise = tuple(num_shotnoise)
+        self.__dict__.update(_volume=volume, _num_shotnoise=num_shotnoise, _num_zero=num_zero)
 
     @property
     def num(self):
@@ -58,6 +61,14 @@ class Spectrum2Poles(BinnedStatistic):
     k = BinnedStatistic.x
     kavg = BinnedStatistic.xavg
     nmodes = BinnedStatistic.weights
+
+    def shotnoise(self, projs=Ellipsis):
+        """Shot noise."""
+        iprojs = self._index_projs(projs)
+        isscalar = not isinstance(iprojs, list)
+        num_shotnoise = [s / self._norm for s in self._num_shotnoise]
+        if isscalar: return num_shotnoise[iprojs]
+        return [num_shotnoise[iproj] for iproj in iprojs]
 
     def volume(self, projs=Ellipsis):
         """Volume (optionally restricted to input projs)."""
@@ -74,12 +85,9 @@ class Spectrum2Poles(BinnedStatistic):
     def value(self):
         """Power spectrum estimate."""
         toret = list(self.num)
-        for ill, ell in enumerate(self._projs):
-            toret[ill] = toret[ill] - self._num_shotnoise * (ell == 0)
-            mask_zero = (self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.)
-            tmp = toret[ill] - self._num_zero[ill] / self._weights[ill]
-            toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
-        return tuple(tmp.real / self._norm for tmp in toret)
+        for ill, ell in enumerate(self.ells):
+            toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]).real / self._norm
+        return tuple(toret)
 
     @plotter
     def plot(self, fig=None):
@@ -126,7 +134,8 @@ class Correlation2Poles(BinnedStatistic):
     _label_proj = r'$\ell$'
     _label_value = r'$\xi_{\ell}(s)$'
     _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_zero', '_volume']
+    _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero', '_volume']
+    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero', '_volume']
     _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
     _init_fields = {'s': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'volume': '_volume', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
@@ -141,20 +150,22 @@ class Correlation2Poles(BinnedStatistic):
                 item = (item,) * len(ells)
             return tuple(item)
 
-        if num_zero is None: num_zero = _tuple(0.)
-        num_zero = tuple(jnp.asarray(p) for p in num_zero)
-        self.__dict__.update(_num_shotnoise=jnp.asarray(num_shotnoise), _num_zero=num_zero)
         super().__init__(x=_tuple(s), edges=_tuple(edges), projs=ells, value=num,
                          weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
         if volume is None: volume = tuple(nmodes.copy() for nmodes in self.nmodes())
         else: volume = _tuple(volume)
-        self.__dict__.update(_volume=volume)
-
-    @property
-    def shotnoise(self):
-        """Shot noise."""
-        return self._num_shotnoise / self._norm
-
+        if num_zero is None: num_zero = _tuple(0.)
+        num_zero = list(num_zero)
+        for ill, value in enumerate(num_zero):
+            if jnp.size(value) <= 1: num_zero[ill] = jnp.zeros_like(self._value[ill]).at[...].set(value)
+        num_zero = tuple(num_zero)
+        if not isinstance(num_shotnoise, (tuple, list)):
+             num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
+        num_shotnoise = list(num_shotnoise)
+        for ill, value in enumerate(num_shotnoise):
+            if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
+        num_shotnoise = tuple(num_shotnoise)
+        self.__dict__.update(_volume=volume, _num_shotnoise=num_shotnoise, _num_zero=num_zero)
     @property
     def num(self):
         """Correlation function with shot noise *not* subtracted."""
@@ -164,6 +175,14 @@ class Correlation2Poles(BinnedStatistic):
     savg = BinnedStatistic.xavg
     nmodes = BinnedStatistic.weights
 
+    def shotnoise(self, projs=Ellipsis):
+        """Shot noise."""
+        iprojs = self._index_projs(projs)
+        isscalar = not isinstance(iprojs, list)
+        num_shotnoise = [s / self._norm for s in self._num_shotnoise]
+        if isscalar: return num_shotnoise[iprojs]
+        return [num_shotnoise[iproj] for iproj in iprojs]
+    
     def volume(self, projs=Ellipsis):
         """Volume (optionally restricted to input projs)."""
         iprojs = self._index_projs(projs)
@@ -180,11 +199,8 @@ class Correlation2Poles(BinnedStatistic):
         """Correlation function estimate."""
         toret = list(self.num)
         for ill, ell in enumerate(self.ells):
-            toret[ill] = toret[ill] - self._num_zero[ill]
-            mask_zero = (self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.)
-            tmp = toret[ill] - self._num_shotnoise * (ell == 0)
-            toret[ill] = jnp.where(mask_zero, tmp, toret[ill])
-        return tuple(tmp.real / self._norm for tmp in toret)
+            toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]).real / self._norm
+        return tuple(toret)
 
     def to_spectrum(self, k):
         from .utils import BesselIntegral
@@ -499,8 +515,8 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
         num, num_zero = map(jnp.array, (num, num_zero))
         if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Spectrum2Poles` instance
-        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
-                              num_zero=num_zero, attrs=attrs)
+        num_zero /= bin.nmodes[0]
+        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
 
@@ -528,6 +544,7 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
                 num_zero.append(0.)
 
         num, num_zero = map(jnp.array, (num, num_zero))
+        num_zero /= bin.nmodes[0]
         return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
@@ -627,6 +644,7 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
         num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
         if swap: num, num_zero = map(jnp.conj, (num, num_zero))
         # Format the num results into :class:`Correlation2Poles` instance
+        num_zero /= bin.nmodes[0]
         return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.cellsize.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
     else:  # fixed line-of-sight
@@ -656,6 +674,7 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
                 num_zero.append(0.)
 
         num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
+        num_zero /= bin.nmodes[0]
         return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.cellsize.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 

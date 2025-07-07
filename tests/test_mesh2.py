@@ -828,7 +828,6 @@ if __name__ == '__main__':
     #test_wmatrix()
     #test_gaunt()
     test_smooth_window()
-    exit()
     #test_checkpoint()
     #test_gaunt()
     test_window_box(plot=False)

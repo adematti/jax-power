@@ -184,7 +184,7 @@ class BinParticle2Spectrum(object):
                     particles = particles * 2
     
                 def get(array):
-                    return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
+                    return np.array(array.addressable_data(0))
     
                 cparticles = [cucount.Particles(get(p.positions), get(p.weights)) for p in particles]
                 battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
@@ -259,8 +259,8 @@ class BinParticle2Correlation(object):
                     particles = particles * 2
     
                 def get(array):
-                    return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
-    
+                    return np.array(array.addressable_data(0))
+
                 cparticles = [cucount.Particles(get(p.positions), get(p.weights)) for p in particles]
                 bins = np.append(self.edges[:, 0], self.edges[-1, 1])
                 battrs = cucount.BinAttrs(s=bins, pole=(self.ells[0], self.ells[-1], 2, los))
@@ -295,13 +295,18 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
     particles = list(particles)
     is_distributed = jax.distributed.is_initialized() and (jax.process_count() > 1)
     sharding_mesh = particles[0].attrs.sharding_mesh
-    if is_distributed:
-        if autocorr: particles = particles * 2
-        particle = particles[0]
+
+    def particles_with_sharding(particle):
         sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P())
         p = jax.lax.with_sharding_constraint(particle.positions, sharding)
         w = jax.lax.with_sharding_constraint(particle.weights, sharding)
-        particles[0] = ParticleField(p, w, attrs=particle.attrs)
+        return ParticleField(p, w, attrs=particle.attrs)
+
+    if is_distributed:
+        if autocorr: particles = particles * 2
+        particles[0] = particles_with_sharding(particles[0])
+    else:
+        particles = [particles_with_sharding(particle) for particle in particles]
 
     num = bin(*particles, los=los)
     if is_distributed:
@@ -310,6 +315,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
         num = num.sum(axis=0)
 
     num_zero = jnp.zeros_like(num[..., 0]).at[0].set(num_zero)
+    num_shotnoise = [(2 * ell + 1) * get_legendre(ell)(0.) * num_shotnoise for ell in ells]
 
     if isinstance(bin, BinParticle2Correlation):
         return Correlation2Poles(s=bin.xavg, num=num, ells=ells, edges=bin.edges,

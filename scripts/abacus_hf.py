@@ -187,13 +187,15 @@ def compute_spectrum_window(output_fn, get_randoms, spectrum_fn=None, kind='smoo
 
 def compute_thetacut(output_fn, get_data, get_randoms, spectrum_fn=None, output_spectrum_fn=None, **attrs):
     from jaxpower import MeshAttrs, ParticleField, FKPField, BinParticle2Correlation, compute_particle2, Spectrum2Poles
-    data, randoms = get_data(), get_randoms()
     spectrum = Spectrum2Poles.load(spectrum_fn)
     ells, los = spectrum.projs, spectrum.attrs['los']
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
+
+    data, randoms = get_data(), get_randoms()
     data = ParticleField(*data, attrs=attrs)
     randoms = ParticleField(*randoms, attrs=attrs)
     fkp = FKPField(data, randoms)
+
     bin = BinParticle2Correlation(attrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
     cut = compute_particle2(fkp.particles, bin=bin, los=los)
     cut.save(output_fn)
@@ -203,16 +205,17 @@ def compute_thetacut(output_fn, get_data, get_randoms, spectrum_fn=None, output_
         spectrum.save(output_spectrum_fn)
 
 
-def compute_thetacut_window(output_fn, get_randoms, spectrum_fn=None, window_fn=None, output_window_fn=None, **attrs):
+def compute_thetacut_window(output_fn, get_randoms, spectrum_fn=None, window_fn=None, **attrs):
     from jax import numpy as jnp
     from jaxpower import MeshAttrs, ParticleField, FKPField, BinParticle2Correlation, BinMesh2Spectrum, compute_particle2, Spectrum2Poles, WindowMatrix, compute_smooth2_spectrum_window, BinnedStatistic
     spectrum = Spectrum2Poles.load(spectrum_fn)
     ells, norm = spectrum.projs, spectrum.norm
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
+    output_fn = str(output_fn)
 
     wmatrix = WindowMatrix.load(window_fn)
     edgesin = wmatrix.theory.edges(projs=0)
-    edgesin = jnp.arange(edgesin.min(), 4. * edgesin.max(), edgesin[0, 1] - edgesin[0, 0])
+    edgesin = jnp.arange(edgesin.min(), 10. * edgesin.max(), edgesin[0, 1] - edgesin[0, 0])
     edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
     theory = BinnedStatistic(value=[jnp.zeros_like(edgesin[:, 0])] * len(wmatrix.theory.projs),
                              edges=[edgesin] * len(wmatrix.theory.projs), projs=wmatrix.theory.projs)
@@ -227,31 +230,82 @@ def compute_thetacut_window(output_fn, get_randoms, spectrum_fn=None, window_fn=
 
     bin = BinParticle2Correlation(attrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=list(range(0, 9, 2)))
     cut = compute_particle2(particles, bin=bin, los=los).clone(norm=norm, num_zero=None)
+    #cut.save(output_fn.replace('window_mesh2spectrum_thetacut', 'window_xi_thetacut'))
 
     bin = BinMesh2Spectrum(attrs, edges=spectrum.edges(projs=0), ells=ells)
     cut = compute_smooth2_spectrum_window(cut, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    #cut.save(output_fn.replace('window_mesh2spectrum_thetacut', 'window_thetacut'))
 
-    if output_window_fn is not None:
-        wmatrix = wmatrix.clone(value=wmatrix.view() - cut.view())
-        wmatrix.save(output_window_fn)
+    wmatrix = wmatrix.clone(value=wmatrix.view() - cut.view())
+    wmatrix.save(output_fn)
 
 
 def compute_pypower(output_fn, get_data, get_randoms, **attrs):
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
     from pypower import CatalogFFTPower
     data_positions, data_weights = get_data()
     randoms_positions, randoms_weights = get_randoms()
     direct_selection_attrs = {'theta': (0., 0.05)}
     direct_edges = {'min': 0., 'step': 0.1}
-    from mpi4py import MPI
-    mpicomm = MPI.COMM_WORLD
     direct_attrs = {'nthreads': mpicomm.size}
-    direct_selection_attrs = direct_edges = direct_attrs = None
-    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, direct_selection_attrs=direct_selection_attrs, direct_edges=direct_edges, direct_attrs=direct_attrs)
+    #direct_selection_attrs = direct_edges = direct_attrs = None
+    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, direct_selection_attrs=direct_selection_attrs, direct_edges=direct_edges, direct_attrs=direct_attrs, mpicomm=mpicomm, mpiroot=None)
     power.save(output_fn)
 
 
-def compute_pypower_window(fn, get_randoms, spectrum_fn=None, **attrs):
-    raise NotImplementedError
+def compute_pypower_window(output_fn, get_randoms, spectrum_fn=None, output_window_cut_fn=None, **attrs):
+    from mpi4py import MPI
+    mpicomm = MPI.COMM_WORLD
+    from pypower import CatalogFFTPower, CatalogSmoothWindow, PowerSpectrumMultipoles, PowerSpectrumOddWideAngleMatrix, PowerSpectrumSmoothWindowMatrix
+    output_window_fn = output_fn
+    randoms_positions, randoms_weights = get_randoms()
+    direct_selection_attrs = {'theta': (0., 0.05)}
+    direct_edges = {'min': 0., 'step': 0.1}
+    direct_attrs = {'nthreads': mpicomm.size}
+    power = PowerSpectrumMultipoles.load(spectrum_fn)
+    boxsize = power.attrs['boxsize']
+    edges = power.edges[0]
+    boxscales = [1., 5., 20.][:1]
+    windows = []
+    boxsizes = boxsize * np.array(boxscales)
+    edges = {'step': 2. * np.pi / np.max(boxsizes)}
+    for iboxsize, boxsize in enumerate(boxsizes):
+        windows.append(CatalogSmoothWindow(randoms_positions1=randoms_positions, randoms_weights1=randoms_weights,
+                                           power_ref=power, edges=edges, boxsize=boxsize, position_type='pos',
+                                           direct_attrs=direct_attrs,
+                                           direct_selection_attrs=direct_selection_attrs if iboxsize == 0 else None,
+                                           direct_edges=direct_edges if iboxsize == 0 else None,
+                                           mpicomm=mpicomm, mpiroot=None).poles)
+
+    if windows[0].mpicomm.rank == 0:
+        windows[0].log_info('Concatenating windows')
+        windows = windows[0].concatenate_x(*windows[::-1], frac_nyq=0.9)
+
+        for output_fn, nodirect in zip([output_window_cut_fn, output_window_fn], [False, True]):
+            window = windows
+            if nodirect:
+                window = windows.deepcopy()
+                window.power_direct_nonorm[...] = 0.
+                for name in ['corr_direct_nonorm', 'sep_direct']: setattr(window, name, None)
+    
+            # Let us compute the wide-angle and window function matrix
+            ellsin = (0, 2, 4)  # input (theory) multipoles
+            wa_orders = 1 # wide-angle order
+            sep = np.geomspace(1e-4, 1e5, 1024 * 16) # configuration space separation for FFTlog
+            kin_rebin = 2 # rebin input theory to save memory
+            #sep = np.geomspace(1e-4, 2e4, 1024 * 16) # configuration space separation for FFTlog, 2e4 > sqrt(3) * 8000
+            #kin_rebin = 4 # rebin input theory to save memory
+            kin_lim = (0, 2e1) # pre-cut input (theory) ks to save some memory
+            # Input projections for window function matrix:
+            # theory multipoles at wa_order = 0, and wide-angle terms at wa_order = 1
+            projsin = tuple(ellsin) + tuple(PowerSpectrumOddWideAngleMatrix.propose_out(ellsin, wa_orders=wa_orders))
+            # Window matrix
+            wmatrix = PowerSpectrumSmoothWindowMatrix(power, projsin=projsin, window=window, sep=sep, kin_rebin=kin_rebin, kin_lim=kin_lim)
+            # We resum over theory odd-wide angle
+            wmatrix.resum_input_odd_wide_angle()
+            wmatrix.attrs.update(power.attrs)
+            wmatrix.save(output_fn)
 
 
 def get_proposal_boxsize(tracer):
@@ -266,7 +320,6 @@ def get_proposal_boxsize(tracer):
     if 'QSO' in tracer:
         return 10000.
     raise NotImplementedError(f'tracer {tracer} is unknown')
-
 
 
 def get_box_data_fn(tracer='ELG', zsnap=0.950, imock=0, **kwargs):
@@ -327,7 +380,7 @@ if __name__ == '__main__':
     #todo = ['window-spectrum-box']
     #todo = ['spectrum', 'window-spectrum'][1:]
     todo = ['thetacut', 'window-thetacut'][1:]
-    #todo = ['pypower']
+    #todo = ['pypower', 'window-pypower'][1:]
 
     nmocks = 25
     ells = (0, 2, 4)
@@ -366,7 +419,7 @@ if __name__ == '__main__':
 
         if 'pypower' in todo:
             output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='pypower')
-            compute_pypower(output_fn, data, randoms, **cutsky_args)
+            compute_pypower(output_fn, get_data, get_randoms, **cutsky_args)
 
         if imock == 0:  # any mock as input
             if 'window-spectrum' in todo:
@@ -378,10 +431,15 @@ if __name__ == '__main__':
             if 'window-thetacut' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
                 window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
-                output_window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_thetacut')
-                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_thetacut')
+                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_thetacut')
                 with create_sharding_mesh() as sharding_mesh:
-                    compute_thetacut_window(output_fn, get_randoms, spectrum_fn=spectrum_fn, window_fn=window_fn, output_window_fn=output_window_fn)
+                    compute_thetacut_window(output_fn, get_randoms, spectrum_fn=spectrum_fn, window_fn=window_fn)
+
+            if 'window-pypower' in todo:
+                spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='pypower')
+                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_pypower')
+                output_cut_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_pypower_thetacut')
+                compute_pypower_window(output_fn, get_randoms, spectrum_fn=spectrum_fn, output_window_cut_fn=output_cut_fn)
 
     for imock in range(nmocks):
         data_fn = get_box_data_fn(imock=imock, **catalog_args)
