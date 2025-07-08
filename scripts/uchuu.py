@@ -128,29 +128,16 @@ def get_box_clustering_positions(fn, los='x', **kwargs):
     return (positions + boxsize / 2.) % boxsize - boxsize / 2.
 
 
-def get_data_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, **kwargs):
-    sznap = f'{zsnap:.3f}'.replace('.', 'p')
-    dirname = tracer
-    if tracer == 'QSO':
-        szrange = '0p8to3p5'
-    if tracer == 'ELG_LOP':
-        szrange = '0p8to1p6'
-        dirname = 'ELG_v5'
-    if tracer == 'LRG':
-        szrange = '0p4to1p1'
-    return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph{imock:03d}/CutSky/{dirname}/z{zsnap:.3f}/forclustering/cutsky_abacusHF_DR2_{tracer}_z{sznap}_zcut_{szrange}_clustering.dat.fits'
+def get_data_fn(tracer='LRG1', imock=0, **kwargs):
+    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/GLAM-Uchuu/cut_skies/{tracer}/GLAM-Uchuu_{tracer[:3]}_{imock:02d}_Y3_cut_sky_clustering.dat.fits'
 
 
-def get_randoms_fn(iran=0, **kwargs):
-    return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_{iran:d}_v2.fits'
+def get_randoms_fn(tracer='LRG1', iran=0, **kwargs):
+    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/GLAM-Uchuu/cut_skies/{tracer}/GLAM-Uchuu_{tracer[:3]}_{iran:d}_Y3_cut_sky_clustering.ran.fits'
 
 
-def get_measurement_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), **kwargs):
-    sznap = f'{zsnap:.3f}'.replace('.', 'p')
-    dirname = tracer
-    if tracer == 'ELG_LOP':
-        dirname = 'ELG_v5'
-    return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph{imock:03d}/CutSky/{dirname}/{kind}_abacusHF_DR2_{tracer}_z{sznap}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
+def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', **kwargs):
+    return f'/global/cfs/projectdirs/desi/mocks/cai/GLAM-Uchuu/desipipe_test/cut_skies/{tracer}/{kind}_GLAM-Uchuu_{tracer[:3]}_{imock:03d}_Y3_{region}.npy'
 
 
 def compute_spectrum(output_fn, get_data, get_randoms, ells=(0, 2, 4), los='firstpoint', **attrs):
@@ -422,9 +409,10 @@ def compute_spectrum_covariance(output_fn, get_randoms, theory_fn=None, spectrum
     spectrum = BinnedStatistic.load(spectrum_fn)
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
     randoms = ParticleField(*get_randoms(), attrs=attrs, exchange=True, backend='jax')
+    randoms = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms
 
     theory = BinnedStatistic.load(theory_fn)
-    windows = compute_fkp2_covariance_window(randoms, los=spectrum.attrs['los'], edges={}, interlacing=3, resampler='tsc', compensate=True, alpha=spectrum.attrs['wsum_data1'] / randoms.sum())
+    windows = compute_fkp2_covariance_window(randoms, los=spectrum.attrs['los'], edges={}, interlacing=3, resampler='tsc', compensate=True)
     covs = compute_spectrum2_covariance(windows, theory, flags=['smooth'])
     klim = (0., attrs.knyq.max())
     covs = [cov.select(xlim=klim) for cov in covs]
@@ -437,10 +425,7 @@ def compute_spectrum_covariance(output_fn, get_randoms, theory_fn=None, spectrum
 
 if __name__ == '__main__':
 
-    catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
-    #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.725, zrange=(0.6, 0.8))
-    #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.5, zrange=(0.4, 0.6))
-    #catalog_args = dict(tracer='QSO', region='NGC', zsnap=1.400, zrange=(0.8, 2.1))
+    catalog_args = dict(tracer='BGS', region='SGC')
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4), los='firstpoint')
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
@@ -453,7 +438,11 @@ if __name__ == '__main__':
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 25
+    all_randoms_fn = [get_randoms_fn(iran=iran + 1, **catalog_args) for iran in range(4)]
+    test_radec(*all_randoms_fn)
+    exit()
+
+    nmocks = 50
     ells = (0, 2, 4)
     los = 'firstpoint'
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
@@ -472,7 +461,10 @@ if __name__ == '__main__':
 
     for imock in range(nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
-        all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)][:1]
+        if not Path(data_fn).exists():
+            print(data_fn)
+            continue
+        all_randoms_fn = [get_randoms_fn(iran=iran + 1, **catalog_args) for iran in range(4)]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
 

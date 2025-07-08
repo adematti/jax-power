@@ -604,6 +604,17 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
             new.__dict__[name] = value
         return new
 
+    def __add__(self, other):
+        return self.sum([self, other])
+
+    def __radd__(self, other):
+        if other == 0: return self.copy()
+        return self.__add__(other)
+
+    def __iadd__(self, other):
+        if other == 0: return self.copy()
+        return self.__add__(other)
+    
     @classmethod
     def mean(cls, others):
         return cls.sum(others, weights=1. / len(others))
@@ -870,9 +881,14 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     def xavg(self, projs=Ellipsis, method='mid'):
         """x-coordinates (optionally restricted to input projs)."""
         def get_x(iproj):
-            if method == 'mid':
-                return (self._edges[iproj][:-1] + self._edges[iproj][1:]) / 2.
-            return self._x[iproj]
+            x = self._x[iproj]
+            xmid = jnp.mean(self._edges[iproj], axis=-1)
+            if method == 'mixed':
+                return jnp.where(jnp.isnan(x), xmid, x)
+            elif method == 'mid':
+                return xmid
+            return x
+
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         if isscalar: return get_x(iprojs)

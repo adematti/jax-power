@@ -27,9 +27,8 @@ class Correlation2Spectrum(object):
         return self.k, self._postfactor * fun
 
 
-def compute_fkp2_covariance_window(fkps, bin=None, los='local', **kwargs):
+def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kwargs):
     if not isinstance(fkps, (tuple, list)): fkps = [fkps]
-    fkps = fkps[0].same_mesh(*fkps)
     WW, WS, SS = {}, {}, {}
     if bin is None:
         mattrs = fkps[0].attrs
@@ -41,23 +40,24 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', **kwargs):
         bin = BinMesh2Correlation(mattrs, edges=edges, **kw)
 
     def get_alpha(fkp):
-        return fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1.
+        if alpha is None:
+            return fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1.
+        return alpha
 
     def get_W(fkp):
-        alpha = get_alpha(fkp)
         randoms = fkp.randoms if isinstance(fkp, FKPField) else fkp
         mesh = randoms.paint(**kwargs, out='real')
-        return alpha * mesh / mesh.cellsize.prod()
+        return get_alpha(fkp) * mesh / mesh.cellsize.prod()
 
     def get_S(fkp):
-        alpha = get_alpha(fkp)
         randoms = fkp.randoms if isinstance(fkp, FKPField) else fkp
         mesh = randoms.clone(weights=randoms.weights**2).paint(**kwargs, out='real')
-        return alpha * mesh / mesh.cellsize.prod()
+        return get_alpha(fkp) * mesh / mesh.cellsize.prod()
 
-    Ws = [get_W(fkp) for fkp in fkps]
+    Ws = [get_W(fkp) for fkp in fkps]  # for several fields
     Ss = [get_S(fkp) for fkp in fkps]
     i2pts = tuple(itertools.combinations_with_replacement(tuple(range(len(Ws))), 2))  # pairs of fields for each P(k)
+    # TODO: compute shot-noise
     for iW in itertools.combinations_with_replacement(i2pts, 2):  # then choose two pairs of fields
         iW = iW[0] + iW[1]
         if iW not in WW:
@@ -65,7 +65,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', **kwargs):
             if iW[2:] != iW[:2]:
                 W.append(Ws[iW[2]] * Ws[iW[3]])
             mattrs = W[0].attrs
-            norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
+            norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) * sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
             norm = norm / mattrs.cellsize.prod()**2
             update = dict(norm=norm, attrs={'mattrs': dict(mattrs)})
@@ -272,7 +272,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, q2) in cache_WW:
                             tmp = cache_WW[q1, q2]
                         else:
-                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW[key], pole1.x(projs=p1), q1, q2)
+                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW[key], pole1.xavg(p1, method='mixed'), q1, q2)
                             cache_WW[q1, q2] = tmp
                         cov_WW[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.view(projs=p1)[..., None] * pole2.view(projs=p2)
                 if not has_shotnoise: continue
@@ -286,7 +286,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, ell2) in cache_WS1:
                             tmp = cache_WS1[q1, ell2]
                         else:
-                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS[key], pole1.x(projs=ell1), q1, ell2)
+                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS[key], pole1.xavg(ell1, method='mixed'), q1, ell2)
                             cache_WS1[q1, ell2] = tmp
                         cov_WS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.view(projs=p1)
                 # WS swap
@@ -299,11 +299,11 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q2, ell1) in cache_WS2:
                             tmp = cache_WS2[q2, ell1]
                         else:
-                            tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(WS[key], pole2.x(projs=ell2), q2, ell1)
+                            tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(WS[key], pole2.xavg(ell2, method='mixed'), q2, ell1)
                             cache_WS2[q2, ell1] = tmp
                         cov_WS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole2.view(projs=p2)
                 # SS
-                cov_SS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(SS[key], pole1.x(projs=ell1), ell1, ell2)
+                cov_SS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(SS[key], pole1.xavg(ell1, method='mixed'), ell1, ell2)
 
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
