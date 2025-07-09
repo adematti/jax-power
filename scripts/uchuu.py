@@ -422,11 +422,29 @@ def compute_spectrum_covariance(output_fn, get_randoms, theory_fn=None, spectrum
         cov.save(output_fn.replace('.npy', f'_{suffix}.npy'))
 
 
+def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', los='local', **attrs):
+    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
+    t0 = time.time()
+    data, randoms = get_data(), get_randoms()
+    attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
+    data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
+    randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
+    fkp = FKPField(data, randoms)
+    norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
+    mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+
+    ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
+    bin = BinMesh3Spectrum(attrs, edges={'step': 0.02}, basis=basis, ells=ells)
+    spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+
+    spectrum = spectrum.clone(norm=norm)
+    spectrum.save(output_fn)
+
 
 if __name__ == '__main__':
 
-    catalog_args = dict(tracer='BGS', region='SGC')
-    cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4), los='firstpoint')
+    catalog_args = dict(tracer='LRG3', region='NGC')
+    cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
 
@@ -434,21 +452,16 @@ if __name__ == '__main__':
     #todo = ['spectrum-box']
     #todo = ['window-spectrum-box']
     #todo = ['spectrum', 'window-spectrum'][:1]
-    todo = ['thetacut', 'window-thetacut'][:1]
+    todo = ['bispectrum']
+    #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    all_randoms_fn = [get_randoms_fn(iran=iran + 1, **catalog_args) for iran in range(4)]
-    test_radec(*all_randoms_fn)
-    exit()
-
-    nmocks = 50
-    ells = (0, 2, 4)
-    los = 'firstpoint'
+    nmocks = 5
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 
-    is_distributed = any(td in ['spectrum', 'window-spectrum', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
+    is_distributed = any(td in ['spectrum', 'bispectrum', 'window-spectrum', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
     if is_distributed:
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
@@ -472,7 +485,14 @@ if __name__ == '__main__':
             output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
             with create_sharding_mesh() as sharding_mesh:
                 compute_spectrum(output_fn, get_data, get_randoms, **cutsky_args)
-    
+
+        if 'bispectrum' in todo:
+            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh3spectrum_scoccimarro')
+            with create_sharding_mesh() as sharding_mesh:
+                args = cutsky_args | dict(basis='scoccimarro', cellsize=20.)
+                args.pop('ells')
+                compute_bispectrum(output_fn, get_data, get_randoms, **args)
+
         if 'thetacut' in todo:
             spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
             output_spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_thetacut')

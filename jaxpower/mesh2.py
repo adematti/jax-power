@@ -699,7 +699,7 @@ class FKPField(object):
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        state = asdict(self) | kwargs
+        state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
         return self.__class__(**state)
 
     def exchange(self, **kwargs):

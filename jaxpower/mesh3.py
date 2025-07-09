@@ -4,9 +4,10 @@ from functools import partial
 import numpy as np
 import jax
 from jax import numpy as jnp
+from jax import random
 from dataclasses import dataclass
 
-from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount
+from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
 from .mesh2 import _get_los_vector, _get_zero, FKPField
 from .utils import real_gaunt, BinnedStatistic, get_legendre, get_spherical_jn, get_real_Ylm, plotter, register_pytree_dataclass
 
@@ -63,8 +64,12 @@ class BinMesh3Spectrum(object):
         coords = jnp.sqrt(sum(xx**2 for xx in vec))
         ibin, nmodes1d, xavg = [], [], []
         for edge in edges:
-            ib, nm, x = _get_bin_attrs(coords, edge, wmodes)
-            ib = ib.reshape(coords.shape) - 1
+            ib, nm, x = _get_bin_attrs(coords, edge, wmodes, ravel=False)
+            ib = ib - 1
+            #ib = ib.reshape(coords.shape) - 1
+            #sharding_mesh = mattrs.sharding_mesh
+            #if sharding_mesh.axis_names:
+            #    ib = jax.lax.with_sharding_constraint(ib, jax.sharding.NamedSharding(sharding_mesh, spec=jax.sharding.PartitionSpec(*sharding_mesh.axis_names)))
             x /= nm
             ibin.append(ib)
             nmodes1d.append(nm)
@@ -130,7 +135,6 @@ class BinMesh3Spectrum(object):
                     mask = self.ibin[ivalue] == ibin[ivalue]
                     mesh_prod = mesh_prod * mattrs.c2r(mask.astype(mattrs.dtype))
                 return mesh_prod.sum()
-
             nmodes = jax.lax.map(f, self._iedges)
 
             if False:
@@ -212,13 +216,14 @@ class BinMesh3Spectrum(object):
 @jax.tree_util.register_pytree_node_class
 class Spectrum3Poles(BinnedStatistic):
 
-    _data_fields = BinnedStatistic._data_fields + ['_norm', '_num_shotnoise', '_num_zero']
-    _select_x_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero']
+    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
+    _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero']
     _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero']
-    _sum_fields = BinnedStatistic._sum_fields + ['_norm', '_num_shotnoise', '_num_zero']
+    _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
     _meta_fields = BinnedStatistic._meta_fields + ['basis']
-    _init_fields = BinnedStatistic._init_fields | {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
-                                                   'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
+    _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
+                    'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'basis': 'basis', 'attrs': 'attrs'}
+
 
     def __init__(self, k: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=None, num_zero: jax.Array=None, name: str=None, basis: str=None, attrs: dict=None):
@@ -448,8 +453,31 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
 from .mesh2 import compute_normalization
 
 
-def compute_fkp3_spectrum_normalization(*fkps, cellsize=10.):
+def _split_particles(*particles, nsplits, seed=0):
+    toret = list(particles)
+    nsplits = nsplits - len(particles)
+    if nsplits == 0: return toret
+    nsplits += 1
+    # remove last one
+    particles_to_split = toret[-1]
+    toret = toret[:-1]
+    if isinstance(seed, int):
+        seed = random.key(seed)
+
+    x = create_sharded_random(random.uniform, seed, particles_to_split.size, out_specs=0)
+    for isplit in range(nsplits):
+        mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+        toret.append(particles_to_split.clone(weights=particles_to_split.weights * mask))
+    return toret
+
+
+def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
+    nfkp = len(fkps)
     fkps, same = _format_meshs(*fkps)
+    fkps = list(fkps)
+    if split is not None:
+        randoms = _split_particles(*[fkp.randoms for fkp in fkps[:nfkp]], nsplits=3, seed=split)
+        fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
@@ -477,7 +505,6 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', 
             if isinstance(fkp, FKPField):
                 fkp = fkp.data - fkp.data.sum() / fkp.randoms.sum() * fkp.randoms
             particles.append(fkp)
-
 
     mattrs = particles.attrs
     los, vlos = _format_los(los, ndim=mattrs.ndim)

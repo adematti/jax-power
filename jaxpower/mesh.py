@@ -1904,16 +1904,19 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('sharding_mesh',))  # linear saves memory
-def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, sharding_mesh=None):
+@partial(jax.jit, static_argnames=('sharding_mesh', 'ravel'))  # linear saves memory
+def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
 
     def _get_attrs(coords, edges, weights):
         r"""Return bin index, binned number of modes and coordinates."""
+        shape = coords.shape
         coords = coords.ravel()
         ibin = jnp.digitize(coords, edges, right=False)
         x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
         del coords
         nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+        if not ravel:
+            ibin = ibin.reshape(shape)
         return ibin, nmodes, x
 
     get_attrs = _get_attrs
@@ -1929,7 +1932,7 @@ def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, s
 
         get_attrs = shard_map(get_attrs, mesh=sharding_mesh,
                     in_specs=(P(*sharding_mesh.axis_names), P(None), P(sharding_mesh.axis_names)),
-                    out_specs=(P(sharding_mesh.axis_names), P(None), P(None)))
+                    out_specs=(P(sharding_mesh.axis_names) if ravel else P(*sharding_mesh.axis_names), P(None), P(None)))
 
     return get_attrs(coords, edges, weights)
 
