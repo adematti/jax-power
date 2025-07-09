@@ -123,7 +123,7 @@ def setup_logging(level=logging.INFO, stream=sys.stdout, filename=None, filemode
 def set_env(**environ):
     """
     Temporarily set environment variables inside the context.
-    
+
     Example:
         with set_env(MY_VAR='value'):
             # MY_VAR is set to 'value' here
@@ -614,7 +614,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     def __iadd__(self, other):
         if other == 0: return self.copy()
         return self.__add__(other)
-    
+
     @classmethod
     def mean(cls, others):
         return cls.sum(others, weights=1. / len(others))
@@ -1288,7 +1288,7 @@ class WindowMatrix(object):
     @plotter
     def plot(self, split_projs=True, **kwargs):
         """
-        Plot covariance matrix.
+        Plot window matrix.
 
         Parameters
         ----------
@@ -1352,22 +1352,24 @@ class WindowMatrix(object):
 
         for it, pt in enumerate(self.theory.projs):
             for io, po in enumerate(self.observable.projs):
-                ax = lax[io][it]
+                value = self._value[np.ix_(self.observable._index(projs=pt, concatenate=True), self.theory._index(projs=po, concatenate=True))]
                 for ix, idx in enumerate(indices):
                     ii = [io, it][axis]
                     plotted_ii = [io, it][axis - 1]
+                    iidx = idx
                     if np.issubdtype(idx.dtype, np.floating):
-                        idx = np.abs(observable._x[ii] - idx).argmin()
+                        iidx = np.abs(observable.x()[ii] - idx).argmin()
                     # Indices in approximate window matrix
                     x = plotted_observable._x[plotted_ii]
                     dx = 1.
-                    if axis == 0:  # axis = 'o'
+                    if axis == 0:  # axis = 'o', showing theory, dividing by integration element dx
                         dx = plotted_observable._edges[plotted_ii]
                         dx = dx[..., 1] - dx[..., 0]
-                    value = np.take(self._value[np.ix_(self.observable._index(projs=pt, concatenate=True), self.theory._index(projs=po, concatenate=True))], idx, axis=axis)
-                    value = value / dx
-                    if yscale == 'log': value = np.abs(value)
-                    ax.plot(x, value, alpha=alphas[ix], color=color, label=label if ix == 0 else None)
+                    v = np.take(value, iidx, axis=axis)
+                    v = v / dx
+                    if yscale == 'log': v = np.abs(v)
+                    ax = lax[io][it]
+                    ax.plot(x, v, alpha=alphas[ix], color=color, label=label if ix == 0 else None)
                 ax.set_title(r'${} \times {}$'.format(pt, po))
                 ax.set_xscale(xscale)
                 ax.set_yscale(yscale)
@@ -1404,15 +1406,19 @@ class WindowMatrix(object):
         for po in self.observable.projs:
             for pt in self.theory.projs:
                 xo, xt = self.observable.x(projs=po), self.theory.x(projs=pt)
+                tnew = [self.theory, new][axis]  # new theory axis
+                dx = self.theory.edges(projs=pt)[..., 1] - self.theory.edges(projs=pt)[..., 0]
+                dxnew = tnew.edges(projs=pt)[..., 1] - tnew.edges(projs=pt)[..., 0]
                 ixo, ixt = self.observable._index(projs=po, concatenate=True), self.theory._index(projs=pt, concatenate=True)
                 xxo, xxt = np.meshgrid(xo, xt, indexing='ij')
                 # x is observable.x, y is theory.x - x, z is wmat
                 x = [xxo, xxt][axis]
                 p = [po, pt][axis]
                 y = xxt - xxo
-                v = self._value[np.ix_(ixo, ixt)]
+                v = self._value[np.ix_(ixo, ixt)] / dx
                 x, y, z = x.ravel(), y.ravel(), v.ravel()
                 del xxo, xxt
+                if p not in new.projs: continue
                 ixnew = new._index(projs=p, concatenate=True)
                 xnew = new.x(projs=p)
                 if extrap:
@@ -1436,10 +1442,12 @@ class WindowMatrix(object):
                     if axis == 0:  # observable
                         xo = x
                         idx = (ix, ixt)
+                        ddx = dxnew
                     else:  # theory
                         xt = x
                         idx = (ixo, ix)
-                    value[idx] += interp(x, xt - xo)
+                        ddx = dxnew[ix]
+                    value[idx] += interp(x, xt - xo) * ddx
         return self.clone(**{name: new, 'value': value})
 
 
@@ -1706,8 +1714,15 @@ class CovarianceMatrix(object):
             return self.copy()
         return jnp.asarray(self._value)
 
-    def std(self):
-        return jnp.sqrt(jnp.diag(self._value))
+    def std(self, return_type='nparray'):
+        std = jnp.sqrt(jnp.diag(self._value))
+        if return_type is None:
+            toret = []
+            for observable in self._observables:
+                indices = [self._index(observables=observable, projs=proj, concatenate=True) for proj in observable.projs]
+                toret.append(observable.clone(value=[std[index] for index in indices]))
+            return toret
+        return std
 
     def corrcoef(self, return_type='nparray'):
         std = self.std()
@@ -1861,12 +1876,11 @@ class CovarianceMatrix(object):
             lax = np.array(fig.axes).reshape(fshape[::-1])
         for i1, i2 in itertools.product(*[list(range(s)) for s in fshape]):
             observables, projs = zip(*[observables_projs[i] for i in [i1, i2]])
-            indices = [self._index(observables=observable, projs=proj, concatenate=True) for observable, proj in zip(observables, projs)]
-            value = self._value[np.ix_(*indices)]
+            value = self._value[np.ix_(*[self._index(observables=observable, projs=proj, concatenate=True) for observable, proj in zip(observables, projs)])]
             for offset, alpha in zip(offsets, alphas):
                 index = np.arange(max(min(observable.size - offset for observable in observables), 0))
                 flag = int(i2 > i1)
-                index1, index2 = index + offset * (1 - flag), index + offset * flag
+                index1, index2 = index, index + offset * flag
                 diag = value[index1, index2]
                 x = observables[flag].x()[0][index]
                 if ytransform is not None: diag = ytransform(x, diag)
@@ -1885,43 +1899,34 @@ class CovarianceMatrix(object):
         return fig
 
     @plotter
-    def plot_slice(self, indices, axis='o', color='C0', label=None, xscale='linear', yscale='log', fig=None):
+    def plot_slice(self, indices, axis='vertical', color='C0', label=None, xscale='linear', yscale='log', fig=None):
         from matplotlib import pyplot as plt
         if np.ndim(indices) == 0: indices = [indices]
         indices = np.array(indices)
         alphas = np.linspace(1, 0.2, len(indices))
-        fshape = len(self.observable.projs), len(self.theory.projs)
+        observables_projs = [(observable.select(projs=proj, select_projs=True), proj) for observable in self._observables for proj in observable.projs]
+        fshape = (len(observables_projs),) * 2
         if fig is None:
             fig, lax = plt.subplots(*fshape, sharey=True, figsize=(8, 6), squeeze=False)
         else:
             lax = np.array(fig.axes).reshape(fshape[::-1])
-        axis, _, observable = self._axis_index(axis=axis)
-        plotted_observable = [self.observable, self.theory][axis - 1]
-
-        for it, pt in enumerate(self.theory.projs):
-            for io, po in enumerate(self.observable.projs):
-                ax = lax[io][it]
-                for ix, idx in enumerate(indices):
-                    ii = [io, it][axis]
-                    plotted_ii = [io, it][axis - 1]
-                    if np.issubdtype(idx.dtype, np.floating):
-                        idx = np.abs(observable._x[ii] - idx).argmin()
-                    # Indices in approximate window matrix
-                    x = plotted_observable._x[plotted_ii]
-                    dx = 1.
-                    if axis == 0:  # axis = 'o'
-                        dx = plotted_observable._edges[plotted_ii]
-                        dx = dx[..., 1] - dx[..., 0]
-                    value = np.take(self._value[np.ix_(self.observable._index(projs=pt, concatenate=True), self.theory._index(projs=po, concatenate=True))], idx, axis=axis)
-                    value = value / dx
-                    if yscale == 'log': value = np.abs(value)
-                    ax.plot(x, value, alpha=alphas[ix], color=color, label=label if ix == 0 else None)
-                ax.set_title(r'${} \times {}$'.format(pt, po))
-                ax.set_xscale(xscale)
-                ax.set_yscale(yscale)
-                ax.grid(True)
-                if io == len(self.observable.projs) - 1: ax.set_xlabel(plotted_observable._label_x)
-                if label and it == io == 0: lax[it][io].legend()
+        for i1, i2 in itertools.product(*[list(range(s)) for s in fshape]):
+            observables, projs = zip(*[observables_projs[i] for i in [i1, i2]])
+            value = self._value[np.ix_(*[self._index(observables=observable, projs=proj, concatenate=True) for observable, proj in zip(observables, projs)])]
+            ax = lax[i2, i1]
+            for ix, idx in enumerate(indices):
+                iidx = idx
+                if np.issubdtype(idx.dtype, np.floating):
+                    iidx = np.abs(observables[0].x()[0] - idx).argmin()
+                v = np.take(value, iidx, axis=0)
+                if yscale == 'log': value = np.abs(v)
+                x = observables[1].x()[0]
+                ax.plot(x, v, alpha=alphas[ix], color=color, label=label if ix == 0 else None)
+            ax.set_title(r'${} \times {}$'.format(*projs))
+            ax.set_xscale(xscale)
+            ax.set_yscale(yscale)
+            ax.grid(True)
+            if label and i1 == i2 == 0: lax[i1][i2].legend()
 
         fig.tight_layout()
         fig.subplots_adjust(hspace=0.35, wspace=0.25)

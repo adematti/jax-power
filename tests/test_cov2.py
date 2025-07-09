@@ -35,6 +35,7 @@ def test_covmatrix(plot=False):
     cov2 = CovarianceMatrix.load(fn)
 
     if plot:
+        cov.plot_slice(indices=10, show=True)
         cov.plot(show=True)
         cov2.plot(corrcoef=True, show=True)
 
@@ -248,28 +249,50 @@ def save_fkp_mocks():
     from jaxpower import FKPField, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise
     attrs = MeshAttrs(boxsize=2000., boxcenter=[0., 0., 1200], meshsize=128)
     pattrs = attrs.clone(boxsize=1000., meshsize=64)
-    theory = get_theory(kmax=np.sqrt(3) * attrs.knyq.max()).clone(num_shotnoise=0.)
+    theory = get_theory(kmax=np.sqrt(3) * attrs.knyq.max())#.clone(num_shotnoise=0.)
     bin = BinMesh2Spectrum(attrs, edges=theory.select(xlim=(0., attrs.knyq.max())).edges(projs=0), ells=(0, 2, 4))
     los = 'local'
 
     size = int(1e-4 * pattrs.boxsize.prod())
 
     @jit
-    def mock(seed):
-        mesh = generate_anisotropic_gaussian_mesh(attrs, poles=theory, los=los, seed=seed)
-        data = generate_uniform_particles(pattrs, size, seed=seed).clone(attrs=attrs)
-        data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
-        randoms = generate_uniform_particles(pattrs, 5 * size, seed=42).clone(attrs=attrs)
+    def mock_shotnoise(seed):
+        seeds = random.split(seed)
+        #mesh = generate_anisotropic_gaussian_mesh(attrs, poles=theory, los=los, seed=seed)
+        data = generate_uniform_particles(pattrs, size, seed=seeds[0]).clone(attrs=attrs)
+        #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+        randoms = generate_uniform_particles(pattrs, 5 * size, seed=seeds[1]).clone(attrs=attrs)
         fkp = FKPField(data, randoms)
         mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='complex')
-        norm = compute_fkp2_spectrum_normalization(fkp)
-        shotnoise = compute_fkp2_spectrum_shotnoise(fkp)
-        return compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=shotnoise)
+        norm, num_shotnoise = (size / pattrs.boxsize.prod())**2 * pattrs.boxsize.prod(), 0.
+        #norm = compute_fkp2_spectrum_normalization(fkp, cellsize=None)
+        num_shotnoise = compute_fkp2_spectrum_shotnoise(fkp)
+        return compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
+
+    @jit
+    def mock(seed):
+        seeds = random.split(seed)
+        mesh = generate_anisotropic_gaussian_mesh(attrs, poles=theory, los=los, seed=seed)
+        data = generate_uniform_particles(pattrs, size, seed=seeds[0]).clone(attrs=attrs)
+        data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+        randoms = generate_uniform_particles(pattrs, 5 * size, seed=seeds[1]).clone(attrs=attrs)
+        fkp = FKPField(data, randoms)
+        mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='complex')
+        norm, num_shotnoise = (size / pattrs.boxsize.prod())**2 * pattrs.boxsize.prod(), 0.
+        #norm = compute_fkp2_spectrum_normalization(fkp, cellsize=None)
+        num_shotnoise = compute_fkp2_spectrum_shotnoise(fkp)
+        return compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
+
+    for i, fn in enumerate(mock_fn(basename='fkp_shotnoise')):
+        print(i, end=" ", flush=True)
+        poles = mock_shotnoise(random.key(i))
+        poles.save(fn)
 
     for i, fn in enumerate(mock_fn(basename='fkp')):
         print(i, end=" ", flush=True)
         poles = mock(random.key(i))
         poles.save(fn)
+    print()
 
 
 def test_fkp2_window(plot=False):
@@ -304,39 +327,40 @@ def test_fkp2_window(plot=False):
 
 
 def test_fkp2_covariance(plot=False):
-
-    if False:
-        cov_mocks = Spectrum2Poles.cov(list(map(Spectrum2Poles.load, mock_fn(basename='fkp'))))
-        #cov_mocks = cov_mocks.select(xlim=klim)
-        cov_mocks.observables()[0].plot(show=True)
-        cov_mocks.plot(corrcoef=True, show=True)
-        exit()
-
     attrs = MeshAttrs(boxsize=2000., boxcenter=[0., 0., 1200], meshsize=128)
     pattrs = attrs.clone(boxsize=1000., meshsize=64)
-    theory = get_theory(kmax=attrs.knyq.max()).clone(num_shotnoise=0.)
 
-    size = int(1e6)
-    randoms = generate_uniform_particles(pattrs, size, seed=32).clone(attrs=attrs)
+    theory = get_theory(kmax=attrs.knyq.max())#.clone(num_shotnoise=0.)
+    size = int(1e-4 * pattrs.boxsize.prod())
+
+    ialpha = 5
+    randoms = generate_uniform_particles(pattrs, size * ialpha, seed=32).clone(attrs=attrs)
     #edges = {'step': attrs.cellsize.min()}
     edges = None
-    windows = compute_fkp2_covariance_window(randoms, edges=edges, interlacing=2, resampler='tsc', los='local')
-    covs = compute_spectrum2_covariance(windows, theory, delta=0.2)
-    cov = sum(covs)
-    klim = (0., attrs.knyq.max())
-    cov = cov.select(xlim=klim)
+    windows = compute_fkp2_covariance_window(randoms, edges=edges, interlacing=2, resampler='tsc', los='local', alpha=1. / ialpha)
+    #windows[0][0, 0, 0, 0].plot(show=True)
 
-    cov_mocks = Spectrum2Poles.cov(list(map(Spectrum2Poles.load, mock_fn(basename='fkp'))))
-    cov_mocks = cov_mocks.select(xlim=klim)
-    #cov_smooth = compute_spectrum2_covariance(pattrs, theory, flags=('smooth',)).select(xlim=klim)
+    covs = compute_spectrum2_covariance(windows, theory, delta=0.2)
+    klim = (0., attrs.knyq.max())
+    covs = [cov.select(xlim=klim) for cov in covs]
+
+    cov_mocks = Spectrum2Poles.cov(list(map(Spectrum2Poles.load, mock_fn(basename='fkp')))).select(xlim=klim)
+    cov_mocks_shotnoise = Spectrum2Poles.cov(list(map(Spectrum2Poles.load, mock_fn(basename='fkp_shotnoise')))).select(xlim=klim)
+
+    ratio_shotnoise = cov_mocks.observables()[0].shotnoise(0)[0] / cov_mocks_shotnoise.observables()[0].shotnoise(0)[0]
 
     if plot:
-        ytransform = lambda x, y: x**4 * y
+        ytransform = lambda x, y: x**2 * y
         kw = dict(ytransform=ytransform)
-        #cov.plot(corrcoef=True, show=True)
-        #fig = None
-        fig = cov.plot_diag(**kw, color='C0')
-        cov_mocks.plot_diag(**kw, color='C2', fig=fig, show=True)
+        fig = covs[2].plot_diag(**kw, color='C0')
+        cov_mocks_shotnoise.plot_diag(**kw, color='C1', fig=fig, show=True)
+    if plot:
+        ytransform = lambda x, y: x**2 * y
+        kw = dict(ytransform=ytransform)
+        cov_ws = covs[1].clone(value=ratio_shotnoise * covs[1].view())
+        cov_ss = covs[2].clone(value=ratio_shotnoise**2 * covs[2].view())
+        fig = (covs[0] + cov_ws + cov_ss).plot_diag(**kw, color='C0')
+        cov_mocks.plot_diag(**kw, color='C1', fig=fig, show=True)
 
 
 def test_fftlog2():
@@ -499,8 +523,9 @@ if __name__ == '__main__':
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
-    test_cutsky2_covariance(plot=True)
+    #test_cutsky2_covariance(plot=True)
     #test_cutsky2_covariance_fftlog(plot=True)
+    #save_fkp_mocks()
     #test_fkp2_window(plot=True)
-    #test_fkp2_covariance(plot=True)
+    test_fkp2_covariance(plot=True)
     #test_from_pypower()

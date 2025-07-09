@@ -1336,7 +1336,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
 
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
-    
+
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
         kw_sharding = kwargs | dict(halo_size=resampler.order, sharding_mesh=sharding_mesh)
@@ -1585,11 +1585,13 @@ class ParticleField(object):
 
         positions = jnp.asarray(positions)
         if weights is None:
-            weights = jnp.ones_like(positions, shape=positions.shape[:-1], device=positions.sharding)
+            weights = jnp.ones_like(positions, shape=positions.shape[:-1])
         else:
             weights = jnp.asarray(weights)
+        if with_sharding:
+            weights = jax.lax.with_sharding_constraint(weights, positions.sharding)
 
-        if with_sharding and getattr(positions.sharding, 'mesh', None) is None and (not exchange or backend == 'jax'):
+        if with_sharding and (not exchange or backend == 'jax') and getattr(positions.sharding, 'mesh', None) is None:
             positions, weights = make_particles_from_local(positions, weights)
 
         if with_sharding and exchange:
@@ -1772,7 +1774,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
-    
+
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
         _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))

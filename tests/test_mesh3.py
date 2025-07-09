@@ -3,11 +3,12 @@ from pathlib import Path
 from functools import partial
 
 import numpy as np
+from matplotlib import pyplot as plt
 import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, utils)
+from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, compute_normalization, utils)
 
 
 dirname = Path('_tests')
@@ -104,9 +105,64 @@ def test_timing():
     timing(f2, cmesh)
 
 
+def test_polybin3d():
+
+    from PolyBin3D import PolyBin3D, BSpec
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    attrs = MeshAttrs(meshsize=100, boxsize=1000., boxcenter=1000.)
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    edges = [np.arange(0.01, 0.10, 0.02), np.arange(0.01, 0.15, 0.02), np.arange(0.01, 0.15, 0.02)]
+    #edges = [np.arange(0.01, 0.08, 0.02), np.arange(0.01, 0.08, 0.02), np.arange(0.01, 0.08, 0.02)]
+
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0, 2])
+
+    for los in ['z', 'local'][1:]:
+
+        kw = dict(gridsize=attrs.meshsize, boxsize=attrs.boxsize, boxcenter=attrs.boxcenter * (0. if los == 'z' else 1.))
+        base = PolyBin3D(sightline='global' if los == 'z' else los, **kw, backend='jax', real_fft=False)
+        bspec = BSpec(base, k_bins=edges[0],
+                    lmax=2, k_bins_squeeze=edges[1],
+                    include_partial_triangles=False)
+
+        for imock in [0]:
+            mesh = generate_gaussian_mesh(attrs, pkvec, seed=imock)
+            t0 = time.time()
+            spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+            #print('norm', spectrum.norm, compute_normalization(*([mesh.clone(value=jnp.ones_like(mesh.value))] * 3)))
+            jax.block_until_ready(spectrum)
+            t1 = time.time()
+            bk = bspec.Bk_ideal(data=np.array(mesh.value), discreteness_correction=False)
+            k123 = bspec.get_ks()
+            t2 = time.time()
+            print(f'jax-power took {t1 - t0:.2f} s')
+            print(f'polybin took {t2 - t1:.2f} s')
+
+            if imock == 0:
+                ax = plt.gca()
+                weight = k123.prod(axis=0)
+                for name in ['b0', 'b2']:
+                    ax.plot(weight * bk[name], color='C0')
+
+                k = spectrum.xavg(projs=0, method='mid')
+                weight = k.prod(axis=-1)
+                for projs in [0, 2]:
+                    ax.plot(weight * spectrum.view(projs=projs), color='C1')
+                plt.show()
+
+
+
 if __name__ == '__main__':
+
+    from jax import config
+    config.update('jax_enable_x64', True)
 
     import warnings
     warnings.filterwarnings('error')
-    test_mesh3_spectrum(plot=False)
+    #test_mesh3_spectrum(plot=False)
     #test_timing()
+    test_polybin3d()

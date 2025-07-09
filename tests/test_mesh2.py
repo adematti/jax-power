@@ -691,12 +691,10 @@ def test_smooth_window():
 
 
 def test_wmatrix(plot=False):
-    xo = np.linspace(0., 0.2, 21)
-    xt = np.linspace(0., 0.2, 41)
     ellsin = (0, 2)
     ells = (0, 2)
-    theory = BinnedStatistic(x=[xt] * len(ellsin), projs=ellsin)
-    observable = BinnedStatistic(x=[xo] * len(ells), projs=ells)
+    theory = BinnedStatistic(x=[np.linspace(0., 0.2, 41)] * len(ellsin), projs=ellsin)
+    observable = BinnedStatistic(x=[np.linspace(0., 0.2, 21)] * len(ells), projs=ells)
     theory2 = BinnedStatistic(x=[np.linspace(0., 0.3, 61)] * len(ellsin), projs=ellsin)
     observable2 = BinnedStatistic(x=[np.linspace(0., 0.3, 61)] * len(ells), projs=ells)
 
@@ -707,7 +705,7 @@ def test_wmatrix(plot=False):
 
     value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
     wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
-    if plot: wmatrix.plot(show=True)
+    #if plot: wmatrix.plot(show=True)
 
     wmatrix1 = wmatrix.slice(slice(0, -1), axis='o')
     assert wmatrix1.shape[0] == wmatrix.shape[0] - 1 * len(ellsin)
@@ -730,6 +728,39 @@ def test_wmatrix(plot=False):
         wmatrix2.plot(show=True)
         wmatrix3.plot(show=True)
         wmatrix3.plot_slice(indices=5, show=True)
+
+
+    theory = BinnedStatistic(x=[np.linspace(0., 0.2, 41)] * len(ellsin), projs=ellsin)
+    observable = BinnedStatistic(x=[np.linspace(0., 0.2, 21)] * len(ells), projs=ells)
+    value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
+    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
+    wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
+    #wmatrix2.plot(show=True)
+
+    def value(xx):
+        return jnp.ones_like(xx)
+
+    theory = BinnedStatistic(x=[np.geomspace(0.001, 0.3, 101)] * len(ellsin), projs=ellsin)
+    observable = BinnedStatistic(x=[np.linspace(0., 0.2, 21)] * len(ells), projs=ells)
+    value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
+    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
+    wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
+    wmatrix2.plot(show=True)
+
+    def value(xx):
+        return xx**2
+
+    v = theory.clone(value=[value(xx) for xx in theory.x()])
+    vw = wmatrix.dot(v, zpt=False, return_type=None)
+    v2 = theory2.clone(value=[value(xx) for xx in theory2.x()])
+    vw2 = wmatrix2.dot(v2, zpt=False, return_type=None)
+    if plot:
+        from matplotlib import pyplot as plt
+        ax = plt.gca()
+        proj = 0
+        ax.plot(vw.x(proj), vw.view(projs=proj), color='C0')
+        ax.plot(vw2.x(proj), vw2.view(projs=proj), color='C1')
+        plt.show()
 
 
 def test_sympy():
@@ -825,7 +856,6 @@ if __name__ == '__main__':
     #test_window_timing()
     #test_sympy()
     #test_window()
-    #test_wmatrix()
     #test_gaunt()
     test_smooth_window()
     #test_checkpoint()

@@ -182,7 +182,7 @@ class Correlation2Poles(BinnedStatistic):
         num_shotnoise = [s / self._norm for s in self._num_shotnoise]
         if isscalar: return num_shotnoise[iprojs]
         return [num_shotnoise[iproj] for iproj in iprojs]
-    
+
     def volume(self, projs=Ellipsis):
         """Volume (optionally restricted to input projs)."""
         iprojs = self._index_projs(projs)
@@ -761,6 +761,9 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
 def compute_fkp2_spectrum_normalization(*fkps, cellsize=10.):
     # This is the pypower normalization - move to new one?
     fkps, autocorr = _format_meshs(*fkps)
+    kw = dict(cellsize=cellsize)
+    for name in list(kw):
+        if kw[name] is None: kw.pop(name)
     if autocorr:
         fkp = fkps[0]
         randoms = [fkp.data, fkp.randoms]  # cross to remove common noise
@@ -768,14 +771,14 @@ def compute_fkp2_spectrum_normalization(*fkps, cellsize=10.):
         #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
         #randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
         alpha = fkp.data.sum() / fkp.randoms.sum()
-        norm = alpha * compute_normalization(*randoms, cellsize=cellsize)
+        norm = alpha * compute_normalization(*randoms, **kw)
     else:
         randoms = [fkps[0].data, fkps[1].randoms]  # cross to remove common noise
         alpha2 = fkps[1].data.sum() / fkps[1].randoms.sum()
-        norm = alpha2 * compute_normalization(*randoms, cellsize=cellsize)
+        norm = alpha2 * compute_normalization(*randoms, **kw)
         randoms = [fkps[1].data, fkps[0].randoms]
         alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
-        norm += alpha2 * compute_normalization(*randoms, cellsize=cellsize)
+        norm += alpha2 * compute_normalization(*randoms, **kw)
         norm = norm / 2
     return norm
 
@@ -1066,7 +1069,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
                 wmat.append(my_map(f, kin))
 
-        else:   
+        else:
 
             for ellin in ellsin:
                 legin = get_legendre(ellin)(mu)
