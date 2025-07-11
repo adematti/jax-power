@@ -11,7 +11,7 @@ from .utils import WindowMatrix, CovarianceMatrix, BinnedStatistic, mkdir, plott
 class BaseWindowRotation(object):
 
     logger = logging.getLogger('WindowRotation')
-    _meta_fields = ['observable', 'theory', 'xhalfout', 'wmatrix', 'covmatrix', 'mmatrix', 'state', 'attrs']
+    _meta_fields = ['observable', 'theory', 'xohalf', 'wmatrix', 'covmatrix', 'mmatrix', 'state', 'attrs']
 
     def __init__(self, wmatrix, covmatrix, attrs=None, **kwargs):
         self.set_wmatrix(wmatrix, **kwargs)
@@ -31,7 +31,7 @@ class BaseWindowRotation(object):
             idx = len(self.ox[0]) // 2
         wm00 = wm00[idx]
         height = np.max(wm00)  # peak height
-        xmax = self.ox[0][np.argmin(np.abs(wm00 - height))]  # k at maximum
+        xmax = self.tx[0][np.argmin(np.abs(wm00 - height))]  # k at maximum
         # Measuring bandwidth
         masks = (self.tx[0] < xmax, self.tx[0] > xmax)
         xx = tuple(self.tx[0][mask][np.argmin(np.abs(wm00[mask] - height / 2.))] for mask in masks)
@@ -40,7 +40,8 @@ class BaseWindowRotation(object):
         tdx = self.theory.edges(projs=self.tprojs[0])
         tdx = tdx[..., 1] - tdx[..., 0]
         mask_half = (wm00 / tdx) / np.max(wm00 / tdx, axis=1)[:, None] > 0.5
-        self.xhalfout = np.sum(wm00 * mask_half * self.tx[0], axis=1) / np.sum(wm00 * mask_half, axis=1)
+        self.xohalf = np.sum(wm00 * mask_half * self.tx[0], axis=1) / np.sum(wm00 * mask_half, axis=1)
+        self.xohalf = [self.xohalf] * len(self.oprojs)
 
     @property
     def oprojs(self):
@@ -145,11 +146,11 @@ class BaseWindowRotation(object):
         return self.mmatrix, self.state
 
     @plotter
-    def plot_wmatrix_slice(self, index):
+    def plot_wmatrix_slice(self, indices):
         wmatrix = WindowMatrix(observable=self.observable, theory=self.theory, value=self.wmatrix)
         wmatrix_rotated = WindowMatrix(observable=self.observable, theory=self.theory, value=self.rotate()[0])
-        fig = wmatrix.plot_slice(index=index, color='C0', label='$W$', yscale='log')
-        return wmatrix_rotated.plot_slice(index=index, color='C1', label='$W^{\prime}$', yscale='log', fig=fig)
+        fig = wmatrix.plot_slice(indices, color='C0', label='$W$', yscale='log')
+        return wmatrix_rotated.plot_slice(indices, color='C1', label=r'$W^{\prime}$', yscale='log', fig=fig)
 
     @plotter
     def plot_compactness(self, frac=0.95, xlim=None, projs=None):
@@ -220,9 +221,9 @@ class WindowRotationSpectrum2(BaseWindowRotation):
 
     _meta_fields = BaseWindowRotation._meta_fields + ['marg_precmatrix', 'marg_prior_mo', 'marg_theory_offset']
 
-    def setup(self, Mtarg=None, Minit='momt', max_sigma_W=1000, max_sigma_R=1000, factor_diff_proj=100):
+    def setup(self, Mtarg=None, Minit='momt', max_sigma_W=5, max_sigma_R=5, factor_diff_proj=10):
         tx = np.concatenate(list(self.tx))
-        ox = np.concatenate(list(self.ox))
+        ox = np.concatenate(list(self.xohalf))
         if Mtarg is None:
             Mtarg = jnp.eye(len(ox))
 
@@ -232,21 +233,25 @@ class WindowRotationSpectrum2(BaseWindowRotation):
             if with_momt:
                 mo, mt = [], []
                 txcut = self.tx[0][len(self.tx[0]) // 2]
-                oidx = np.argmin(self.ox[0] - txcut) // 2
+                oidx = np.argmin(np.abs(self.ox[0] - txcut)) // 2
+                #txcut, oidx = 0.20, 20
                 for omask, oproj in zip(self.mask_oprojs, self.oprojs):
                     trow = self.wmatrix[omask, :][oidx, :]
                     mt.append(trow * (tx >= txcut))  # choose vector that captures non-diagonal behavior
                     tmp = jnp.zeros(len(omask))
                     if oproj in self.tprojs:
                         tmask = self.mask_tprojs[self.tprojs.index(oproj)]
-                        if trow[tmask][-1] > 0:
-                            tmp = tmp.at[omask].set(self.wmatrix[omask, tmask][..., -1] / trow[tmask][-1])
+                        if trow[tmask][-1] != 0 and oproj in self.oprojs:
+                            omask = self.mask_oprojs[self.oprojs.index(oproj)]
+                            tmp = tmp.at[omask].set(self.wmatrix[np.ix_(omask, tmask)][..., -1] / trow[tmask][-1])
                     mo.append(tmp)
                 Minit = (Minit, mo, mt)
         with_momt = isinstance(Minit, tuple)
 
         weights_wmatrix = np.empty_like(self.wmatrix)
         weights_covmatrix = np.empty_like(self.covmatrix)
+        if weights_covmatrix.shape[0] != weights_wmatrix.shape[0]:
+            raise ValueError(f'shapes of covariance and window matrix must match; found {weights_covmatrix.shape} and {weights_wmatrix.shape}')
         for omask, oproj in zip(self.mask_oprojs, self.oprojs):
             weights_wmatrix[omask, :] = np.minimum(((tx - ox[omask, None]) / self.xbandwidth)**2, max_sigma_W**2)
             mask = np.ones_like(weights_wmatrix[omask, :])
@@ -265,7 +270,7 @@ class WindowRotationSpectrum2(BaseWindowRotation):
             return C / denom
 
         def loss(mmatrix):
-            Wp, Cp = self.rotate(mmatrix=mmatrix)
+            Wp, Cp = self.rotate(mmatrix=mmatrix, prior_cov=False)
             if with_momt: mmatrix = mmatrix[0]
             loss_W = jnp.sum(softabs(Wp * weights_wmatrix)) / jnp.sum(softabs(Wp) * (weights_wmatrix > 0))
             #loss_W = jnp.sum(softabs(Wp * weights_wmatrix)) / jnp.sum(softabs(Wp) * weights_wmatrix_denom)
@@ -274,12 +279,17 @@ class WindowRotationSpectrum2(BaseWindowRotation):
             #loss_C = jnp.sum(softabs(Rp * weights_covmatrix)) / jnp.sum(softabs(Rp) * weights_covmatrix_denom)
             loss_M = 10 * jnp.sum((jnp.sum(mmatrix, axis=1) - 1.)**2)
             #print(loss_W, loss_C, weights_wmatrix.sum(), weights_covmatrix.sum(), weights_wmatrix.shape, weights_covmatrix.shape)
+            #print(loss_W, loss_C, loss_M)
             return loss_W + loss_C + loss_M
 
         self.init = Minit
         self.loss = loss
 
-    def rotate(self, mmatrix=None, covmatrix=None, data=None, mask_cov=None, theory=None, shotnoise=0., xlim=None):
+    @property
+    def with_momt(self):
+        return isinstance(self.mmatrix, tuple)
+
+    def rotate(self, mmatrix=None, covmatrix=None, data=None, mask_cov=None, prior_data=True, prior_cov=True):
         """Return prior and precmatrix if input theory."""
         if mmatrix is None: mmatrix = self.mmatrix
         input_covmatrix = covmatrix is not None
@@ -292,55 +302,48 @@ class WindowRotationSpectrum2(BaseWindowRotation):
             for mmo, mmt, omask in zip(mo, mt, self.mask_oprojs):
                 mask_mo = omask * mmo
                 Wsub += jnp.outer(mask_mo, mmt)
+            mo = jnp.array(mo)
         else:
             Wsub = Csub = 0.
 
-        def marg_precmatrix(precmatrix, mo, m):
-            deriv = np.zeros((len(mo),) + precmatrix.shape[:1])
-            deriv[:, mask_cov if mask_cov is not None else Ellipsis] = mo
-            fisher = deriv.dot(precmatrix).dot(deriv.T)
-            derivp = deriv.dot(precmatrix)
-            fisher += np.diag(1. / m**2)  # prior
-            return precmatrix - derivp.T.dot(np.linalg.solve(fisher, derivp))
-
         #print('WC', Wsub.sum(), Csub.sum())
         wmatrix_rotated = jnp.matmul(mmatrix, self.wmatrix) - Wsub
+
         if mask_cov is not None:
-            if xlim is not None:
-                raise ValueError('cannot pass both mask_cov and xlim')
             tmpmmatrix = np.eye(covmatrix.shape[0])
             tmpmmatrix[np.ix_(mask_cov, mask_cov)] = mmatrix
             mmatrix = tmpmmatrix
         covmatrix_rotated = mmatrix.dot(covmatrix).dot(mmatrix.T) - Csub
-        if xlim is not None:
-            mask_xout = self.observable._index(xlim=xlim, concatenate=True)
-            wmatrix_rotated = wmatrix_rotated[mask_xout, :]
-            covmatrix_rotated = covmatrix_rotated[np.ix_(mask_xout, mask_xout)]
+        if with_momt and prior_cov:
+            covmatrix_rotated += mo.T.dot(jnp.diag(self.marg_prior_mo)).dot(mo)
+
         if data is not None:
             data = np.asarray(data).real.ravel()
             #data_rotated = np.matmul(mmatrix, data + shotnoise * self.mask_ellsout[0]) - shotnoise * self.mask_ellsout[0]
             data_rotated = np.matmul(mmatrix, data)
-            if xlim is not None:
-                data_rotated = data_rotated[mask_xout]
-                if with_momt: mo = [mmo[mask_xout] for mmo in mo]
-            if theory is not None and with_momt:
-                theory = np.asarray(theory).real.ravel()
-                precmatrix = np.linalg.inv(covmatrix_rotated)
-                deriv = np.array(mo)
-                derivp = deriv.dot(precmatrix)
-                fisher = derivp.dot(deriv.T)
-                data_with_shotnoise, theory_with_shotnoise = data_rotated, theory
-                if shotnoise:
-                    data_with_shotnoise = data_rotated + shotnoise * self.mask_oprojs[self.oprojs.index(0)][mask_xout if xlim is not None else Ellipsis]
-                    theory_with_shotnoise = theory + shotnoise * self.mask_tprojs[self.tprojs.index(0)]
-                self.marg_prior_mo = m = np.linalg.solve(fisher, derivp.dot(data_with_shotnoise - np.matmul(wmatrix_rotated, theory_with_shotnoise)))
-                offset = np.dot(m, mo)
-                precmatrix = marg_precmatrix(precmatrix, mo, m)
-                return wmatrix_rotated, covmatrix_rotated, data_rotated, m, offset, precmatrix
+            if with_momt and prior_data:
+                data_rotated -= self.marg_prior_mo.dot(mo)
             return wmatrix_rotated, covmatrix_rotated, data_rotated
-        if input_covmatrix and with_momt and hasattr(self, 'marg_prior_mo'):
-            return wmatrix_rotated, covmatrix_rotated, marg_precmatrix(np.linalg.inv(covmatrix_rotated), mo, self.marg_prior_mo)
+
         return wmatrix_rotated, covmatrix_rotated
+
+    def set_prior(self, data, theory, covmatrix=None, xlim=None):
+        if not self.with_momt:
+            self.logger.info(f'I did not use momt parameters -- no prior set')
+        wmatrix_rotated, covmatrix_rotated, data_rotated = self.rotate(covmatrix=covmatrix, data=data, prior_data=False, prior_cov=False)
+        mmatrix, mo, mt = self.mmatrix
+        if xlim is not None:
+            mask_xout = self.observable._index(xlim=xlim, concatenate=True)
+            wmatrix_rotated = wmatrix_rotated[mask_xout, :]
+            covmatrix_rotated = covmatrix_rotated[np.ix_(mask_xout, mask_xout)]
+            data_rotated = data_rotated[mask_xout]
+            if self.with_momt: mo = [mmo[mask_xout] for mmo in mo]
+        theory = np.asarray(theory).real.ravel()
+        precmatrix = np.linalg.inv(covmatrix_rotated)
+        deriv = np.array(mo)
+        derivp = deriv.dot(precmatrix)
+        fisher = derivp.dot(deriv.T)
+        self.marg_prior_mo = np.linalg.solve(fisher, derivp.dot(data_rotated - np.matmul(wmatrix_rotated, theory)))
 
     @plotter
     def plot_rotated(self, data, shotnoise=0., xlim=None):

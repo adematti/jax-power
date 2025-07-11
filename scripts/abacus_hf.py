@@ -138,10 +138,12 @@ def get_data_fn(tracer='ELG_LOP', zsnap=0.950, imock=0, **kwargs):
         dirname = 'ELG_v5'
     if tracer == 'LRG':
         szrange = '0p4to1p1'
+    #return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph{imock:03d}/CutSky/{dirname}/z{zsnap:.3f}/forclustering/masked_cutsky_abacusHF_DR2_{tracer}_z{sznap}_zcut_{szrange}_clustering.dat.fits'
     return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/AbacusSummit_base_c000_ph{imock:03d}/CutSky/{dirname}/z{zsnap:.3f}/forclustering/cutsky_abacusHF_DR2_{tracer}_z{sznap}_zcut_{szrange}_clustering.dat.fits'
 
 
 def get_randoms_fn(iran=0, **kwargs):
+    #return f'/global/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_0_v2.fits'
     return f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_{iran:d}_v2.fits'
 
 
@@ -392,14 +394,13 @@ def compute_theory(output_fn, spectrum_fns, window_fn, target_spectrum_fn=None):
     from jax import numpy as jnp
     from jaxpower import Spectrum2Poles, WindowMatrix
 
-    pk_box = Spectrum2Poles.mean([Spectrum2Poles.load(fn) for fn in spectrum_fns])
-    wmat_box = WindowMatrix.load(window_fn)
     rebin = 5
-    wmat_square = wmat_box.slice(slice(0, None, rebin), axis='o').slice(slice(0, None, rebin), axis='t')
+    pk_box = Spectrum2Poles.mean([Spectrum2Poles.load(fn) for fn in spectrum_fns]).slice(slice(0, None, rebin))
+    wmat_square = WindowMatrix.load(window_fn).slice(slice(0, None, rebin), axis='o').slice(slice(0, None, rebin), axis='t')
     # Invert the square window matrix
     observable_to_theory = wmat_square.clone(value=np.linalg.inv(wmat_square.view()),
                                              theory=wmat_square.observable, observable=wmat_square.theory)
-    pk_box_deconvolved = observable_to_theory.dot(pk_box.slice(slice(0, None, rebin)), return_type=None)
+    pk_box_deconvolved = observable_to_theory.dot(pk_box, return_type=None, zpt=False)
     # Let's just do a spline interpolation of the "deconvolved" P(k)
     # (one could do something better, fitting some real model given a preliminary covariance matrix)
     from scipy import interpolate
@@ -435,6 +436,64 @@ def compute_spectrum_covariance(output_fn, get_randoms, theory_fn=None, spectrum
         cov.save(output_fn.replace('.npy', f'_{suffix}.npy'))
 
 
+def rotate(output_fn, window_fn, covariance_fn, Minit='momt', mock_fns=None, theory_fn=None,
+          output_window_fn=None, output_covariance_fn=None):
+    from jaxpower import WindowMatrix, CovarianceMatrix, WindowRotationSpectrum2, Spectrum2Poles
+    klim, rebin = (0., 0.3), 5
+    ktlim = (0., 0.5)
+    kcut = (0., 0.2)
+    covmatrix = CovarianceMatrix.load(covariance_fn).slice(slice(0, None, rebin)).select(xlim=klim)
+    wmatrix = WindowMatrix.load(window_fn).slice(covmatrix.observables()[0], axis='o')
+    wmatrix = wmatrix.select(xlim=ktlim, axis='t')
+
+    rotation = WindowRotationSpectrum2(wmatrix=wmatrix, covmatrix=covmatrix, xpivot=0.1)
+    rotation.setup(Minit=Minit)
+    rotation.fit()
+    if rotation.with_momt and mock_fns is not None:
+        mock = Spectrum2Poles.mean([Spectrum2Poles.load(fn) for fn in mock_fns])
+        theory = Spectrum2Poles.load(theory_fn).slice(wmatrix.theory)
+        mock = mock.slice(wmatrix.observable)
+        # To set up priors
+        rotation.set_prior(data=mock.view(), theory=theory.view(), xlim=kcut)
+    wrotated, crotated = rotation.rotate(prior_cov=False)[:2]
+    wmatrix = wmatrix.clone(value=wrotated)
+    covmatrix = covmatrix.clone(value=crotated)
+    if rotation.with_momt:
+        covmatrix.attrs['mo'] = [mo for mo in rotation.mmatrix[1]]
+        covmatrix.attrs['marg_prior_mo'] = rotation.marg_prior_mo 
+    if output_window_fn is not None:
+        wmatrix.save(output_window_fn)
+    if output_covariance_fn is not None:
+        covmatrix.save(output_covariance_fn)
+    rotation.save(output_fn)
+
+
+def postprocess_rotation(output_fns, rotation_fn, data_fns):
+    from jax import numpy as jnp
+    from jaxpower import WindowMatrix, CovarianceMatrix, WindowRotationSpectrum2, Spectrum2Poles
+    rotation = WindowRotationSpectrum2.load(rotation_fn)
+    for data_fn, output_fn in zip(data_fns, output_fns):
+        spectrum = Spectrum2Poles.load(data_fn).slice(rotation.observable)
+        rotated = rotation.rotate(data=spectrum)[2]
+        num = (rotated + jnp.concatenate(spectrum.shotnoise())) * spectrum.norm
+        spectrum = spectrum.clone(num=num)
+        spectrum.save(output_fn)
+
+
+def rotate_old(output_fn, window_fn, covariance_fn, Minit='momt'):
+    from jaxpower import WindowMatrix, CovarianceMatrix, WindowRotationSpectrum2
+    klim, rebin = (0., 0.3), 5
+    ktlim = (0., 0.5)
+    covmatrix = CovarianceMatrix.load(covariance_fn).slice(slice(0, None, rebin)).select(xlim=klim)
+    wmatrix = WindowMatrix.load(window_fn).slice(covmatrix.observables()[0], axis='o')
+    wmatrix = wmatrix.select(xlim=ktlim, axis='t')
+
+    from rotation_old import WindowRotation
+    rotation = WindowRotation(wmatrix=wmatrix, covmatrix=covmatrix)
+    rotation.fit(Minit=Minit, max_sigma_W=5, max_sigma_R=5, factor_diff_ell=10, csub=False)
+    rotation.save(output_fn)
+    
+
 def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', los='local', **attrs):
     from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
     t0 = time.time()
@@ -445,13 +504,9 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     fkp = FKPField(data, randoms)
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
     bin = BinMesh3Spectrum(attrs, edges={'step': 0.02}, basis=basis, ells=ells)
-
-
     norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
-
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-
     spectrum = spectrum.clone(norm=norm)
     spectrum.save(output_fn)
 
@@ -459,6 +514,7 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
 
 if __name__ == '__main__':
 
+    #catalog_args = dict(tracer='ELG_LOP', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
     catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
     #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.725, zrange=(0.6, 0.8))
     #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.5, zrange=(0.4, 0.6))
@@ -471,12 +527,13 @@ if __name__ == '__main__':
     #todo = ['spectrum-box']
     #todo = ['window-spectrum-box']
     #todo = ['spectrum', 'window-spectrum'][:1]
-    todo = ['bispectrum']
+    todo = ['rotate']
+    #todo = ['bispectrum']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 5
+    nmocks = 25
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 
@@ -498,14 +555,14 @@ if __name__ == '__main__':
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
 
         if 'spectrum' in todo:
-            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
+            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='masked_mesh2spectrum')
             with create_sharding_mesh() as sharding_mesh:
                 compute_spectrum(output_fn, get_data, get_randoms, **cutsky_args)
 
         if 'bispectrum' in todo:
-            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh3spectrum_scoccimarro')
+            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh3spectrum_scoccimarro2')
             with create_sharding_mesh() as sharding_mesh:
-                args = cutsky_args | dict(basis='scoccimarro', cellsize=20.)
+                args = cutsky_args | dict(basis='scoccimarro', cellsize=15.)
                 args.pop('ells')
                 compute_bispectrum(output_fn, get_data, get_randoms, **args)
 
@@ -547,6 +604,43 @@ if __name__ == '__main__':
                 output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='covariance_mesh2spectrum')
                 with create_sharding_mesh() as sharding_mesh:
                     compute_spectrum_covariance(output_fn, get_randoms, spectrum_fn=spectrum_fn, theory_fn=theory_fn)
+
+            if 'rotate' in todo:
+                window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
+                covariance_fn = get_measurement_fn(imock=imock, **catalog_args, kind='covariance_mesh2spectrum')
+                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='rotation_mesh2spectrum')
+                output_window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_rotated')
+                rotate(output_fn, window_fn, covariance_fn, Minit=None, output_window_fn=output_window_fn)
+                #output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='rotation_old_mesh2spectrum')
+                #rotate_old(output_fn, window_fn, covariance_fn, Minit=None)
+                rotation_fn = output_fn
+                data_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum') for imock in range(nmocks)]
+                output_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_rotated') for imock in range(nmocks)]
+                postprocess_rotation(output_fns, rotation_fn, data_fns)
+
+                target_spectrum_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh2spectrum')
+                spectrum_fns = [get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh2spectrum') for imock in range(nmocks)]
+                window_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='window_mesh2spectrum')
+                output_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='theory_mesh2spectrum')
+                compute_theory(output_fn, spectrum_fns, window_fn, target_spectrum_fn=target_spectrum_fn)
+                theory_fn = output_fn
+
+                window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_thetacut')
+                covariance_fn = get_measurement_fn(imock=imock, **catalog_args, kind='covariance_mesh2spectrum')
+                output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='rotation_mesh2spectrum_thetacut')
+                mock_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_thetacut') for imock in range(nmocks)]
+                output_window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum_thetacut_rotated')
+                output_covariance_fn = get_measurement_fn(imock=imock, **catalog_args, kind='covariance_mesh2spectrum_rotated')
+                rotate(output_fn, window_fn, covariance_fn, mock_fns=mock_fns, theory_fn=theory_fn,
+                      output_window_fn=output_window_fn, output_covariance_fn=output_covariance_fn)
+
+                #output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='rotation_old_mesh2spectrum_thetacut')
+                #rotate_old(output_fn, window_fn, covariance_fn)
+                rotation_fn = output_fn
+                data_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_thetacut') for imock in range(nmocks)]
+                output_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_thetacut_rotated') for imock in range(nmocks)]
+                postprocess_rotation(output_fns, rotation_fn, data_fns)
+                    
 
             if 'window-pypower' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='pypower')

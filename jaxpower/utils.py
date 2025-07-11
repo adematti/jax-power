@@ -1265,7 +1265,7 @@ class WindowMatrix(object):
         return '{}({}, {})'.format(self.__class__.__name__, self._observable, self._theory)
 
     def __array__(self, *args, **kwargs):
-        return np.asarray(self._value, *args, **kwargs)
+        return np.asarray(self.view(), *args, **kwargs)
 
     @property
     def shape(self):
