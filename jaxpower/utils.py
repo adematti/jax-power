@@ -1880,7 +1880,7 @@ class CovarianceMatrix(object):
             for offset, alpha in zip(offsets, alphas):
                 index = np.arange(max(min(observable.size - offset for observable in observables), 0))
                 flag = int(i2 > i1)
-                index1, index2 = index, index + offset * flag
+                index1, index2 = index, index + offset
                 diag = value[index1, index2]
                 x = observables[flag].x()[0][index]
                 if ytransform is not None: diag = ytransform(x, diag)

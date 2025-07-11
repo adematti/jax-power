@@ -453,31 +453,39 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
 from .mesh2 import compute_normalization
 
 
-def _split_particles(*particles, nsplits, seed=0):
+def _split_particles(*particles, seed=0):
     toret = list(particles)
-    nsplits = nsplits - len(particles)
-    if nsplits == 0: return toret
-    nsplits += 1
+    particles_to_split, nsplits = [], 0
+    # Loop in reverse order
+    for particle in particles[::-1]:
+        if particle is None:
+            nsplits += 1
+        else:
+            particles_to_split.append((particle, nsplits))
+            nsplits = 0
+    # Reorder
+    particles_to_split = particles_to_split[::-1]
     # remove last one
-    particles_to_split = toret[-1]
-    toret = toret[:-1]
     if isinstance(seed, int):
         seed = random.key(seed)
-
-    x = create_sharded_random(random.uniform, seed, particles_to_split.size, out_specs=0)
-    for isplit in range(nsplits):
-        mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
-        toret.append(particles_to_split.clone(weights=particles_to_split.weights * mask))
+    seeds = random.split(seed, len(particles_to_split))
+    toret = []
+    for i, (particle, nsplits) in enumerate(particles_to_split):
+        x = create_sharded_random(random.uniform, seeds[i], particle.size, out_specs=0)
+        for isplit in range(nsplits):
+            mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+            toret.append(particle.clone(weights=particle.weights * mask))
     return toret
 
 
 def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
-    nfkp = len(fkps)
-    fkps, same = _format_meshs(*fkps)
-    fkps = list(fkps)
+    fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
-        randoms = _split_particles(*[fkp.randoms for fkp in fkps[:nfkp]], nsplits=3, seed=split)
+        randoms = _split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
+        fkps, same = _format_meshs(*fkps)
         fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
+    else:
+        fkps, same = _format_meshs(*fkps)
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)

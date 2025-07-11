@@ -35,8 +35,9 @@ def test_covmatrix(plot=False):
     cov2 = CovarianceMatrix.load(fn)
 
     if plot:
-        cov.plot_slice(indices=10, show=True)
-        cov.plot(show=True)
+        cov2.plot_diag([0, 1], show=True)
+        cov2.plot_slice(indices=10, show=True)
+        cov2.plot(show=True)
         cov2.plot(corrcoef=True, show=True)
 
 
@@ -519,7 +520,7 @@ if __name__ == '__main__':
     #config.update('jax_enable_x64', True)
     #test_fftlog2()
     #export_sympy()
-    #test_covmatrix(plot=True)
+    test_covmatrix(plot=True)
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
@@ -527,5 +528,5 @@ if __name__ == '__main__':
     #test_cutsky2_covariance_fftlog(plot=True)
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
-    test_fkp2_covariance(plot=True)
+    #test_fkp2_covariance(plot=True)
     #test_from_pypower()

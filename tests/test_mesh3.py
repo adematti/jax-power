@@ -8,7 +8,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, compute_normalization, utils)
+from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_normalization, compute_fkp3_spectrum_normalization, utils)
 
 
 dirname = Path('_tests')
@@ -68,7 +68,7 @@ def test_timing():
     import time
     from jax import jit, random
     from jaxpower.mesh import create_sharded_random
-    from jaxpower.bspec import get_real_Ylm, spherical_jn
+    from jaxpower.mesh3 import get_real_Ylm, spherical_jn
 
     @jit
     def f1(mesh):
@@ -155,6 +155,26 @@ def test_polybin3d():
                 plt.show()
 
 
+def test_normalization():
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    attrs = MeshAttrs(meshsize=100, boxsize=1000., boxcenter=1000.)
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    boxcenter = [1300., 0., 0.]
+    attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=128)
+
+    mesh = generate_gaussian_mesh(attrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e5)
+    data = generate_uniform_particles(attrs, size, seed=32)
+    data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+    randoms = generate_uniform_particles(attrs, size, seed=42)
+    fkp = FKPField(data, randoms)
+    norm = compute_fkp3_spectrum_normalization(fkp, split=42)
+
+
 
 if __name__ == '__main__':
 
@@ -165,4 +185,5 @@ if __name__ == '__main__':
     warnings.filterwarnings('error')
     #test_mesh3_spectrum(plot=False)
     #test_timing()
-    test_polybin3d()
+    #test_polybin3d()
+    test_normalization()
