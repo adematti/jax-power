@@ -155,6 +155,60 @@ def test_polybin3d():
                 plt.show()
 
 
+def test_triumvirate():
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    attrs = MeshAttrs(meshsize=100, boxsize=1000., boxcenter=1000.)
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    boxcenter = [1300., 0., 0.]
+    attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=64)
+
+    mesh = generate_gaussian_mesh(attrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e5)
+    data = generate_uniform_particles(attrs, size, seed=32)
+    data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+
+    mesh = data.paint(resampler='cic', interlacing=False, compensate=True)
+    edges = np.linspace(0.01, 0.3, 30)
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[(0, 0, 0)])
+    spectrum = compute_mesh3_spectrum(mesh, los='z', bin=bin)
+
+    from triumvirate.logger import setup_logger
+    from triumvirate.catalogue import ParticleCatalogue
+    from triumvirate.threept import compute_bispec_in_gpp_box
+    from triumvirate.dataobjs import Binning
+
+    trv_logger = setup_logger(log_level=20)
+    catalogue = ParticleCatalogue(*np.array(data.positions.T), ws=np.array(data.weights), nz=np.ones_like(data.weights))
+
+    binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
+    results = compute_bispec_in_gpp_box(
+                    catalogue,
+                    degrees=(0, 0, 0),
+                    binning=binning,
+                    form='diag',
+                    sampling_params={
+                        'assignment': 'cic',
+                        'boxsize': list(np.array(attrs.boxsize)),
+                        'ngrid': list(np.array(attrs.meshsize))},
+                    logger=trv_logger)
+
+    ax = plt.gca()
+    raw = spectrum.view()
+    #print(spectrum.nmodes()[0] / (results['nmodes_1'] * results['nmodes_2']))
+    print(raw / results['bk_raw'] * attrs.cellsize.prod())
+    exit()
+    ax.plot(results['bk_raw'], label='triumvirate')
+    ax.plot(jnp.concatenate(spectrum.num), label='jaxpower')
+    ax.legend()
+    plt.show()
+
+
+
+
 def test_normalization():
     def pk(k):
         kp = 0.03
@@ -181,9 +235,8 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    import warnings
-    warnings.filterwarnings('error')
     #test_mesh3_spectrum(plot=False)
     #test_timing()
     #test_polybin3d()
-    test_normalization()
+    #test_normalization()
+    test_triumvirate()

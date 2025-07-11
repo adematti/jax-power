@@ -83,7 +83,7 @@ class BinMesh3Spectrum(object):
             if not isinstance(array, (tuple, list)):
                 array = [array] * ndim
             if 'diagonal' in basis or 'equilateral' in basis:
-                grid = jnp.array(array[0])
+                grid = [jnp.array(array[0])] * ndim
             else:
                 grid = jnp.meshgrid(*array, sparse=False, indexing='ij')
             return jnp.column_stack([tmp.ravel() for tmp in grid])
@@ -175,10 +175,14 @@ class BinMesh3Spectrum(object):
 
     def __call__(self, *meshs, remove_zero=False):
         values = []
+        ndim = 3 if 'scoccimarro' in self.basis else 2
         for imesh, mesh in enumerate(meshs):
             value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
-            if remove_zero and imesh < self.xavg.shape[1]:  # 0, 1 for sugiyama, 0, 1, 2 for scoccimaro
-                value = value.at[(0,) * value.ndim].set(0.)
+            if remove_zero:
+                if imesh < ndim:  # 0, 1 for sugiyama, 0, 1, 2 for scoccimaro
+                    value = value.at[(0,) * value.ndim].set(0.)
+                else:
+                    value = value - jnp.mean(value)
             values.append(value)
 
         if self._buffer_iedges is None:
@@ -187,7 +191,7 @@ class BinMesh3Spectrum(object):
                     mesh_prod = 1.
                 else:
                     mesh_prod = values[2]
-                for ivalue, value in enumerate(values[:self.xavg.shape[1]]):  # values if 'scoccimarro' else values[:2]
+                for ivalue, value in enumerate(values[:ndim]):
                     mesh_prod = mesh_prod * self.mattrs.c2r(value * (self.ibin[ivalue] == ibin[ivalue]))
                 return mesh_prod.sum()
 
@@ -199,7 +203,7 @@ class BinMesh3Spectrum(object):
                 def f_bin(value, ibin):
                     return self.mattrs.c2r(value * (self.ibin == ibin))
 
-                iter_binned_values = [jax.vmap(partial(f_bin, value))(edge) for value, edge in zip(values[:self.xavg.shape[1]], uedges)]
+                iter_binned_values = [jax.vmap(partial(f_bin, value))(edge) for value, edge in zip(values[:ndim], uedges)]
 
                 def f_prod(index):
                     if 'scoccimarro' in self.basis: mesh_prod = 1.
@@ -435,14 +439,22 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
             carry += (4. * np.pi)**2 * im[3] * bin(*tmp)
             return carry, im
 
+        @partial(jax.checkpoint, static_argnums=0)
+        def f(Ylm, carry, im):
+            tmp = tuple(meshs)
+            carry = bin(*tmp)
+            return carry, im
+
         for ill, (ell1, ell2, ell3) in enumerate(ells):
             Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
             if los != 'z':
-                xs = [(im1, im2, im3, real_gaunt.get(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.)) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
+                xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3))) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
             else:
-                xs = [(im1, im2, im3, real_gaunt.get(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.)) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
+                xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3))) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
             xs = [jnp.array(xx) for xx in zip(*[xx for xx in xs if xx[-1]])]
-            num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
+
+            #num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
+            num.append(bin(*meshs, remove_zero=True) / bin.nmodes[ill])
             num_zero.append(jnp.real(prod(map(_get_zero, meshs[:2])) * meshs[2].sum()) if (ell1, ell2, ell3) == (0, 0, 0) else 0.)
 
     # FIXME: computing num_zero is a bit involved
@@ -511,7 +523,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', 
             particles.append(particles[s])
         else:
             if isinstance(fkp, FKPField):
-                fkp = fkp.data - fkp.data.sum() / fkp.randoms.sum() * fkp.randoms
+                fkp = fkp.particles
             particles.append(fkp)
 
     mattrs = particles.attrs
@@ -580,9 +592,9 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', 
             for ell1, ell2, ell3 in ells:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
                 if los != 'z':
-                    xs = [(im1, im2, im3, real_gaunt.get(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
+                    xs = [(im1, im2, im3, real_gaunt(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
                 else:
-                    xs = [(im1, im2, im3, real_gaunt.get(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
+                    xs = [(im1, im2, im3, real_gaunt(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
                 xs = [jnp.array(xx) for xx in zip(*[xx for xx in xs if xx[-1]])]
                 sign = (-1)**((ell1 + ell2) // 2)
                 s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=rmesh.clone(value=jnp.zeros_like(rmesh.value)), xs=xs)[0])
