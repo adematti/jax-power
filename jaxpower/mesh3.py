@@ -117,15 +117,27 @@ class BinMesh3Spectrum(object):
                 split_edges.append(jnp.array_split(uedges[axis], nsplits, axis=0))
                 split_iedges.append(jnp.array_split(axis_iedges, nsplits, axis=0))
             _buffer_global_iedges, _buffer_iedges, _buffer_iuedges = [], [], []
+            size_max, usize_max = 0, 0
             for biuedges, buedges in zip(itertools.product(*split_iedges), itertools.product(*split_edges)):
                 mask = get_order_mask(buedges)
                 if mask.sum():
                     _buffer_global_iedges.append(_product(biuedges)[mask])
                     _buffer_iedges.append(_product([jnp.arange(len(iedge)) for iedge in biuedges])[mask])
                     _buffer_iuedges.append(biuedges)
+                    size_max = max(size_max, len(_buffer_iedges[-1]))
+                    usize_max = max(usize_max, *[len(b) for b in _buffer_iuedges[-1]])
+
+            #print('Number of FFTs', sum(sum(len(bb) for bb in b) for b in _buffer_iuedges))
+            # Pad to be able to use jax.lax.map, otherwise compilation time is prohibitive
+            for i in range(len(_buffer_global_iedges)):
+                _buffer_global_iedges[i] = jnp.pad(_buffer_global_iedges[i], [(0, size_max - len(_buffer_global_iedges[i])), (0, 0)], mode='edge')
+                _buffer_iedges[i] = jnp.pad(_buffer_iedges[i], [(0, size_max - len(_buffer_iedges[i])), (0, 0)], mode='edge')
+                _buffer_iuedges[i] = jnp.stack([jnp.pad(b, (0, usize_max - len(b)), mode='edge') for b in _buffer_iuedges[i]])
+
+            #print('Number of FFTs padded', sum(sum(len(bb) for bb in b) for b in _buffer_iuedges))
             _buffer_global_iedges = jnp.concatenate(_buffer_global_iedges, axis=0)
             _buffer_sort = jnp.array([jnp.flatnonzero(jnp.all(iedge == _buffer_global_iedges, axis=1))[0] for iedge in iedges])
-            _buffer_iedges = (_buffer_iedges, _buffer_iuedges, _buffer_sort)
+            _buffer_iedges = (jnp.stack(_buffer_iedges), jnp.stack(_buffer_iuedges), _buffer_sort)
         else:
             _buffer_iedges = None
 
@@ -174,7 +186,8 @@ class BinMesh3Spectrum(object):
             return jax.lax.map(f, self._iedges, batch_size=self.batch_size)
 
         else:
-            def f(iedges, uiedges):
+            def f(args):
+                iedges, uiedges = args
 
                 def f_bin(value, axis, ibin):
                     return self.mattrs.c2r(value * (self.ibin[axis] == ibin))
@@ -190,7 +203,8 @@ class BinMesh3Spectrum(object):
 
                 return jax.lax.map(f_prod, iedges)
 
-            return jnp.concatenate(list(map(f, *self._buffer_iedges[:2])))[self._buffer_iedges[2]]
+            return jax.lax.map(f, self._buffer_iedges[:2]).ravel()[self._buffer_iedges[2]]
+            #return jnp.concatenate(list(map(f, *self._buffer_iedges[:2])))[self._buffer_iedges[2]]
 
 
 @jax.tree_util.register_pytree_node_class

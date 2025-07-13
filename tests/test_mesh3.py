@@ -109,15 +109,17 @@ def test_timing():
 
     from jaxpower.mesh import create_sharded_random
 
-    attrs = MeshAttrs(meshsize=128, boxsize=1000.)
-    edges = [np.arange(0.01, 0.15, 0.01) for kmax in attrs.knyq]
-    #bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0], buffer_size=4)
+    attrs = MeshAttrs(meshsize=256, boxsize=1000.)
+    edges = [np.arange(0.01, 0.2, 0.01) for kmax in attrs.knyq]
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0], buffer_size=4)
+    # batch_size is mostly useless
+    #bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0], batch_size=12)
     cmeshs = [attrs.create(kind='real', fill=create_sharded_random(random.normal, random.key(42), shape=attrs.meshsize)).r2c() for axis in range(3)]
 
 
-    def test(ff):
-        f = jax.jit(ff)
+    def test(ff, jit=True):
+        if jit: f = jax.jit(ff)
+        else: f = ff
         bk = f(*cmeshs)
         bk = jax.block_until_ready(bk)
         t0 = time.time()
@@ -141,7 +143,7 @@ def test_timing():
         return jax.lax.map(f2, bin._iedges)
 
     bk1 = test(f)
-    bk2 = test(bin.__call__)
+    bk2 = test(bin.__call__, jit=True)
     assert np.allclose(bk1, bk2)
 
 
@@ -267,11 +269,14 @@ def test_normalization():
 
 if __name__ == '__main__':
 
+    #import os
+    #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
+    #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
+
     from jax import config
     config.update('jax_enable_x64', True)
 
     test_timing()
-    exit()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
     #test_polybin3d()
