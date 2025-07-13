@@ -690,6 +690,18 @@ def test_smooth_window():
         plt.show()
 
 
+def test_box_window():
+
+    ellsin = (0, 2, 4)
+
+    attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
+    bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    edgesin = jnp.arange(0., attrs.knyq.max() * 1.2, 0.01)
+
+    wmatrix = compute_mesh2_spectrum_window(attrs, edgesin=edgesin, ellsin=ellsin, bin=bin, los='x')
+    wmatrix.plot(show=True)
+
+
 def test_wmatrix(plot=False):
     ellsin = (0, 2)
     ells = (0, 2)
@@ -846,10 +858,15 @@ def test_split():
         print(f'cache {_paint._cache_size()} {time.time() - t0:.2f}')
 
 
+
+
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+
+    test_box_window()
+    exit()
 
     #import warnings
     #warnings.simplefilter("error")

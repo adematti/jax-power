@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
 from .mesh2 import _get_los_vector, _get_zero, FKPField
-from .utils import real_gaunt, BinnedStatistic, get_legendre, get_spherical_jn, get_real_Ylm, plotter, register_pytree_dataclass
+from .utils import real_gaunt, BinnedStatistic, WindowMatrix, get_legendre, get_spherical_jn, get_real_Ylm, plotter, register_pytree_dataclass
 
 
 @partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
@@ -506,7 +506,7 @@ def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
     return norm
 
 
-def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', **kwargs):
+def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', **kwargs):
     fkps, same = _format_meshs(*fkps)
     ells = _format_ells(ells, basis=bin.basis)
     shotnoise = [jnp.ones_like(bin.xavg[..., 0]) for ill in range(len(ells))]
@@ -537,8 +537,55 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', 
 
     if 'scoccimaro' in bin.basis:
 
-        # Eq. 56 of https://arxiv.org/pdf/1506.02729, 1 => 3
-        raise NotImplementedError('Scoccimarro bispectrum shot noise not implemented yet')
+        # Eq. 58 of https://arxiv.org/pdf/1506.02729, 1 => 3
+        if not (same[0] == same[1] == same[2]):
+            raise NotImplementedError
+        cmeshw = particles[0].paint(**kwargs, out='complex')
+        cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
+        sumw3 = jnp.sum(particles[0].weights**3)
+        del particles
+
+        ndim = 3
+        for ill, ell in enumerate(bin.ells):
+            if ell == 0:
+                tmp = cmeshw * cmeshw2.conj()
+                tmp = [bin_mesh2_spectrum(tmp, axis=axis) for axis in range(ndim)]
+
+                def f(ibin):
+                    return sum(tmp[ii] for ii in ibin)
+
+                shotnoise[ill] = jax.lax.map(f, bin._iedges) - 2. * sumw3
+            else:
+                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                xvec = mattrs.rcoords(sparse=True)
+                kvec = mattrs.kcoords(sparse=True)
+
+                @partial(jax.checkpoint, static_argnums=[0, 1])
+                def f(rmesh, Ylm, carry, im):
+                    carry += mattrs.r2c(rmesh * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
+                    return carry, im
+
+                xs = np.arange(len(Ylms))
+                # First line of eq. 58, q1 => q3
+                cmeshw_ell = (4. * jnp.pi) * jax.lax.scan(partial(f, cmeshw.c2r(), Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
+                sn_ell = bin_mesh2_spectrum(cmeshw_ell * cmeshw2.conj(), axis=2)
+                del cmeshw_ell
+
+                cmeshw3_ell = (4. * jnp.pi) * cmeshw * jax.lax.scan(partial(f, cmeshw2.c2r(), Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0].conj()
+                @partial(jax.checkpoint, static_argnums=[0])
+                def f(Ylm, carry, im):
+                    Ylm = Ylm(*kvec)
+                    bin3_Ylm = bin_mesh2_spectrum(Ylm, axis=0)
+                    # Second line of eq. 58
+                    tmp = cmeshw3_ell * Ylm
+                    tmp = [bin_mesh2_spectrum(tmp, axis=axis) for axis in range(ndim - 1)]
+
+                    def f2(ibin):
+                        return sum(bin3_Ylm[ibin[0]] * tmp[ii] for ii in ibin[1:])
+                    carry += jax.lax.map(f2, bin._iedges)
+                    return carry, im
+
+                shotnoise[ill] = (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=sn_ell, xs=xs)[0]
 
     else:
         # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132
@@ -631,3 +678,191 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='x', 
                 shotnoise[ill] += s113[ill]
 
     return tuple(shotnoise)
+
+
+
+
+def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_selection=None, power=None, seed=42, norm=None):
+
+    assert 'scoccimarro' in bin.basis, 'fisher is only available for scoccimarro basis'
+
+    periodic = apply_selection is None
+    rdtype = mattrs.rdtype
+
+    los, vlos = _format_los(los, ndim=mattrs.ndim)
+
+    _norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)**2
+    if norm is None: norm = _norm
+
+    if periodic:
+        xmid = jnp.mean(bin.edges, axis=-1).T
+        kvec = mattrs.kcoords(sparse=True)
+
+        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
+        del knorm
+
+        fisher = [[0. for illin in range(len(bin.ells))] for ell in range(len(bin.ells))]
+        for ill, ell in enumerate(bin.ells):
+            for illin, ellin in enumerate(bin.ells):
+                # The Fourier-space grid
+                legin = get_legendre(ellin)(mu)
+                legout = get_legendre(ell)(mu)
+
+                def f(weights, ibin):
+                    mesh_prod = 1.
+                    for ivalue in range(3):
+                        mask = (bin.ibin[ivalue] == ibin[ivalue]) * weights[ivalue]
+                        mesh_prod = mesh_prod * mattrs.c2r(mask.astype(mattrs.dtype))
+                    return jnp.sum(mesh_prod)
+
+                def fmap(*weights):
+                    return jax.lax.map(partial(f, weights), bin._iedges[mask], batch_size=bin.batch_size)
+
+                tmp = jnp.ones_like(xmid[0])
+                mask = (xmid[1] != xmid[0]) & (xmid[2] != xmid[1])
+                tmp = tmp.at[mask].set(fmap(1., 1., legin * legout))
+                mask = (xmid[1] == xmid[0]) & (xmid[2] != xmid[1])
+                tmp = tmp.at[mask].set(2 * fmap(1., 1., legin * legout))
+                mask = (xmid[1] != xmid[0]) & (xmid[2] == xmid[1])
+                tmp = tmp.at[mask].set(fmap(1., legin, legout) + fmap(1., 1., legin * legout))
+                mask = (xmid[1] == xmid[0]) & (xmid[2] == xmid[1])
+                tmp = tmp.at[mask].set(4. * fmap(1., legin, legout) + 2. * fmap(1., 1., legin * legout))
+                fisher[ill][illin] = jnp.diag(tmp)
+
+        fisher = np.block(fisher)
+
+    else:
+
+        def apply_SinvW(cmap):
+            return apply_selection(cmap.c2r()).r2c()
+
+        def apply_Ainv(cmap):
+            return cmap * Ainv
+
+        # Define Q map code
+        def compute_Q(weighting, cmaps, Q_Ainv=None):
+            # Filter maps appropriately
+            if weighting == 'Sinv':
+                cwmaps = [apply_SinvW(cmap) for cmap in cmaps]
+                fisher = jnp.zeros((len(bin.ells) * len(bin._iedges),) * 2)
+            else:
+                cwmaps = [apply_Ainv(cmap) for cmap in cmaps]
+                Q_Ainv = jnp.zeros((len(bin._iedges),) + tuple(mattrs.meshsize))
+            del cmaps
+            rwmaps = [cwmap.c2r() for cwmap in cwmaps]
+
+            def apply_fourier_legendre(ell, cmesh):
+                kvec = mattrs.kcoords(sparse=True)
+                mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
+                return get_legendre(ell)(mu) * cmesh
+
+            def apply_fourier_harmonics(ell, rmesh):
+                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                xvec = mattrs.rcoords(sparse=True)
+                kvec = mattrs.kcoords(sparse=True)
+
+                @partial(jax.checkpoint, static_argnums=0)
+                def f(Ylm, carry, im):
+                    carry += mattrs.r2c(rmesh * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
+                    return carry, im
+
+                xs = np.arange(len(Ylms))
+                return (4. * jnp.pi) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
+
+            def apply_real_harmonics(ell, cmesh):
+                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                xvec = mattrs.rcoords(sparse=True)
+                kvec = mattrs.kcoords(sparse=True)
+
+                @partial(jax.checkpoint, static_argnums=0)
+                def f(Ylm, carry, im):
+                    carry += mattrs.c2r(cmesh * jax.lax.switch(im, Ylm, *kvec)) * jax.lax.switch(im, Ylm, *xvec)
+                    return carry, im
+
+                xs = np.arange(len(Ylms))
+                return (4. * jnp.pi) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='real'), xs=xs)[0]
+
+            # Compute g_{b,0} maps
+            g_b0_maps, leg_maps = [], []
+            for idim in range(2):
+                g_b0_maps.append([mattrs.c2r(cwmaps[idim] * (bin.ibin[idim + 1] == b)) for b in bin.uiedges[idim + 1]])
+                if vlos is None:
+                    leg_maps.append([apply_fourier_harmonics(ell, rwmaps[idim]) for ell in bin.ells])
+
+            for ibin3 in bin.uiedges[-1]:
+                g_bBl_maps = []
+                for idim in range(2):
+                    tmp = []
+                    for ell in bin.ells:
+                        if vlos is not None: tmp.append(mattrs.c2r(apply_fourier_legendre(ell, cwmaps[idim] * (bin.ibin[2] == ibin3))))
+                        else: tmp.append(mattrs.c2r(leg_maps[idim] * (bin.ibin[2] == ibin3)))
+                    g_bBl_maps.append(tmp)
+
+                for ibin1 in bin.uiedges[0]:
+                    if weighting == 'Sinv':
+                        ibins2 = jnp.flatnonzero((bin._iedges[..., 0] == ibin1) & (bin._iedges[..., 2] == ibin3))
+                        if not ibins2.size: continue
+                        for ill, ell in enumerate(bin.ells):
+                            # Compute FT[g_{0, bA}, g_{ell, bB}]
+                            ft_ABl = mattrs.r2c(g_b0_maps[0][ibin1] * g_bBl_maps[0][ill][ibin3] - g_b0_maps[1][ibin1] * g_bBl_maps[1][ill][ibin3])
+                            for ibin2 in ibins2:
+                                fisher = fisher.at[ibin2 + ill * len(bin._iedges)].set(jnp.sum(ft_ABl * Q_Ainv.conj() * (bin.ibin[1] == ibin2)))
+
+                    if weighting == 'Ainv':
+                        # Find which elements of the Q3 matrix this pair is used for (with ordering)
+                        ibins1 = jnp.flatnonzero((bin._iedges[..., 0] == ibin1) & (bin._iedges[..., 1] == ibin1))
+                        ibins2 = jnp.flatnonzero((bin._iedges[..., 1] == ibin1) & (bin._iedges[..., 2] == ibin3))
+                        ibins3 = jnp.flatnonzero((bin._iedges[..., 2] == ibin3) & (bin._iedges[..., 0] == ibin1))
+                        if ibins1.size + ibins2.size + ibins2.size:
+                            continue
+                        ft_ABl = []
+                        for ell in bin.ells:
+                            ft_ABl.append(mattrs.r2c(g_bBl_maps[0][bin.ells.index(0)][ibin1] * g_bBl_maps[0][ill][ibin3] - g_bBl_maps[1][bin.ells.index(0)][ibin1] * g_bBl_maps[1][ill][ibin3]))
+
+                        def add_Q_element(Q_Ainv, idim, ibins):
+                            # Iterate over these elements and add to the output arrays
+                            for ibin2 in ibins:
+                                ibin = bin._iedges[ibin, idim]
+                                for ill, ell in enumerate(bin.ells):
+                                    if (ell == 0) or (idim == 2):
+                                        tmp = ft_ABl[ill] * (bin.ibin[idim] == ibin)
+                                    else:
+                                        if vlos is not None:
+                                            tmp = apply_fourier_legendre(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[idim] == ibin))
+                                        else:
+                                            tmp = apply_real_harmonics(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[idim] == ibin)).r2c()
+                                    Q_Ainv[ibin2 + ill * len(bin._iedges)] += tmp
+
+                        Q_Ainv = add_Q_element(Q_Ainv, 2, ibins1)
+                        Q_Ainv = add_Q_element(Q_Ainv, 0, ibins2)
+                        Q_Ainv = add_Q_element(Q_Ainv, 1, ibins3)
+
+            if weighting == 'Sinv':
+                return fisher
+            return Q_Ainv
+
+        A, Ainv = 1., 1.
+        if power is not None:
+            kvec = mattrs.kcoords(sparse=True)
+            A = power(kvec)
+            Ainv = jnp.where(A == 0., 1., 1 / A)
+
+        if isinstance(seed, int):
+            seed = random.key(seed)
+
+        seeds = random.split(seed, 2)
+        cmaps = [mattrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=mattrs.meshsize)).r2c() * jnp.sqrt(A) for seed in seeds]
+
+        Q_Ainv = compute_Q('Ainv', cmaps)
+        for ibin in range(Q_Ainv.shape[0]):
+            Q_Ainv = Q_Ainv.at[ibin].set(apply_SinvW(Q_Ainv))
+
+        fisher = compute_Q('Sinv', cmaps, Q_Ainv=Q_Ainv)
+        fisher = 1. / 2. * fisher / norm
+
+    observable = BinnedStatistic(x=[bin.xavg] * len(bin.ells), value=[jnp.zeros_like(bin.xavg)] * len(bin.ells), edges=[bin.edges] * len(bin.ells),
+                                 weights=[bin.nmodes] * len(bin.ells), projs=bin.ells)
+    theory = observable.clone(weights=[jnp.ones_like(bin.nmodes)] * len(bin.ells))
+    wmat = WindowMatrix(observable, theory, fisher, attrs={'norm': norm})
+    return wmat

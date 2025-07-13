@@ -408,7 +408,7 @@ def _format_los(los, ndim=3):
     return los, vlos, swap
 
 
-def compute_mesh2(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum | BinMesh2Correlation=None, los: str | np.ndarray='x'):
+def compute_mesh2(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum | BinMesh2Correlation=None, los: str | np.ndarray='z'):
     if isinstance(bin, BinMesh2Spectrum):
         return compute_mesh2_spectrum(*meshs, bin=bin, los=los)
     elif isinstance(bin, BinMesh2Correlation):
@@ -416,7 +416,7 @@ def compute_mesh2(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectru
     raise ValueError(f'bin must be either BinMesh2Spectrum or BinMesh2Correlation, not {type(bin)}')
 
 
-def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum=None, los: str | np.ndarray='x') -> Spectrum2Poles:
+def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
     r"""
     Compute power spectrum from mesh.
 
@@ -548,7 +548,7 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
         return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
-def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Correlation=None, los: str | np.ndarray='x') -> Correlation2Poles:
+def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Correlation=None, los: str | np.ndarray='z') -> Correlation2Poles:
     r"""
     Compute 2-pt correlation function from mesh.
 
@@ -888,7 +888,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
 
 
 def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
-                                  bin: BinMesh2Spectrum=None, los: str | np.ndarray='x',
+                                  bin: BinMesh2Spectrum=None, los: str | np.ndarray='z',
                                   buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
     r"""
     Compute mean power spectrum from mesh.
@@ -932,11 +932,9 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
     periodic = isinstance(meshs[0], MeshAttrs)
     if periodic:
         assert autocorr
-        rdtype = float
-        mattrs = meshs[0]
     else:
-        rdtype = meshs[0].real.dtype
         mattrs = meshs[0].attrs
+    rdtype = mattrs.rdtype
 
     _norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
     if norm is None: norm = _norm
@@ -981,6 +979,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
         if np.ndim(ellsin) == 0: ellsin = (ellsin,)
         ellsin = list(ellsin)
+        common = False
 
         if not periodic:
 
@@ -992,6 +991,9 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
             Q = _2r(meshs[0] * meshs[1].conj()) / mattrs.meshsize.prod(dtype=rdtype)
         else:
             Q = None
+            mask_kin = jnp.all(kin >= bin.edges[0], axis=-1) & jnp.all(kin <= bin.edges[-1], axis=-1)
+            mask_edges = jnp.all(bin.edges >= kin[0], axis=-1) & jnp.all(bin.edges <= kin[-1], axis=-1)
+            common = mask_edges.sum() == mask_kin.sum() and jnp.allclose(kin[mask_kin], bin.edges[mask_edges])
 
         kvec = mattrs.kcoords(sparse=True)
         knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
@@ -1074,15 +1076,24 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
             for ellin in ellsin:
                 legin = get_legendre(ellin)(mu)
 
-                def f(kin):
-                    Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * rnorm * mattrs.meshsize.prod(dtype=rdtype))
-                    if Q is not None: Aell = _2c(Q * _2r(Aell))
+                if common:
+                    Aell = mattrs.create(kind='complex', fill=legin * rnorm * mattrs.meshsize.prod(dtype=rdtype))
                     power = _bin(Aell)
-                    if pbar:
-                        t.update(n=round(1 / len(ellsin)))
-                    return power
+                    wmat_ellin = jnp.zeros_like(power, shape=(kin.shape[0], power.size))
+                    wmat_ellin = wmat_ellin.at[jnp.tile(jnp.flatnonzero(mask_kin), len(bin.ells)), jnp.tile(mask_edges, len(bin.ells))].set(power)
 
-                wmat.append(my_map(f, kin))
+                else:
+
+                    def f(kin):
+                        Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * rnorm * mattrs.meshsize.prod(dtype=rdtype))
+                        if Q is not None: Aell = _2c(Q * _2r(Aell))
+                        power = _bin(Aell)
+                        if pbar:
+                            t.update(n=round(1 / len(ellsin)))
+                        return power
+                    wmat_ellin = my_map(f, kin)
+
+                wmat.append(wmat_ellin)
 
         wmat = jnp.concatenate(wmat, axis=0).T
 
@@ -1427,7 +1438,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
 
 def compute_mesh2_spectrum_mean(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
-                                bin: BinMesh2Spectrum=None, los: str | np.ndarray='x') -> Spectrum2Poles:
+                                bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
     r"""
     Compute mean power spectrum from mesh.
 

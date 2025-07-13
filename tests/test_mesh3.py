@@ -105,6 +105,42 @@ def test_timing():
     timing(f2, cmesh)
 
 
+def test_timing():
+
+    from jaxpower.mesh import create_sharded_random
+
+    attrs = MeshAttrs(meshsize=100, boxsize=1000.)
+    edges = [np.arange(0.01, 0.2, 0.01) for kmax in attrs.knyq]
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0])
+    cmeshs = [attrs.create(kind='real', fill=create_sharded_random(random.normal, random.key(42), shape=attrs.meshsize)).r2c() for axis in range(3)]
+
+    def test(ff):
+        f = jax.jit(ff)
+        bk = f(*cmeshs)
+        bk = jax.block_until_ready(bk)
+        t0 = time.time()
+        bk = f(*cmeshs)
+        bk = jax.block_until_ready(bk)
+        print(time.time() - t0)
+
+    def f(*values):
+        meshs = []
+
+        def f2(axis, ibin):
+            return bin.mattrs.c2r(values[axis].value * (bin.ibin[axis] == ibin))
+
+        for axis in range(3):
+            meshs.append(jax.lax.map(partial(f2, axis), xs=jnp.arange(len(bin._nmodes1d[axis]))))
+
+        def f2(ibin):
+            return jnp.sum(meshs[0][ibin[0]] * meshs[1][ibin[1]] * meshs[2][ibin[2]])
+
+        return jax.lax.map(f2, bin._iedges)
+
+    test(f)
+    test(bin.__call__)
+
+
 def test_polybin3d():
 
     from PolyBin3D import PolyBin3D, BSpec
@@ -160,11 +196,9 @@ def test_triumvirate():
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
 
-    attrs = MeshAttrs(meshsize=100, boxsize=1000., boxcenter=1000.)
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
-    boxcenter = [1300., 0., 0.]
-    attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=64)
+    attrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
 
     mesh = generate_gaussian_mesh(attrs, pkvec, seed=42, unitary_amplitude=True)
     size = int(1e5)
@@ -200,12 +234,10 @@ def test_triumvirate():
     raw = spectrum.view()
     #print(spectrum.nmodes()[0] / (results['nmodes_1'] * results['nmodes_2']))
     print(raw / results['bk_raw'] * attrs.cellsize.prod())
-    exit()
     ax.plot(results['bk_raw'], label='triumvirate')
     ax.plot(jnp.concatenate(spectrum.num), label='jaxpower')
     ax.legend()
     plt.show()
-
 
 
 
@@ -235,8 +267,10 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    test_timing()
+    exit()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
     #test_polybin3d()
     #test_normalization()
-    test_triumvirate()
+    #test_triumvirate()
