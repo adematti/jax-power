@@ -62,7 +62,7 @@ class BinMesh3Spectrum(object):
             edges = [edges] * ndim
 
         coords = jnp.sqrt(sum(xx**2 for xx in vec))
-        ibin, nmodes1d, xavg = [], [], []
+        ibin, nmodes1d, xavg, uedges = [], [], [], []
         for edge in edges:
             ib, nm, x = _get_bin_attrs(coords, edge, wmodes, ravel=False)
             ib = ib - 1
@@ -74,7 +74,8 @@ class BinMesh3Spectrum(object):
             ibin.append(ib)
             nmodes1d.append(nm)
             xavg.append(x)
-        edges = edges + [edges[-1]] * (ndim - len(edges))
+            uedges.append(jnp.column_stack([edge[:-1], edge[1:]]))
+        uedges = uedges + [uedges[-1]] * (ndim - len(uedges))
         ibin = ibin + [ibin[-1]] * (ndim - len(ibin))
         nmodes1d = nmodes1d + [nmodes1d[-1]] * (ndim - len(nmodes1d))
         xavg = xavg + [xavg[-1]] * (ndim - len(xavg))
@@ -88,12 +89,15 @@ class BinMesh3Spectrum(object):
                 grid = jnp.meshgrid(*array, sparse=False, indexing='ij')
             return jnp.column_stack([tmp.ravel() for tmp in grid])
 
-        xmid = _product([(edge[:-1] + edge[1:]) / 2. for edge in edges])
-        mask = True
-        for i in range(xmid.shape[1] - 1): mask &= xmid[:, i] <= xmid[:, i + 1]  # select k1 <= k2 <= k3...
+        def get_order_mask(edges):
+            xmid = _product([jnp.mean(edge, axis=-1) for edge in edges])
+            mask = True
+            for i in range(xmid.shape[1] - 1): mask &= xmid[:, i] <= xmid[:, i + 1]  # select k1 <= k2 <= k3...
+            return mask
 
+        mask = get_order_mask(uedges)
         # of shape (nbins, ndim, 2)
-        edges = jnp.concatenate([_product([edge[:-1] for edge in edges])[..., None], _product([edge[1:] for edge in edges])[..., None]], axis=-1)[mask]
+        edges = jnp.concatenate([_product([edge[..., 0] for edge in uedges])[..., None], _product([edge[..., 1] for edge in uedges])[..., None]], axis=-1)[mask]
         xavg = _product(xavg)[mask]
         nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
         iedges = _product([jnp.arange(len(xx)) for xx in nmodes1d])[mask]
@@ -106,17 +110,22 @@ class BinMesh3Spectrum(object):
         nmodes = [nmodes] * len(ells)
 
         if buffer_size >= 1:
-            raise NotImplementedError
-            iuedges = jnp.unique(edges)
-            iuedges_size = (len(iuedges) + buffer_size - 1) // buffer_size * buffer_size
-            iuedges = jnp.pad(iuedges, pad_width=(0, iuedges_size - len(iuedges)), mode='edge').reshape(-1, buffer_size)
-            _buffer_iedges, _buffer_iuedges = [], []
-            for biuedges in itertools.product(*iuedges):
-                _buffer_iedges.append(_product(biuedges))
-                _buffer_iuedges.append(jnp.stack(biuedges))
-            _buffer_iedges = jnp.stack(_buffer_iedges), jnp.stack(_buffer_iuedges)
-            _buffer_sort = jnp.array([jnp.flatnonzero(jnp.all(iedge == _buffer_iedges.reshape(-1, iedges.shape[1]), axis=1))[0] for iedge in iedges])
-            _buffer_iedges =_buffer_iedges + (_buffer_sort,)
+            split_edges, split_iedges = [], []
+            for axis in range(ndim):
+                axis_iedges = jnp.arange(len(uedges[axis]))
+                nsplits = (len(axis_iedges) + buffer_size - 1) // buffer_size
+                split_edges.append(jnp.array_split(uedges[axis], nsplits, axis=0))
+                split_iedges.append(jnp.array_split(axis_iedges, nsplits, axis=0))
+            _buffer_global_iedges, _buffer_iedges, _buffer_iuedges = [], [], []
+            for biuedges, buedges in zip(itertools.product(*split_iedges), itertools.product(*split_edges)):
+                mask = get_order_mask(buedges)
+                if mask.sum():
+                    _buffer_global_iedges.append(_product(biuedges)[mask])
+                    _buffer_iedges.append(_product([jnp.arange(len(iedge)) for iedge in biuedges])[mask])
+                    _buffer_iuedges.append(biuedges)
+            _buffer_global_iedges = jnp.concatenate(_buffer_global_iedges, axis=0)
+            _buffer_sort = jnp.array([jnp.flatnonzero(jnp.all(iedge == _buffer_global_iedges, axis=1))[0] for iedge in iedges])
+            _buffer_iedges = (_buffer_iedges, _buffer_iuedges, _buffer_sort)
         else:
             _buffer_iedges = None
 
@@ -135,42 +144,9 @@ class BinMesh3Spectrum(object):
                     mask = self.ibin[ivalue] == ibin[ivalue]
                     mesh_prod = mesh_prod * mattrs.c2r(mask.astype(mattrs.dtype))
                 return mesh_prod.sum()
+
             nmodes = jax.lax.map(f, self._iedges)
-
-            if False:
-                symfactors = []
-                for ell in ells:
-                    if ell == 0:
-                        tmp = symfactor
-                    else:
-                        # The Fourier-space grid
-                        kvec = mattrs.kcoords(sparse=True)
-                        Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
-
-                        tmp = symfactor.copy()
-
-                        def f(ibin):
-                            mesh_sum = 0.
-                            for Ylm in Ylms:
-                                mesh_prod = 1.
-                                for ivalue in range(1, ndim):
-                                    mask = (self.ibin[ivalue] == ibin[ivalue])
-                                    mask *= Ylm(*kvec)
-                                    mesh_prod = mesh_prod * mattrs.c2r(mask.astype(mattrs.dtype))
-                                mesh_sum += mesh_prod
-                            mask = (self.ibin[0] == ibin[0])
-                            return jnp.sum(mattrs.c2r(mask.astype(mattrs.dtype)) * mesh_sum)
-
-                        mask = (xmid[1] != xmid[0]) & (xmid[2] == xmid[1])
-                        tmp = tmp.at[mask].set(1 + jax.lax.map(f, self._iedges[mask], batch_size=self.batch_size) / nmodes[mask])
-                        mask = (xmid[1] != xmid[0]) & (xmid[2] == xmid[1])
-                        tmp = tmp.at[mask].set(2 + 4 * jax.lax.map(f, self._iedges[mask], batch_size=self.batch_size) / nmodes[mask])
-
-                    symfactors.append(tmp)
-
-                nmodes = [nmodes / jnp.where(nmodes == 0, 1, symfactor) for symfactor in symfactors]
-            else:
-                nmodes = [nmodes] * len(ells)
+            nmodes = [nmodes] * len(ells)
             self.__dict__.update(nmodes=nmodes)
 
     def __call__(self, *meshs, remove_zero=False):
@@ -191,30 +167,30 @@ class BinMesh3Spectrum(object):
                     mesh_prod = 1.
                 else:
                     mesh_prod = values[2]
-                for ivalue, value in enumerate(values[:ndim]):
-                    mesh_prod = mesh_prod * self.mattrs.c2r(value * (self.ibin[ivalue] == ibin[ivalue]))
+                for axis, value in enumerate(values[:ndim]):
+                    mesh_prod = mesh_prod * self.mattrs.c2r(value * (self.ibin[axis] == ibin[axis]))
                 return mesh_prod.sum()
 
             return jax.lax.map(f, self._iedges, batch_size=self.batch_size)
 
         else:
-            def f(iedges, uedges):
+            def f(iedges, uiedges):
 
-                def f_bin(value, ibin):
-                    return self.mattrs.c2r(value * (self.ibin == ibin))
+                def f_bin(value, axis, ibin):
+                    return self.mattrs.c2r(value * (self.ibin[axis] == ibin))
 
-                iter_binned_values = [jax.vmap(partial(f_bin, value))(edge) for value, edge in zip(values[:ndim], uedges)]
+                iter_binned_values = [jax.lax.map(partial(f_bin, value, axis), edge, batch_size=self.batch_size) for axis, (value, edge) in enumerate(zip(values[:ndim], uiedges))]
 
                 def f_prod(index):
                     if 'scoccimarro' in self.basis: mesh_prod = 1.
                     else: mesh_prod = values[2]
-                    for ivalue, value in enumerate(iter_binned_values):
-                        mesh_prod *= value[index[ivalue]]
+                    for axis, value in enumerate(iter_binned_values):
+                        mesh_prod *= value[index[axis]]
                     return mesh_prod.sum()
 
-                return jax.vmap(f_prod)(iedges)
+                return jax.lax.map(f_prod, iedges)
 
-            return jax.lax.map(f, *self._buffer_iedges[:2]).ravel()[self._buffer_iedges[2]]
+            return jnp.concatenate(list(map(f, *self._buffer_iedges[:2])))[self._buffer_iedges[2]]
 
 
 @jax.tree_util.register_pytree_node_class

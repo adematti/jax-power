@@ -109,10 +109,12 @@ def test_timing():
 
     from jaxpower.mesh import create_sharded_random
 
-    attrs = MeshAttrs(meshsize=100, boxsize=1000.)
-    edges = [np.arange(0.01, 0.2, 0.01) for kmax in attrs.knyq]
-    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0])
+    attrs = MeshAttrs(meshsize=128, boxsize=1000.)
+    edges = [np.arange(0.01, 0.15, 0.01) for kmax in attrs.knyq]
+    #bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0], buffer_size=4)
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0], buffer_size=4)
     cmeshs = [attrs.create(kind='real', fill=create_sharded_random(random.normal, random.key(42), shape=attrs.meshsize)).r2c() for axis in range(3)]
+
 
     def test(ff):
         f = jax.jit(ff)
@@ -122,6 +124,7 @@ def test_timing():
         bk = f(*cmeshs)
         bk = jax.block_until_ready(bk)
         print(time.time() - t0)
+        return bk
 
     def f(*values):
         meshs = []
@@ -137,8 +140,9 @@ def test_timing():
 
         return jax.lax.map(f2, bin._iedges)
 
-    test(f)
-    test(bin.__call__)
+    bk1 = test(f)
+    bk2 = test(bin.__call__)
+    assert np.allclose(bk1, bk2)
 
 
 def test_polybin3d():
@@ -238,7 +242,6 @@ def test_triumvirate():
     ax.plot(jnp.concatenate(spectrum.num), label='jaxpower')
     ax.legend()
     plt.show()
-
 
 
 def test_normalization():
