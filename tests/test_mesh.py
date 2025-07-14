@@ -88,20 +88,28 @@ def test_real_mesh():
 def test_resamplers():
     for shape in [(3,), (4, 3, 5)]:
         meshshape = np.array(shape)
-        size = 100
+        size = 10000
         positions = meshshape * random.uniform(random.key(42), shape=(size, len(meshshape)))
         weights = 1. + random.uniform(random.key(42), shape=(size,))
         for resampler in ['ngp', 'cic', 'tsc', 'pcs']:
             mesh = jnp.zeros(meshshape)
             mesh = getattr(resamplers, resampler).paint(mesh, positions, weights)
             assert np.allclose(mesh.sum(), weights.sum())
+            mesh2 = jnp.zeros(meshshape)
+            mesh2 = getattr(resamplers, resampler + '2').paint(mesh2, positions, weights)
+            assert np.allclose(mesh2.sum(), weights.sum())
+            assert np.allclose(mesh2, mesh)
+            mesh = random.uniform(random.key(64), shape=meshshape)
+            weights = getattr(resamplers, resampler).read(mesh, positions)
+            weights2 = getattr(resamplers, resampler + '2').read(mesh, positions)
+            assert np.allclose(weights, weights2)
 
 
-def test_jit():
+def test_paint_jit():
 
     from jaxpower.resamplers import tsc
     mesh = jnp.zeros((32,) * 3)
-    positions = random.uniform(random.key(64), shape=(100000, 3))
+    positions = random.uniform(random.key(64), shape=(3000000, 3))
     t0 = time.time()
     paint = jax.jit(tsc.paint)
     mesh = paint(mesh, positions)
@@ -177,6 +185,9 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+    #test_paint_jit()
+    test_resamplers()
+    exit()
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
