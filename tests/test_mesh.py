@@ -95,21 +95,15 @@ def test_resamplers():
             mesh = jnp.zeros(meshshape)
             mesh = getattr(resamplers, resampler).paint(mesh, positions, weights)
             assert np.allclose(mesh.sum(), weights.sum())
-            mesh2 = jnp.zeros(meshshape)
-            mesh2 = getattr(resamplers, resampler + '2').paint(mesh2, positions, weights)
-            assert np.allclose(mesh2.sum(), weights.sum())
-            assert np.allclose(mesh2, mesh)
             mesh = random.uniform(random.key(64), shape=meshshape)
             weights = getattr(resamplers, resampler).read(mesh, positions)
-            weights2 = getattr(resamplers, resampler + '2').read(mesh, positions)
-            assert np.allclose(weights, weights2)
 
 
 def test_paint_jit():
 
     from jaxpower.resamplers import tsc
-    mesh = jnp.zeros((32,) * 3)
-    positions = random.uniform(random.key(64), shape=(3000000, 3))
+    mesh = jnp.zeros((256,) * 3)
+    positions = random.uniform(random.key(64), shape=(1000000, 3))
     t0 = time.time()
     paint = jax.jit(tsc.paint)
     mesh = paint(mesh, positions)
@@ -124,12 +118,12 @@ def test_paint_jit():
 
     positions = ParticleField(positions, attrs=dict(meshsize=mesh.shape, boxsize=1., boxcenter=0.5))
     t0 = time.time()
-    positions.paint(resampler='tsc')
+    positions.paint(resampler='tsc', interlacing=3, compensate=True)
     print(f'time for jit {time.time() - t0:.2f}')
     t0 = time.time()
     nmock = 10
     for i in range(nmock):
-        mesh = positions.paint(resampler='tsc')
+        mesh = positions.paint(resampler='tsc', interlacing=3, compensate=True)
         jax.block_until_ready(mesh)
     print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
 
@@ -185,13 +179,12 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-    #test_paint_jit()
-    test_resamplers()
-    exit()
+
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
     test_resamplers()
+    test_paint_jit()
     test_static_array()
     test_particle_field()
     test_dtype()

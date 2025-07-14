@@ -46,3 +46,7 @@ Example notebooks presenting most use cases are provided in directory nb/.
 Multi-GPU 3D FFT and halo exhcange is handled with (publication incoming!):
 [jaxdecomp](https://github.com/DifferentiableUniverseInitiative/jaxDecomp)
 by Wassim Kabalan and François Lanusse.
+
+## Acknowledgments
+
+Hugo Simon-Onfroy for more jit-friendly resamplers: [montecosmo](https://github.com/hsimonfroy)

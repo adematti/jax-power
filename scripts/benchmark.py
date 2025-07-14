@@ -172,7 +172,7 @@ if __name__ == '__main__':
         from jaxpower import compute_mesh2_spectrum, create_sharding_mesh
         jitted_compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'], donate_argnums=[0])
 
-    for imock in range(1):
+    for imock in range(2):
         catalog_dir = Path(f'/dvs_ro/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
         data_fn = catalog_dir / f'{tracer}_{region}_clustering.dat.fits'
         all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)][:5]
