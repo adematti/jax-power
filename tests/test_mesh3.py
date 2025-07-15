@@ -207,41 +207,36 @@ def test_triumvirate():
     attrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
 
     mesh = generate_gaussian_mesh(attrs, pkvec, seed=42, unitary_amplitude=True)
-    size = int(1e5)
+    size = int(1e4)
     data = generate_uniform_particles(attrs, size, seed=32)
-    data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+    # Triumvirate doesn't take weights for box statistics...
+    #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
 
     mesh = data.paint(resampler='cic', interlacing=False, compensate=True)
+    mesh = mesh / mesh.mean() #- 1.
     edges = np.linspace(0.01, 0.3, 30)
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[(0, 0, 0)])
     spectrum = compute_mesh3_spectrum(mesh, los='z', bin=bin)
 
-    from triumvirate.logger import setup_logger
     from triumvirate.catalogue import ParticleCatalogue
     from triumvirate.threept import compute_bispec_in_gpp_box
-    from triumvirate.dataobjs import Binning
+    from triumvirate.parameters import ParameterSet
 
-    trv_logger = setup_logger(log_level=20)
-    catalogue = ParticleCatalogue(*np.array(data.positions.T), ws=np.array(data.weights), nz=np.ones_like(data.weights))
+    catalogue = ParticleCatalogue(*np.array(data.positions.T), nz=np.ones_like(data.weights) * jnp.sum(data.weights) / attrs.boxsize.prod())
 
-    binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
-    results = compute_bispec_in_gpp_box(
-                    catalogue,
-                    degrees=(0, 0, 0),
-                    binning=binning,
-                    form='diag',
-                    sampling_params={
-                        'assignment': 'cic',
-                        'boxsize': list(np.array(attrs.boxsize)),
-                        'ngrid': list(np.array(attrs.meshsize))},
-                    logger=trv_logger)
+    #trv_logger = setup_logger(log_level=20)
+    #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
+    paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], (0, 0, 0))), wa_orders=dict(i=None, j=None), range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', boxsize=dict(zip('xyz', attrs.boxsize)), ngrid=dict(zip('xyz', attrs.meshsize)), verbose=20)
+    print(paramset)
+    paramset = ParameterSet(param_dict=paramset)
+    results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
 
     ax = plt.gca()
     raw = spectrum.view()
     #print(spectrum.nmodes()[0] / (results['nmodes_1'] * results['nmodes_2']))
-    print(raw / results['bk_raw'] * attrs.cellsize.prod())
+    print(spectrum.view() / results['bk_raw'])
     ax.plot(results['bk_raw'], label='triumvirate')
-    ax.plot(jnp.concatenate(spectrum.num), label='jaxpower')
+    ax.plot(spectrum.view(), label='jaxpower')
     ax.legend()
     plt.show()
 
@@ -276,9 +271,9 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_timing()
+    #test_timing()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
     #test_polybin3d()
     #test_normalization()
-    #test_triumvirate()
+    test_triumvirate()

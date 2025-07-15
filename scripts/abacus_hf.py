@@ -503,13 +503,33 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
     fkp = FKPField(data, randoms)
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
-    bin = BinMesh3Spectrum(attrs, edges={'step': 0.02}, basis=basis, ells=ells)
+    bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
     norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
     spectrum = spectrum.clone(norm=norm)
     spectrum.save(output_fn)
 
+
+def compute_box_bispectrum(output_fn, get_data, basis='scoccimarro', los='z', **attrs):
+    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
+    t0 = time.time()
+    data = get_data()
+    attrs = MeshAttrs(**attrs)
+    data = ParticleField(data, attrs=attrs, exchange=True, backend='jax')
+    mesh = data.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
+    edges = np.arange(0., 0.12, 0.01)
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis=basis, ells=ells, buffer_size=4)
+    jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'], donate_argnums=[0])
+    mesh = fkp.paint(resampler='tsc', interlacing=False, compensate=False, out='real')
+    spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    spectrum.attrs.update(mesh=dict(mesh.attrs), los=los)
+    jax.block_until_ready(spectrum)
+    t1 = time.time()
+    if jax.process_index() == 0:
+        print(f'Done in {t1 - t0:.2f}')
+    spectrum.save(output_fn)
 
 
 if __name__ == '__main__':
@@ -560,7 +580,7 @@ if __name__ == '__main__':
                 compute_spectrum(output_fn, get_data, get_randoms, **cutsky_args)
 
         if 'bispectrum' in todo:
-            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh3spectrum_scoccimarro2')
+            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh3spectrum_scoccimarro')
             with create_sharding_mesh() as sharding_mesh:
                 args = cutsky_args | dict(basis='scoccimarro', cellsize=15.)
                 args.pop('ells')
@@ -656,6 +676,13 @@ if __name__ == '__main__':
             with create_sharding_mesh() as sharding_mesh:
                 compute_box_spectrum(output_fn, get_data, **box_args)
 
+        if 'bispectrum-box' in todo:
+            output_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh3spectrum_scoccimarro')
+            with create_sharding_mesh() as sharding_mesh:
+                args = cutsky_args | dict(basis='scoccimarro')
+                args.pop('ells')
+                compute_box_bispectrum(output_fn, get_data, get_randoms, **args)
+        
         if imock == 0:
             if 'window-spectrum-box' in todo:
                 spectrum_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh2spectrum')

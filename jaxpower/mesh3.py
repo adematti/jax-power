@@ -157,13 +157,14 @@ class BinMesh3Spectrum(object):
                     mesh_prod = mesh_prod * mattrs.c2r(mask.astype(mattrs.dtype))
                 return mesh_prod.sum()
 
-            nmodes = jax.lax.map(f, self._iedges)
+            nmodes = jax.lax.map(f, self._iedges) * self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)**2
             nmodes = [nmodes] * len(ells)
             self.__dict__.update(nmodes=nmodes)
 
     def __call__(self, *meshs, remove_zero=False):
         values = []
         ndim = 3 if 'scoccimarro' in self.basis else 2
+        norm = self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)**2
         for imesh, mesh in enumerate(meshs):
             value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
             if remove_zero:
@@ -183,7 +184,7 @@ class BinMesh3Spectrum(object):
                     mesh_prod = mesh_prod * self.mattrs.c2r(value * (self.ibin[axis] == ibin[axis]))
                 return mesh_prod.sum()
 
-            return jax.lax.map(f, self._iedges, batch_size=self.batch_size)
+            return jax.lax.map(f, self._iedges, batch_size=self.batch_size) * norm
 
         else:
             def f(args):
@@ -203,8 +204,8 @@ class BinMesh3Spectrum(object):
 
                 return jax.lax.map(f_prod, iedges)
 
-            return jax.lax.map(f, self._buffer_iedges[:2]).ravel()[self._buffer_iedges[2]]
-            #return jnp.concatenate(list(map(f, *self._buffer_iedges[:2])))[self._buffer_iedges[2]]
+            return jax.lax.map(f, self._buffer_iedges[:2]).ravel()[self._buffer_iedges[2]] * norm
+            #return jnp.concatenate(list(map(f, *self._buffer_iedges[:2])))[self._buffer_iedges[2]] * mesh.meshsize.prod(dtype=mattrs.rdtype)**2
 
 
 @jax.tree_util.register_pytree_node_class
