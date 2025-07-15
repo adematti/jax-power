@@ -403,7 +403,7 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
                 Ylms = [get_real_Ylm(ell3, m) for m in range(-ell3, ell3 + 1)]
                 xs = np.arange(len(Ylms))
                 tmp = tuple(meshs[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshs[0].clone(value=jnp.zeros_like(meshs[0].value)), xs=xs)[0],)
-                tmp = (4. * np.pi) * bin(*tmp) / bin.nmodes[ill3]
+                tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
                 num.append(tmp)
                 num_zero.append(jnp.real(prod(map(_get_zero, meshs))) if ell3 == 0 else 0.)
 
@@ -427,13 +427,7 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
             tmp = tuple(meshs[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshs[2],)
-            carry += (4. * np.pi)**2 * im[3] * bin(*tmp)
-            return carry, im
-
-        @partial(jax.checkpoint, static_argnums=0)
-        def f(Ylm, carry, im):
-            tmp = tuple(meshs)
-            carry = bin(*tmp)
+            carry += (4. * np.pi)**2 * im[3] * bin(*tmp, remove_zero=True)
             return carry, im
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
@@ -444,8 +438,8 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
                 xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3))) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
             xs = [jnp.array(xx) for xx in zip(*[xx for xx in xs if xx[-1]])]
 
-            #num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
-            num.append(bin(*meshs, remove_zero=True) / bin.nmodes[ill])
+            num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
+            #num.append(bin(*meshs, remove_zero=True) / bin.nmodes[ill])
             num_zero.append(jnp.real(prod(map(_get_zero, meshs[:2])) * meshs[2].sum()) if (ell1, ell2, ell3) == (0, 0, 0) else 0.)
 
     # FIXME: computing num_zero is a bit involved
@@ -499,17 +493,18 @@ def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
 
 def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', **kwargs):
     fkps, same = _format_meshs(*fkps)
-    ells = _format_ells(ells, basis=bin.basis)
+    # ells
+    ells = bin.ells
     shotnoise = [jnp.ones_like(bin.xavg[..., 0]) for ill in range(len(ells))]
 
     def bin_mesh2_spectrum(mesh, axis):
-        return _bincount(bin.ibin[axis], mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin.nmodes1d[axis]
+        return _bincount(bin.ibin[axis], mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin._nmodes1d[axis]
 
     if same[2] == same[1] + 1 == same[0] + 2:
         return tuple(shotnoise)
 
     particles = []
-    for fkp, s in zip(fkp, same):
+    for fkp, s in zip(fkps, same):
         if s < len(particles):
             particles.append(particles[s])
         else:
@@ -517,14 +512,12 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 fkp = fkp.particles
             particles.append(fkp)
 
-    mattrs = particles.attrs
+    mattrs = particles[0].attrs
     los, vlos = _format_los(los, ndim=mattrs.ndim)
     # The real-space grid
     xvec = mattrs.rcoords(sparse=True)
     # The Fourier-space grid
     kvec = mattrs.kcoords(sparse=True)
-    # ells
-    ells = bin.ells
 
     if 'scoccimaro' in bin.basis:
 
@@ -537,7 +530,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         del particles
 
         ndim = 3
-        for ill, ell in enumerate(bin.ells):
+        for ill, ell in enumerate(ells):
             if ell == 0:
                 tmp = cmeshw * cmeshw2.conj()
                 tmp = [bin_mesh2_spectrum(tmp, axis=axis) for axis in range(ndim)]
@@ -585,7 +578,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             if ells == [(0, 0)]:
                 return [jnp.sum(particles[0].weights**3) / jnp.sqrt(4. * jnp.pi)]
             rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-            s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)) for ell, m in ells]
+            s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ells]
             return s111
 
         def compute_S122(particles, ells, axis):  # 1 == 2
@@ -597,38 +590,39 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 return carry, im
 
             cmesh = particles[0].paint(**kwargs, out='complex')
-
+            s122 = []
             for ell in ells:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
                 xs = jnp.arange(len(Ylms))
-                s122.append(4. * jnp.pi * bin_mesh2_spectrum(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0] * cmesh, axis) - s111 * (ell == 0))
+                s122.append(4. * jnp.pi * bin_mesh2_spectrum(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0] * cmesh, axis) - s111_00 * (ell == 0))
             return s122
 
         def compute_S113(particles, ells):
 
             ells3 = sorted(list(set(ell[2] for ell in ells)))
-            ells3 = [(ell, m) for m in range(-ell, ell + 1) for ell in ells3]
+            ells3 = [(ell, m)  for ell in ells3 for m in range(-ell, ell + 1)]
             s111 = compute_S111(particles, ells3)
 
             rmesh = particles[2].paint(**kwargs, out='real')
             cmesh = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
 
             @partial(jax.checkpoint, static_argnums=(0, 1))
-            def f(Ylm, jl, carry, im):
+            def f(Ylms, jl, carry, im):
                 los = xvec if vlos is None else vlos
-                tmp = im[3] * (jax.lax.switch(im[2], Ylm, *los) * rmesh).r2c() * cmesh - im[4].c2r()
+                tmp = im[3] * (rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh - im[4]
                 xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
-                tmp *= jax.lax.switch(im[0], Ylm, *xvec) * jax.lax.switch(im[1], Ylm, *xvec)
+                tmp *= jax.lax.switch(im[0], Ylms[0], *xvec) * jax.lax.switch(im[1], Ylms[1], *xvec)
 
                 def fk(k):
-                    return tmp * jl[0](xnorm * k[0]) * jl[1](xnorm * [1])
+                    return tmp * jl[0](xnorm * k[0]) * jl[1](xnorm * k[1])
 
                 carry += (4. * np.pi)**2 * jax.lax.map(fk, bin.xavg)
                 return carry, im
 
             s113 = []
             for ell1, ell2, ell3 in ells:
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                print(ell1, ell2, ell3, ells)
+                Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
                 if los != 'z':
                     xs = [(im1, im2, im3, real_gaunt(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
                 else:
@@ -639,10 +633,11 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
             return s113
 
-        s111 = 0.
+        s111_00 = 0.
         if same[0] == same[1] == same[2]:
-            s111 = jnp.sqrt(4. * jnp.pi) * compute_S111(particles, [(0, 0)])[0]
-            shotnoise[ells.index((0, 0, 0))] += s111
+            s111_00 = jnp.sqrt(4. * jnp.pi) * compute_S111(particles, [(0, 0)])[0]
+            ell0 = (0, 0, 0)
+            if ell0 in ells: shotnoise[ells.index(ell0)] += s111_00
 
         if same[1] == same[2]:
             ells1 = [ell[0] for ell in ells if ell[2] == ell[0] and ell[1] == 0]

@@ -1941,6 +1941,9 @@ def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, s
 @partial(jax.jit, static_argnames=('length', 'antisymmetric', 'sharding_mesh'))
 def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, sharding_mesh=None):
 
+    if not isinstance(ibin, (tuple, list)):
+        ibin = [ibin]
+
     def _count(value, *ibin):
         value = value.ravel()
         if weights is not None:
@@ -1950,7 +1953,7 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
         count = lambda ib: jnp.bincount(ib, weights=value, length=length + 2)
         if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
             count = lambda ib: jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
-        value = sum(count(ib) for ib in ibin)
+        value = sum(count(ib.ravel() if ib.ndim > 1 else ib) for ib in ibin)
         return value[1:-1] / len(ibin)
 
     count = _count

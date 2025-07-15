@@ -8,7 +8,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_normalization, compute_fkp3_spectrum_normalization, utils)
+from jaxpower import (compute_mesh3_spectrum, BinMesh3Spectrum, MeshAttrs, Spectrum3Poles, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_normalization, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, utils)
 
 
 dirname = Path('_tests')
@@ -215,8 +215,11 @@ def test_triumvirate():
     mesh = data.paint(resampler='cic', interlacing=False, compensate=True)
     mesh = mesh / mesh.mean() #- 1.
     edges = np.linspace(0.01, 0.3, 30)
-    bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[(0, 0, 0)])
+    ell = (2, 0, 2)
+    #ell = (0, 0, 0)
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
     spectrum = compute_mesh3_spectrum(mesh, los='z', bin=bin)
+    shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los='z')
 
     from triumvirate.catalogue import ParticleCatalogue
     from triumvirate.threept import compute_bispec_in_gpp_box
@@ -226,7 +229,7 @@ def test_triumvirate():
 
     #trv_logger = setup_logger(log_level=20)
     #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
-    paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], (0, 0, 0))), wa_orders=dict(i=None, j=None), range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', boxsize=dict(zip('xyz', attrs.boxsize)), ngrid=dict(zip('xyz', attrs.meshsize)), verbose=20)
+    paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None), range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', boxsize=dict(zip('xyz', attrs.boxsize)), ngrid=dict(zip('xyz', attrs.meshsize)), verbose=20)
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
