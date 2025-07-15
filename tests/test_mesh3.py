@@ -215,11 +215,12 @@ def test_triumvirate():
     mesh = data.paint(resampler='cic', interlacing=False, compensate=True)
     mesh = mesh / mesh.mean() #- 1.
     edges = np.linspace(0.01, 0.3, 30)
-    ell = (2, 0, 2)
-    #ell = (0, 0, 0)
+    ell = (0, 0, 0)
+    #ell = (2, 0, 2)
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
     spectrum = compute_mesh3_spectrum(mesh, los='z', bin=bin)
-    shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los='z')
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los='z')
+    spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
     from triumvirate.catalogue import ParticleCatalogue
     from triumvirate.threept import compute_bispec_in_gpp_box
@@ -229,7 +230,9 @@ def test_triumvirate():
 
     #trv_logger = setup_logger(log_level=20)
     #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
-    paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None), range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', boxsize=dict(zip('xyz', attrs.boxsize)), ngrid=dict(zip('xyz', attrs.meshsize)), verbose=20)
+    paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None),
+                    range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic',
+                    boxsize=dict(zip('xyz', np.array(attrs.boxsize))), ngrid=dict(zip('xyz', np.array(attrs.meshsize))), verbose=20)
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
@@ -237,9 +240,13 @@ def test_triumvirate():
     ax = plt.gca()
     raw = spectrum.view()
     #print(spectrum.nmodes()[0] / (results['nmodes_1'] * results['nmodes_2']))
-    print(spectrum.view() / results['bk_raw'])
+    #print(spectrum.view() / results['bk_raw'])
+    sn = jnp.concatenate(spectrum.shotnoise())
     ax.plot(results['bk_raw'], label='triumvirate')
-    ax.plot(spectrum.view(), label='jaxpower')
+    ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
+    #ax.plot(spectrum.view(), label='jaxpower')
+    #ax.plot(results['bk_shot'], label='triumvirate')
+    #ax.plot(sn, label='jaxpower')
     ax.legend()
     plt.show()
 

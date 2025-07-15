@@ -424,10 +424,11 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
 
         @partial(jax.checkpoint, static_argnums=0)
         def f(Ylm, carry, im):
+            coeff, im = im[3], im[:3]
             tmp = tuple(meshs[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshs[2],)
-            carry += (4. * np.pi)**2 * im[3] * bin(*tmp, remove_zero=True)
+            carry += (4. * np.pi)**2 * coeff * bin(*tmp, remove_zero=True)
             return carry, im
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
@@ -495,7 +496,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     fkps, same = _format_meshs(*fkps)
     # ells
     ells = bin.ells
-    shotnoise = [jnp.ones_like(bin.xavg[..., 0]) for ill in range(len(ells))]
+    shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
 
     def bin_mesh2_spectrum(mesh, axis):
         return _bincount(bin.ibin[axis], mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin._nmodes1d[axis]
@@ -541,8 +542,6 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 shotnoise[ill] = jax.lax.map(f, bin._iedges) - 2. * sumw3
             else:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
-                xvec = mattrs.rcoords(sparse=True)
-                kvec = mattrs.kcoords(sparse=True)
 
                 @partial(jax.checkpoint, static_argnums=[0, 1])
                 def f(rmesh, Ylm, carry, im):
@@ -556,6 +555,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 del cmeshw_ell
 
                 cmeshw3_ell = (4. * jnp.pi) * cmeshw * jax.lax.scan(partial(f, cmeshw2.c2r(), Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0].conj()
+
                 @partial(jax.checkpoint, static_argnums=[0])
                 def f(Ylm, carry, im):
                     Ylm = Ylm(*kvec)
@@ -586,22 +586,20 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
-                carry += (rmesh * jax.lax.switch(im, Ylm, *xvec)).r2c().conj() * jax.lax.switch(im, Ylm, *kvec)
+                im, s111 = im
+                # Second and third lines
+                carry += (rmesh * jax.lax.switch(im, Ylm, *xvec)).r2c().conj() * jax.lax.switch(im, Ylm, *kvec) * cmesh - s111
                 return carry, im
 
             cmesh = particles[0].paint(**kwargs, out='complex')
             s122 = []
             for ell in ells:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
-                xs = jnp.arange(len(Ylms))
-                s122.append(4. * jnp.pi * bin_mesh2_spectrum(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0] * cmesh, axis) - s111_00 * (ell == 0))
+                xs = (jnp.arange(len(Ylms)), jnp.array([s111[ellms.index((ell, m))] for m in range(-ell, ell + 1)]))
+                s122.append(4. * jnp.pi * bin_mesh2_spectrum(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0], axis))
             return s122
 
         def compute_S113(particles, ells):
-
-            ells3 = sorted(list(set(ell[2] for ell in ells)))
-            ells3 = [(ell, m)  for ell in ells3 for m in range(-ell, ell + 1)]
-            s111 = compute_S111(particles, ells3)
 
             rmesh = particles[2].paint(**kwargs, out='real')
             cmesh = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
@@ -609,35 +607,38 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             @partial(jax.checkpoint, static_argnums=(0, 1))
             def f(Ylms, jl, carry, im):
                 los = xvec if vlos is None else vlos
-                tmp = im[3] * (rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh - im[4]
+                s111, coeff, im = im[-1], im[3], im[:3]
+                # Fourth line
+                tmp = coeff * (rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh.conj() - s111
                 xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
-                tmp *= jax.lax.switch(im[0], Ylms[0], *xvec) * jax.lax.switch(im[1], Ylms[1], *xvec)
+                tmp = tmp.c2r() * jax.lax.switch(im[0], Ylms[0], *xvec) * jax.lax.switch(im[1], Ylms[1], *xvec)
 
                 def fk(k):
-                    return tmp * jl[0](xnorm * k[0]) * jl[1](xnorm * k[1])
+                    return jnp.sum(tmp.value * jl[0](xnorm * k[0]) * jl[1](xnorm * k[1]))
 
                 carry += (4. * np.pi)**2 * jax.lax.map(fk, bin.xavg)
                 return carry, im
 
             s113 = []
             for ell1, ell2, ell3 in ells:
-                print(ell1, ell2, ell3, ells)
                 Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
                 if los != 'z':
-                    xs = [(im1, im2, im3, real_gaunt(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
+                    xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), s111[ellms.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
                 else:
-                    xs = [(im1, im2, im3, real_gaunt(((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), 0.), s111[ells3.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
+                    xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), s111[ellms.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
                 xs = [jnp.array(xx) for xx in zip(*[xx for xx in xs if xx[-1]])]
                 sign = (-1)**((ell1 + ell2) // 2)
-                s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=rmesh.clone(value=jnp.zeros_like(rmesh.value)), xs=xs)[0])
+                s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0]), xs=xs)[0])
 
             return s113
 
-        s111_00 = 0.
+        uells = sorted(sum(ells, start=tuple()))
+        ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
+        s111 = [0.] * len(ellms)
         if same[0] == same[1] == same[2]:
-            s111_00 = jnp.sqrt(4. * jnp.pi) * compute_S111(particles, [(0, 0)])[0]
+            s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
-            if ell0 in ells: shotnoise[ells.index(ell0)] += s111_00
+            if ell0 in ells: shotnoise[ells.index(ell0)] += jnp.sqrt(4. * jnp.pi) * s111[ellms.index((0, 0))]
 
         if same[1] == same[2]:
             ells1 = [ell[0] for ell in ells if ell[2] == ell[0] and ell[1] == 0]
@@ -645,7 +646,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             s122 = compute_S122(particles01, ells1, 0)
 
             for ill, ell in enumerate(ells):
-                if ell[0] in ells1:
+                if ell[2] == ell[0] and ell[1] == 0:
                     idx = ells1.index(ell[0])
                     shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
 
@@ -654,7 +655,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             particles01 = [particles[1], particles[0]]
             s121 = compute_S122(particles01, ells2, 1)
             for ill, ell in enumerate(ells):
-                if ell[1] in ells2:
+                if ell[2] == ell[1] and ell[0] == 0:
                     idx = ells2.index(ell[1])
                     shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
 
