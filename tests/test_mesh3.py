@@ -212,15 +212,19 @@ def test_triumvirate():
     # Triumvirate doesn't take weights for box statistics...
     #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
 
-    mesh = data.paint(resampler='cic', interlacing=False, compensate=True)
-    mesh = mesh / mesh.mean() #- 1.
-    edges = np.linspace(0.01, 0.3, 30)
+    mesh = data.paint(resampler='cic', interlacing=False, compensate=False)
+    mean = mesh.mean()
+    #mean = 1.
+    #mesh = mesh - mean
+    edges = np.arange(0.01, attrs.knyq[0], 0.01)
     ell = (0, 0, 0)
     #ell = (2, 0, 2)
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
+
     spectrum = compute_mesh3_spectrum(mesh, los='z', bin=bin)
-    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los='z')
-    spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los='z', resampler='cic', compensate=True, interlacing=False)
+    spectrum = spectrum.clone(norm=spectrum.norm * mean**3)
+    spectrum = spectrum.clone(num_shotnoise=jnp.array(num_shotnoise))
 
     from triumvirate.catalogue import ParticleCatalogue
     from triumvirate.threept import compute_bispec_in_gpp_box
@@ -231,7 +235,7 @@ def test_triumvirate():
     #trv_logger = setup_logger(log_level=20)
     #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
     paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None),
-                    range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic',
+                    range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', interlace='off',
                     boxsize=dict(zip('xyz', np.array(attrs.boxsize))), ngrid=dict(zip('xyz', np.array(attrs.meshsize))), verbose=20)
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
@@ -242,6 +246,9 @@ def test_triumvirate():
     #print(spectrum.nmodes()[0] / (results['nmodes_1'] * results['nmodes_2']))
     #print(spectrum.view() / results['bk_raw'])
     sn = jnp.concatenate(spectrum.shotnoise())
+    #print(sn)
+    print(results['bk_shot'])
+    print(sn / results['bk_shot'])
     ax.plot(results['bk_raw'], label='triumvirate')
     ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
     #ax.plot(spectrum.view(), label='jaxpower')

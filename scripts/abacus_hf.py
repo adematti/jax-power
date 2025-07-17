@@ -186,6 +186,7 @@ def compute_spectrum_window(output_fn, get_randoms, spectrum_fn=None, kind='smoo
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
     randoms = ParticleField(*get_randoms(), attrs=attrs, exchange=True, backend='jax')
     randoms = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms
+    los = spectrum.attrs['los']
     num_shotnoise = jnp.sum(randoms.weights**2)
     mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     del randoms
@@ -535,8 +536,8 @@ def compute_box_bispectrum(output_fn, get_data, basis='scoccimarro', los='z', **
 if __name__ == '__main__':
 
     #catalog_args = dict(tracer='ELG_LOP', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
-    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
-    #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.725, zrange=(0.6, 0.8))
+    #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
+    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
     #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.5, zrange=(0.4, 0.6))
     #catalog_args = dict(tracer='QSO', region='NGC', zsnap=1.400, zrange=(0.8, 2.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
@@ -546,8 +547,8 @@ if __name__ == '__main__':
     todo = []
     #todo = ['spectrum-box']
     #todo = ['window-spectrum-box']
-    #todo = ['spectrum', 'window-spectrum'][:1]
-    todo = ['rotate']
+    todo = ['spectrum', 'window-spectrum'][1:]
+    #todo = ['rotate']
     #todo = ['bispectrum']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
@@ -570,12 +571,12 @@ if __name__ == '__main__':
 
     for imock in range(nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
-        all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)][:1]
+        all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
 
         if 'spectrum' in todo:
-            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='masked_mesh2spectrum')
+            output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
             with create_sharding_mesh() as sharding_mesh:
                 compute_spectrum(output_fn, get_data, get_randoms, **cutsky_args)
 

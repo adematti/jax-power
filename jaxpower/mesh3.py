@@ -142,8 +142,7 @@ class BinMesh3Spectrum(object):
             _buffer_iedges = None
 
         ells = _format_ells(ells, basis=basis)
-        self.__dict__.update(edges=edges, xavg=xavg, nmodes=nmodes, ibin=ibin, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size,
-                             _iedges=iedges, _buffer_iedges=_buffer_iedges, _nmodes1d=nmodes1d, ells=ells)
+        self.__dict__.update(edges=edges, xavg=xavg, nmodes=nmodes, ibin=ibin, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size, _iedges=iedges, _buffer_iedges=_buffer_iedges, _nmodes1d=nmodes1d, ells=ells)
 
         if 'scoccimarro' in basis:
             symfactor = jnp.ones_like(xmid[0])
@@ -492,14 +491,14 @@ def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
     return norm
 
 
-def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', **kwargs):
+def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', mesh_shotnoise=False, **kwargs):
     fkps, same = _format_meshs(*fkps)
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
 
     def bin_mesh2_spectrum(mesh, axis):
-        return _bincount(bin.ibin[axis], mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin._nmodes1d[axis]
+        return _bincount(bin.ibin[axis] + 1, mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin._nmodes1d[axis]
 
     if same[2] == same[1] + 1 == same[0] + 2:
         return tuple(shotnoise)
@@ -517,6 +516,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     los, vlos = _format_los(los, ndim=mattrs.ndim)
     # The real-space grid
     xvec = mattrs.rcoords(sparse=True)
+    svec = mattrs.rcoords(kind='separation', sparse=True)
     # The Fourier-space grid
     kvec = mattrs.kcoords(sparse=True)
 
@@ -526,11 +526,27 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         if not (same[0] == same[1] == same[2]):
             raise NotImplementedError
         cmeshw = particles[0].paint(**kwargs, out='complex')
+        cmeshw = cmeshw.clone(value=cmeshw.value.at[(0,) * cmeshw.ndim].set(0.))  # remove zero-mode
         cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
         sumw3 = jnp.sum(particles[0].weights**3)
         del particles
 
         ndim = 3
+        def apply_fourier_legendre(ell, cmesh):
+            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
+            return get_legendre(ell)(mu) * cmesh
+
+        def apply_fourier_harmonics(ell, rmesh):
+            Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+
+            @partial(jax.checkpoint, static_argnums=[0, 1])
+            def f(rmesh, Ylm, carry, im):
+                carry += mattrs.r2c(rmesh * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
+                return carry, im
+
+            xs = np.arange(len(Ylms))
+            return (4. * jnp.pi) * jax.lax.scan(partial(f, rmesh, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
+
         for ill, ell in enumerate(ells):
             if ell == 0:
                 tmp = cmeshw * cmeshw2.conj()
@@ -541,20 +557,18 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
                 shotnoise[ill] = jax.lax.map(f, bin._iedges) - 2. * sumw3
             else:
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
-
-                @partial(jax.checkpoint, static_argnums=[0, 1])
-                def f(rmesh, Ylm, carry, im):
-                    carry += mattrs.r2c(rmesh * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
-                    return carry, im
-
-                xs = np.arange(len(Ylms))
                 # First line of eq. 58, q1 => q3
-                cmeshw_ell = (4. * jnp.pi) * jax.lax.scan(partial(f, cmeshw.c2r(), Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
+                if vlos is not None:
+                    cmeshw_ell = apply_fourier_legendre(ell, cmeshw.c2r())
+                else:
+                    cmeshw_ell = apply_fourier_harmonics(ell, cmeshw.c2r())
                 sn_ell = bin_mesh2_spectrum(cmeshw_ell * cmeshw2.conj(), axis=2)
                 del cmeshw_ell
 
-                cmeshw3_ell = (4. * jnp.pi) * cmeshw * jax.lax.scan(partial(f, cmeshw2.c2r(), Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0].conj()
+                if vlos is not None:
+                    cmeshw3_ell = cmeshw * apply_fourier_legendre(ell, cmeshw2.c2r()).conj()
+                else:
+                    cmeshw3_ell = cmeshw * apply_fourier_harmonics(ell, cmeshw2.c2r()).conj()
 
                 @partial(jax.checkpoint, static_argnums=[0])
                 def f(Ylm, carry, im):
@@ -574,21 +588,23 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     else:
         # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132
 
-        def compute_S111(particles, ells):
-            if ells == [(0, 0)]:
-                return [jnp.sum(particles[0].weights**3) / jnp.sqrt(4. * jnp.pi)]
-            rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-            s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ells]
+        def compute_S111(particles, ellms):
+            if mesh_shotnoise:
+                rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
+                s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ellms]
+            else:
+                s0 = jnp.sum(particles[0].weights**3) / jnp.sqrt(4. * jnp.pi)
+                s111 = [s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms]
             return s111
 
-        def compute_S122(particles, ells, axis):  # 1 == 2
+        def compute_S122(particles, ells, axis):  # 1 == 2            
             rmesh = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
                 im, s111 = im
                 # Second and third lines
-                carry += (rmesh * jax.lax.switch(im, Ylm, *xvec)).r2c().conj() * jax.lax.switch(im, Ylm, *kvec) * cmesh - s111
+                carry += jax.lax.switch(im, Ylm, *kvec) * ((rmesh * jax.lax.switch(im, Ylm, *xvec)).r2c().conj() * cmesh - s111)
                 return carry, im
 
             cmesh = particles[0].paint(**kwargs, out='complex')
@@ -603,18 +619,19 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
             rmesh = particles[2].paint(**kwargs, out='real')
             cmesh = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
-
+            cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
+            
             @partial(jax.checkpoint, static_argnums=(0, 1))
             def f(Ylms, jl, carry, im):
                 los = xvec if vlos is None else vlos
                 s111, coeff, im = im[-1], im[3], im[:3]
                 # Fourth line
-                tmp = coeff * (rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh.conj() - s111
-                xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
-                tmp = tmp.c2r() * jax.lax.switch(im[0], Ylms[0], *xvec) * jax.lax.switch(im[1], Ylms[1], *xvec)
+                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh.conj() - s111)
+                snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+                tmp = tmp.c2r() * jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)
 
                 def fk(k):
-                    return jnp.sum(tmp.value * jl[0](xnorm * k[0]) * jl[1](xnorm * k[1]))
+                    return jnp.sum(tmp.value * jl[0](snorm * k[0]) * jl[1](snorm * k[1]))
 
                 carry += (4. * np.pi)**2 * jax.lax.map(fk, bin.xavg)
                 return carry, im
@@ -642,22 +659,24 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
         if same[1] == same[2]:
             ells1 = [ell[0] for ell in ells if ell[2] == ell[0] and ell[1] == 0]
-            particles01 = particles
-            s122 = compute_S122(particles01, ells1, 0)
-
-            for ill, ell in enumerate(ells):
-                if ell[2] == ell[0] and ell[1] == 0:
-                    idx = ells1.index(ell[0])
-                    shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
+            if ells1:
+                particles01 = particles
+                s122 = compute_S122(particles01, ells1, 0)
+    
+                for ill, ell in enumerate(ells):
+                    if ell[2] == ell[0] and ell[1] == 0:
+                        idx = ells1.index(ell[0])
+                        shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
 
         if same[0] == same[2]:
             ells2 = [ell[1] for ell in ells if ell[2] == ell[1] and ell[0] == 0]
-            particles01 = [particles[1], particles[0]]
-            s121 = compute_S122(particles01, ells2, 1)
-            for ill, ell in enumerate(ells):
-                if ell[2] == ell[1] and ell[0] == 0:
-                    idx = ells2.index(ell[1])
-                    shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
+            if ells2:
+                particles01 = [particles[1], particles[0]]
+                s121 = compute_S122(particles01, ells2, 1)
+                for ill, ell in enumerate(ells):
+                    if ell[2] == ell[1] and ell[0] == 0:
+                        idx = ells2.index(ell[1])
+                        shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
 
         if same[0] == same[1]:
             s113 = compute_S113(particles, ells)

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mockfactory import Catalog, sky_to_cartesian, setup_logging
+from mockfactory import Catalog, sky_to_cartesian, utils, setup_logging
 
 def select_region(ra, dec, region=None):
     # print('select', region)
@@ -38,6 +38,32 @@ def select_region(ra, dec, region=None):
     raise ValueError('unknown region {}'.format(region))
 
 
+footprint_fn = '_tests/footprint.npy'
+_footprint = {}
+nside = 256
+
+
+def save_footprint():
+    import healpy as hp
+    global _footprint
+    fn = f'/dvs_ro/cfs/projectdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/randoms/rands_intiles_DARK_nomask_0_v2.fits'
+    catalog = Catalog.read(fn)
+    pix = hp.ang2pix(nside, catalog['RA'], catalog['DEC'], lonlat=True)
+    for region in ['NGC', 'SGC']:
+        mask = select_region(catalog['RA'], catalog['DEC'], region)
+        _footprint[region] = np.bincount(pix[mask], minlength=hp.nside2npix(nside)) > 0
+    np.save(footprint_fn, _footprint)
+
+
+def select_footprint(ra, dec, region):
+    import healpy as hp
+    pix = hp.ang2pix(nside, ra, dec, lonlat=True)
+    global _footprint
+    if not _footprint:
+        _footprint = np.load(footprint_fn, allow_pickle=True)[()]
+    return _footprint[region][pix]
+
+
 def get_clustering_rdzw(*fns, zrange=None, region=None, tracer=None, **kwargs):
     from mpi4py import MPI
     mpicomm = MPI.COMM_WORLD
@@ -47,18 +73,17 @@ def get_clustering_rdzw(*fns, zrange=None, region=None, tracer=None, **kwargs):
         irank = ifn % mpicomm.size
         catalogs[ifn] = (irank, None)
         if mpicomm.rank == irank:  # Faster to read catalogs from one rank
-            catalog = Catalog.read(fn, mpicomm=MPI.COMM_SELF)
-            catalog.get(catalog.columns())  # Faster to read all columns at once
+            columns = np.load(fn)
+            columns = {name: columns[name] if name in columns else columns[name.lower()] for name in ['RA', 'DEC', 'Z']}
+            catalog = Catalog(columns, mpicomm=MPI.COMM_SELF)
             for name in ['WEIGHT', 'WEIGHT_FKP']:
                 if name not in catalog: catalog[name] = catalog.ones()
-            if tracer is not None and 'Z' not in catalog:
-                catalog['Z'] = catalog[f'Z_{tracer}']
             catalog = catalog[['RA', 'DEC', 'Z', 'WEIGHT', 'WEIGHT_FKP']]
             if zrange is not None:
                 mask = (catalog['Z'] >= zrange[0]) & (catalog['Z'] <= zrange[1])
                 catalog = catalog[mask]
             if region is not None:
-                mask = select_region(catalog['RA'], catalog['DEC'], region)
+                mask = select_footprint(catalog['RA'], catalog['DEC'], region)
                 catalog = catalog[mask]
             catalogs[ifn] = (irank, catalog)
 
@@ -81,72 +106,42 @@ def get_clustering_positions_weights(*fns, **kwargs):
     return positions, weights
 
 
-def test_radec(*fns):
-    import fitsio
-    ra, dec = [], []
-    for fn in fns:
-        cat = fitsio.read(fn)
-        ra.append(cat['RA'])
-        dec.append(cat['DEC'])
-    ra, dec = np.concatenate(ra), np.concatenate(dec)
-    # Define structured dtype
-    dtype = [('RA', 'f8'), ('DEC', 'f8')]
-    # Create structured array
-    structured = np.zeros(ra.shape[0], dtype=dtype)
-    structured['RA'] = ra
-    structured['DEC'] = dec
-    unique = np.unique(structured).size
-    print('Fraction of duplicated RA/DEC {:.3f}'.format(1 - unique / structured.size))
+
+def get_data_fn(tracer='LRG', imock=0, **kwargs):
+    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{imock:d}_full_sky.npz'
 
 
-def get_box_clustering_positions(fn, los='x', **kwargs):
-    from mpi4py import MPI
-    mpicomm = MPI.COMM_WORLD
-
-    catalog = None
-    mpiroot = 0
-    boxsize, scalev = None, None
-
-    if mpicomm.rank == mpiroot:  # Faster to read catalogs from one rank
-        catalog = Catalog.read(fn, mpicomm=MPI.COMM_SELF)
-        catalog.get(catalog.columns())  # Faster to read all columns at once
-        boxsize = catalog.header['BOXSIZE']
-        scalev = catalog.header['VELZ2KMS']
-    boxsize, scalev = mpicomm.bcast((boxsize, scalev), root=mpiroot)
-
-    if mpicomm.size > 1:
-        catalog = Catalog.scatter(catalog, mpicomm=mpicomm, mpiroot=mpiroot)
-    
-    positions = np.column_stack([catalog['X'], catalog['Y'], catalog['Z']])
-    velocities = np.column_stack([catalog['VX'], catalog['VY'], catalog['VZ']]) / scalev
-    vlos = los
-    if isinstance(los, str):
-        vlos = [0.] * 3
-        vlos['xyz'.index(los)] = 1.
-    vlos = np.array(vlos)
-    positions = positions + np.sum(velocities * vlos, axis=-1)[..., None] * vlos[None, :]
-    return (positions + boxsize / 2.) % boxsize - boxsize / 2.
+def get_randoms_fn(tracer='LRG', iran=0, zrange=(0.8, 1.1), **kwargs):
+    return f'/pscratch/sd/a/adematti/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{iran:d}_full_sky.npz'
 
 
-def get_data_fn(tracer='LRG1', imock=0, **kwargs):
-    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/GLAM-Uchuu/cut_skies/{tracer}/GLAM-Uchuu_{tracer[:3]}_{imock:02d}_Y3_cut_sky_clustering.dat.fits'
+def make_randoms(z, randoms_fn, seed=42):
+    from mockfactory import RandomCutskyCatalog
+    randoms = RandomCutskyCatalog(csize=z.size, seed=seed)
+    # Quick and dirty, 1 MPI process only
+    rng = np.random.RandomState(seed=42)
+    mask = False
+    for region in ['NGC', 'SGC']:
+        mask |= select_footprint(randoms['RA'], randoms['DEC'], region)
+    randoms = randoms[mask]
+    randoms['Z'] = rng.choice(z, randoms.size)
+    randoms = {name: randoms[name] for name in ['RA', 'DEC', 'Z']}
+    Path(randoms_fn).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(randoms_fn, **randoms)
 
 
-def get_randoms_fn(tracer='LRG1', iran=0, **kwargs):
-    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/GLAM-Uchuu/cut_skies/{tracer}/GLAM-Uchuu_{tracer[:3]}_{iran:d}_Y3_cut_sky_clustering.ran.fits'
+def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), **kwargs):
+    return f'/global/cfs/projectdirs/desi/mocks/cai/holi/desipipe_test/{tracer.lower()}/{kind}_{tracer.lower()}_real{imock:d}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
 
 
-def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', **kwargs):
-    return f'/global/cfs/projectdirs/desi/mocks/cai/GLAM-Uchuu/desipipe_test/cut_skies/{tracer}/{kind}_GLAM-Uchuu_{tracer[:3]}_{imock:03d}_Y3_{region}.npy'
-
-
-def compute_spectrum(output_fn, get_data, get_randoms, ells=(0, 2, 4), los='firstpoint', **attrs):
+def compute_spectrum(output_fn, get_data, randoms, ells=(0, 2, 4), los='firstpoint', **attrs):
     from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, BinMesh2Spectrum, get_mesh_attrs, compute_mesh2_spectrum)
     t0 = time.time()
-    data, randoms = get_data(), get_randoms()
+    data = get_data()
     attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
     data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
     randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
+    print(data.size, randoms.size)
     fkp = FKPField(data, randoms)
     norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
@@ -170,7 +165,6 @@ def compute_spectrum_window(output_fn, get_randoms, spectrum_fn=None, kind='smoo
     attrs = MeshAttrs(**spectrum.attrs['mesh'])
     randoms = ParticleField(*get_randoms(), attrs=attrs, exchange=True, backend='jax')
     randoms = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms
-    los = spectrum.attrs['los']
     num_shotnoise = jnp.sum(randoms.weights**2)
     mesh = randoms.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     del randoms
@@ -261,24 +255,21 @@ def get_proposal_boxsize(tracer):
     raise NotImplementedError(f'tracer {tracer} is unknown')
 
 
-
 if __name__ == '__main__':
 
-    catalog_args = dict(tracer='BGS', region='NGC')
+    catalog_args = dict(tracer='QSO', region='NGC', zrange=(0.8, 2.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
 
     todo = []
-    #todo = ['spectrum-box']
-    #todo = ['window-spectrum-box']
     todo = ['spectrum', 'window-spectrum'][1:]
-    #todo = ['bispectrum']
+    #todo = ['randoms']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 5
+    nmocks = 50
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 
@@ -293,19 +284,21 @@ if __name__ == '__main__':
 
     from jaxpower.mesh import create_sharding_mesh
 
+    randoms = None
     for imock in range(nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
-        if not Path(data_fn).exists():
-            print(data_fn)
-            continue
-        all_randoms_fn = [get_randoms_fn(iran=iran + 1, **catalog_args) for iran in range(4)]
+        if not Path(data_fn).exists(): continue
+        all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(1)]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
+        if randoms is None and 'randoms' not in todo:
+            randoms = get_randoms()
+        print(imock, flush=True)
 
         if 'spectrum' in todo:
             output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
             with create_sharding_mesh() as sharding_mesh:
-                compute_spectrum(output_fn, get_data, get_randoms, **cutsky_args)
+                compute_spectrum(output_fn, get_data, randoms, **cutsky_args)
 
         if 'bispectrum' in todo:
             output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh3spectrum_scoccimarro')
@@ -321,7 +314,18 @@ if __name__ == '__main__':
             with create_sharding_mesh() as sharding_mesh:
                 compute_thetacut(output_fn, get_data, get_randoms, spectrum_fn=spectrum_fn, output_spectrum_fn=output_spectrum_fn)
 
-        if imock == 0:  # any mock as input
+        if imock == 10:  # any mock as input
+
+            if 'randoms' in todo:
+                #save_footprint()
+                list_fns = [get_data_fn(imock=imock, **catalog_args) for imock in range(nmocks)]
+                list_fns = [data_fn for data_fn in list_fns if Path(data_fn).exists()]
+                data = [get_clustering_rdzw(data_fn, **(catalog_args | dict(zrange=None, region=None)))[2] for data_fn in list_fns]
+                data = np.concatenate(data)
+                for iran in range(4):
+                    randoms_fn = get_randoms_fn(iran=iran, **catalog_args)
+                    make_randoms(data, randoms_fn, seed=iran)
+
             if 'window-spectrum' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
                 output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
