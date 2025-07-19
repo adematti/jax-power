@@ -491,11 +491,16 @@ def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
     return norm
 
 
-def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', mesh_shotnoise=False, **kwargs):
+def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', convention=None, resampler='cic', interlacing=False, **kwargs):
     fkps, same = _format_meshs(*fkps)
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
+    kwargs.update(resampler=resampler, interlacing=interlacing)
+
+    from . import resamplers
+    resampler = resamplers.get_resampler(resampler)
+    interlacing = max(interlacing, 1) >= 2
 
     def bin_mesh2_spectrum(mesh, axis):
         return _bincount(bin.ibin[axis] + 1, mesh.value, weights=bin.wmodes, length=len(bin.xavg)) / bin._nmodes1d[axis]
@@ -519,6 +524,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     svec = mattrs.rcoords(kind='separation', sparse=True)
     # The Fourier-space grid
     kvec = mattrs.kcoords(sparse=True)
+    kcirc = mattrs.kcoords(kind='circular', sparse=True)
 
     if 'scoccimaro' in bin.basis:
 
@@ -580,30 +586,39 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
                     def f2(ibin):
                         return sum(bin3_Ylm[ibin[0]] * tmp[ii] for ii in ibin[1:])
+
                     carry += jax.lax.map(f2, bin._iedges)
                     return carry, im
 
+                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                xs = np.arange(len(Ylms))
                 shotnoise[ill] = (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=sn_ell, xs=xs)[0]
 
     else:
         # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132
 
         def compute_S111(particles, ellms):
-            if mesh_shotnoise:
-                rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-                s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ellms]
-            else:
+            if convention == 'triumvirate':
                 s0 = jnp.sum(particles[0].weights**3) / jnp.sqrt(4. * jnp.pi)
                 s111 = [s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms]
+            else:
+                rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
+                s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ellms]
             return s111
 
-        def compute_S122(particles, ells, axis):  # 1 == 2            
+        def compensate_shotnoise(s111):
+            if convention == 'triumvirate' and not interlacing:
+                return s111 * resampler.aliasing_shotnoise(1., kcirc) / resampler.compensate(1., kcirc)
+            return s111
+
+        def compute_S122(particles, ells, axis):  # 1 == 2
             rmesh = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
                 im, s111 = im
                 # Second and third lines
+                s111 = compensate_shotnoise(s111)
                 carry += jax.lax.switch(im, Ylm, *kvec) * ((rmesh * jax.lax.switch(im, Ylm, *xvec)).r2c().conj() * cmesh - s111)
                 return carry, im
 
@@ -620,11 +635,12 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             rmesh = particles[2].paint(**kwargs, out='real')
             cmesh = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
             cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
-            
+
             @partial(jax.checkpoint, static_argnums=(0, 1))
             def f(Ylms, jl, carry, im):
                 los = xvec if vlos is None else vlos
                 s111, coeff, im = im[-1], im[3], im[:3]
+                s111 = compensate_shotnoise(s111)
                 # Fourth line
                 tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh.conj() - s111)
                 snorm = jnp.sqrt(sum(xx**2 for xx in svec))
@@ -640,10 +656,10 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             for ell1, ell2, ell3 in ells:
                 Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
                 if los != 'z':
-                    xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), s111[ellms.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
+                    xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), s111[ellms.index((ell3, im3 - ell3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2, ell3)])]
                 else:
-                    xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), s111[ellms.index((ell3, im3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
-                xs = [jnp.array(xx) for xx in zip(*[xx for xx in xs if xx[-1]])]
+                    xs = [(im1, im2, im3, real_gaunt((ell1, im1 - ell1), (ell2, im2 - ell2), (ell3, im3 - ell3)), s111[ellms.index((ell3, im3 - ell3))]) for im1, im2, im3 in itertools.product(*[np.arange(2 * ell + 1) for ell in (ell1, ell2)] + [[ell3]])]
+                xs = [jnp.array(xx) for xx in zip(*[xx for xx in xs if xx[-2]])]
                 sign = (-1)**((ell1 + ell2) // 2)
                 s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0]), xs=xs)[0])
 
@@ -662,7 +678,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             if ells1:
                 particles01 = particles
                 s122 = compute_S122(particles01, ells1, 0)
-    
+
                 for ill, ell in enumerate(ells):
                     if ell[2] == ell[0] and ell[1] == 0:
                         idx = ells1.index(ell[0])

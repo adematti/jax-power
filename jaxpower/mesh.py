@@ -1307,7 +1307,7 @@ class RealMeshField(BaseMeshField):
 def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False, **kwargs):
     """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
 
-    resampler = getattr(resamplers, resampler, resampler)
+    resampler = resamplers.get_resampler(resampler)
     if isinstance(compensate, bool):
         if compensate:
             kernel_compensate = resampler.compensate
@@ -1746,7 +1746,7 @@ class ParticleField(object):
 def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, out: str='real', **kwargs):
     """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
 
-    resampler = getattr(resamplers, resampler, resampler)
+    resampler = resamplers.get_resampler(resampler)
     interlacing = max(interlacing, 1)
     interlacing_shifts = jnp.astype(jnp.arange(interlacing) * 1. / interlacing, attrs.rdtype)
 

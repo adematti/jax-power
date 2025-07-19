@@ -6,8 +6,7 @@ Reference
 https://arxiv.org/pdf/1512.07295
 """
 
-import itertools
-from collections.abc import Callable
+from functools import partial
 
 import numpy as np
 import jax
@@ -21,6 +20,36 @@ def _compensate_tophat_convolution_kernel(order: int):
         for kk in kvec:
             kernel *= jnp.sinc(kk / (2 * jnp.pi))**(-order)
         return value * kernel
+
+    fn.kind = 'circular'
+
+    return fn
+
+
+def _aliasing_shotnoise_kernel(order: int):
+
+    def kernel1(angle):  # NGP
+        return 1.
+
+    def kernel2(angle):  # CIC
+        return 1. - 2. / 3. * jnp.sin(angle)**2
+
+    def kernel3(angle):  # TSC
+        s2 = jnp.sin(angle)**2
+        return 1. - s2 + 2. / 15. * s2**2
+
+    def kernel4(angle):  # PCS
+        s2 = jnp.sin(angle)**2
+        return 1. - 4. / 3. * s2 + 2. / 5. * s2 * s2 - 4. / 315. * s2**3
+
+    _shotnoise_kernels = [None, kernel1, kernel2, kernel3, kernel4]
+
+    def fn(value, kvec):
+        kernel = 1.
+        for kk in kvec:
+            kernel *= _shotnoise_kernels[order](kk)
+        return value * kernel
+
     fn.kind = 'circular'
 
     return fn
@@ -32,8 +61,8 @@ def _compensate_tophat_convolution_kernel(order: int):
 from itertools import product
 
 
-paint_kernels = [
-    lambda s: jnp.full(jnp.shape(s)[-1:], jnp.inf), # Dirac
+_resampler_kernels = [
+    None,
     lambda s: jnp.full(jnp.shape(s)[-1:], 1.), # NGP
     lambda s: 1 - s, # CIC
     lambda s: (s <= 1/2) * (3/4 - s**2) + (1/2 < s) / 2 * (3/2 - s)**2, # TSC
@@ -63,7 +92,7 @@ def paint(mesh: tuple | jnp.ndarray, positions, weights=1., order: int=2):
     def step(carry, ishift):
         idx = id0 + ishift
         s = jnp.abs(idx - positions)
-        idx, ker = wrap(idx), paint_kernels[order](s).prod(-1)
+        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(-1)
 
         idx = jnp.unstack(idx, axis=-1)
         # idx = tuple(jnp.moveaxis(idx, -1, 0)) # TODO: JAX >= 0.4.28 for unstack
@@ -89,7 +118,7 @@ def read(mesh: jnp.ndarray, positions, order: int=2):
     def step(carry, ishift):
         idx = id0 + ishift
         s = jnp.abs(idx - positions)
-        idx, ker = wrap(idx), paint_kernels[order](s).prod(-1)
+        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(-1)
 
         idx = jnp.unstack(idx, axis=-1)
         # idx = tuple(jnp.moveaxis(idx, -1, 0)) # TODO: JAX >= 0.4.28 for unstack
@@ -101,7 +130,13 @@ def read(mesh: jnp.ndarray, positions, order: int=2):
     return out
 
 
-from functools import partial
+for i, name in enumerate(['ngp', 'cic', 'tsc', 'pcs']):
+    order = i + 1
+    globals()[name] = type(name, (), dict(paint=partial(paint, order=order), read=partial(read, order=order),
+                                          compensate=_compensate_tophat_convolution_kernel(order),
+                                          aliasing_shotnoise=_aliasing_shotnoise_kernel(order),
+                                          order=order))
 
-for order, name in enumerate(['dirac', 'ngp', 'cic', 'tsc', 'pcs']):
-    globals()[name] = type(name, (), dict(paint=partial(paint, order=order), read=partial(read, order=order), compensate=_compensate_tophat_convolution_kernel(order), order=order))
+
+def get_resampler(resampler):
+    return globals().get(resampler, resampler)

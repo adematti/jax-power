@@ -197,7 +197,7 @@ def test_polybin3d():
                 plt.show()
 
 
-def test_triumvirate():
+def test_triumvirate_box():
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -212,19 +212,21 @@ def test_triumvirate():
     # Triumvirate doesn't take weights for box statistics...
     #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
 
-    mesh = data.paint(resampler='cic', interlacing=False, compensate=False)
+    kw = dict(resampler='cic', interlacing=False, compensate=True)
+    mesh = data.paint(**kw)
     mean = mesh.mean()
     #mean = 1.
     #mesh = mesh - mean
     edges = np.arange(0.01, attrs.knyq[0], 0.01)
     ell = (0, 0, 0)
     #ell = (2, 0, 2)
+    los = 'z'
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
-    spectrum = compute_mesh3_spectrum(mesh, los='z', bin=bin)
-    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los='z', resampler='cic', compensate=True, interlacing=False)
+    spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, convention=None, los=los, **kw)
     spectrum = spectrum.clone(norm=spectrum.norm * mean**3)
-    spectrum = spectrum.clone(num_shotnoise=jnp.array(num_shotnoise))
+    spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
     from triumvirate.catalogue import ParticleCatalogue
     from triumvirate.threept import compute_bispec_in_gpp_box
@@ -240,20 +242,72 @@ def test_triumvirate():
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
+    print(np.array(num_shotnoise).ravel() / results['bk_shot'])
 
     ax = plt.gca()
-    raw = spectrum.view()
-    #print(spectrum.nmodes()[0] / (results['nmodes_1'] * results['nmodes_2']))
-    #print(spectrum.view() / results['bk_raw'])
-    sn = jnp.concatenate(spectrum.shotnoise())
-    #print(sn)
-    print(results['bk_shot'])
-    print(sn / results['bk_shot'])
-    ax.plot(results['bk_raw'], label='triumvirate')
+    #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
     ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
-    #ax.plot(spectrum.view(), label='jaxpower')
-    #ax.plot(results['bk_shot'], label='triumvirate')
-    #ax.plot(sn, label='jaxpower')
+    ax.plot(spectrum.view(), label='jaxpower')
+    ax.legend()
+    plt.show()
+
+
+def test_triumvirate_survey():
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    attrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
+
+    mesh = generate_gaussian_mesh(attrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e4)
+    data = generate_uniform_particles(attrs, size, seed=32)
+    # Triumvirate doesn't take weights for box statistics...
+    #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+    randoms = generate_uniform_particles(attrs, 2 * size, seed=42)
+    fkp = FKPField(data, randoms)
+
+    kw = dict(resampler='cic', interlacing=False, compensate=True)
+    mesh = fkp.paint(**kw)
+    #mean = 1.
+    #mesh = mesh - mean
+    edges = np.arange(0.01, attrs.knyq[0], 0.01)
+    #ell = (0, 0, 0)
+    ell = (2, 0, 2)
+    los = 'local'
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
+
+    spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los=los, **kw)
+    mean = size / attrs.meshsize.prod(dtype=float)
+    spectrum = spectrum.clone(norm=spectrum.norm * mean**3)
+    #spectrum = spectrum.clone(num_shotnoise=jnp.array(num_shotnoise))
+
+    from triumvirate.catalogue import ParticleCatalogue
+    from triumvirate.threept import compute_bispec
+    from triumvirate.parameters import ParameterSet
+    from triumvirate.logger import setup_logger
+
+    logger = setup_logger(20)
+    data = ParticleCatalogue(*np.array(data.positions.T), ws=data.weights, nz=size / attrs.boxsize.prod())
+    randoms = ParticleCatalogue(*np.array(randoms.positions.T), ws=randoms.weights, nz=size / attrs.boxsize.prod())
+
+    #trv_logger = setup_logger(log_level=20)
+    #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
+    paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None),
+                    range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', interlace='off', alignment='centre', padfactor=0.,
+                    boxsize=dict(zip('xyz', np.array(attrs.boxsize))),
+                    ngrid=dict(zip('xyz', np.array(attrs.meshsize))), verbose=20)
+
+    paramset = ParameterSet(param_dict=paramset)
+    results = compute_bispec(data, randoms, paramset=paramset, logger=logger)
+
+    ax = plt.gca()
+    #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
+    ax.plot(results['bk_raw'], label='triumvirate')
+    ax.plot(spectrum.view(), label='jaxpower')
     ax.legend()
     plt.show()
 
@@ -293,4 +347,5 @@ if __name__ == '__main__':
     #test_timing()
     #test_polybin3d()
     #test_normalization()
-    test_triumvirate()
+    test_triumvirate_box()
+    #test_triumvirate_survey()
