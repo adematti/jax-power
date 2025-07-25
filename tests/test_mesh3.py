@@ -239,8 +239,8 @@ def test_triumvirate_box():
     #mean = 1.
     #mesh = mesh - mean
     edges = np.arange(0.01, attrs.knyq[0], 0.01)
-    ell = (0, 0, 0)
-    #ell = (2, 0, 2)
+    #ell = (0, 0, 0)
+    ell = (2, 0, 2)
     los = 'z'
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
@@ -265,6 +265,8 @@ def test_triumvirate_box():
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
 
+    #print(results['bk_raw'] / spectrum_raw.view())
+    #print((results['bk_raw'] - results['bk_shot']) / spectrum.view())
     ax = plt.gca()
     #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
     ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')

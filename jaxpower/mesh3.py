@@ -360,7 +360,7 @@ def _format_los(los, ndim=3):
 
 def _iter_triposh(*ells, los='local'):
     ell1, ell2, ell3 = ells
-    ms = [np.arange(-ell, ell + 1) for ell in (ell1, ell2, ell3)]
+    ms = [np.arange(-ell, ell + 1) for ell in ells]
     if los == 'z':
         ms[-1] = [0]
     toret, acc = [], []
@@ -373,7 +373,7 @@ def _iter_triposh(*ells, los='local'):
             idx = acc.index(neg)
             toret[idx][-1] = (-1)**ell3
             continue
-        toret.append([im1, im2, im3, gaunt, sym])
+        toret.append([im1 + ell1, im2 + ell2, im3 + ell3, gaunt, sym])  # m indexing starting from 0
         acc.append(toret[-1][:3])
     return [jnp.array(xx) for xx in zip(*toret)]
 
