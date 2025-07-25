@@ -612,22 +612,23 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             return s111
 
         def compensate_shotnoise(s111):
-            if convention == 'triumvirate' and not interlacing:
-                return s111 * resampler.aliasing_shotnoise(1., kcirc) / resampler.compensate(1., kcirc)
+            if False: #convention == 'triumvirate' and not interlacing:
+                return s111 * resampler.aliasing_shotnoise(1., kcirc) * resampler.compensate(1., kcirc)
             return s111
 
         def compute_S122(particles, ells, axis):  # 1 == 2
             rmesh = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
+            cmesh = particles[0].paint(**kwargs, out='complex')
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
                 im, s111 = im
                 # Second and third lines
                 s111 = compensate_shotnoise(s111)
-                carry += jax.lax.switch(im, Ylm, *kvec) * ((rmesh * jax.lax.switch(im, Ylm, *xvec)).r2c().conj() * cmesh - s111)
+                los = xvec if vlos is None else vlos
+                carry += jax.lax.switch(im, Ylm, *kvec) * ((rmesh * jax.lax.switch(im, Ylm, *los)).r2c() * cmesh.conj() - s111)
                 return carry, im
 
-            cmesh = particles[0].paint(**kwargs, out='complex')
             s122 = []
             for ell in ells:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
@@ -677,23 +678,27 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             if ell0 in ells: shotnoise[ells.index(ell0)] += jnp.sqrt(4. * jnp.pi) * s111[ellms.index((0, 0))]
 
         if same[1] == same[2]:
-            ells1 = [ell[0] for ell in ells if ell[2] == ell[0] and ell[1] == 0]
+            def select(ell): return ell[2] == ell[0] and ell[1] == 0
+
+            ells1 = [ell[0] for ell in ells if select(ell)]
             if ells1:
                 particles01 = particles
                 s122 = compute_S122(particles01, ells1, 0)
 
                 for ill, ell in enumerate(ells):
-                    if ell[2] == ell[0] and ell[1] == 0:
+                    if select(ell):
                         idx = ells1.index(ell[0])
                         shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
 
         if same[0] == same[2]:
-            ells2 = [ell[1] for ell in ells if ell[2] == ell[1] and ell[0] == 0]
+            def select(ell): return ell[2] == ell[1] and ell[0] == 0
+
+            ells2 = [ell[1] for ell in ells if select(ell)]
             if ells2:
                 particles01 = [particles[1], particles[0]]
                 s121 = compute_S122(particles01, ells2, 1)
                 for ill, ell in enumerate(ells):
-                    if ell[2] == ell[1] and ell[0] == 0:
+                    if select(ell):
                         idx = ells2.index(ell[1])
                         shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
 
