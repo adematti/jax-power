@@ -198,7 +198,7 @@ def test_polybin3d():
             if imock == 0:
                 k = spectrum.xavg(projs=0, method='mid')
                 weight = k.prod(axis=-1)
-                spectrum_no_shotnoise = spectrum.clone(num_shotnoise=None)
+                spectrum_raw = spectrum.clone(num_shotnoise=None)
 
                 ax = plt.gca()
                 weight = k123.prod(axis=0)
@@ -206,7 +206,7 @@ def test_polybin3d():
                     ax.plot(weight * bk[name], color='C0')
 
                 for proj in [0, 2]:
-                    ax.plot(weight * spectrum_no_shotnoise.view(projs=proj), color='C1')
+                    ax.plot(weight * spectrum_raw.view(projs=proj), color='C1')
                     ax.plot(weight * spectrum.view(projs=proj), color='C1', linestyle='--')
                 plt.show()
 
@@ -214,7 +214,7 @@ def test_polybin3d():
                 ax = plt.gca()
                 weight = k123.prod(axis=0)
                 for proj in [0, 2]:
-                    ax.plot(weight * (spectrum.view(projs=proj) - spectrum_no_shotnoise.view(projs=proj)), color='C0', linestyle='-')
+                    ax.plot(weight * (spectrum.view(projs=proj) - spectrum_raw.view(projs=proj)), color='C0', linestyle='-')
                 plt.show()
 
 
@@ -239,8 +239,8 @@ def test_triumvirate_box():
     #mean = 1.
     #mesh = mesh - mean
     edges = np.arange(0.01, attrs.knyq[0], 0.01)
-    #ell = (0, 0, 0)
-    ell = (2, 0, 2)
+    ell = (0, 0, 0)
+    #ell = (2, 0, 2)
     los = 'z'
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
@@ -366,7 +366,7 @@ if __name__ == '__main__':
     #test_timing()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
-    test_polybin3d()
+    #test_polybin3d()
     #test_normalization()
-    #test_triumvirate_box()
+    test_triumvirate_box()
     #test_triumvirate_survey()
