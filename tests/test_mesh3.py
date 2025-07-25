@@ -218,14 +218,15 @@ def test_triumvirate_box():
     #mean = 1.
     #mesh = mesh - mean
     edges = np.arange(0.01, attrs.knyq[0], 0.01)
-    ell = (0, 0, 0)
-    #ell = (2, 0, 2)
+    #ell = (0, 0, 0)
+    ell = (2, 0, 2)
     los = 'z'
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, convention=None, los=los, **kw)
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, convention='triumvirate', los=los, **kw)
     spectrum = spectrum.clone(norm=spectrum.norm * mean**3)
+    spectrum_raw = spectrum
     spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
     from triumvirate.catalogue import ParticleCatalogue
@@ -242,7 +243,6 @@ def test_triumvirate_box():
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
-    print(np.array(num_shotnoise).ravel() / results['bk_shot'])
 
     ax = plt.gca()
     #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
@@ -347,5 +347,5 @@ if __name__ == '__main__':
     #test_timing()
     #test_polybin3d()
     #test_normalization()
-    test_triumvirate_box()
+    #test_triumvirate_box()
     #test_triumvirate_survey()

@@ -18,8 +18,8 @@ def _compensate_tophat_convolution_kernel(order: int):
     def fn(value, kvec):
         kernel = 1.
         for kk in kvec:
-            kernel *= jnp.sinc(kk / (2 * jnp.pi))**(-order)
-        return value * kernel
+            kernel *= jnp.sinc(kk / (2 * jnp.pi))
+        return value * kernel**(-order)
 
     fn.kind = 'circular'
 
@@ -32,14 +32,14 @@ def _aliasing_shotnoise_kernel(order: int):
         return 1.
 
     def kernel2(angle):  # CIC
-        return 1. - 2. / 3. * jnp.sin(angle)**2
+        return 1. - 2. / 3. * jnp.sin(angle / 2.)**2
 
     def kernel3(angle):  # TSC
-        s2 = jnp.sin(angle)**2
+        s2 = jnp.sin(angle / 2.)**2
         return 1. - s2 + 2. / 15. * s2**2
 
     def kernel4(angle):  # PCS
-        s2 = jnp.sin(angle)**2
+        s2 = jnp.sin(angle / 2.)**2
         return 1. - 4. / 3. * s2 + 2. / 5. * s2 * s2 - 4. / 315. * s2**3
 
     _shotnoise_kernels = [None, kernel1, kernel2, kernel3, kernel4]
