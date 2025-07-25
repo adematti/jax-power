@@ -158,42 +158,63 @@ def test_polybin3d():
     attrs = MeshAttrs(meshsize=100, boxsize=1000., boxcenter=1000.)
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
+    mesh = generate_gaussian_mesh(attrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e4)
+    data = generate_uniform_particles(attrs, size, seed=32)
+    #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+    kw = dict(resampler='tsc', interlacing=2, compensate=True)
+    mesh = data.paint(**kw)
+    mean = mesh.mean()
+    mesh = mesh - mean
+
     edges = [np.arange(0.01, 0.10, 0.02), np.arange(0.01, 0.15, 0.02), np.arange(0.01, 0.15, 0.02)]
     #edges = [np.arange(0.01, 0.08, 0.02), np.arange(0.01, 0.08, 0.02), np.arange(0.01, 0.08, 0.02)]
 
-    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0, 2])
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0, 2], buffer_size=4)
 
     for los in ['z', 'local'][1:]:
 
         kw = dict(gridsize=attrs.meshsize, boxsize=attrs.boxsize, boxcenter=attrs.boxcenter * (0. if los == 'z' else 1.))
         base = PolyBin3D(sightline='global' if los == 'z' else los, **kw, backend='jax', real_fft=False)
         bspec = BSpec(base, k_bins=edges[0],
-                    lmax=2, k_bins_squeeze=edges[1],
-                    include_partial_triangles=False)
+                      lmax=2, k_bins_squeeze=edges[1],
+                      include_partial_triangles=False)
 
         for imock in [0]:
-            mesh = generate_gaussian_mesh(attrs, pkvec, seed=imock)
             t0 = time.time()
             spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-            #print('norm', spectrum.norm, compute_normalization(*([mesh.clone(value=jnp.ones_like(mesh.value))] * 3)))
+            spectrum = spectrum.clone(norm=spectrum.norm * mean**3)
+            num_shotnoise = compute_fkp3_spectrum_shotnoise(data, los=los, bin=bin, **kw)
+            spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
+
             jax.block_until_ready(spectrum)
             t1 = time.time()
-            bk = bspec.Bk_ideal(data=np.array(mesh.value), discreteness_correction=False)
+            bk = bspec.Bk_ideal(data=mesh.value / mean, discreteness_correction=False)
             k123 = bspec.get_ks()
             t2 = time.time()
             print(f'jax-power took {t1 - t0:.2f} s')
             print(f'polybin took {t2 - t1:.2f} s')
 
             if imock == 0:
+                k = spectrum.xavg(projs=0, method='mid')
+                weight = k.prod(axis=-1)
+                spectrum_no_shotnoise = spectrum.clone(num_shotnoise=None)
+
                 ax = plt.gca()
                 weight = k123.prod(axis=0)
                 for name in ['b0', 'b2']:
                     ax.plot(weight * bk[name], color='C0')
 
-                k = spectrum.xavg(projs=0, method='mid')
-                weight = k.prod(axis=-1)
-                for projs in [0, 2]:
-                    ax.plot(weight * spectrum.view(projs=projs), color='C1')
+                for proj in [0, 2]:
+                    ax.plot(weight * spectrum_no_shotnoise.view(projs=proj), color='C1')
+                    ax.plot(weight * spectrum.view(projs=proj), color='C1', linestyle='--')
+                plt.show()
+
+
+                ax = plt.gca()
+                weight = k123.prod(axis=0)
+                for proj in [0, 2]:
+                    ax.plot(weight * (spectrum.view(projs=proj) - spectrum_no_shotnoise.view(projs=proj)), color='C0', linestyle='-')
                 plt.show()
 
 
@@ -345,7 +366,7 @@ if __name__ == '__main__':
     #test_timing()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
-    #test_polybin3d()
+    test_polybin3d()
     #test_normalization()
-    test_triumvirate_box()
+    #test_triumvirate_box()
     #test_triumvirate_survey()
