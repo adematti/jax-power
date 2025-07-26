@@ -1,9 +1,11 @@
+import os
+from functools import partial
 from dataclasses import dataclass
 
-import os
 import numpy as np
 import jax
 from jax import numpy as jnp
+from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 from .mesh import MeshAttrs, staticarray, ParticleField, _identity_fn
@@ -66,7 +68,7 @@ except ImportError:
     pass
 
 
-def _scan(bin, *particles, los='firstpoint'):
+def _scancount(bin, *particles, los='firstpoint'):
     ells = bin.ells
 
     if 'theta' in bin.selection:
@@ -81,7 +83,7 @@ def _scan(bin, *particles, los='firstpoint'):
         nest = True
 
         def _sort_particles(*particles):
-            ipix = [hp.vec2pix(nside, *(particle.positions.T / jnp.sqrt(jnp.sum(particle.positions**2, axis=-1))), nest=nest) for particle in particles]
+            ipix = [hp.vec2pix(nside, *(particle[0].T / jnp.sqrt(jnp.sum(particle[0]**2, axis=-1))), nest=nest) for particle in particles]
             ipix_all = np.concatenate(ipix)
             ipix_count = np.bincount(ipix_all, minlength=hp.nside2npix(nside))
             neighbors = hp.get_all_neighbours(nside, np.flatnonzero(ipix_count), nest=nest)
@@ -96,8 +98,8 @@ def _scan(bin, *particles, los='firstpoint'):
                 indices = _sort_array(ipix_all, ipix[i], minlength=ipix_count_max)
                 mask = indices >= 0
                 indices = np.where(mask, indices, 0)
-                positions = particle.positions[indices] #* jnp.where(mask, 1., jnp.nan)[..., None]
-                weights = particle.weights[indices] * mask
+                positions = particle[0][indices] #* jnp.where(mask, 1., jnp.nan)[..., None]
+                weights = particle[1][indices] * mask
                 toret.append((positions, weights))
             #sl = np.flatnonzero(np.isin(ipix_all, ipix[0]))[:10]
             #toret = [toret[0][..., sl]] + [(tmp[0], tmp[1]) for tmp in toret[1:]]
@@ -108,11 +110,32 @@ def _scan(bin, *particles, los='firstpoint'):
 
     autocorr = len(particles) == 1
     neighbors, *sorted_particles = _sort_particles(*particles)
-    num = jnp.zeros((len(ells), len(bin.edges)), dtype=particles[0].positions.dtype)
+    num = jnp.zeros((len(ells), len(bin.edges)), dtype=particles[0][0].dtype)
 
-    #@jax.jit
+    if isinstance(bin, BinParticle2Spectrum):
+        def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
+            dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
+            toret = []
+            for ell in self.ells:
+                wleg = (-1)**(ell // 2) * (2 * ell + 1) * get_legendre(ell)(mu) * weight
+                tmp = jax.lax.map(lambda x: jnp.sum(get_spherical_jn(ell)(x * dist) * wleg), self.xavg, batch_size=max(min(1000 * 1000 / dist.size, 1), len(self.xavg), 1))
+                toret.append(tmp)
+            return jnp.stack(toret)
+    else:
+        def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
+            dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
+            if self.linear:
+                idx = jnp.floor((dist - self.edges[0, 0]) / (self.edges[0, 1] - self.edges[0, 0])).astype(jnp.int16)
+            else:
+                bins = jnp.append(self.edges[:, 0], self.edges[-1, 1])
+                idx = jnp.digitize(bins, dist, right=False) - 1
+            mask = (idx >= 0) & (idx < len(self.edges))
+            weight *= mask
+            idx = jnp.where(mask, idx, 0)
+            return jnp.stack([jnp.zeros(len(self.edges)).at[idx].add((2 * ell + 1) * get_legendre(ell)(mu) * weight) for ell in self.ells])
+
     def f(carry, particles):
-        carry += bin._slab(*particles, los=los)
+        carry += _slab(bin, *particles, los=los)
         return carry, None
 
     for neighbor in neighbors:
@@ -167,33 +190,42 @@ class BinParticle2Spectrum(object):
         engine = get_engine(engine)
         self.__dict__.update(edges=edges, xavg=xavg, selection=selection, boxsize=boxsize, ells=ells, engine=engine)
 
-    def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
-        dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
-        toret = []
-        for ell in self.ells:
-            wleg = (-1)**(ell // 2) * (2 * ell + 1) * get_legendre(ell)(mu) * weight
-            tmp = jax.lax.map(lambda x: jnp.sum(get_spherical_jn(ell)(x * dist) * wleg), self.xavg, batch_size=max(min(1000 * 1000 / dist.size, 1), len(self.xavg), 1))
-            toret.append(tmp)
-        return jnp.stack(toret)
-
     def __call__(self, *particles, los='firstpoint'):
+        sharding_mesh = particles[0].attrs.sharding_mesh
+        if len(particles) == 1: particles = particles * 2
+        particles = [(particle.positions, particle.weights) for particle in particles]
+        
         if self.engine == 'cucount':
-            with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
-                from cucountlib import cucount
-                if len(particles) == 1:
-                    particles = particles * 2
-    
-                def get(array):
-                    return np.array(array.addressable_data(0))
-    
-                cparticles = [cucount.Particles(get(p.positions), get(p.weights)) for p in particles]
-                battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
-                sattrs = cucount.SelectionAttrs(**self.selection)
-                toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
-        else:
-            toret = _scan(self, *particles, los=los)
-        return toret
 
+            def _custom_callback(*particles):
+                with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
+                    from cucountlib import cucount
+                    cparticles = [cucount.Particles(np.array(particle[0]), np.array(particle[1])) for particle in particles]
+                    battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
+                    sattrs = cucount.SelectionAttrs(**self.selection)
+                    toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
+                return toret
+
+            out_type = jax.ShapeDtypeStruct((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
+            _call = partial(jax.pure_callback, _custom_callback, out_type)
+
+        else:
+
+            def _call(*particles):
+                return _scancount(self, *particles, los=los)
+
+        call = _call
+
+        if sharding_mesh.axis_names:
+
+            def call(*particles):
+                return jax.lax.psum(_call(*particles), sharding_mesh.axis_names)
+
+            call = shard_map(call, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P()), out_specs=P())
+
+        return call(*particles)
+
+    
     def tree_flatten(self):
         state = {name: getattr(self, name) for name in self.__annotations__.keys()}
         meta_fields = ['selection', 'engine'] + (['boxsize'] if self.boxsize is None else [])
@@ -238,37 +270,45 @@ class BinParticle2Correlation(object):
         ells = _format_ells(ells)
         engine = get_engine(engine)
         self.__dict__.update(edges=edges, xavg=xavg, selection=selection, linear=linear, boxsize=boxsize, ells=ells, engine=engine)
-
-    def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
-        dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
-        if self.linear:
-            idx = jnp.floor((dist - self.edges[0, 0]) / (self.edges[0, 1] - self.edges[0, 0])).astype(jnp.int16)
-        else:
-            bins = jnp.append(self.edges[:, 0], self.edges[-1, 1])
-            idx = jnp.digitize(bins, dist, right=False) - 1
-        mask = (idx >= 0) & (idx < len(self.edges))
-        weight *= mask
-        idx = jnp.where(mask, idx, 0)
-        return jnp.stack([jnp.zeros(len(self.edges)).at[idx].add((2 * ell + 1) * get_legendre(ell)(mu) * weight) for ell in self.ells])
     
     def __call__(self, *particles, los='firstpoint'):
+        sharding_mesh = particles[0].attrs.sharding_mesh
+        if len(particles) == 1: particles = particles * 2
+        particles = [(particle.positions, particle.weights) for particle in particles]
+        
         if self.engine == 'cucount':
-            with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
-                from cucountlib import cucount
-                if len(particles) == 1:
-                    particles = particles * 2
-    
-                def get(array):
-                    return np.array(array.addressable_data(0))
 
-                cparticles = [cucount.Particles(get(p.positions), get(p.weights)) for p in particles]
-                bins = np.append(self.edges[:, 0], self.edges[-1, 1])
-                battrs = cucount.BinAttrs(s=bins, pole=(self.ells[0], self.ells[-1], 2, los))
-                sattrs = cucount.SelectionAttrs(**self.selection)
-                toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
+            def _custom_callback(*particles):
+                with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
+                    from cucountlib import cucount
+                    cparticles = [cucount.Particles(np.array(particle[0]), np.array(particle[1])) for particle in particles]
+                    bins = np.append(self.edges[:, 0], self.edges[-1, 1])
+                    #battrs = cucount.BinAttrs(s=bins, pole=(self.ells[0], self.ells[-1], 2, los))
+                    battrs = cucount.BinAttrs(s=bins, pole=(np.array(self.ells), los))
+                    sattrs = cucount.SelectionAttrs(**self.selection)
+                    toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
+                return toret
+
+            out_type = jax.ShapeDtypeStruct((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
+            _call = partial(jax.pure_callback, _custom_callback, out_type)
+            #_call = partial(jax.experimental.io_callback, _custom_callback, out_type)
+            #_call = _custom_callback
+
         else:
-            toret = _scan(self, *particles, los=los)
-        return toret
+
+            def _call(*particles):
+                return _scancount(self, *particles, los=los)
+
+        call = _call
+
+        if sharding_mesh.axis_names:
+
+            def call(*particles):
+                return jax.lax.psum(_call(*particles), sharding_mesh.axis_names)
+
+            call = shard_map(call, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P()), out_specs=P())
+
+        return call(*particles)
 
     def tree_flatten(self):
         state = {name: getattr(self, name) for name in self.__annotations__.keys()}
@@ -290,30 +330,12 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
     # Can't be computed easily in general because of the selection
     num_zero = 0.  #jnp.sum(particles[0].weights)**2 if autocorr else jnp.sum(particles[0].weights) * jnp.sum(particles[1].weights)
     num_shotnoise = 0.
-    if autocorr:
-        num_shotnoise = jnp.sum(particles[0].weights**2)
     particles = list(particles)
-    is_distributed = jax.distributed.is_initialized() and (jax.process_count() > 1)
-    sharding_mesh = particles[0].attrs.sharding_mesh
-
-    def particles_with_sharding(particle):
-        sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P())
-        p = jax.lax.with_sharding_constraint(particle.positions, sharding)
-        w = jax.lax.with_sharding_constraint(particle.weights, sharding)
-        return ParticleField(p, w, attrs=particle.attrs)
-
-    if is_distributed:
-        if autocorr: particles = particles * 2
-        particles[0] = particles_with_sharding(particles[0])
-    else:
-        particles = [particles_with_sharding(particle) for particle in particles]
+    if autocorr:
+        particles = particles * 2
+        num_shotnoise = jnp.sum(particles[0].weights**2)
 
     num = bin(*particles, los=los)
-    if is_distributed:
-        sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
-        num = jax.make_array_from_process_local_data(sharding, num[None, ...])
-        num = num.sum(axis=0)
-
     num_zero = jnp.zeros_like(num[..., 0]).at[0].set(num_zero)
     num_shotnoise = [(2 * ell + 1) * get_legendre(ell)(0.) * num_shotnoise for ell in ells]
 

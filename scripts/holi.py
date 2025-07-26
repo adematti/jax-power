@@ -74,7 +74,9 @@ def get_clustering_rdzw(*fns, zrange=None, region=None, tracer=None, **kwargs):
         catalogs[ifn] = (irank, None)
         if mpicomm.rank == irank:  # Faster to read catalogs from one rank
             columns = np.load(fn)
-            columns = {name: columns[name] if name in columns else columns[name.lower()] for name in ['RA', 'DEC', 'Z']}
+            #columns = {name: columns[name] if name in columns else columns[name.lower()] for name in ['RA', 'DEC', 'Z']}
+            columns = {name: columns[name] if name in columns else columns[name.lower()] for name in ['RA', 'DEC', 'Z_RSD']}
+            columns['Z'] = columns.pop('Z_RSD')
             catalog = Catalog(columns, mpicomm=MPI.COMM_SELF)
             for name in ['WEIGHT', 'WEIGHT_FKP']:
                 if name not in catalog: catalog[name] = catalog.ones()
@@ -83,7 +85,8 @@ def get_clustering_rdzw(*fns, zrange=None, region=None, tracer=None, **kwargs):
                 mask = (catalog['Z'] >= zrange[0]) & (catalog['Z'] <= zrange[1])
                 catalog = catalog[mask]
             if region is not None:
-                mask = select_footprint(catalog['RA'], catalog['DEC'], region)
+                #mask = select_footprint(catalog['RA'], catalog['DEC'], region)
+                mask = select_region(catalog['RA'], catalog['DEC'], region)
                 catalog = catalog[mask]
             catalogs[ifn] = (irank, catalog)
 
@@ -108,11 +111,13 @@ def get_clustering_positions_weights(*fns, **kwargs):
 
 
 def get_data_fn(tracer='LRG', imock=0, **kwargs):
-    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{imock:d}_full_sky.npz'
+    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v2.0/seed{imock:04d}/holi_{tracer}_v2.0_GCcomb_clustering.dat.npz'
+    #return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{imock:d}_full_sky.npz'
 
 
 def get_randoms_fn(tracer='LRG', iran=0, zrange=(0.8, 1.1), **kwargs):
-    return f'/pscratch/sd/a/adematti/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{iran:d}_full_sky.npz'
+    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v2.0/seed{imock:04d}/holi_{tracer}_v2.0_GCcomb_0_clustering.ran.npz'
+    #return f'/pscratch/sd/a/adematti/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{iran:d}_full_sky.npz'
 
 
 def make_randoms(z, randoms_fn, seed=42):
@@ -131,7 +136,8 @@ def make_randoms(z, randoms_fn, seed=42):
 
 
 def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), **kwargs):
-    return f'/global/cfs/projectdirs/desi/mocks/cai/holi/desipipe_test/{tracer.lower()}/{kind}_{tracer.lower()}_real{imock:d}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
+    return f'/global/cfs/cdirs/desi/mocks/cai/holi/desipipe_test/v2.0/seed{imock:04d}/{kind}_holi_{tracer}_v2.0_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
+    #return f'/global/cfs/projectdirs/desi/mocks/cai/holi/desipipe_test/v1/{tracer.lower()}/{kind}_{tracer.lower()}_real{imock:d}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
 
 
 def compute_spectrum(output_fn, get_data, randoms, ells=(0, 2, 4), los='firstpoint', **attrs):
@@ -141,7 +147,7 @@ def compute_spectrum(output_fn, get_data, randoms, ells=(0, 2, 4), los='firstpoi
     attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
     data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
     randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
-    print(data.size, randoms.size)
+    #print(data.size, randoms.size)
     fkp = FKPField(data, randoms)
     norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
@@ -257,19 +263,20 @@ def get_proposal_boxsize(tracer):
 
 if __name__ == '__main__':
 
-    catalog_args = dict(tracer='QSO', region='NGC', zrange=(0.8, 2.1))
+    #catalog_args = dict(tracer='QSO', region='NGC', zrange=(0.8, 2.1))
+    catalog_args = dict(tracer='LRG', region='NGC', zrange=(0.8, 1.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
 
     todo = []
-    todo = ['spectrum', 'window-spectrum'][1:]
+    todo = ['spectrum', 'window-spectrum'][:1]
     #todo = ['randoms']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 50
+    nmocks = 220
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 

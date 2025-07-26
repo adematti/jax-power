@@ -254,10 +254,31 @@ def test_particle2(plot=False):
         ax.plot([], [], color='k', linestyle='-', label='complex')
         plt.show()
 
+def test():
+    from jax.experimental.shard_map import shard_map
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    sharding_mesh = jax.make_mesh((2,), ('x',))
+
+    def custom(x, y):
+        x, y = np.array(x), np.array(y)
+        return np.sum(x + y)
+
+    def s(x):
+        out_type = jax.ShapeDtypeStruct((), float)
+        return jax.lax.psum(jax.pure_callback(custom, out_type, x['x'], x['y']), sharding_mesh.axis_names)
+
+    s = shard_map(s, mesh=sharding_mesh, in_specs=P(*sharding_mesh.axis_names), out_specs=P(None))
+    x = jnp.ones(10)
+    x = jax.device_put(x, jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names)))
+    print(s({'x': x, 'y': x}))
 
 
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-    test_particle2(plot=True)
+    #test_particle2(plot=True)
+    jax.distributed.initialize()
+    test()
+    jax.distributed.shutdown()
