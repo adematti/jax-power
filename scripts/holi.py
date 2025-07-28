@@ -110,14 +110,16 @@ def get_clustering_positions_weights(*fns, **kwargs):
 
 
 
-def get_data_fn(tracer='LRG', imock=0, **kwargs):
-    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v2.0/seed{imock:04d}/holi_{tracer}_v2.0_GCcomb_clustering.dat.npz'
-    #return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{imock:d}_full_sky.npz'
+def get_data_fn(tracer='LRG', imock=0, version='v2', **kwargs):
+    if version == 'v2':
+        return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v2.0/seed{imock:04d}/holi_{tracer}_v2.0_GCcomb_clustering.dat.npz'
+    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{imock:d}_full_sky.npz'
 
 
-def get_randoms_fn(tracer='LRG', iran=0, zrange=(0.8, 1.1), **kwargs):
-    return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v2.0/seed{imock:04d}/holi_{tracer}_v2.0_GCcomb_0_clustering.ran.npz'
-    #return f'/pscratch/sd/a/adematti/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{iran:d}_full_sky.npz'
+def get_randoms_fn(tracer='LRG', imock=0, iran=0, zrange=(0.8, 1.1), version='v2', **kwargs):
+    if version == 'v2':
+        return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/holi/v2.0/seed{imock:04d}/holi_{tracer}_v2.0_GCcomb_0_clustering.ran.npz'
+    return f'/pscratch/sd/a/adematti/cai/holi/v1/{tracer.lower()}/v1.0/{tracer.lower()}_real{iran:d}_full_sky.npz'
 
 
 def make_randoms(z, randoms_fn, seed=42):
@@ -135,9 +137,10 @@ def make_randoms(z, randoms_fn, seed=42):
     np.savez(randoms_fn, **randoms)
 
 
-def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), **kwargs):
-    return f'/global/cfs/cdirs/desi/mocks/cai/holi/desipipe_test/v2.0/seed{imock:04d}/{kind}_holi_{tracer}_v2.0_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
-    #return f'/global/cfs/projectdirs/desi/mocks/cai/holi/desipipe_test/v1/{tracer.lower()}/{kind}_{tracer.lower()}_real{imock:d}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
+def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), version='v2', **kwargs):
+    if version == 'v2':
+        return f'/global/cfs/cdirs/desi/mocks/cai/holi/desipipe_test/v2.0/seed{imock:04d}/{kind}_holi_{tracer}_v2.0_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
+    return f'/global/cfs/projectdirs/desi/mocks/cai/holi/desipipe_test/v1/{tracer.lower()}/{kind}_{tracer.lower()}_real{imock:d}_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
 
 
 def compute_spectrum(output_fn, get_data, randoms, ells=(0, 2, 4), los='firstpoint', **attrs):

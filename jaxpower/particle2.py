@@ -283,7 +283,6 @@ class BinParticle2Correlation(object):
                     from cucountlib import cucount
                     cparticles = [cucount.Particles(np.array(particle[0]), np.array(particle[1])) for particle in particles]
                     bins = np.append(self.edges[:, 0], self.edges[-1, 1])
-                    #battrs = cucount.BinAttrs(s=bins, pole=(self.ells[0], self.ells[-1], 2, los))
                     battrs = cucount.BinAttrs(s=bins, pole=(np.array(self.ells), los))
                     sattrs = cucount.SelectionAttrs(**self.selection)
                     toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
