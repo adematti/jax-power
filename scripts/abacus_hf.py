@@ -496,7 +496,7 @@ def rotate_old(output_fn, window_fn, covariance_fn, Minit='momt'):
     
 
 def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', los='local', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
+    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
     t0 = time.time()
     data, randoms = get_data(), get_randoms()
     attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
@@ -506,24 +506,27 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
     bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
     norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
-    mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    kw = dict(resampler='tsc', interlacing=3, compensate=True)
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(fkp, los=los, bin=bin, **kw)
+    mesh = fkp.paint(**kw, out='real')
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    spectrum = spectrum.clone(norm=norm)
+    spectrum = spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
     spectrum.save(output_fn)
 
 
 def compute_box_bispectrum(output_fn, get_data, basis='scoccimarro', los='z', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
+    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
     t0 = time.time()
     data = get_data()
     attrs = MeshAttrs(**attrs)
     data = ParticleField(data, attrs=attrs, exchange=True, backend='jax')
     mesh = data.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
-    edges = np.arange(0., 0.12, 0.01)
-    bin = BinMesh3Spectrum(attrs, edges=edges, basis=basis, ells=ells, buffer_size=4)
+    bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
     jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'], donate_argnums=[0])
-    mesh = fkp.paint(resampler='tsc', interlacing=False, compensate=False, out='real')
+    kw = dict(resampler='tsc', interlacing=3, compensate=True)
+    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, los=los, bin=bin, **kw)
+    mesh = fkp.paint(**kw, out='real')
     spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
     spectrum.attrs.update(mesh=dict(mesh.attrs), los=los)
     jax.block_until_ready(spectrum)
@@ -537,8 +540,8 @@ if __name__ == '__main__':
 
     #catalog_args = dict(tracer='ELG_LOP', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
     #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
-    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
-    #catalog_args = dict(tracer='LRG', region='SGC', zsnap=0.5, zrange=(0.4, 0.6))
+    #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
+    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.5, zrange=(0.4, 0.6))
     #catalog_args = dict(tracer='QSO', region='NGC', zsnap=1.400, zrange=(0.8, 2.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
@@ -547,14 +550,14 @@ if __name__ == '__main__':
     todo = []
     #todo = ['spectrum-box']
     #todo = ['window-spectrum-box']
-    todo = ['spectrum', 'window-spectrum'][1:]
+    #todo = ['spectrum', 'window-spectrum'][1:]
     #todo = ['rotate']
-    #todo = ['bispectrum']
+    todo = ['bispectrum']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 25
+    nmocks = 5
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 

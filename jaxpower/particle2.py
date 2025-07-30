@@ -151,12 +151,34 @@ def get_engine(engine='auto'):
     assert engine in ['auto', 'jax', 'cucount']
     if engine == 'auto':
         try:
-            from cucountlib import cucount
+            import cucount
         except ImportError:
             engine = 'jax'
         else:
             engine = 'cucount'
     return engine
+
+
+from .mesh import default_sharding_mesh
+
+@default_sharding_mesh
+def _slice_particles(particles, nslices=None, sharding_mesh=None):
+    if sharding_mesh.axis_names and sharding_mesh.devices.size > 1:
+        if nslices is None: nslices = sharding_mesh.devices.size
+        if nslices == 1:
+            yield particles
+        else:
+            for islice in range(nslices):
+
+                def f(array):
+                    local_size = array.shape[0]
+                    return array[slice(islice * local_size // nslices, (islice + 1) * local_size // nslices)]
+
+                sliced_particles = shard_map(partial(jax.tree_map, f), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,)), out_specs=P(sharding_mesh.axis_names,))(particles)
+
+                yield sliced_particles
+    else:
+        yield particles
 
 
 @jax.tree_util.register_pytree_node_class
@@ -197,18 +219,14 @@ class BinParticle2Spectrum(object):
         
         if self.engine == 'cucount':
 
-            def _custom_callback(*particles):
-                with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
-                    from cucountlib import cucount
-                    cparticles = [cucount.Particles(np.array(particle[0]), np.array(particle[1])) for particle in particles]
-                    battrs = cucount.BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
-                    sattrs = cucount.SelectionAttrs(**self.selection)
-                    toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
-                return toret
-
-            out_type = jax.ShapeDtypeStruct((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
-            _call = partial(jax.pure_callback, _custom_callback, out_type)
-
+            def _call(*particles):
+                from cucount.jax import count2, Particles, BinAttrs, SelectionAttrs, setup_logging
+                setup_logging('error')
+                particles = [Particles(*particle) for particle in particles]
+                battrs = BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
+                sattrs = SelectionAttrs(**self.selection)
+                return count2(*particles, battrs=battrs, sattrs=sattrs).T
+        
         else:
 
             def _call(*particles):
@@ -218,11 +236,13 @@ class BinParticle2Spectrum(object):
 
         if sharding_mesh.axis_names:
 
-            def call(*particles):
-                return jax.lax.psum(_call(*particles), sharding_mesh.axis_names)
+            call = shard_map(lambda *particles: jax.lax.psum(_call(*particles), sharding_mesh.axis_names), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(None)), out_specs=P(None))
 
-            call = shard_map(call, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P()), out_specs=P())
-
+            toret = 0.
+            for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh):
+                toret += call(particles[0], particles2)
+            return toret
+        
         return call(*particles)
 
     
@@ -278,21 +298,14 @@ class BinParticle2Correlation(object):
         
         if self.engine == 'cucount':
 
-            def _custom_callback(*particles):
-                with set_env(CUDA_VISIBLE_DEVICES=os.environ.get('SLURM_LOCALID', '0')):
-                    from cucountlib import cucount
-                    cparticles = [cucount.Particles(np.array(particle[0]), np.array(particle[1])) for particle in particles]
-                    bins = np.append(self.edges[:, 0], self.edges[-1, 1])
-                    battrs = cucount.BinAttrs(s=bins, pole=(np.array(self.ells), los))
-                    sattrs = cucount.SelectionAttrs(**self.selection)
-                    toret = cucount.count2(*cparticles, battrs=battrs, sattrs=sattrs).T
-                return toret
-
-            out_type = jax.ShapeDtypeStruct((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
-            _call = partial(jax.pure_callback, _custom_callback, out_type)
-            #_call = partial(jax.experimental.io_callback, _custom_callback, out_type)
-            #_call = _custom_callback
-
+            def _call(*particles):
+                from cucount.jax import count2, Particles, BinAttrs, SelectionAttrs, setup_logging
+                setup_logging('error')
+                particles = [Particles(*particle) for particle in particles]
+                bins = np.append(self.edges[:, 0], self.edges[-1, 1])
+                battrs = BinAttrs(s=bins, pole=(np.array(self.ells), los))
+                sattrs = SelectionAttrs(**self.selection)
+                return count2(*particles, battrs=battrs, sattrs=sattrs).T
         else:
 
             def _call(*particles):
@@ -301,11 +314,20 @@ class BinParticle2Correlation(object):
         call = _call
 
         if sharding_mesh.axis_names:
+            # Note about parallel computation:
+            # To create a shard array, with same size on all process,
+            # we add particles with weight 0 located at the mean position of the data chunk.
+            # This creates a lot of repeats at the same location,
+            # which would lead to an increased computation time in the pair counting,
+            # as it is dominated by the pairs in that spatial bin.
+            # So in cucount we remove all particles with weight 0 prior to pair counting.
+            call = shard_map(lambda *particles: jax.lax.psum(_call(*particles), sharding_mesh.axis_names), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(None)), out_specs=P(None))
 
-            def call(*particles):
-                return jax.lax.psum(_call(*particles), sharding_mesh.axis_names)
-
-            call = shard_map(call, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P()), out_specs=P())
+            # Loop to reduce computational footprint
+            toret = 0.
+            for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh):
+                toret += call(particles[0], particles2)
+            return toret
 
         return call(*particles)
 

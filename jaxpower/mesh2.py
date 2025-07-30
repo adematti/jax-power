@@ -45,8 +45,8 @@ class Spectrum2Poles(BinnedStatistic):
         for ill, value in enumerate(num_zero):
             if jnp.size(value) <= 1: num_zero[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
         num_zero = tuple(num_zero)
-        if not isinstance(num_shotnoise, (tuple, list)):
-             num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
+        if num_shotnoise is None: num_shotnoise = 0.
+        if not isinstance(num_shotnoise, (tuple, list)): num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
         num_shotnoise = list(num_shotnoise)
         for ill, value in enumerate(num_shotnoise):
             if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.zeros_like(self._value[ill]).at[...].set(value)
@@ -159,8 +159,8 @@ class Correlation2Poles(BinnedStatistic):
         for ill, value in enumerate(num_zero):
             if jnp.size(value) <= 1: num_zero[ill] = jnp.zeros_like(self._value[ill]).at[...].set(value)
         num_zero = tuple(num_zero)
-        if not isinstance(num_shotnoise, (tuple, list)):
-             num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
+        if num_shotnoise is None: num_shotnoise = 0.
+        if not isinstance(num_shotnoise, (tuple, list)): num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
         num_shotnoise = list(num_shotnoise)
         for ill, value in enumerate(num_shotnoise):
             if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
