@@ -238,10 +238,13 @@ class BinParticle2Spectrum(object):
 
             call = shard_map(lambda *particles: jax.lax.psum(_call(*particles), sharding_mesh.axis_names), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(None)), out_specs=P(None))
 
-            toret = 0.
-            for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh):
-                toret += call(particles[0], particles2)
-            return toret
+            # Loop to reduce computational footprint
+            nshards = sharding_mesh.devices.size
+            particles2 = jax.tree_map(lambda array: array.reshape(nshards, array.shape[0] // nshards, *array.shape[1:]), particles[1])
+            init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
+            return jax.lax.scan(lambda carry, particles2: (carry + call(particles[0], particles2), 0), init, particles2)[0]
+            
+            #return sum(call(particles[0], particles2) for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh))
         
         return call(*particles)
 
@@ -324,10 +327,12 @@ class BinParticle2Correlation(object):
             call = shard_map(lambda *particles: jax.lax.psum(_call(*particles), sharding_mesh.axis_names), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(None)), out_specs=P(None))
 
             # Loop to reduce computational footprint
-            toret = 0.
-            for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh):
-                toret += call(particles[0], particles2)
-            return toret
+            nshards = sharding_mesh.devices.size
+            particles2 = jax.tree_map(lambda array: array.reshape(nshards, array.shape[0] // nshards, *array.shape[1:]), particles[1])
+            init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
+            return jax.lax.scan(lambda carry, particles2: (carry + call(particles[0], particles2), 0), init, particles2)[0]
+            
+            #return sum(call(particles[0], particles2) for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh))
 
         return call(*particles)
 

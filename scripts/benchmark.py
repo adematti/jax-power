@@ -206,7 +206,7 @@ if __name__ == '__main__':
     for imock in range(1):
         catalog_dir = Path(f'/dvs_ro/cfs/cdirs/desi//survey/catalogs/Y1/mocks/SecondGenMocks/AbacusSummit_v4_2/altmtl{imock:d}/mock{imock:d}/LSScats/')
         data_fn = catalog_dir / f'{tracer}_{region}_clustering.dat.fits'
-        all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)]
+        all_randoms_fn = [catalog_dir / f'{tracer}_{region}_{iran:d}_clustering.ran.fits' for iran in range(10)]#[:1]
 
         if todo == 'jaxpower':
             fn = get_mock_fn(f'jaxpower_{imock:d}')
