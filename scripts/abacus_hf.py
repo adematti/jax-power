@@ -540,8 +540,8 @@ if __name__ == '__main__':
 
     #catalog_args = dict(tracer='ELG_LOP', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
     #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
-    #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
-    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.5, zrange=(0.4, 0.6))
+    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
+    #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.5, zrange=(0.4, 0.6))
     #catalog_args = dict(tracer='QSO', region='NGC', zsnap=1.400, zrange=(0.8, 2.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
@@ -549,21 +549,19 @@ if __name__ == '__main__':
 
     todo = []
     #todo = ['spectrum-box']
-    #todo = ['window-spectrum-box']
+    todo = ['window-spectrum-box']
     #todo = ['spectrum', 'window-spectrum'][1:]
     #todo = ['rotate']
-    todo = ['bispectrum']
+    #todo = ['bispectrum']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 5
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    nmocks = 25
     t0 = time.time()
 
-    is_distributed = any(td in ['spectrum', 'bispectrum', 'window-spectrum', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
+    is_distributed = any(td in ['spectrum', 'thetacut', 'bispectrum', 'window-spectrum', 'window-thetacut', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
     if is_distributed:
-        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
         import jax
         jax.distributed.initialize()

@@ -932,6 +932,7 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
     periodic = isinstance(meshs[0], MeshAttrs)
     if periodic:
         assert autocorr
+        mattrs = meshs[0]
     else:
         mattrs = meshs[0].attrs
     rdtype = mattrs.rdtype
