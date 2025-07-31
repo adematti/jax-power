@@ -716,6 +716,14 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
 
     assert 'scoccimarro' in bin.basis, 'fisher is only available for scoccimarro basis'
 
+    if apply_selection is None and isinstance(mattrs, RealMeshField):
+
+        selection = mattrs
+        mattrs = selection.attrs
+
+        def apply_selection(mesh):
+            return mesh * selection
+
     periodic = apply_selection is None
     rdtype = mattrs.rdtype
 
@@ -815,18 +823,18 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
 
             # Compute g_{b,0} maps
             g_b0_maps, leg_maps = [], []
-            for idim in range(2):
-                g_b0_maps.append([mattrs.c2r(cwmaps[idim] * (bin.ibin[idim + 1] == b)) for b in bin.uiedges[idim + 1]])
+            for axis in range(2):
+                g_b0_maps.append([mattrs.c2r(cwmaps[axis] * (bin.ibin[axis + 1] == b)) for b in bin._uiedges[axis + 1]])
                 if vlos is None:
-                    leg_maps.append([apply_fourier_harmonics(ell, rwmaps[idim]) for ell in bin.ells])
+                    leg_maps.append([apply_fourier_harmonics(ell, rwmaps[axis]) for ell in bin.ells])
 
             for ibin3 in bin.uiedges[-1]:
                 g_bBl_maps = []
-                for idim in range(2):
+                for axis in range(2):
                     tmp = []
                     for ell in bin.ells:
-                        if vlos is not None: tmp.append(mattrs.c2r(apply_fourier_legendre(ell, cwmaps[idim] * (bin.ibin[2] == ibin3))))
-                        else: tmp.append(mattrs.c2r(leg_maps[idim] * (bin.ibin[2] == ibin3)))
+                        if vlos is not None: tmp.append(mattrs.c2r(apply_fourier_legendre(ell, cwmaps[axis] * (bin.ibin[2] == ibin3))))
+                        else: tmp.append(mattrs.c2r(leg_maps[axis] * (bin.ibin[2] == ibin3)))
                     g_bBl_maps.append(tmp)
 
                 for ibin1 in bin.uiedges[0]:
@@ -850,18 +858,18 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                         for ell in bin.ells:
                             ft_ABl.append(mattrs.r2c(g_bBl_maps[0][bin.ells.index(0)][ibin1] * g_bBl_maps[0][ill][ibin3] - g_bBl_maps[1][bin.ells.index(0)][ibin1] * g_bBl_maps[1][ill][ibin3]))
 
-                        def add_Q_element(Q_Ainv, idim, ibins):
+                        def add_Q_element(Q_Ainv, axis, ibins):
                             # Iterate over these elements and add to the output arrays
                             for ibin2 in ibins:
-                                ibin = bin._iedges[ibin, idim]
+                                ibin = bin._iedges[ibin, axis]
                                 for ill, ell in enumerate(bin.ells):
-                                    if (ell == 0) or (idim == 2):
-                                        tmp = ft_ABl[ill] * (bin.ibin[idim] == ibin)
+                                    if (ell == 0) or (axis == 2):
+                                        tmp = ft_ABl[ill] * (bin.ibin[axis] == ibin)
                                     else:
                                         if vlos is not None:
-                                            tmp = apply_fourier_legendre(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[idim] == ibin))
+                                            tmp = apply_fourier_legendre(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[axis] == ibin))
                                         else:
-                                            tmp = apply_real_harmonics(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[idim] == ibin)).r2c()
+                                            tmp = apply_real_harmonics(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[axis] == ibin)).r2c()
                                     Q_Ainv[ibin2 + ill * len(bin._iedges)] += tmp
 
                         Q_Ainv = add_Q_element(Q_Ainv, 2, ibins1)

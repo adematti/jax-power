@@ -31,7 +31,6 @@ def test_mesh3_spectrum(plot=False):
     for basis in ['sugiyama-diagonal', 'scoccimarro-equilateral']:
 
         ells = [0] if 'scoccimarro' in basis else [(0, 0, 0)]
-
         bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells)
 
         @partial(jax.jit, static_argnames=['los'])
@@ -61,6 +60,27 @@ def test_mesh3_spectrum(plot=False):
                 ax = power.plot().axes[0]
                 ax.set_title(los)
                 plt.show()
+
+
+def test_binned_statistic():
+
+    for basis in ['sugiyama-diagonal', 'scoccimarro']:
+        ells = [0, 2] if 'scoccimarro' in basis else [(0, 0, 0), (0, 0, 2)]
+        attrs = MeshAttrs(meshsize=64, boxsize=1000.)
+        bin = BinMesh3Spectrum(attrs, edges={'step': 0.03}, basis=basis, ells=ells, buffer_size=10)
+        spectrum = Spectrum3Poles(k=bin.xavg, num=[jnp.ones_like(bin.xavg[..., 0])] * len(ells), nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=1., num_zero=None, basis=bin.basis)
+        xlim = (0., 0.1)
+        tmp = spectrum.select(xlim=xlim)
+        assert np.all(tmp.xavg()[0] < xlim[-1])
+        if 'sugiyama' in basis:
+            tmp = spectrum.slice(slice(0, None, 3))
+            xlim = (0., [0.1, 0.12])
+            tmp = spectrum.select(xlim=xlim)
+        else:
+            tmp = spectrum.slice((slice(0, None, 2), slice(0, None, 2), slice(0, None, 3)))
+            xlim = ([0., 0.03, 0.05], [0.1, 0.12, 0.1])
+            tmp = spectrum.select(xlim=xlim)
+        assert np.all((np.array(tmp.xavg()[0]) > xlim[0]) & (np.array(tmp.xavg()[0]) < xlim[-1]))
 
 
 def test_timing():
@@ -355,6 +375,31 @@ def test_normalization():
     norm = compute_fkp3_spectrum_normalization(fkp, split=42)
 
 
+def survey_selection(size=int(1e7), seed=random.key(42), scale=0.25, paint=True):
+    from jaxpower import ParticleField
+    attrs = MeshAttrs(boxsize=1000., boxcenter=[0., 0., 1000], meshsize=64)
+    xvec = attrs.xcoords(kind='position', sparse=False)
+    limits = attrs.boxcenter - attrs.boxsize / 4., attrs.boxcenter + attrs.boxsize / 4.
+    # Generate Gaussian-distributed positions
+    positions = scale * random.normal(seed, shape=(size, attrs.ndim))
+    #positions = scale * (2 * random.uniform(seed, shape=(size, attrs.ndim)) - 1.)
+    bscale = scale  # cut at 1 sigmas
+    mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+    positions = positions * attrs.boxsize + attrs.boxcenter
+    toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
+    if paint: toret = toret.paint(resampler='ngp', interlacing=1, compensate=False)
+    return toret
+
+
+def test_fisher():
+    from jaxpower.mesh3 import compute_fisher_scoccimarro
+
+    selection = survey_selection()
+    attrs = selection.attrs
+    edges = np.arange(0.01, attrs.knyq[0], 0.01)
+    bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0, 2])
+    fisher = compute_fisher_scoccimarro(selection, bin=bin)
+
 
 if __name__ == '__main__':
 
@@ -370,5 +415,7 @@ if __name__ == '__main__':
     #test_timing()
     #test_polybin3d()
     #test_normalization()
-    test_triumvirate_box()
+    #test_triumvirate_box()
     #test_triumvirate_survey()
+    test_binned_statistic()
+    #test_fisher()

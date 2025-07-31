@@ -682,6 +682,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         for iproj in iprojs:
             if method == 'mid': xx = (self._edges[iproj][..., 0] + self._edges[iproj][..., 1]) / 2.
             else: xx = self._x[iproj]
+            xx = np.asarray(xx)
             if xlim is not None:
                 tmp = (xx >= xlim[0]) & (xx <= xlim[1])
                 tmp = np.all(tmp, axis=tuple(range(1, tmp.ndim)))
@@ -724,22 +725,52 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         if isinstance(edges, BinnedStatistic):
             edges = list(edges._edges)
         toret = []
+
+        def get_unique_edges(edges):
+            return [jnp.unique(edges[:, axis], axis=0) for axis in range(edges.shape[1])]
+
+        def get_1d_slice(edges, sl):
+            sl1 = edges[sl, 0]
+            sl2 = edges[sl.start + sl.step - 1:sl.stop + sl.step - 1:sl.step, 1]
+            size = min(sl1.shape[0], sl2.shape[0])
+            return jnp.column_stack([sl1[:size], sl2[:size]])
+
         for iproj in iprojs:
+            self_edges = self._edges[iproj]
             if isinstance(edges, list): iedges = edges[iproj]
             else: iedges = edges
+            ndim = (1 if self_edges.ndim < 3 else self_edges.shape[1])
             if isinstance(iedges, slice):
-                sl = _format_slice(iedges, len(self._x[iproj]))
-                sl1 = self._edges[iproj][sl, ..., 0]
-                sl2 = self._edges[iproj][sl.start + sl.step - 1:sl.stop + sl.step - 1:sl.step, ..., 1]
-                iedges = jnp.concatenate([sl1[..., None], sl2[..., None]], axis=-1)
-            matrix = np.zeros((len(iedges), len(self._weights[iproj])), dtype=float)
-            for iedge, edge in enumerate(iedges):  # iterate on data vector size
-                mask = (self._edges[iproj][..., 0] >= edge[..., 0]) & (self._edges[iproj][..., 1] <= edge[..., 1])  # (size, ndim, 2)
-                if mask.ndim > 2: mask = mask.all(axis=1)  # (N>1)-dim vector
-                if weighted:
-                    matrix[iedge, mask] = self._weights[iproj][mask]
+                iedges = (iedges,) * ndim
+            if isinstance(iedges, tuple):
+                assert all(isinstance(iedge, slice) for iedge in iedges)
+                slices = [_format_slice(iedge, len(self_edges)) for iedge in iedges]
+                assert len(slices) == ndim, f'Provided tuple of slices should be of size {ndim:d}, found {len(slices):d}'
+                if self_edges.ndim == 2:
+                    iedges = get_1d_slice(self_edges, slices[0])
                 else:
-                    matrix[iedge, mask] = 1.
+                    iedges1d = [get_1d_slice(e, s) for e, s in zip(get_unique_edges(self_edges), slices)]
+
+                    def isin2d(array1, array2):
+                        assert len(array1) == len(array2)
+                        toret = True
+                        for a1, a2 in zip(array1, array2): toret &= jnp.isin(a1, a2)
+                        return toret
+
+                    # This is to keep the same ordering
+                    upedges = self_edges[..., 1][isin2d(self_edges[..., 1].T, [e[..., 1] for e in iedges1d])]
+                    lowedges = jnp.column_stack([iedges1d[axis][..., 0][jnp.searchsorted(iedges1d[axis][..., 1], upedges[..., axis])] for axis in range(ndim)])
+                    iedges = jnp.concatenate([lowedges[..., None], upedges[..., None]], axis=-1)
+
+            # Broadcast iedges[:, None, :] against edges[None, :, :]
+            mask = (self_edges[None, ..., 0] >= iedges[:, None, ..., 0]) & (self_edges[None, ..., 1] <= iedges[:, None, ..., 1])  # (new_size, old_size) or (new_size, old_size, ndim)
+            if mask.ndim >= 3:
+                mask = mask.all(axis=-1)  # collapse extra dims if needed
+            if weighted:
+                matrix = jnp.where(mask, self._weights[iproj][None, :], 0.0)
+            else:
+                matrix = mask.astype(float)
+
             if normalize:
                 matrix /= jnp.where(jnp.all(matrix == 0, axis=-1), 1., jnp.sum(matrix, axis=-1))[:, None]
             toret.append(matrix)
@@ -786,7 +817,9 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
                 elif name == '_weights':
                     state[name][iproj] = matrix.dot(state[name][iproj])
                 else:
-                    state[name][iproj] = nwmatrix.dot(jnp.where(self._weights[iproj] == 0, 0., state[name][iproj]))
+                    mask = self._weights[iproj] == 0
+                    tmp = jnp.where(mask[(Ellipsis,) + (None,) * (state[name][iproj].ndim - mask.ndim)], 0., state[name][iproj])
+                    state[name][iproj] = nwmatrix.dot(tmp)
         state = {name: getattr(self, name) for name in self._data_fields + self._meta_fields} | {name: tuple(value) for name, value in state.items()}
         projs = self._projs
         if select_projs:
