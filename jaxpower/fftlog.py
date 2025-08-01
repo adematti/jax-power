@@ -51,30 +51,22 @@ class FFTlog(object):
         x : array_like
             Input log-spaced coordinates. Must be strictly increasing.
             If 1D, is broadcast to the number of provided kernels.
-
         kernel : callable, list of callables
             Mellin transform of the kernel:
             .. math:: U_{K}(z) = \int_{0}^{\infty} t^{z-1} K(t) dt
             If a list of kernels is provided, will perform all transforms at once.
-
         q : float, list of floats, default=0
             Power-law tilt(s) to regularise integration.
-
         minfolds : int, default=2
             Padded size is ``2**n``, with minimum :math:`n` statisfying ``2**n > minfolds * x.size``.
-
         lowring : bool, default=True
             If ``True`` set output coordinates according to the low-ringing condition, otherwise set it with ``xy``.
-
         xy : float, list of floats, default=1
             Enforce the reciprocal product (i.e. ``x[0] * y[-1]``) of the input ``x`` and output ``y`` coordinates.
-
         check_level : int, default=0
             If non-zero run sanity checks on input.
-
         engine : string, default='jax'
             FFT engine. See :meth:`set_fft_engine`.
-
         engine_kwargs : dict
             Arguments for FFT engine.
 
@@ -202,14 +194,12 @@ class FFTlog(object):
             Function to be transformed.
             Last dimensions should match (:attr:`nparallel`, len(x)) where ``len(x)`` is the size of the input x-coordinates.
             (if :attr:`nparallel` is 1, the only requirement is the last dimension to be len(x).
-
         extrap : float, string, default=0
             How to extrapolate function outside of  ``x`` range to fit the integration range.
             If 'log', performs a log-log extrapolation.
             If 'edge', pad ``fun`` with its edge values.
             Else, pad ``fun`` with the provided value.
             Pass a tuple to differentiate between left and right sides.
-
         keep_padding : bool, default=False
             Whether to return function padded to the number of points in the integral.
             By default, crop it to its original size.

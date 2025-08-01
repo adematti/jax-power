@@ -82,8 +82,6 @@ def longrange(r_split: float = 0.):
     -------
     fn : callable
         Kernel callable to be applied to mesh: ``mesh.apply(fn)``.
-
-    TODO: @modichirag add documentation
     """
     def fn(value, kvec):
         if r_split != 0:

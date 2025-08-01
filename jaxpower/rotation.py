@@ -9,18 +9,87 @@ from .utils import WindowMatrix, CovarianceMatrix, BinnedStatistic, mkdir, plott
 
 
 class BaseWindowRotation(object):
+    """
+    Base class for window matrix (:class:`WindowMatrix`) rotation: make it more diagonal in a likelihood-informed way.
+    Routines are provided to correspondingly rotate the data vector (:class:`BinnedStatistic`) and covariance matrix (:class:`CovarianceMatrix`).
+
+    Reference
+    ---------
+    https://arxiv.org/abs/2406.04804
+
+    Parameters
+    ----------
+    wmatrix : WindowMatrix
+        Window matrix object containing observable and theory information.
+    covmatrix : CovarianceMatrix or array_like
+        Covariance matrix for the observable.
+    attrs : dict, optional
+        Additional attributes.
+    **kwargs
+        Additional keyword arguments for window matrix setup.
+
+    Attributes
+    ----------
+    observable : BinnedStatistic
+        Observable object.
+    theory : BinnedStatistic
+        Theory object.
+    wmatrix : ndarray
+        Window matrix.
+    covmatrix : ndarray
+        Covariance matrix.
+    mmatrix : ndarray
+        Transformation matrix (default identity).
+    xohalf : list
+        Characteristic scale for each observable.
+    xbandwidth : float
+        Bandwidth of the window matrix.
+    attrs : dict
+        Additional attributes.
+    state : object
+        Fitting state.
+    init : object
+        Initial fit parameters.
+    loss : callable
+        Loss function for fitting.
+    """
 
     logger = logging.getLogger('WindowRotation')
     _meta_fields = ['observable', 'theory', 'xohalf', 'wmatrix', 'covmatrix', 'mmatrix', 'state', 'attrs']
 
-    def __init__(self, wmatrix, covmatrix, attrs=None, **kwargs):
+    def __init__(self, wmatrix: WindowMatrix, covmatrix: CovarianceMatrix, attrs: dict=None, **kwargs):
+        """
+        Initialize the rotation.
+
+        Parameters
+        ----------
+        wmatrix : WindowMatrix
+            Window matrix object.
+        covmatrix : CovarianceMatrix or array-like
+            Covariance matrix.
+        attrs : dict, optional
+            Additional attributes.
+        **kwargs
+            Additional keyword arguments for window matrix setup.
+        """
         self.set_wmatrix(wmatrix, **kwargs)
         self.set_covmatrix(covmatrix)
         self.attrs = dict(attrs or {})
         self.clear()
         self.init = self.loss = None
 
-    def set_wmatrix(self, wmatrix, xpivot=None):
+    def set_wmatrix(self, wmatrix: WindowMatrix, xpivot: float=None):
+        """
+        Set the window matrix and compute characteristic scales.
+
+        Parameters
+        ----------
+        wmatrix : WindowMatrix
+            Window matrix object.
+        xpivot : float, optional
+            Pivot value for characteristic scale calculation.
+            Default to the middle of the observed data vector.
+        """
         self.observable, self.theory = wmatrix.observable, wmatrix.theory
         self.wmatrix = jnp.array(wmatrix.view())
 
@@ -45,18 +114,22 @@ class BaseWindowRotation(object):
 
     @property
     def oprojs(self):
+        """Return list of observable projections."""
         return self.observable.projs
 
     @property
     def tprojs(self):
+        """Return list of theory projections."""
         return self.theory.projs
 
     @property
     def ox(self):
+        """Return list of observable coordinates."""
         return self.observable.x()
 
     @property
     def tx(self):
+        """Return list of theory coordinates."""
         return self.theory.x()
 
     @property
@@ -79,22 +152,63 @@ class BaseWindowRotation(object):
             mask.append(tmp)
         return mask
 
-    def set_covmatrix(self, covmatrix):
+    def set_covmatrix(self, covmatrix: CovarianceMatrix | jax.Array):
+        """
+        Set the covariance matrix.
+
+        Parameters
+        ----------
+        covmatrix : CovarianceMatrix or array-like
+            Covariance matrix to set.
+        """
         if isinstance(covmatrix, CovarianceMatrix):
             covmatrix = covmatrix.view()
         self.covmatrix = jnp.array(covmatrix)
 
     def clear(self):
+        """Reset the transformation matrix to identity."""
         self.mmatrix = np.eye(self.covmatrix.shape[0])  # default M matrix
 
     def setup(self):
+        """
+        Abstract method to set up loss function and initial parameters for fitting.
+
+        Raises
+        ------
+        NotImplementedError
+            Must be implemented in subclasses.
+        """
         raise NotImplementedError
 
     def rotate(self):
+        """
+        Abstract method to perform window matrix rotation.
+
+        Raises
+        ------
+        NotImplementedError
+            Must be implemented in subclasses.
+        """
         raise NotImplementedError
 
     def fit(self, state=None, **kwargs):
-        """Fit."""
+        """
+        Fit the transformation matrix using gradient-based optimization.
+
+        Parameters
+        ----------
+        state : tuple, optional
+            Previous fitting state.
+        **kwargs
+            Additional arguments for optimizer.
+
+        Returns
+        -------
+        mmatrix : jax.Array
+            Fitted transformation matrix.
+        state : tuple
+            Final optimizer state.
+        """
         import optax
         if getattr(self, 'loss', None) is None or getattr(self, 'init', None) is None:
             raise ValueError('call "setup" to set loss function and init')
@@ -147,6 +261,28 @@ class BaseWindowRotation(object):
 
     @plotter
     def plot_wmatrix_slice(self, indices):
+        """
+        Plot a slice of the window matrix before and after rotation.
+
+        Parameters
+        ----------
+        indices : array-like
+            Indices for which to take slices.
+        fig : matplotlib.figure.Figure, default=None
+            Optionally, a figure with at least 1 axis.
+        fn : str, Path, default=None
+            Optionally, path where to save figure.
+            If not provided, figure is not saved.
+        kw_save : dict, default=None
+            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
+        show : bool, default=False
+            If ``True``, show figure.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            Figure object.
+        """
         wmatrix = WindowMatrix(observable=self.observable, theory=self.theory, value=self.wmatrix)
         wmatrix_rotated = WindowMatrix(observable=self.observable, theory=self.theory, value=self.rotate()[0])
         fig = wmatrix.plot_slice(indices, color='C0', label='$W$', yscale='log')
@@ -154,6 +290,37 @@ class BaseWindowRotation(object):
 
     @plotter
     def plot_compactness(self, frac=0.95, xlim=None, projs=None):
+        """
+        Plot the compactness of the window matrix for different projections.
+
+        Reference
+        ---------
+        Fig. 14 of https://arxiv.org/pdf/2406.04804
+
+        Parameters
+        ----------
+        frac : float, default=0.95
+            At each observed point, plot the theory coordinate for which the
+            fraction of the sum of the window matrix along the theory is ``frac``.
+        xlim : tuple, optional
+            x-axis limits.
+        projs : list, optional
+            Projections to plot.
+        fig : matplotlib.figure.Figure, default=None
+            Optionally, a figure with at least 1 axis.
+        fn : str, Path, default=None
+            Optionally, path where to save figure.
+            If not provided, figure is not saved.
+        kw_save : dict, default=None
+            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
+        show : bool, default=False
+            If ``True``, show figure.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            Figure object.
+        """
         from matplotlib import pyplot as plt
         if projs is None:
             projs = self.oprojs
@@ -218,10 +385,39 @@ class BaseWindowRotation(object):
 
 
 class WindowRotationSpectrum2(BaseWindowRotation):
+    """
+    Window rotation class for 2-point spectrum analysis.
 
+    Extends BaseWindowRotation to support marginalization and advanced setup for spectrum rotation.
+
+    Attributes
+    ----------
+    marg_precmatrix : ndarray
+        Marginalized precision matrix.
+    marg_prior_mo : ndarray
+        Marginalized prior offset.
+    marg_theory_offset : ndarray
+        Marginalized theory offset.
+    """
     _meta_fields = BaseWindowRotation._meta_fields + ['marg_precmatrix', 'marg_prior_mo', 'marg_theory_offset']
 
     def setup(self, Mtarg=None, Minit='momt', max_sigma_W=5, max_sigma_R=5, factor_diff_proj=10):
+        """
+        Set up the loss function and initial parameters for rotation fitting.
+
+        Parameters
+        ----------
+        Mtarg : ndarray, optional
+            Target transformation matrix.
+        Minit : str or tuple, optional
+            Initialization method or tuple of initial values.
+        max_sigma_W : float, optional
+            Maximum sigma for window matrix weighting.
+        max_sigma_R : float, optional
+            Maximum sigma for covariance matrix weighting.
+        factor_diff_proj : float, optional
+            Weighting factor for off-diagonal blocks.
+        """
         tx = np.concatenate(list(self.tx))
         ox = np.concatenate(list(self.xohalf))
         if Mtarg is None:
@@ -290,7 +486,33 @@ class WindowRotationSpectrum2(BaseWindowRotation):
         return isinstance(self.mmatrix, tuple)
 
     def rotate(self, mmatrix=None, covmatrix=None, data=None, mask_cov=None, prior_data=True, prior_cov=True):
-        """Return prior and precmatrix if input theory."""
+        """
+        Rotate the window and covariance matrices, optionally transforming data.
+
+        Parameters
+        ----------
+        mmatrix : ndarray or tuple, optional
+            Transformation matrix or tuple for marginalization.
+        covmatrix : ndarray, optional
+            Covariance matrix to rotate.
+        data : array_like, optional
+            Data vector to transform.
+        mask_cov : array_like, optional
+            Mask for covariance matrix.
+        prior_data : bool, optional
+            Whether to apply prior to data.
+        prior_cov : bool, optional
+            Whether to apply prior to covariance.
+
+        Returns
+        -------
+        wmatrix_rotated : ndarray
+            Rotated window matrix.
+        covmatrix_rotated : ndarray
+            Rotated covariance matrix.
+        data_rotated : ndarray, optional
+            Rotated data vector (if data is provided).
+        """
         if mmatrix is None: mmatrix = self.mmatrix
         input_covmatrix = covmatrix is not None
         if not input_covmatrix: covmatrix = self.covmatrix
@@ -328,6 +550,24 @@ class WindowRotationSpectrum2(BaseWindowRotation):
         return wmatrix_rotated, covmatrix_rotated
 
     def set_prior(self, data, theory, covmatrix=None, xlim=None):
+        r"""
+        Set the prior for window rotation parameters :math:`s`
+
+        Reference
+        ---------
+        Eq. 5.4 of https://arxiv.org/pdf/2406.04804
+
+        Parameters
+        ----------
+        data : array-like
+            Data vector.
+        theory : array-like
+            Theory vector.
+        covmatrix : ndarray, optional
+            Covariance matrix.
+        xlim : tuple, optional
+            X-axis limits.
+        """
         if not self.with_momt:
             self.logger.info(f'I did not use momt parameters -- no prior set')
         wmatrix_rotated, covmatrix_rotated, data_rotated = self.rotate(covmatrix=covmatrix, data=data, prior_data=False, prior_cov=False)
@@ -347,6 +587,32 @@ class WindowRotationSpectrum2(BaseWindowRotation):
 
     @plotter
     def plot_rotated(self, data, shotnoise=0., xlim=None):
+        """
+        Plot the rotated data and original data for each projection.
+
+        Parameters
+        ----------
+        data : array-like
+            Data vector.
+        shotnoise : float, optional
+            Shot noise value.
+        xlim : tuple, optional
+            X-axis limits.
+        fig : matplotlib.figure.Figure, default=None
+            Optionally, a figure with at least 1 axis.
+        fn : str, Path, default=None
+            Optionally, path where to save figure.
+            If not provided, figure is not saved.
+        kw_save : dict, default=None
+            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
+        show : bool, default=False
+            If ``True``, show figure.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            Figure object.
+        """
         from matplotlib import pyplot as plt
         oprojs = self.oprojs
         data_rotated = self.rotate(data=data, shotnoise=shotnoise)[2]
@@ -369,6 +635,40 @@ class WindowRotationSpectrum2(BaseWindowRotation):
 
     @plotter
     def plot_validation(self, data, theory, xlim=None, covmatrix=None, shotnoise=0., marg_shotnoise=False, nobs=1):
+        """
+        Validation plot of the window matrix and rotation, including error bars and residuals.
+
+        Parameters
+        ----------
+        data : array-like
+            Data vector.
+        theory : array-like
+            Theory vector.
+        xlim : tuple, optional
+            x-axis limits.
+        covmatrix : ndarray, optional
+            Covariance matrix.
+        shotnoise : float, optional
+            Shot noise value.
+        marg_shotnoise : bool, optional
+            Whether to marginalize shot noise.
+        nobs : int, optional
+            Number of observations for error scaling.
+        fig : matplotlib.figure.Figure, default=None
+            Optionally, a figure with at least 1 axis.
+        fn : str, Path, default=None
+            Optionally, path where to save figure.
+            If not provided, figure is not saved.
+        kw_save : dict, default=None
+            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
+        show : bool, default=False
+            If ``True``, show figure.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+            Figure object.
+        """
         from matplotlib import pyplot as plt
         oprojs = self.oprojs
 

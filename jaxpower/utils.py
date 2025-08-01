@@ -50,13 +50,17 @@ def savefig(filename: str, fig=None, bbox_inches='tight', pad_inches=0.1, dpi=20
 
     Parameters
     ----------
-    filename : string
-        Path where to save figure.
-
-    fig : matplotlib.figure.Figure, default=None
-        Figure to save. Defaults to current figure.
-
-    kwargs : dict
+    filename : str
+        Path to save the figure.
+    fig : matplotlib.figure.Figure, optional
+        Figure to save. If None, uses current figure.
+    bbox_inches : str, optional
+        Bounding box for saving.
+    pad_inches : float, optional
+        Padding around the figure.
+    dpi : int, optional
+        Dots per inch.
+    **kwargs
         Optional arguments for :meth:`matplotlib.figure.Figure.savefig`.
 
     Returns
@@ -80,16 +84,12 @@ def setup_logging(level=logging.INFO, stream=sys.stdout, filename=None, filemode
     ----------
     level : str, int, default=logging.INFO
         Logging level.
-
     stream : _io.TextIOWrapper, default=sys.stdout
         Where to stream.
-
     filename : string, default=None
         If not ``None`` stream to file name.
-
     filemode : string, default='w'
         Mode to open file, only used if filename is not ``None``.
-
     kwargs : dict
         Other arguments for :func:`logging.basicConfig`.
     """
@@ -122,7 +122,7 @@ def setup_logging(level=logging.INFO, stream=sys.stdout, filename=None, filemode
 @contextmanager
 def set_env(**environ):
     """
-    Temporarily set environment variables inside the context.
+    Context manager to temporarily set environment variables.
 
     Example:
         with set_env(MY_VAR='value'):
@@ -211,6 +211,7 @@ def rebin(array: np.ndarray | jax.Array, factor: int | tuple, axis: int | tuple=
     return array
 
 def _format_slice(sl, size):
+    """Format a Python slice object for array indexing."""
     if sl is None: sl = slice(None)
     start, stop, step = sl.start, sl.stop, sl.step
     # To handle slice(0, None, 1)
@@ -226,37 +227,38 @@ def _format_slice(sl, size):
 
 
 class FakeFigure(object):
+    """
+    Fake figure class to wrap axes for plotting utilities.
 
+    Parameters
+    ----------
+    axes : list or object
+        Axes to wrap.
+    """
     def __init__(self, axes):
         if not hasattr(axes, '__iter__'):
             axes = [axes]
         self.axes = list(axes)
 
-def plotter(*args, **kwargs):
 
+def plotter(*args, **kwargs):
+    """
+    Return wrapper for plotting functions, that adds the following (optional) arguments to ``func``:
+
+    Parameters
+    ----------
+    fn : str, Path, default=None
+        Optionally, path where to save figure.
+        If not provided, figure is not saved.
+    kw_save : dict, default=None
+        Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
+    show : bool, default=False
+        If ``True``, show figure.
+    """
     from functools import wraps
 
     def get_wrapper(func):
-        """
-        Return wrapper for plotting functions, that adds the following (optional) arguments to ``func``:
 
-        Parameters
-        ----------
-        fn : str, Path, default=None
-            Optionally, path where to save figure.
-            If not provided, figure is not saved.
-
-        kw_save : dict, default=None
-            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
-
-        show : bool, default=False
-            If ``True``, show figure.
-
-        interactive : True or dict, default=False
-            If not None, use interactive interface provided by ipywidgets. Interactive can be a dictionary
-            with several entries:
-                * ref_param : Use to display reference theory
-        """
         @wraps(func)
         def wrapper(*args, fn=None, kw_save=None, show=False, fig=None, **kwargs):
 
@@ -291,52 +293,6 @@ def plotter(*args, **kwargs):
     return get_wrapper(args[0])
 
 
-class MemoryMonitor(object):
-    """
-    Class that monitors memory usage and clock, useful to check for memory leaks.
-
-    >>> with MemoryMonitor() as mem:
-            '''do something'''
-            mem()
-            '''do something else'''
-    """
-    def __init__(self, pid=None):
-        """
-        Initalize :class:`MemoryMonitor` and register current memory usage.
-
-        Parameters
-        ----------
-        pid : int, default=None
-            Process identifier. If ``None``, use the identifier of the current process.
-        """
-        import psutil
-        self.proc = psutil.Process(os.getpid() if pid is None else pid)
-        self.mem = self.proc.memory_info().rss / 1e6
-        self.time = time.time()
-        msg = 'using {:.3f} [Mb]'.format(self.mem)
-        print(msg, flush=True)
-
-    def __enter__(self):
-        """Enter context."""
-        return self
-
-    def __call__(self, log=None):
-        """Update memory usage."""
-        mem = self.proc.memory_info().rss / 1e6
-        t = time.time()
-        msg = 'using {:.3f} [Mb] (increase of {:.3f} [Mb]) after {:.3f} [s]'.format(mem, mem - self.mem, t - self.time)
-        if log:
-            msg = '[{}] {}'.format(log, msg)
-        print(msg, flush=True)
-        self.mem = mem
-        self.time = t
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        """Exit context."""
-        self()
-
-
-
 class RegisteredStatistic(type):
 
     """Metaclass registering :class:`BinnedStatistic`-derived classes."""
@@ -363,22 +319,16 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
     ----------
     _x : tuple
         Coordinates.
-
     _edges : list, array, default=None
         Edges.
-
     _projs : tuple, default=None
         Projections.
-
     _value : tuple
         Data vector value.
-
     _weights : tuple
         Weights for rebinning.
-
     name : str
         Name.
-
     attrs : dict
         Other attributes.
     """
@@ -406,22 +356,16 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
         ----------
         x : list, array, ObservableArray
             Coordinates.
-
         edges : list, array, default=None
             Edges.
-
         projs : list, default=None
             Projections.
-
         value : list, array
             Data vector value.
-
         weights : list, array
             Weights for rebinning.
-
         name : str, default=None
             Optionally, name.
-
         attrs : dict, default=None
             Optionally, attributes.
         """
@@ -579,6 +523,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
 
     @classmethod
     def sum(cls, others, weights=None):
+        """Sum input :class:`BinnedStatistic` objects."""
         if weights is None:
             weights = np.ones(len(others))
         weights = np.asarray(weights)
@@ -621,6 +566,7 @@ class BinnedStatistic(metaclass=RegisteredStatistic):
 
     @classmethod
     def cov(cls, others, return_type=None):
+        r"""Return covariance of input :class:`BinnedStatistic` objects."""
         observables = None
         values = []
         for other in others:

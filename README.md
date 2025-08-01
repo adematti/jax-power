@@ -1,52 +1,108 @@
-# JAX-powered power spectrum estimator
+# 🚀 jax-power: JAX-Powered Power Spectrum Estimation
 
-**jax-power** is a package for auto and cross power spectrum and associated window function estimation,
-for periodic boxes, survey geometry, in the flat-sky or plane-parallel configurations.
+**`jax-power`** is a package for estimating **auto** and **cross power spectra**.
+It supports periodic boxes and survey geometries, global and local line-of-sight.
 
-A typical auto power spectrum estimation is as simple as (for multi-GPU):
+Distributed, multi-GPU computation with JAX.
+
+---
+
+## 📦 Installation
+
+You can install the latest version directly from the GitHub repository:
+
+```bash
+pip install git+https://github.com/adematti/jax-power.git
 ```
+
+Alternatively, if you plan to contribute or modify the code, install in editable (development) mode:
+
+```bash
+git clone https://github.com/adematti/jax-power.git
+cd jax-power
+pip install -e .
+```
+
+### Requirements
+
+- Python ≥ 3.9
+- `jax`, `jaxlib` (with GPU or TPU support, if applicable)
+- `numpy`
+- [`jaxdecomp`](https://github.com/DifferentiableUniverseInitiative/jaxDecomp) — for distributed FFT and halo exchange
+
+We recommend following the [official JAX installation guide](https://jax.readthedocs.io/en/latest/installation.html) to ensure correct setup for your hardware (CPU/GPU/TPU).
+
+---
+
+## 🧪 Quick Example: Auto Power Spectrum with Multi-GPU
+
+```python
 import jax
 # Initialize JAX distributed environment
 jax.distributed.initialize()
 
 from jax import numpy as jnp
-from jaxpower import get_mesh_attrs, compute_mesh2_spectrum, ParticleField, FKPField, create_sharding_mesh
+from jaxpower import (
+    get_mesh_attrs,
+    compute_mesh2_spectrum,
+    ParticleField,
+    FKPField,
+    create_sharding_mesh,
+    BinMesh2Spectrum,
+    compute_fkp2_spectrum_normalization,
+    compute_fkp2_spectrum_shotnoise
+)
 
-with create_sharding_mesh() as sharding_mesh:  # specify how to spatially distribute particles / mesh
+with create_sharding_mesh() as sharding_mesh:  # distribute mesh and particles
 
-    # Create MeshAttrs
+    # Create MeshAttrs from positions (assumed already sharded across processes)
     attrs = get_mesh_attrs(data_positions, randoms_positions, boxpad=2., meshsize=128)
-    # Input ``data_positions``, ``data_weights``, ``randoms_positions``, ``randoms_weights`` are assumed scattered over the different processes.
+
     data = ParticleField(data_positions, data_weights, attrs=attrs, exchange=True)
     randoms = ParticleField(randoms_positions, randoms_weights, attrs=attrs, exchange=True)
     fkp = FKPField(data, randoms)
-    norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
-    # particles are already exchanged in ``get_particle_field``
-    mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real', pexchange=False)
-    del fkp
-    # Tip: can be done once for many P(k) evaluation
-    bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=(0, 2, 4))
-    # Then compute power spectrum
-    # One can jit the function
-    compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'])
-    pk = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
-    # Add the normalization and shot noise information
-    pk = power.clone(norm=norm, num_shotnoise=num_shotnoise)
-    pk.save('power.npy')
 
-# Close JAX distributed environment
+    # Compute normalization and shot noise terms
+    norm = compute_fkp2_spectrum_normalization(fkp)
+    num_shotnoise = compute_fkp2_spectrum_shotnoise(fkp)
+
+    # Paint FKP field to mesh
+    mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    del fkp  # cleanup
+
+    # Define k-bin edges and multipoles
+    bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=(0, 2, 4))
+
+    # JIT the power spectrum function
+    compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'])
+
+    # Compute P(k)
+    power = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
+    power = power.clone(norm=norm, num_shotnoise=num_shotnoise)
+
+    # Save result
+    power.save('power.npy')
+
+# Shut down distributed environment
 jax.distributed.shutdown()
 ```
 
-Example notebooks presenting most use cases are provided in directory nb/.
+📝 Example notebooks are available in the `nb/` directory.
 
+---
 
-## Citations
+## 📚 Citation
 
-Multi-GPU 3D FFT and halo exhcange is handled with (publication incoming!):
-[jaxdecomp](https://github.com/DifferentiableUniverseInitiative/jaxDecomp)
-by Wassim Kabalan and François Lanusse.
+Multi-GPU 3D FFT and halo exchange support is provided by:
 
-## Acknowledgments
+> **`jaxdecomp`** — [https://github.com/DifferentiableUniverseInitiative/jaxDecomp](https://github.com/DifferentiableUniverseInitiative/jaxDecomp)
+> Developed by *Wassim Kabalan* and *François Lanusse*.
+> 📄 *Publication incoming!*
 
-Hugo Simon-Onfroy for more jit-friendly resamplers: [montecosmo](https://github.com/hsimonfroy)
+---
+
+## 🙏 Acknowledgments
+
+Thanks to **Hugo Simon-Onfroy** for providing JIT-friendly resamplers via [`montecosmo`](https://github.com/hsimonfroy).
+
+---

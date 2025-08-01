@@ -10,7 +10,21 @@ from .utils import CovarianceMatrix, BinnedStatistic, legendre_product, get_sphe
 
 
 class Correlation2Spectrum(object):
+    """
+    Transform a function from s-space to 2D k-space using (2D) FFTLog.
 
+    Parameters
+    ----------
+    k : array-like
+        Wavenumber array.
+    ells : tuple
+        Tuple of two multipole orders (ell1, ell2).
+
+    Attributes
+    ----------
+    s : array-like
+        Separation array.
+    """
     def __init__(self, k, ells):
         from .fftlog import SpectrumToCorrelation
         fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False)
@@ -22,12 +36,54 @@ class Correlation2Spectrum(object):
         self.s = fftlog.y
 
     def __call__(self, fun):
+        """
+        Apply the transformation to a 1D function in s-space.
+
+        Parameters
+        ----------
+        fun : array-like
+            Function values in s-space.
+
+        Returns
+        -------
+        k : array-like
+            Wavenumber array.
+        transformed : array-like, 2D
+            Transformed function in k-space.
+        """
         fun = self._H * fun
         _, fun = self._fftlog(fun, extrap=False, ignore_prepostfactor=True)
         return self.k, self._postfactor * fun
 
 
 def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kwargs):
+    """
+    Compute the window matrices (WW, WS, SS) for the FKP 2-point covariance.
+
+    Parameters
+    ----------
+    fkps : (list of) FKPField, ParticleField
+        (List of) FKP or Particle fields.
+    bin : BinMesh2Correlation, optional
+        Binning operator.
+    los : str, optional
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+        Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
+        Else, a 3-vector.
+    alpha : float, optional
+        Normalization factor for the randoms: sum(data_weights) / sum(randoms_weights).
+    kwargs : dict
+        Additional arguments for mesh painting, see :meth:`ParticleField.paint`.
+
+    Returns
+    -------
+    WW : dict
+        Dictionary of window matrices for pairs of fields.
+    WS : dict
+        Dictionary of window matrices for field-shotnoise cross terms.
+    SS : dict
+        Dictionary of window matrices for shotnoise terms.
+    """
     if not isinstance(fkps, (tuple, list)): fkps = [fkps]
     WW, WS, SS = {}, {}, {}
     if bin is None:
@@ -82,18 +138,39 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kw
     return WW, WS, SS
 
 
-def compute_mesh2_covariance_window(meshs, bin=None, los='local', **kwargs):
-    if not isinstance(meshs, (tuple, list)): meshs = [meshs]
+def compute_mesh2_covariance_window(meshes, bin=None, los='local', **kwargs):
+    """
+    Compute the window matrices (WW) for the 2-point covariance from mesh fields.
+
+    Parameters
+    ----------
+    meshes : (list of) RealMeshField
+        (List of) mesh fields.
+    bin : BinMesh2Correlation, optional
+        Binning operator.
+    los : str, optional
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+        Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
+        Else, a 3-vector.
+    kwargs : dict
+        Additional arguments for mesh painting, see :meth:`ParticleField.paint`.
+
+    Returns
+    -------
+    WW : dict
+        Dictionary of window matrices for pairs of fields.
+    """
+    if not isinstance(meshes, (tuple, list)): meshes = [meshes]
 
     def _2r(mesh):
         if not isinstance(mesh, RealMeshField):
             mesh = mesh.c2r()
         return mesh
 
-    meshs = [_2r(mesh) for mesh in meshs]
+    meshes = [_2r(mesh) for mesh in meshes]
     WW = {}
     if bin is None:
-        mattrs = meshs[0].attrs
+        mattrs = meshes[0].attrs
         kw = {'edges': None, 'ells': tuple(range(0, 9, 2))}
         for name in kw: kw[name] = kwargs.pop(name, kw[name])
         edges = kw.pop('edges', None) or {}
@@ -104,8 +181,8 @@ def compute_mesh2_covariance_window(meshs, bin=None, los='local', **kwargs):
     def get_W(mesh):
         return mesh / mesh.cellsize.prod()
 
-    Ws = [get_W(mesh) for mesh in meshs]
-    del meshs
+    Ws = [get_W(mesh) for mesh in meshes]
+    del meshes
     i2pts = tuple(itertools.combinations_with_replacement(tuple(range(len(Ws))), 2))  # pairs of fields for each P(k)
     for iW in itertools.combinations_with_replacement(i2pts, 2):  # then choose two pairs of fields
         iW = iW[0] + iW[1]
@@ -123,6 +200,28 @@ def compute_mesh2_covariance_window(meshs, bin=None, los='local', **kwargs):
 
 
 def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
+    """
+    Compute the covariance matrix for the 2-point power spectrum, given window matrices and poles.
+
+    Parameters
+    ----------
+    window2 : dict or MeshAttrs
+        Window matrices (WW, WS, SS).
+        A :class:`MeshAttrs` instance can be directly provided instead, in case the selection function is trivial (constant).
+    poles : dict or BinnedStatistic
+        Dictionary of BinnedStatistic objects for each observable, or a single :class:`BinnedStatistic` instance.
+    delta : float, optional
+        Maximum :math:`|k_i - k_j|` (in :math:`k`-bin units) for which to compute the covariance.
+    flags : tuple, optional
+        Flags controlling the computation:
+        - 'smooth' (default for non-trivial selection function): no binning effects
+        - 'fftlog': same as 'smooth', but using 2D fftlog instead of naive spherical Bessel integration.
+
+    Returns
+    -------
+    cov : CovarianceMatrix or tuple of CovarianceMatrix
+        Covariance matrix (or tuple of matrices: PP, PS and SS if WS and SS are input).
+    """
     # TODO: check for multiple fields
 
     def finalize(cov):

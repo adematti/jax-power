@@ -148,6 +148,19 @@ def _scancount(bin, *particles, los='firstpoint'):
 
 
 def get_engine(engine='auto'):
+    """
+    Select the computation engine for pair counting.
+
+    Parameters
+    ----------
+    engine : {'auto', 'jax', 'cucount'}, optional
+        Engine selection. 'auto' tries to use cucount if available.
+
+    Returns
+    -------
+    engine : str
+        Selected engine name.
+    """
     assert engine in ['auto', 'jax', 'cucount']
     if engine == 'auto':
         try:
@@ -184,9 +197,36 @@ def _slice_particles(particles, nslices=None, sharding_mesh=None):
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class BinParticle2Spectrum(object):
+    """
+    Binning class for estimating the 2-point power spectrum from particle pairs.
 
+    Parameters
+    ----------
+    mattrs : MeshAttrs, optional
+        Mesh attributes, e.g., boxsize, k-space limits.
+    edges : array-like or dict, optional
+        Bin edges or binning specification.
+    selection : dict, optional
+        Selection criteria for pairs.
+    ells : int or array-like, optional
+        Multipole orders to compute.
+    engine : {'auto', 'jax', 'cucount'}, optional
+        Computation engine.
+
+    Attributes
+    ----------
+    edges : ndarray
+        Bin edges for pair separation.
+    boxsize : array-like
+        Size of the periodic box.
+    selection : dict
+        Selection criteria.
+    ells : ndarray
+        Multipole orders.
+    engine : str
+        Computation engine.
+    """
     edges: jax.Array = None
-    xavg: jax.Array = None
     boxsize: jax.Array = None
     selection: dict = None
     engine: str = None
@@ -213,10 +253,25 @@ class BinParticle2Spectrum(object):
         self.__dict__.update(edges=edges, xavg=xavg, selection=selection, boxsize=boxsize, ells=ells, engine=engine)
 
     def __call__(self, *particles, los='firstpoint'):
+        """
+        Compute the binned power spectrum multipoles from particle pairs.
+
+        Parameters
+        ----------
+        *particles : ParticleField
+            Particle fields to correlate (autocorrelation if one provided).
+        los : str, optional
+            Line-of-sight definition.
+
+        Returns
+        -------
+        spectrum : ndarray
+            Power spectrum multipoles for each bin.
+        """
         sharding_mesh = particles[0].attrs.sharding_mesh
         if len(particles) == 1: particles = particles * 2
         particles = [(particle.positions, particle.weights) for particle in particles]
-        
+
         if self.engine == 'cucount':
 
             def _call(*particles):
@@ -226,7 +281,7 @@ class BinParticle2Spectrum(object):
                 battrs = BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
                 sattrs = SelectionAttrs(**self.selection)
                 return count2(*particles, battrs=battrs, sattrs=sattrs).T
-        
+
         else:
 
             def _call(*particles):
@@ -243,12 +298,11 @@ class BinParticle2Spectrum(object):
             particles2 = jax.tree_map(lambda array: array.reshape(nshards, array.shape[0] // nshards, *array.shape[1:]), particles[1])
             init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
             return jax.lax.scan(lambda carry, particles2: (carry + call(particles[0], particles2), 0), init, particles2)[0]
-            
+
             #return sum(call(particles[0], particles2) for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh))
-        
+
         return call(*particles)
 
-    
     def tree_flatten(self):
         state = {name: getattr(self, name) for name in self.__annotations__.keys()}
         meta_fields = ['selection', 'engine'] + (['boxsize'] if self.boxsize is None else [])
@@ -265,7 +319,37 @@ class BinParticle2Spectrum(object):
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class BinParticle2Correlation(object):
+    """
+    Binning class for estimating the 2-point correlation function from particle pairs.
 
+    Parameters
+    ----------
+    mattrs : MeshAttrs, optional
+        Mesh attributes, e.g., boxsize.
+    edges : array_like or dict, optional
+        Bin edges or binning specification.
+    selection : dict, optional
+        Selection criteria for pairs.
+    ells : int or array_like, optional
+        Multipole orders to compute.
+    engine : {'auto', 'jax', 'cucount'}, optional
+        Computation engine.
+
+    Attributes
+    ----------
+    edges : ndarray
+        Bin edges for pair separation.
+    boxsize : array-like
+        Size of the periodic box.
+    selection : dict
+        Selection criteria.
+    ells : ndarray
+        Multipole orders.
+    linear : bool
+        Whether binning is linear.
+    engine : str
+        Computation engine.
+    """
     edges: jax.Array = None
     xavg: jax.Array = None
     boxsize: jax.Array = None
@@ -293,12 +377,27 @@ class BinParticle2Correlation(object):
         ells = _format_ells(ells)
         engine = get_engine(engine)
         self.__dict__.update(edges=edges, xavg=xavg, selection=selection, linear=linear, boxsize=boxsize, ells=ells, engine=engine)
-    
+
     def __call__(self, *particles, los='firstpoint'):
+        """
+        Compute the binned correlation function multipoles from particle pairs.
+
+        Parameters
+        ----------
+        *particles : ParticleField
+            Particle fields to correlate (autocorrelation if one provided).
+        los : str, optional
+            Line-of-sight definition.
+
+        Returns
+        -------
+        correlation : ndarray
+            Correlation function multipoles for each bin.
+        """
         sharding_mesh = particles[0].attrs.sharding_mesh
         if len(particles) == 1: particles = particles * 2
         particles = [(particle.positions, particle.weights) for particle in particles]
-        
+
         if self.engine == 'cucount':
 
             def _call(*particles):
@@ -331,7 +430,7 @@ class BinParticle2Correlation(object):
             particles2 = jax.tree_map(lambda array: array.reshape(nshards, array.shape[0] // nshards, *array.shape[1:]), particles[1])
             init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
             return jax.lax.scan(lambda carry, particles2: (carry + call(particles[0], particles2), 0), init, particles2)[0]
-            
+
             #return sum(call(particles[0], particles2) for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh))
 
         return call(*particles)
@@ -350,7 +449,23 @@ class BinParticle2Correlation(object):
 
 
 def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | BinParticle2Correlation=None, los='firstpoint'):
+    """
+    Compute the 2-point spectrum or correlation function from particles.
 
+    Parameters
+    ----------
+    *particles : ParticleField
+        Particles to correlate (autocorrelation if one provided).
+    bin : BinParticle2Spectrum or BinParticle2Correlation
+        Binning object specifying edges, selection, and multipoles.
+    los : str, optional
+        Line-of-sight definition.
+
+    Returns
+    -------
+    result : Spectrum2Poles or Correlation2Poles
+        Resulting spectrum or correlation function object.
+    """
     ells = bin.ells
     autocorr = len(particles) == 1
     # Can't be computed easily in general because of the selection

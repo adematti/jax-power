@@ -46,7 +46,6 @@ class staticarray(np.ndarray):
     Class overriding a numpy array, so that it can be passed in ``meta_fields``.
     Otherwise an error is raised whenever a ``jax.tree.map`` is fed with two different dataclass instances.
     """
-
     def __new__(cls, input_array):
         # Input array is an already formed ndarray instance
         # We first cast to be our class type
@@ -380,7 +379,9 @@ def global_array_from_single_device_arrays(sharding, arrays, return_slices=False
     ndim = per_host_chunks[0].ndim
     per_host_size = jnp.array([per_host_chunk.shape[0] for per_host_chunk in per_host_chunks])
     all_size = jax.make_array_from_process_local_data(sharding, per_host_size)
-    all_size = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(all_size).addressable_data(0)
+    # Line below fails with no attribute .with_spec for jax 0.6.2
+    #all_size = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(all_size).addressable_data(0)
+    all_size = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding.mesh, P()))(all_size).addressable_data(0)
     max_size = all_size.max().item()
     if not np.all(all_size == max_size):
         per_host_chunks = [pad(per_host_chunk, [(0, max_size - per_host_chunk.shape[0])] + [(0, 0)] * (ndim - 1)) for per_host_chunk in per_host_chunks]
@@ -395,7 +396,9 @@ def global_array_from_single_device_arrays(sharding, arrays, return_slices=False
 
 def allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwargs):
     tmp, slices = global_array_from_single_device_arrays(sharding, arrays, return_slices=True, **kwargs)
-    tmp = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(tmp).addressable_data(0)  # replicated accross all devices
+    # Line below fails with no attribute .with_spec for jax 0.6.2
+    #tmp = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(tmp).addressable_data(0)  # replicated accross all devices
+    tmp = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding.mesh, P()))(tmp).addressable_data(0)
     tmp = jnp.concatenate([tmp[sl] for sl in slices], axis=0)
     if return_slices:
         sizes = np.cumsum([0] + [sl.stop - sl.start for sl in slices])
@@ -1327,6 +1330,8 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
     with_sharding = bool(sharding_mesh.axis_names)
 
     positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
+    out = jnp.zeros_like(positions, shape=positions.shape[:1])
+    _read = lambda mesh, positions, out: resampler.read(mesh, positions, out=out)
 
     if with_sharding:
         shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
@@ -1343,8 +1348,8 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
         value, offset = pad_halo(value, **kw_sharding)
         value = exchange_halo(value, **kw_sharding)
         positions = positions + offset
-        return shard_map(resampler.read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names))(value, positions)
-    return resampler.read(value, positions)
+        _read = shard_map(_read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names))
+    return _read(value, positions, out)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -1582,20 +1587,18 @@ class ParticleField(object):
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding:
             backend, kwargs = _get_distributed_backend(positions, backend=backend, **kwargs)
-
+            sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names))
         positions = jnp.asarray(positions)
         if weights is None:
             weights = jnp.ones_like(positions, shape=positions.shape[:-1])
         else:
             weights = jnp.asarray(weights)
-        if with_sharding:
-            weights = jax.lax.with_sharding_constraint(weights, positions.sharding)
 
-        if with_sharding and (not exchange or backend == 'jax') and getattr(positions.sharding, 'mesh', None) is None:
-            positions, weights = make_particles_from_local(positions, weights)
+        input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
+        input_is_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is not None
 
         if with_sharding and exchange:
-            if getattr(positions.sharding, 'mesh', None) is not None and backend == 'mpi':
+            if backend == 'mpi' and input_is_sharded:
 
                 def get(array):
                     return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
@@ -1603,8 +1606,22 @@ class ParticleField(object):
                 positions = get(positions)
                 weights = get(weights)
 
+            if backend == 'jax' and input_is_not_sharded:
+                positions, weights = make_particles_from_local(positions, weights)
+
+            if backend == 'jax':
+                positions, weights = jax.device_put((positions, weights), sharding)
+
             positions, exchange = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
             weights = exchange(weights)
+
+        # If sharding and not exchange, but input arrays aren't sharded, assume input arrays are local and shard them here
+        if with_sharding and (not exchange):
+            if input_is_not_sharded:
+                positions, weights = make_particles_from_local(positions, weights)
+            else:
+                positions, weights = jax.device_put((positions, weights), sharding)
+
         self.__dict__.update(positions=positions, weights=weights, attrs=attrs)
 
     def clone(self, **kwargs):
@@ -1707,20 +1724,16 @@ class ParticleField(object):
         resampler : str, Callable
             Resampler to read particule weights from mesh.
             One of ['ngp', 'cic', 'tsc', 'pcs'].
-
         interlacing : int, default=0
             If 0 or 1, no interlacing correction.
             If > 1, order of interlacing correction.
             Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
-
         compensate : bool, default=False
             If ``True``, applies compensation to the mesh after painting.
-
         dtype : default=None
             Mesh array type.
-
         out : str, default='real'
-            If 'real', return a :class:`RealMeshField`, else :class:`HermitianComplexMeshField`
+            If 'real', return a :class:`RealMeshField`, else :class:`ComplexMeshField`
             or :class:`ComplexMeshField` if ``dtype`` is complex.
 
         Returns
@@ -1904,13 +1917,14 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('sharding_mesh', 'ravel'))  # linear saves memory
+@partial(jax.jit, static_argnames=('sharding_mesh', 'ravel'))  # if we want to save some memory, consider linear binning
 def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
 
     def _get_attrs(coords, edges, weights):
         r"""Return bin index, binned number of modes and coordinates."""
         shape = coords.shape
         coords = coords.ravel()
+
         ibin = jnp.digitize(coords, edges, right=False)
         x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
         del coords
@@ -1921,7 +1935,7 @@ def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, s
 
     get_attrs = _get_attrs
 
-    if sharding_mesh.axis_names:
+    if sharding_mesh.axis_names and sharding_mesh.devices.size > 1:  # sharding_mesh.devices.size > 1, otherwise, obscure error...
 
         def get_attrs(coords, edges, weights):
             r"""Return bin index, binned number of modes and coordinates."""

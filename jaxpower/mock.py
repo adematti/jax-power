@@ -1,5 +1,4 @@
 from collections.abc import Callable
-from functools import partial
 
 import numpy as np
 import jax
@@ -11,15 +10,32 @@ from .mesh2 import _get_los_vector
 from .utils import BinnedStatistic, get_legendre, get_real_Ylm
 
 
-def generate_gaussian_mesh(attrs, power: Callable, seed: int=42,
+def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
                            unitary_amplitude: bool=False):
 
-    """Generate :class:`RealMeshField` with input power."""
+    r"""
+    Generate a Gaussian random field mesh with a given power spectrum.
 
+    Parameters
+    ----------
+    mattrs : MeshAttrs
+        Mesh attributes (box size, mesh size, etc.).
+    power : Callable
+        Function returning the power spectrum as a function of :math:`k`-vector.
+    seed : int, optional
+        Random seed for mesh generation.
+    unitary_amplitude : bool, optional
+        If ``True``, normalize the amplitude to be unitary.
+
+    Returns
+    -------
+    mesh : RealMeshField
+        Generated mesh field with the specified power spectrum.
+    """
     if isinstance(seed, int):
         seed = random.key(seed)
 
-    mesh = attrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=attrs.meshsize)).r2c()
+    mesh = mattrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=mattrs.meshsize)).r2c()
 
     def kernel(value, kvec):
         ker = jnp.sqrt(power(kvec) / mesh.cellsize.prod())
@@ -31,10 +47,30 @@ def generate_gaussian_mesh(attrs, power: Callable, seed: int=42,
     return mesh.c2r()
 
 
-def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
+def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: BinnedStatistic | dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
+    """
+    Generate a Gaussian random field mesh with input power spectrum multipoles.
 
-    """Generate :class:`RealMeshField` with input power spectrum multipoles."""
+    Parameters
+    ----------
+    mattrs : MeshAttrs
+        Mesh attributes (box size, mesh size, etc.).
+    poles : dict or BinnedStatistic or list
+        Dictionary of multipole order to power spectrum function, or :class:`BinnedStatistic`, or list of power spectra.
+    seed : int, default=42
+        Random seed for mesh generation.
+    los : str, optional
+        Line-of-sight specification ('x', 'y', 'z', or 'local').
+    unitary_amplitude : bool, optional
+        If True, normalize the amplitude to be unitary.
+    kwargs : dict
+        Additional arguments for interpolation.
 
+    Returns
+    -------
+    mesh : RealMeshField
+        Generated mesh field with the specified multipole power spectra.
+    """
     ells = (0, 2, 4)
     kin = None
     if isinstance(poles, BinnedStatistic):
@@ -47,12 +83,12 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         seed = random.key(seed)
 
     def generate_normal(seed):
-        mesh = attrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=attrs.meshsize)).r2c()
+        mesh = mattrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=mattrs.meshsize)).r2c()
         if unitary_amplitude:
-            mesh *= jnp.sqrt(attrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
+            mesh *= jnp.sqrt(mattrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
         return mesh
 
-    kvec = attrs.kcoords(sparse=True)
+    kvec = mattrs.kcoords(sparse=True)
     knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
     kshape = np.broadcast_shapes(*(kk.shape for kk in kvec))
 
@@ -76,9 +112,9 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         def get_meshs(seeds):
 
             if is_callable:
-                p0, p2, p4 = (get_theory(ell) / attrs.cellsize.prod() for ell in ells)
+                p0, p2, p4 = (get_theory(ell) / mattrs.cellsize.prod() for ell in ells)
             else:
-                p0, p2, p4 = (poles[ell] / attrs.cellsize.prod() for ell in ells)
+                p0, p2, p4 = (poles[ell] / mattrs.cellsize.prod() for ell in ells)
 
             a11 = 35. / 18. * p4
             a00 = p0 - 1. / 5. * a11
@@ -124,31 +160,45 @@ def generate_anisotropic_gaussian_mesh(attrs, poles: dict[Callable], seed: int=4
         return mesh
 
     else:
-        vlos = _get_los_vector(los, ndim=attrs.ndim)
+        vlos = _get_los_vector(los, ndim=mattrs.ndim)
         mesh = generate_normal(seed)
 
         def kernel(value, kvec):
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
-            ker = sum(get_theory(ell) / attrs.cellsize.prod() * get_legendre(ell)(mu) for ell in ells)
+            ker = sum(get_theory(ell) / mattrs.cellsize.prod() * get_legendre(ell)(mu) for ell in ells)
             ker = jnp.sqrt(ker)
             if unitary_amplitude:
-                ker *= jnp.sqrt(attrs.meshsize.prod(dtype=value.real.dtype)) / jnp.abs(value)
+                ker *= jnp.sqrt(mattrs.meshsize.prod(dtype=value.real.dtype)) / jnp.abs(value)
             return value * ker
 
         mesh = mesh.apply(kernel, kind='wavenumber').c2r()
         return mesh
 
 
-def generate_uniform_particles(attrs, size, seed: int=42):
+def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42):
+    """
+    Generate uniformly distributed particles in the input box.
 
-    """Generate :class:`ParticleField` in input box."""
+    Parameters
+    ----------
+    mattrs : MeshAttrs
+        Mesh attributes (box size, mesh size, etc.).
+    size : int
+        Number of particles to generate.
+    seed : int, optional
+        Random seed for particle generation.
 
+    Returns
+    -------
+    particles : ParticleField
+        Generated uniformly distributed particles.
+    """
     if isinstance(seed, int):
         seed = random.key(seed)
 
     def sample(key, shape):
-        return attrs.boxsize * random.uniform(key, shape + (len(attrs.boxsize),), dtype=attrs.dtype) - attrs.boxsize / 2. + attrs.boxcenter
+        return mattrs.boxsize * random.uniform(key, shape + (len(mattrs.boxsize),), dtype=mattrs.dtype) - mattrs.boxsize / 2. + mattrs.boxcenter
 
     positions = create_sharded_random(sample, seed, shape=size, out_specs=0)
-    positions = exchange_particles(attrs, positions=positions, return_inverse=False)[0]
-    return ParticleField(positions, attrs=attrs)
+    #positions = exchange_particles(mattrs, positions=positions, return_inverse=False)[0]
+    return ParticleField(positions, attrs=mattrs, exchange=True)

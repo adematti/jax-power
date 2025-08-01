@@ -858,15 +858,80 @@ def test_split():
         print(f'cache {_paint._cache_size()} {time.time() - t0:.2f}')
 
 
+def test_shard():
+
+    # Initialize JAX distributed environment
+    #jax.distributed.initialize()
+
+    # Let's simulate distributed calculation
+        # Let's create some mesh mock!
+    import jax
+    from jax import numpy as jnp
+    from jaxpower import MeshAttrs, Spectrum2Poles, generate_anisotropic_gaussian_mesh
+
+    meshsize = 64
+
+
+    def get_theory(kmax=0.3, dk=0.001):
+        # Return theory power spectrum
+        from cosmoprimo.fiducial import DESI
+        cosmo = DESI(engine='eisenstein_hu')
+        z = 1.
+        pk1d = cosmo.get_fourier().pk_interpolator().to_1d(z=z)
+        ellsin = (0, 2, 4)
+        edgesin = jnp.arange(0., kmax, dk)
+        edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+        kin = (edgesin[..., 0] + edgesin[..., 1]) / 2.
+        f, b = cosmo.growth_rate(z), 1.5
+        beta = f / b
+        shotnoise = (1e-3)**(-1)
+        pk = pk1d(kin)
+        poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
+                            0.99 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                            8. / 35 * beta ** 2 * pk])
+        return Spectrum2Poles(k=[kin] * len(ellsin), edges=[edgesin] * len(ellsin), num=list(poles), num_shotnoise=shotnoise, ells=ellsin)
+
+
+    attrs = MeshAttrs(boxsize=1000., meshsize=meshsize)
+    poles = get_theory(4 * attrs.knyq.max())
+
+    from jaxpower import create_sharding_mesh, exchange_particles, ParticleField, compute_fkp2_spectrum_shotnoise, compute_mesh2, get_mesh_attrs
+
+    with create_sharding_mesh() as sharding_mesh:  # specify how to spatially distribute particles / mesh
+        print('Sharding mesh {}.'.format(sharding_mesh))
+        # Generate a Gaussian mock --- everything is already distributed
+        attrs = MeshAttrs(boxsize=1000., meshsize=meshsize, boxcenter=700.)
+        pattrs = attrs.clone(boxsize=800.)
+        size = int(1e6)
+        data = generate_uniform_particles(pattrs, size, seed=42)
+        mmesh = generate_anisotropic_gaussian_mesh(attrs, poles, los='local', seed=68, order=1, unitary_amplitude=True)
+        pattrs = attrs.clone(boxsize=800.)
+        size = int(1e6)
+        data = generate_uniform_particles(pattrs, size, seed=42)
+        data = data.clone(weights=1. + mmesh.read(data.positions, resampler='cic', compensate=True))
+        randoms = generate_uniform_particles(pattrs, 2 * size, seed=43)
+        # Now, pick MeshAttrs
+        attrs = get_mesh_attrs(data.positions, randoms.positions, boxpad=2., meshsize=128)
+        # Create ParticleField, exchanging particles
+        data = ParticleField(data.positions, attrs=attrs, exchange=True)  # or data.clone(exchange=True)
+        randoms = ParticleField(randoms.positions, attrs=attrs, exchange=True)
+        # Now data and randoms are exchanged given MeshAttrs attrs, we can proceed as normal
+        fkp = FKPField(data, randoms, attrs=attrs)
+        norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
+        mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+        del fkp
+        bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+        pk = compute_mesh2(mesh, bin=bin, los='firstpoint')
+        pk = pk.clone(norm=norm, num_shotnoise=num_shotnoise)
+
+    # Close JAX distributed environment
+    #jax.distributed.shutdown()
 
 
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-
-    test_box_window()
-    exit()
 
     #import warnings
     #warnings.simplefilter("error")

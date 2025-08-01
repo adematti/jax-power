@@ -20,6 +20,24 @@ prod = functools.partial(functools.reduce, operator.mul)
 @partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
 @dataclass(init=False, frozen=True)
 class BinMesh3Spectrum(object):
+    """
+    Binning operator for 3D mesh to bispectrum.
+
+    Parameters
+    ----------
+    mattrs : MeshAttrs or BaseMeshField
+        Mesh attributes or mesh field.
+    edges : array-like, dict, or None, optional
+        Bin edges or binning configuration.
+    ells : int or tuple, optional
+        Multipole orders.
+    basis : str, optional
+        Binning basis ('sugiyama', 'sugiyama-diagonal', 'scoccimarro', 'scoccimarro-equilateral').
+    batch_size : int, optional
+        Batch size for JAX mapping.
+    buffer_size : int, optional
+        Buffer size for chunked binning: number of meshes that van be kept into memory.
+    """
 
     edges: jax.Array = None
     nmodes: jax.Array = None
@@ -157,19 +175,34 @@ class BinMesh3Spectrum(object):
             def bin(axis, ibin):
                 return mattrs.c2r(self.ibin[axis] == ibin)
 
-            def reduce(meshs):
-                return prod(meshs).sum()
+            def reduce(meshes):
+                return prod(meshes).sum()
 
             nmodes = self.bin_reduce_meshs(bin, reduce) * self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)**2
             nmodes = [nmodes] * len(ells)
             self.__dict__.update(nmodes=nmodes)
 
     def bin_reduce_meshs(self, bin, reduce):
+        """
+        Reduce over mesh bins using provided binning and reduction functions.
+
+        Parameters
+        ----------
+        bin : callable
+            Function to bin mesh along each axis.
+        reduce : callable
+            Function to reduce binned meshes.
+
+        Returns
+        -------
+        result : array-like
+            Reduced mesh values.
+        """
         if self._buffer_iedges is None:
 
             def f(ibin):
-                meshs = (bin(axis, ibin_) for axis, ibin_ in enumerate(ibin))
-                return reduce(meshs)
+                meshes = (bin(axis, ibin_) for axis, ibin_ in enumerate(ibin))
+                return reduce(meshes)
 
             return jax.lax.map(f, self._iedges, batch_size=self.batch_size)
 
@@ -181,18 +214,32 @@ class BinMesh3Spectrum(object):
                 iter_binned_meshs = [jax.lax.map(partial(bin, axis), edge, batch_size=self.batch_size) for axis, edge in enumerate(uiedges)]
 
                 def f_reduce(index):
-                    meshs = (value[index[axis]] for axis, value in enumerate(iter_binned_meshs))
-                    return reduce(meshs)
+                    meshes = (value[index[axis]] for axis, value in enumerate(iter_binned_meshs))
+                    return reduce(meshes)
 
                 return jax.lax.map(f_reduce, iedges)
 
             return jax.lax.map(f, self._buffer_iedges[:2]).ravel()[self._buffer_iedges[2]]
 
-    def __call__(self, *meshs, remove_zero=False):
+    def __call__(self, *meshes, remove_zero=False):
+        """
+        Bin and reduce input meshes to compute the bispectrum.
+
+        Parameters
+        ----------
+        meshes : array-like or BaseMeshField
+            Input meshes.
+        remove_zero : bool, optional
+            Whether to remove the zero mode.
+
+        Returns
+        -------
+        binned : array-like
+        """
         values = []
         ndim = 3 if 'scoccimarro' in self.basis else 2
         norm = self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)**2
-        for imesh, mesh in enumerate(meshs):
+        for imesh, mesh in enumerate(meshes):
             value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
             if remove_zero:
                 if imesh < ndim:  # 0, 1 for sugiyama, 0, 1, 2 for scoccimaro
@@ -204,15 +251,42 @@ class BinMesh3Spectrum(object):
         def bin(axis, ibin):
             return self.mattrs.c2r(values[axis] * (self.ibin[axis] == ibin))
 
-        def reduce(meshs):
-            return prod(meshs, 1. if 'scoccimarro' in self.basis else values[2]).sum()
+        def reduce(meshes):
+            return prod(meshes, 1. if 'scoccimarro' in self.basis else values[2]).sum()
 
         return self.bin_reduce_meshs(bin, reduce) * norm
 
 
 @jax.tree_util.register_pytree_node_class
 class Spectrum3Poles(BinnedStatistic):
+    """
+    Bispectrum multipoles estimate.
 
+    Parameters
+    ----------
+    k : jax.Array
+        Wavenumber bin centers.
+    num : jax.Array
+        Bispectrum values (with shot noise not subtracted).
+    ells : tuple
+        Multipole orders.
+    nmodes : jax.Array, optional
+        Number of modes per bin.
+    edges : jax.Array, optional
+        Bin edges.
+    norm : jax.Array, optional
+        Normalization factor.
+    num_shotnoise : jax.Array, optional
+        Shot noise per multipole.
+    num_zero : jax.Array, optional
+        Zero mode per multipole.
+    name : str, optional
+        Name of the statistic.
+    basis : str, optional
+        Binning basis.
+    attrs : dict, optional
+        Additional attributes.
+    """
     _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
     _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero']
     _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero']
@@ -222,7 +296,7 @@ class Spectrum3Poles(BinnedStatistic):
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'basis': 'basis', 'attrs': 'attrs'}
 
 
-    def __init__(self, k: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, norm: jax.Array=1.,
+    def __init__(self, k: jax.Array, num: jax.Array, ells: tuple, nmodes: jax.Array=None, edges: jax.Array=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=None, num_zero: jax.Array=None, name: str=None, basis: str=None, attrs: dict=None):
 
         def _tuple(item):
@@ -249,12 +323,12 @@ class Spectrum3Poles(BinnedStatistic):
 
     @property
     def norm(self):
-        """Power spectrum normalization."""
+        """Bispectrum normalization."""
         return self._norm
 
     @property
     def num(self):
-        """Power spectrum without shot noise."""
+        """Return the raw bispectrum mutipoles, with shot noise not subtracted and not normalized."""
         return self._value
 
     k = BinnedStatistic.x
@@ -263,10 +337,22 @@ class Spectrum3Poles(BinnedStatistic):
 
     @property
     def ells(self):
+        """Multipole orders."""
         return self._projs
 
-    def shotnoise(self, projs=Ellipsis):
-        """Shot noise."""
+    def shotnoise(self, projs: int | tuple | list=Ellipsis):
+        """
+        Return the shot noise for each multipole.
+
+        Parameters
+        ----------
+        projs : int, list, tuple, or Ellipsis
+            Multipole(s) to return.
+
+        Returns
+        -------
+        shotnoise : array or list
+        """
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         num_shotnoise = [s / self._norm for s in self._num_shotnoise]
@@ -275,7 +361,7 @@ class Spectrum3Poles(BinnedStatistic):
 
     @property
     def value(self):
-        """Power spectrum estimate."""
+        """Return the shot-noise and zero-mode subtracted bispectrum estimate."""
         toret = list(self.num)
         for ill, ells in enumerate(self._projs):
             toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]) / self.norm
@@ -284,7 +370,7 @@ class Spectrum3Poles(BinnedStatistic):
     @plotter
     def plot(self, fig=None):
         r"""
-        Plot bispectrum.
+        Plot the bispectrum multipoles.
 
         Parameters
         ----------
@@ -303,7 +389,8 @@ class Spectrum3Poles(BinnedStatistic):
 
         Returns
         -------
-        ax : matplotlib.axes.Axes
+        fig : matplotlib.figure.Figure
+            Figure object.
         """
         from matplotlib import pyplot as plt
         if fig is None:
@@ -323,18 +410,27 @@ class Spectrum3Poles(BinnedStatistic):
 
 
 
-def _format_meshs(*meshs):
-    meshs = list(meshs)
-    meshs = meshs + [None] * (3 - len(meshs))
+def _format_meshs(*meshes):
+    """Format input meshes for autocorrelation/cross-correlation: return list of 3 meshes,
+    and a list of indices corresponding to the mesh they are equal to."""
+    meshes = list(meshes)
+    meshes = meshes + [None] * (3 - len(meshes))
     same = [0]
-    for mesh in meshs[1:]: same.append(same[-1] if mesh is None else same[-1] + 1)
-    for imesh, mesh in enumerate(meshs):
+    for mesh in meshes[1:]: same.append(same[-1] if mesh is None else same[-1] + 1)
+    for imesh, mesh in enumerate(meshes):
         if mesh is None:
-            meshs[imesh] = meshs[imesh - 1]
-    return meshs, tuple(same)
+            meshes[imesh] = meshes[imesh - 1]
+    return meshes, tuple(same)
 
 
 def _format_ells(ells, basis: str='sugiyama'):
+    """
+    Format multipole orders for bispectrum binning,
+    depending on 'basis'.
+
+    - 'sugiyama': list of 3-tuples
+    - 'scoccimaro': list of integers
+    """
     if 'scoccimarro' in basis:
         if np.ndim(ells) == 0:
             ells = [ells]
@@ -350,6 +446,7 @@ def _format_ells(ells, basis: str='sugiyama'):
 
 
 def _format_los(los, ndim=3):
+    """Format the line-of-sight specification."""
     vlos, swap = None, False
     if isinstance(los, str) and los in ['local']:
         pass
@@ -359,6 +456,7 @@ def _format_los(los, ndim=3):
 
 
 def _iter_triposh(*ells, los='local'):
+    """Iterate over allowed m combinations for Gaunt coefficients."""
     ell1, ell2, ell3 = ells
     ms = [np.arange(-ell, ell + 1) for ell in ells]
     if los == 'z':
@@ -378,11 +476,29 @@ def _iter_triposh(*ells, los='local'):
     return [jnp.array(xx) for xx in zip(*toret)]
 
 
-def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh3Spectrum=None, los: str | np.ndarray='x'):
+def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh3Spectrum=None, los: str | np.ndarray='x'):
+    """
+    Compute the bispectrum multipoles from mesh.
 
-    meshs, same = _format_meshs(*meshs)
-    rdtype = meshs[0].real.dtype
-    mattrs = meshs[0].attrs
+    Parameters
+    ----------
+    meshes : RealMeshField or ComplexMeshField
+        Input meshes.
+    bin : BinMesh3Spectrum
+        Binning operator.
+    los : str or array-like, optional
+        Line-of-sight specification.
+        If ``los`` is 'local', use local (varying) first point (resp. end point) line-of-sight.
+        Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
+        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+
+    Returns
+    -------
+    result : Spectrum3Poles
+    """
+    meshes, same = _format_meshs(*meshes)
+    rdtype = meshes[0].real.dtype
+    mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)**2
 
     los, vlos = _format_los(los, ndim=mattrs.ndim)
@@ -408,42 +524,42 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
     if 'scoccimarro' in bin.basis:
 
         if vlos is None:
-            meshs = [_2c(mesh) for mesh in meshs[:2]] + [_2r(meshs[2])]
+            meshes = [_2c(mesh) for mesh in meshes[:2]] + [_2r(meshes[2])]
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
-                carry += _2c(meshs[2] * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
+                carry += _2c(meshes[2] * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
                 return carry, im
 
             for ill3, ell3 in enumerate(ells):
                 Ylms = [get_real_Ylm(ell3, m) for m in range(-ell3, ell3 + 1)]
                 xs = np.arange(len(Ylms))
-                tmp = tuple(meshs[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshs[0].clone(value=jnp.zeros_like(meshs[0].value)), xs=xs)[0],)
+                tmp = tuple(meshes[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshes[0].clone(value=jnp.zeros_like(meshes[0].value)), xs=xs)[0],)
                 tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
                 num.append(tmp)
-                num_zero.append(jnp.real(prod(map(_get_zero, meshs))) if ell3 == 0 else 0.)
+                num_zero.append(jnp.real(prod(map(_get_zero, meshes))) if ell3 == 0 else 0.)
 
         else:
 
-            meshs = [_2c(mesh) for mesh in meshs]
+            meshes = [_2c(mesh) for mesh in meshes]
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
 
             for ill3, ell3 in enumerate(ells):
-                tmp = meshs[:2] + [meshs[2] * get_legendre(ell3)(mu)]
+                tmp = meshes[:2] + [meshes[2] * get_legendre(ell3)(mu)]
                 tmp = (2 * ell3 + 1) * bin(*tmp) / bin.nmodes[ill3]
                 num.append(tmp)
-                num_zero.append(jnp.real(prod(map(_get_zero, meshs))) if ell3 == 0 else 0.)
+                num_zero.append(jnp.real(prod(map(_get_zero, meshes))) if ell3 == 0 else 0.)
 
     else:
 
-        meshs = [_2c(mesh) for mesh in meshs[:2]] + [_2r(meshs[2])]
+        meshes = [_2c(mesh) for mesh in meshes[:2]] + [_2r(meshes[2])]
 
         @partial(jax.checkpoint, static_argnums=0)
         def f(Ylm, carry, im):
             coeff, sym, im = im[3], im[4], im[:3]
-            tmp = tuple(meshs[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
+            tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
-            tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshs[2],)
+            tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
             tmp = (4. * np.pi)**2 * coeff * bin(*tmp, remove_zero=True)
             carry += tmp + sym * tmp.conj()
             return carry, im
@@ -452,8 +568,8 @@ def compute_mesh3_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
             Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
             xs = _iter_triposh(ell1, ell2, ell3, los=los)
             num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
-            #num.append(bin(*meshs, remove_zero=True) / bin.nmodes[ill])
-            num_zero.append(jnp.real(prod(map(_get_zero, meshs[:2])) * meshs[2].sum()) if (ell1, ell2, ell3) == (0, 0, 0) else 0.)
+            #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
+            num_zero.append(jnp.real(prod(map(_get_zero, meshes[:2])) * meshes[2].sum()) if (ell1, ell2, ell3) == (0, 0, 0) else 0.)
 
     # FIXME: computing num_zero is a bit involved
     num_zero = jnp.array(num_zero) * 0. # / bin.nmodes[0][0]
@@ -464,6 +580,21 @@ from .mesh2 import compute_normalization
 
 
 def _split_particles(*particles, seed=0):
+    """
+    Split input particles for estimation of the bispectrum normalization.
+
+    Parameters
+    ----------
+    particles : ParticleField or None
+        Input particles.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    toret : list
+        List of split particles.
+    """
     toret = list(particles)
     particles_to_split, nsplits = [], 0
     # Loop in reverse order
@@ -489,6 +620,24 @@ def _split_particles(*particles, seed=0):
 
 
 def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
+    """
+    Compute the FKP normalization for the bispectrum.
+
+    Parameters
+    ----------
+    fkps : FKPField
+        FKP fields.
+    cellsize : float, optional
+        Cell size.
+    split : int or None, optional
+        Random seed for splitting.
+        This is useful to get unbiased estimate of the normalization.
+        If ``None``, no splitting is performed.
+
+    Returns
+    -------
+    norm : float
+    """
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
         randoms = _split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
@@ -505,6 +654,39 @@ def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
 
 
 def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', convention=None, resampler='cic', interlacing=False, **kwargs):
+    """
+    Compute the FKP shot noise for the bispectrum.
+
+    Parameters
+    ----------
+    fkps : FKPField
+        FKP fields.
+    bin : BinMesh3Spectrum, optional
+        Binning operator.
+    los : str or array-like, optional
+        Line-of-sight specification.
+        If ``los`` is 'local', use local (varying) first point (resp. end point) line-of-sight.
+        Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
+        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+    convention : str, optional
+        Shot noise convention.
+    resampler : str, Callable
+        Resampler to read particule weights from mesh.
+        One of ['ngp', 'cic', 'tsc', 'pcs'].
+    interlacing : int, default=0
+        If 0 or 1, no interlacing correction.
+        If > 1, order of interlacing correction.
+        Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
+    compensate : bool, default=False
+        If ``True``, applies compensation to the mesh after painting.
+    kwargs : dict
+        Additional arguments for :meth:`ParticleField.paint`.
+
+    Returns
+    -------
+    shotnoise : tuple
+        Shot noise for each multipole.
+    """
     fkps, same = _format_meshs(*fkps)
     # ells
     ells = bin.ells

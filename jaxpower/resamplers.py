@@ -70,7 +70,7 @@ _resampler_kernels = [
 ]
 
 
-def paint(mesh: tuple | jnp.ndarray, positions, weights=1., order: int=2):
+def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
     """
     Paint the positions onto the mesh.
     If mesh is a tuple, paint on a zero mesh with such shape.
@@ -103,7 +103,7 @@ def paint(mesh: tuple | jnp.ndarray, positions, weights=1., order: int=2):
     return mesh
 
 
-def read(mesh: jnp.ndarray, positions, order: int=2):
+def read(mesh: jax.Array, positions, order: int=2, out=None):
     """Read the value at the positions from the mesh."""
     dtype = 'int16' # int16 -> +/- 32_767, trkl
     shape = np.asarray(mesh.shape, dtype=dtype)
@@ -125,11 +125,12 @@ def read(mesh: jnp.ndarray, positions, order: int=2):
         carry += mesh[idx] * ker
         return carry, None
 
-    out = jnp.zeros(id0.shape[:-1])
+    if out is None:
+        out = jnp.zeros_like(positions, shape=positions.shape[:1])
     out = jax.lax.scan(step, out, ishifts)[0]
     return out
 
-
+# Define resampler namespaces, resampler.paint, resampler.read, resampler.compensate, resampler.aliasing_shotnoise, resampler.order
 for i, name in enumerate(['ngp', 'cic', 'tsc', 'pcs']):
     order = i + 1
     globals()[name] = type(name, (), dict(paint=partial(paint, order=order), read=partial(read, order=order),

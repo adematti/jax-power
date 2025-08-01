@@ -6,7 +6,6 @@ import itertools
 from pathlib import Path
 
 import numpy as np
-from scipy import special
 import jax
 from jax import numpy as jnp
 
@@ -16,7 +15,34 @@ from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField,
 
 @jax.tree_util.register_pytree_node_class
 class Spectrum2Poles(BinnedStatistic):
+    r"""
+    Power spectrum multipoles estimate.
 
+    Parameters
+    ----------
+    k : jax.Array
+        Wavenumber bin centers.
+    num : jax.Array or tuple
+        Power spectrum values (with shot noise not subtracted) for each multipole.
+    ells : tuple
+        Multipole orders.
+    nmodes : jax.Array, optional
+        Number of modes per bin.
+    edges : jax.Array, optional
+        Bin edges.
+    volume : jax.Array, optional
+        Volume per bin.
+    norm : jax.Array, optional
+        Normalization factor.
+    num_shotnoise : jax.Array, optional
+        Shot noise per multipole.
+    num_zero : jax.Array, optional
+        Zero mode (i.e. :math:`k = 0`) per multipole.
+    name : str, optional
+        Name of the estimate.
+    attrs : dict, optional
+        Additional attributes.
+    """
     _label_x = r'$k$ [$h/\mathrm{Mpc}$]'
     _label_proj = r'$\ell$'
     _label_value = r'$P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{3}$]'
@@ -27,7 +53,7 @@ class Spectrum2Poles(BinnedStatistic):
     _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
 
-    def __init__(self, k: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, volume: np.ndarray=None, norm: jax.Array=1.,
+    def __init__(self, k: jax.Array, num: jax.Array | tuple, ells: tuple, nmodes: jax.Array=None, edges: jax.Array=None, volume: jax.Array=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=0., num_zero: jax.Array=None, name: str=None, attrs: dict=None):
 
         def _tuple(item):
@@ -55,23 +81,45 @@ class Spectrum2Poles(BinnedStatistic):
 
     @property
     def num(self):
-        """Power spectrum with shot noise *not* subtracted."""
+        """Return the raw power spectrum mutipoles, with shot noise and zero-mode not subtracted and not normalized."""
         return self._value
 
     k = BinnedStatistic.x
     kavg = BinnedStatistic.xavg
     nmodes = BinnedStatistic.weights
 
-    def shotnoise(self, projs=Ellipsis):
-        """Shot noise."""
+    def shotnoise(self, projs: int | list=Ellipsis):
+        """
+        Return the shot noise for each multipole.
+
+        Parameters
+        ----------
+        projs : int, list, or Ellipsis
+            Multipole(s) to return.
+
+        Returns
+        -------
+        shotnoise : array or list
+        """
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         num_shotnoise = [s / self._norm for s in self._num_shotnoise]
         if isscalar: return num_shotnoise[iprojs]
         return [num_shotnoise[iproj] for iproj in iprojs]
 
-    def volume(self, projs=Ellipsis):
-        """Volume (optionally restricted to input projs)."""
+    def volume(self, projs: int | list=Ellipsis):
+        """
+        Return the volume for each multipole.
+
+        Parameters
+        ----------
+        projs : int, list, or Ellipsis
+            Multipole(s) to return.
+
+        Returns
+        -------
+        volume : array or list
+        """
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         if isscalar: return self._volume[iprojs]
@@ -79,11 +127,12 @@ class Spectrum2Poles(BinnedStatistic):
 
     @property
     def ells(self):
+        """Return the multipole orders."""
         return self._projs
 
     @property
     def value(self):
-        """Power spectrum estimate."""
+        """Return the shot-noise and zero-mode subtracted power spectrum estimate."""
         toret = list(self.num)
         for ill, ell in enumerate(self.ells):
             toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]).real / self._norm
@@ -92,26 +141,24 @@ class Spectrum2Poles(BinnedStatistic):
     @plotter
     def plot(self, fig=None):
         r"""
-        Plot power spectrum.
+        Plot the power spectrum multipoles.
 
         Parameters
         ----------
         fig : matplotlib.figure.Figure, default=None
             Optionally, a figure with at least 1 axis.
-
         fn : str, Path, default=None
             Optionally, path where to save figure.
             If not provided, figure is not saved.
-
         kw_save : dict, default=None
             Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
-
         show : bool, default=False
             If ``True``, show figure.
 
         Returns
         -------
-        ax : matplotlib.axes.Axes
+        fig : matplotlib.figure.Figure
+            Figure object.
         """
         from matplotlib import pyplot as plt
         if fig is None:
@@ -129,7 +176,34 @@ class Spectrum2Poles(BinnedStatistic):
 
 @jax.tree_util.register_pytree_node_class
 class Correlation2Poles(BinnedStatistic):
+    """
+    Correlation function multipoles estimator.
 
+    Parameters
+    ----------
+    s : jax.Array
+        Separation bin centers.
+    num : jax.Array
+        Correlation function values (with shot noise not subtracted) for each multipole.
+    ells : tuple
+        Multipole orders.
+    nmodes : jax.Array, optional
+        Number of modes per bin.
+    edges : jax.Array, optional
+        Bin edges.
+    volume : jax.Array, optional
+        Volume per bin.
+    norm : jax.Array, optional
+        Normalization factor.
+    num_shotnoise : jax.Array, optional
+        Shot noise per multipole.
+    num_zero : jax.Array, optional
+        Zero mode per multipole.
+    name : str, optional
+        Name of the statistic.
+    attrs : dict, optional
+        Additional attributes.
+    """
     _label_x = r'$s$ [$\mathrm{Mpc}/h$]'
     _label_proj = r'$\ell$'
     _label_value = r'$\xi_{\ell}(s)$'
@@ -140,7 +214,7 @@ class Correlation2Poles(BinnedStatistic):
     _init_fields = {'s': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'volume': '_volume', 'ells': '_projs', 'norm': '_norm',
                     'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
 
-    def __init__(self, s: np.ndarray, num: jax.Array, ells: tuple, nmodes: np.ndarray=None, edges: np.ndarray=None, volume: np.ndarray=None, norm: jax.Array=1.,
+    def __init__(self, s: jax.Array, num: jax.Array, ells: tuple, nmodes: jax.Array=None, edges: jax.Array=None, volume: jax.Array=None, norm: jax.Array=1.,
                  num_shotnoise: jax.Array=0., num_zero: jax.Array=None, name: str=None, attrs: dict=None):
 
         def _tuple(item):
@@ -166,25 +240,48 @@ class Correlation2Poles(BinnedStatistic):
             if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
         num_shotnoise = tuple(num_shotnoise)
         self.__dict__.update(_volume=volume, _num_shotnoise=num_shotnoise, _num_zero=num_zero)
+
     @property
     def num(self):
-        """Correlation function with shot noise *not* subtracted."""
+        """Return the raw correlation function mutipoles, with shot noise and zero-mode not subtracted and not normalized."""
         return self._value
 
     s = BinnedStatistic.x
     savg = BinnedStatistic.xavg
     nmodes = BinnedStatistic.weights
 
-    def shotnoise(self, projs=Ellipsis):
-        """Shot noise."""
+    def shotnoise(self, projs: int | list=Ellipsis):
+        """
+        Return the shot noise for each multipole.
+
+        Parameters
+        ----------
+        projs : int, list, or Ellipsis
+            Multipole(s) to return.
+
+        Returns
+        -------
+        shotnoise : array or list
+        """
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         num_shotnoise = [s / self._norm for s in self._num_shotnoise]
         if isscalar: return num_shotnoise[iprojs]
         return [num_shotnoise[iproj] for iproj in iprojs]
 
-    def volume(self, projs=Ellipsis):
-        """Volume (optionally restricted to input projs)."""
+    def volume(self, projs: int | list=Ellipsis):
+        """
+        Return the volume for each multipole.
+
+        Parameters
+        ----------
+        projs : int, list, or Ellipsis
+            Multipole(s) to return.
+
+        Returns
+        -------
+        volume : array or list
+        """
         iprojs = self._index_projs(projs)
         isscalar = not isinstance(iprojs, list)
         if isscalar: return self._volume[iprojs]
@@ -192,6 +289,7 @@ class Correlation2Poles(BinnedStatistic):
 
     @property
     def ells(self):
+        """Return the multipole orders."""
         return self._projs
 
     @property
@@ -203,6 +301,18 @@ class Correlation2Poles(BinnedStatistic):
         return tuple(toret)
 
     def to_spectrum(self, k):
+        """
+        Convert the correlation function multipoles to power spectrum multipoles.
+
+        Parameters
+        ----------
+        k : array-like or BinnedStatistic
+            Wavenumber bin centers or :class:`BinnedStatistic` instance.
+
+        Returns
+        -------
+        Spectrum2Poles
+        """
         from .utils import BesselIntegral
         num = []
         for ill, ell in enumerate(self.ells):
@@ -228,26 +338,24 @@ class Correlation2Poles(BinnedStatistic):
     @plotter
     def plot(self, fig=None):
         r"""
-        Plot correlation function.
+        Plot the correlation function multipoles.
 
         Parameters
         ----------
         fig : matplotlib.figure.Figure, default=None
             Optionally, a figure with at least 1 axis.
-
         fn : str, Path, default=None
             Optionally, path where to save figure.
             If not provided, figure is not saved.
-
         kw_save : dict, default=None
             Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
-
         show : bool, default=False
             If ``True``, show figure.
 
         Returns
         -------
-        ax : matplotlib.axes.Axes
+        fig : matplotlib.figure.Figure
+            Figure object.
         """
         from matplotlib import pyplot as plt
         if fig is None:
@@ -267,7 +375,24 @@ class Correlation2Poles(BinnedStatistic):
 @partial(register_pytree_dataclass, meta_fields=['ells'])
 @dataclass(init=False, frozen=True)
 class BinMesh2Spectrum(object):
+    """
+    Binning operator for mesh to power spectrum.
 
+    Parameters
+    ----------
+    mattrs : MeshAttrs or BaseMeshField
+        Mesh attributes.
+    edges : array-like, dict, or None, optional
+        ``edges`` may be:
+        - a numpy array containing the :math:`k`-edges.
+        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
+            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
+        - ``None``, defaults to empty dictionary.
+    ells : int or tuple, optional
+        Multipole orders.
+    mode_oversampling : int, optional
+        Oversampling factor for binning.
+    """
     edges: jax.Array = None
     nmodes: jax.Array = None
     xavg: jax.Array = None
@@ -311,6 +436,22 @@ class BinMesh2Spectrum(object):
         self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells)
 
     def __call__(self, mesh, antisymmetric=False, remove_zero=False):
+        """
+        Bin the mesh to compute the power spectrum.
+
+        Parameters
+        ----------
+        mesh : array-like or BaseMeshField
+            Input mesh.
+        antisymmetric : bool, optional
+            Whether the mesh is hermitian antisymmetric.
+        remove_zero : bool, optional
+            Whether to remove the zero mode.
+
+        Returns
+        -------
+        binned : array-like
+        """
         weights = self.wmodes
         value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
         if remove_zero:
@@ -321,7 +462,24 @@ class BinMesh2Spectrum(object):
 @partial(register_pytree_dataclass, meta_fields=['ells'])
 @dataclass(init=False, frozen=True)
 class BinMesh2Correlation(object):
+    """
+    Binning operator for mesh to correlation function.
 
+    Parameters
+    ----------
+    mattrs : MeshAttrs or BaseMeshField
+        Mesh attributes.
+    edges : array-like, dict, or None, optional
+        ``edges`` may be:
+        - a numpy array containing the :math:`s`-edges.
+        - a dictionary, with keys 'min' (minimum :math:`s`, defaults to 0), 'max' (maximum :math:`s`, defaults to ``(boxsize / 2)``),
+            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`s` (norm) values between 'min' and 'max').
+        - ``None``, defaults to empty dictionary.
+    ells : int or tuple, optional
+        Multipole orders.
+    mode_oversampling : int, optional
+        Oversampling factor for binning.
+    """
     edges: jax.Array = None
     nmodes: jax.Array = None
     xavg: jax.Array = None
@@ -360,6 +518,20 @@ class BinMesh2Correlation(object):
         self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, ells=ells)
 
     def __call__(self, mesh, remove_zero=False):
+        """
+        Bin the mesh to compute the correlation function.
+
+        Parameters
+        ----------
+        mesh : array-like or BaseMeshField
+            Input mesh.
+        remove_zero : bool, optional
+            Whether to remove the zero mode.
+
+        Returns
+        -------
+        binned : array-like
+        """
         value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
         if remove_zero:
             value = value.at[(0,) * value.ndim].set(0.)
@@ -367,6 +539,7 @@ class BinMesh2Correlation(object):
 
 
 def _get_los_vector(los: str | np.ndarray, ndim=3):
+    """Return the line-of-sight vector."""
     vlos = None
     if isinstance(los, str):
         vlos = [0.] * ndim
@@ -377,19 +550,21 @@ def _get_los_vector(los: str | np.ndarray, ndim=3):
 
 
 def _get_zero(mesh):
+    """Return the zero mode of the mesh."""
     return mesh[(0,) * mesh.ndim]
 
 
-def _format_meshs(*meshs):
-    meshs = list(meshs)
-    assert 1 <= len(meshs) <= 2
-    meshs = meshs + [None] * (2 - len(meshs))
+def _format_meshs(*meshes):
+    """Format input meshes for autocorrelation/cross-correlation: return list of two meshes, and boolean if they are equal."""
+    meshes = list(meshes)
+    assert 1 <= len(meshes) <= 2
+    meshes = meshes + [None] * (2 - len(meshes))
     same = [0]
-    for mesh in meshs[1:]: same.append(same[-1] if mesh is None else same[-1] + 1)
-    for imesh, mesh in enumerate(meshs):
+    for mesh in meshes[1:]: same.append(same[-1] if mesh is None else same[-1] + 1)
+    for imesh, mesh in enumerate(meshes):
         if mesh is None:
-            meshs[imesh] = meshs[imesh - 1]
-    return meshs, same[1] == same[0]
+            meshes[imesh] = meshes[imesh - 1]
+    return meshes, same[1] == same[0]
 
 
 def _format_ells(ells):
@@ -408,51 +583,58 @@ def _format_los(los, ndim=3):
     return los, vlos, swap
 
 
-def compute_mesh2(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum | BinMesh2Correlation=None, los: str | np.ndarray='z'):
-    if isinstance(bin, BinMesh2Spectrum):
-        return compute_mesh2_spectrum(*meshs, bin=bin, los=los)
-    elif isinstance(bin, BinMesh2Correlation):
-        return compute_mesh2_correlation(*meshs, bin=bin, los=los)
-    raise ValueError(f'bin must be either BinMesh2Spectrum or BinMesh2Correlation, not {type(bin)}')
-
-
-def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
-    r"""
-    Compute power spectrum from mesh.
+def compute_mesh2(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum | BinMesh2Correlation=None, los: str | np.ndarray='z'):
+    """
+    Dispatch to :func:`compute_mesh2_spectrum` or :func:`compute_mesh2_correlation`
+    depending on type of input ``bin``.
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField
-        Input mesh(s).
-
-    edges : np.ndarray, dict, default=None
-        ``edges`` may be:
-        - a numpy array containing the :math:`k`-edges.
-        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
-            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
-        - ``None``, defaults to empty dictionary.
-
-    ells : tuple, default=0
-        Multiple orders to compute.
-
-    los : str, array, default=None
-        If ``los`` is 'firstpoint' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+    meshes : RealMeshField or ComplexMeshField
+        Input meshes.
+    bin : BinMesh2Spectrum or BinMesh2Correlation
+        Binning operator.
+    los : str or array-like, optional
+        Line-of-sight specification.
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector.
 
-    mode_oversampling : int, default=0
-        If > 0, artificially increase the resolution of the input mesh by a factor ``2 * mode_oversampling + 1``.
-        In practice, shift the coordinates of the coordinates of the input grid by ``np.arange(-mode_oversampling, mode_oversampling + 1)``
-        along each of x, y, z axes.
-        This reduces "discrete grid binning effects".
+    Returns
+    -------
+    result : Spectrum2Poles or Correlation2Poles
+    """
+    if isinstance(bin, BinMesh2Spectrum):
+        return compute_mesh2_spectrum(*meshes, bin=bin, los=los)
+    elif isinstance(bin, BinMesh2Correlation):
+        return compute_mesh2_correlation(*meshes, bin=bin, los=los)
+    raise ValueError(f'bin must be either BinMesh2Spectrum or BinMesh2Correlation, not {type(bin)}')
+
+
+def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
+    r"""
+    Compute the power spectrum multipoles from mesh.
+
+    Parameters
+    ----------
+    meshs : RealMeshField or ComplexMeshField
+        Input mesh(es).
+    bin : BinMesh2Spectrum
+        Binning operator.
+    los : str or array-like, optional
+        Line-of-sight specification.
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+        Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
+        Else, a 3-vector.
 
     Returns
     -------
-    power : Spectrum2Poles
+    result : Spectrum2Poles
     """
-    meshs, autocorr = _format_meshs(*meshs)
-    rdtype = meshs[0].real.dtype
-    mattrs = meshs[0].attrs
+
+    meshes, autocorr = _format_meshs(*meshes)
+    rdtype = meshes[0].real.dtype
+    mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
@@ -472,11 +654,11 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
     if vlos is None:  # local, varying line-of-sight
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
-        if swap: meshs = meshs[::-1]
+        if swap: meshes = meshes[::-1]
 
-        rmesh1 = meshs[0]
-        A0 = _2c(rmesh1 if autocorr else meshs[1])
-        del meshs
+        rmesh1 = meshes[0]
+        A0 = _2c(rmesh1 if autocorr else meshes[1])
+        del meshes
 
         num, num_zero = [], []
         if 0 in ells:
@@ -520,13 +702,13 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
 
     else:  # fixed line-of-sight
 
-        for imesh, mesh in enumerate(meshs[:1 if autocorr else 2]):
-            meshs[imesh] = _2c(mesh)
+        for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+            meshes[imesh] = _2c(mesh)
         if autocorr:
-            Aell = meshs[0].clone(value=meshs[0].real**2 + meshs[0].imag**2)  # saves a bit of memory
+            Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
         else:
-            Aell = meshs[0] * meshs[1].conj()
-        del meshs
+            Aell = meshes[0] * meshes[1].conj()
+        del meshes
 
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
@@ -548,43 +730,29 @@ def compute_mesh2_spectrum(*meshs: RealMeshField | ComplexMeshField, bin: BinMes
         return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
 
 
-def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: BinMesh2Correlation=None, los: str | np.ndarray='z') -> Correlation2Poles:
-    r"""
-    Compute 2-pt correlation function from mesh.
+def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Correlation=None, los: str | np.ndarray='z') -> Correlation2Poles:
+    """
+    Compute the correlation function multipoles from mesh.
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField
-        Input mesh(s).
-
-    edges : np.ndarray, dict, default=None
-        ``edges`` may be:
-        - a numpy array containing the :math:`k`-edges.
-        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
-            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
-        - ``None``, defaults to empty dictionary.
-
-    ells : tuple, default=0
-        Multiple orders to compute.
-
-    los : str, array, default=None
-        If ``los`` is 'firstpoint' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+    meshs : RealMeshField or ComplexMeshField
+        Input meshes.
+    bin : BinMesh2Correlation
+        Binning operator.
+    los : str or array-like, optional
+        Line-of-sight specification.
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector.
 
-    mode_oversampling : int, default=0
-        If > 0, artificially increase the resolution of the input mesh by a factor ``2 * mode_oversampling + 1``.
-        In practice, shift the coordinates of the coordinates of the input grid by ``np.arange(-mode_oversampling, mode_oversampling + 1)``
-        along each of x, y, z axes.
-        This reduces "discrete grid binning effects".
-
     Returns
     -------
-    corr : Correlation2Poles
+    result : Correlation2Poles
     """
-    meshs, autocorr = _format_meshs(*meshs)
-    rdtype = meshs[0].real.dtype
-    mattrs = meshs[0].attrs
+    meshes, autocorr = _format_meshs(*meshes)
+    rdtype = meshes[0].real.dtype
+    mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
@@ -604,11 +772,11 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
     if vlos is None:  # local, varying line-of-sight
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
-        if swap: meshs = meshs[::-1]
+        if swap: meshes = meshes[::-1]
 
-        rmesh1 = meshs[0]
-        A0 = _2c(rmesh1 if autocorr else meshs[1])
-        del meshs
+        rmesh1 = meshes[0]
+        A0 = _2c(rmesh1 if autocorr else meshes[1])
+        del meshes
 
         num, num_zero = [], []
         if 0 in ells:
@@ -649,14 +817,14 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
 
     else:  # fixed line-of-sight
 
-        for imesh, mesh in enumerate(meshs[:1 if autocorr else 2]):
-            meshs[imesh] = _2c(mesh)
+        for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+            meshes[imesh] = _2c(mesh)
         if autocorr:
-            Aell = meshs[0].clone(value=meshs[0].real**2 + meshs[0].imag**2)  # saves a bit of memory
+            Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
         else:
-            Aell = meshs[0] * meshs[1].conj()
+            Aell = meshes[0] * meshes[1].conj()
         Aell = Aell.c2r()  # convert to real space
-        del meshs
+        del meshes
 
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
@@ -682,7 +850,14 @@ def compute_mesh2_correlation(*meshs: RealMeshField | ComplexMeshField, bin: Bin
 @dataclass(frozen=True, init=False)
 class FKPField(object):
     """
-    Class defining the FKP field, data - randoms.
+    FKP field: data minus randoms.
+
+    Parameters
+    ----------
+    data : ParticleField
+        Data particles.
+    randoms : ParticleField
+        Random particles.
 
     References
     ----------
@@ -692,6 +867,18 @@ class FKPField(object):
     randoms: ParticleField
 
     def __init__(self, data, randoms, attrs=None):
+        """
+        Initialize FKPField.
+
+        Parameters
+        ----------
+        data : ParticleField
+            Data particles.
+        randoms : ParticleField
+            Random particles.
+        attrs : MeshAttrs, optional
+            Mesh attributes.
+        """
         if attrs is not None:
             data = data.clone(attrs=attrs)
             randoms = randoms.clone(attrs=attrs)
@@ -703,13 +890,16 @@ class FKPField(object):
         return self.__class__(**state)
 
     def exchange(self, **kwargs):
+        """In distributed computation, exchange particles such that their distribution matches the mesh shards."""
         return self.clone(data=self.data.clone(exchange=True, **kwargs), randoms=self.randoms.clone(exchange=True, **kwargs), attrs=self.attrs)
 
     @property
     def attrs(self):
+        """Mesh attributes."""
         return self.data.attrs
 
     def split(self, nsplits=1, extent=None):
+        """Split particles into subregions."""
         from .mesh import _get_extent
         if extent is None:
             extent = _get_extent(self.data.positions, self.randoms.positions)
@@ -719,6 +909,7 @@ class FKPField(object):
 
     @property
     def particles(self):
+        """Return the FKP field as a :class:`ParticleField`."""
         particles = getattr(self, '_particles', None)
         if particles is None:
             self.__dict__['_particles'] = particles = (self.data - self.data.sum() / self.randoms.sum() * self.randoms).clone(attrs=self.data.attrs)
@@ -726,22 +917,59 @@ class FKPField(object):
 
     def paint(self, resampler: str | Callable='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real', **kwargs):
+        """
+        Paint the FKP field onto a mesh.
+
+        Parameters
+        ----------
+        resampler : str, Callable, default='cic'
+            Resampler to read particule weights from mesh.
+            One of ['ngp', 'cic', 'tsc', 'pcs'].
+        interlacing : int, default=0
+            If 0 or 1, no interlacing correction.
+            If > 1, order of interlacing correction.
+            Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
+        compensate : bool, default=False
+            If ``True``, applies compensation to the mesh after painting.
+        dtype : default=None
+            Mesh array type.
+        out : str, default='real'
+            If 'real', return a :class:`RealMeshField`, else :class:`ComplexMeshField`
+            or :class:`ComplexMeshField` if ``dtype`` is complex.
+
+        Returns
+        -------
+        mesh : MeshField
+        """
         return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
 
 
 def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic', **kwargs) -> jax.Array:
     """
-    Return normalization, in volume**(1 - len(inputs)) unit.
+    Compute normalization for input fields, in volume**(1 - len(inputs)) unit.
+
+    Parameters
+    ----------
+    inputs : RealMeshField or ParticleField
+        Input fields.
+    resampler : str, Callable, default='cic'
+        Resampling method.
+    kwargs : dict
+        Additional arguments for :meth:`ParticleField.paint`.
+
+    Returns
+    -------
+    normalization : jax.Array
 
     Warning
     -------
     Input particles are considered uncorrelated.
     """
-    meshs, particles = [], []
+    meshes, particles = [], []
     attrs = dict(kwargs)
     for inp in inputs:
         if isinstance(inp, RealMeshField):
-            meshs.append(inp)
+            meshes.append(inp)
             attrs = {name: getattr(inp, name) for name in ['boxsize', 'boxcenter', 'meshsize']}
         else:
             particles.append(inp)
@@ -751,14 +979,28 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
         attrs = particles[0].attrs.clone(**get_mesh_attrs(**(cattrs | attrs)))
         particles = [particle.clone(attrs=attrs) for particle in particles]
     normalization = 1
-    for mesh in meshs:
+    for mesh in meshes:
         normalization *= mesh
     for particle in particles:
         normalization *= particle.paint(resampler=resampler, interlacing=0, compensate=False)
     return normalization.sum() * normalization.cellsize.prod()**(1 - len(inputs))
 
 
-def compute_fkp2_spectrum_normalization(*fkps, cellsize=10.):
+def compute_fkp2_spectrum_normalization(*fkps: FKPField, cellsize: float=10.):
+    """
+    Compute the FKP normalization for the power spectrum.
+
+    Parameters
+    ----------
+    fkps : FKPField or ParticleField
+        FKP fields.
+    cellsize : float, optional
+        Cell size.
+
+    Returns
+    -------
+    norm : jax.Array
+    """
     # This is the pypower normalization - move to new one?
     fkps, autocorr = _format_meshs(*fkps)
     kw = dict(cellsize=cellsize)
@@ -783,13 +1025,26 @@ def compute_fkp2_spectrum_normalization(*fkps, cellsize=10.):
     return norm
 
 
-def compute_fkp2_spectrum_shotnoise(*fkps):
+def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField):
+    """
+    Compute the FKP shot noise for the power spectrum.
+
+    Parameters
+    ----------
+    fkps : FKPField or ParticleField
+        FKP or particle fields.
+
+    Returns
+    -------
+    shotnoise : jax.Array
+    """
     # This is the pypower normalization - move to new one?
     fkps, autocorr = _format_meshs(*fkps)
     if autocorr:
-        fkp = fkps[0]
-        alpha = fkp.data.sum() / fkp.randoms.sum()
-        shotnoise = jnp.sum(fkp.data.weights**2) + alpha**2 * jnp.sum(fkp.randoms.weights**2)
+        particles = fkp = fkps[0]
+        if isinstance(fkp, FKPField):
+            particles = fkp.particles
+        shotnoise = jnp.sum(particles.weights**2)
     else:
         shotnoise = 0.
     return shotnoise
@@ -831,9 +1086,24 @@ def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
 
 
 def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2Spectrum=None) -> WindowMatrix:
+    """
+    Compute the "smooth" (no binning effect) power spectrum window matrix.
 
-    r"""Compute "smooth" power spectrum window matrix given input configuration-space window function."""
+    Parameters
+    ----------
+    window : BinnedStatistic
+        Configuration-space window function.
+    edgesin : np.ndarray
+        Input bin edges.
+    ellsin : tuple, optional
+        Input multipole orders.
+    bin : BinMesh2Spectrum, optional
+        Output binning.
 
+    Returns
+    -------
+    wmat : WindowMatrix
+    """
     from .utils import legendre_product, BesselIntegral
     tophat_method = 'rect'
     ells = bin.ells
@@ -887,38 +1157,41 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     return wmat
 
 
-def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
+def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
                                   bin: BinMesh2Spectrum=None, los: str | np.ndarray='z',
                                   buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
     r"""
-    Compute mean power spectrum from mesh.
+    Compute the power spectrum window matrix from mesh.
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField, MeshAttrs
-        Input mesh(s).
+    meshes : RealMeshField, ComplexMeshField, MeshAttrs
+        Input mesh(es).
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
-
-    edges : np.ndarray, dict, default=None
-        ``edges`` may be:
-        - a numpy array containing the :math:`k`-edges.
-        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
-            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
-        - ``None``, defaults to empty dictionary.
-
-    ells : tuple, default=0
-        Multiple orders to compute.
-
+    edgesin : np.ndarray
+        Input bin edges.
+    ellsin : tuple
+        Input multipole orders.
+    bin : BinMesh2Spectrum
+        Output binning.
     los : str, array, default=None
-        If ``los`` is 'firstpoint' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector.
-
-    mode_oversampling : int, default=0
-        If > 0, artificially increase the resolution of the input mesh by a factor ``2 * mode_oversampling + 1``.
-        In practice, shift the coordinates of the coordinates of the input grid by ``np.arange(-mode_oversampling, mode_oversampling + 1)``
-        along each of x, y, z axes.
-        This reduces "discrete grid binning effects".
+    buffer : str or device, optional
+        Buffer for intermediate results (meshes).
+        If string, save intermerdiate meshes to this path.
+    batch_size : int, optional
+        Batch size for computation: how many meshes hold in memory.
+    pbar : bool, optional
+        Whether to show a progress bar.
+    norm : float, optional
+        Normalization factor.
+    flags : tuple, optional
+        Additional computation flags.
+        - "smooth": smooth approximation to the window matrix (no binning effect)
+        - "infinite": input power spectrum is turned into theory correlation function with "infinite" resolution.
+        - else: input power spectrum is defined on the mesh. Useful for control variate estimates.
 
     Returns
     -------
@@ -928,13 +1201,13 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
     from .utils import BesselIntegral
 
-    meshs, autocorr = _format_meshs(*meshs)
-    periodic = isinstance(meshs[0], MeshAttrs)
+    meshes, autocorr = _format_meshs(*meshes)
+    periodic = isinstance(meshes[0], MeshAttrs)
     if periodic:
         assert autocorr
-        mattrs = meshs[0]
+        mattrs = meshes[0]
     else:
-        mattrs = meshs[0].attrs
+        mattrs = meshes[0].attrs
     rdtype = mattrs.rdtype
 
     _norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
@@ -984,12 +1257,12 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
         if not periodic:
 
-            for imesh, mesh in enumerate(meshs[:1 if autocorr else 2]):
-                meshs[imesh] = _2c(mesh)
+            for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+                meshes[imesh] = _2c(mesh)
             if autocorr:
-                meshs[1] = meshs[0]
+                meshes[1] = meshes[0]
 
-            Q = _2r(meshs[0] * meshs[1].conj()) / mattrs.meshsize.prod(dtype=rdtype)
+            Q = _2r(meshes[0] * meshes[1].conj()) / mattrs.meshsize.prod(dtype=rdtype)
         else:
             Q = None
             mask_kin = jnp.all(kin >= bin.edges[0], axis=-1) & jnp.all(kin <= bin.edges[-1], axis=-1)
@@ -1106,15 +1379,15 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
         ellsin = list(ellsin)
 
         # In this case, theory must be a dictionary of (multipole, wide_angle_order)
-        if swap: meshs = meshs[::-1]
+        if swap: meshes = meshes[::-1]
 
         if periodic:
-            meshs = [mattrs.create(kind='real', fill=1.)]
+            meshes = [mattrs.create(kind='real', fill=1.)]
 
-        rmesh1 = _2r(meshs[0])
-        rmesh2 = rmesh1 if autocorr else _2r(meshs[1])
-        A0 = _2c(meshs[0] if autocorr else meshs[1])
-        del meshs
+        rmesh1 = _2r(meshes[0])
+        rmesh2 = rmesh1 if autocorr else _2r(meshes[1])
+        A0 = _2c(meshes[0] if autocorr else meshes[1])
+        del meshes
 
         # The real-space grid
         xvec = mattrs.xcoords(sparse=True)
@@ -1438,56 +1711,41 @@ def compute_mesh2_spectrum_window(*meshs: RealMeshField | ComplexMeshField | Mes
 
 
 
-def compute_mesh2_spectrum_mean(*meshs: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
+def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
                                 bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
     r"""
-    Compute mean power spectrum from mesh.
+    Compute the mean power spectrum from mesh and theory.
 
     Parameters
     ----------
-    meshs : RealMeshField, ComplexMeshField, ComplexMeshField, MeshAttrs
-        Input mesh(s).
+    meshes : RealMeshField, ComplexMeshField, ComplexMeshField, MeshAttrs
+        Input mesh(es).
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
-
-    theory : Callable, dict[Callable]
+    theory : Callable, dict[Callable], BinnedStatistic, Spectrum2Poles
         Mean theory power spectrum. Either a callable (if ``los`` is an axis),
         or a dictionary of callables, with keys the multipole orders :math:`\ell`.
         Also possible to add wide-angle order :math:`n`, such that the key is the tuple :math:`(\ell, n)`.
-
-    edges : np.ndarray, dict, default=None
-        ``edges`` may be:
-        - a numpy array containing the :math:`k`-edges.
-        - a dictionary, with keys 'min' (minimum :math:`k`, defaults to 0), 'max' (maximum :math:`k`, defaults to ``np.pi / (boxsize / meshsize)``),
-            'step' (if not provided :func:`find_unique_edges` is used to find unique :math:`k` (norm) values between 'min' and 'max').
-        - ``None``, defaults to empty dictionary.
-
-    ells : tuple, default=0
-        Multiple orders to compute.
-
+        One can also directly provided a :class:`BinnedStatistic` or :class:`Spectrum2Poles` instance.
+    bin : BinMesh2Spectrum
+        Output binning.
     los : str, array, default=None
-        If ``los`` is 'firstpoint' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector.
-
-    mode_oversampling : int, default=0
-        If > 0, artificially increase the resolution of the input mesh by a factor ``2 * mode_oversampling + 1``.
-        In practice, shift the coordinates of the coordinates of the input grid by ``np.arange(-mode_oversampling, mode_oversampling + 1)``
-        along each of x, y, z axes.
-        This reduces "discrete grid binning effects".
 
     Returns
     -------
     power : Spectrum2Poles
     """
-    meshs, autocorr = _format_meshs(*meshs)
-    periodic = isinstance(meshs[0], MeshAttrs)
+    meshes, autocorr = _format_meshs(*meshes)
+    periodic = isinstance(meshes[0], MeshAttrs)
     if periodic:
         assert autocorr
         rdtype = float
-        mattrs = meshs[0]
+        mattrs = meshes[0]
     else:
-        rdtype = meshs[0].real.dtype
-        mattrs = meshs[0].attrs
+        rdtype = meshes[0].real.dtype
+        mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
     rnorm = norm / mattrs.meshsize.prod(dtype=rdtype)
 
@@ -1539,12 +1797,12 @@ def compute_mesh2_spectrum_mean(*meshs: RealMeshField | ComplexMeshField | MeshA
 
         if not periodic:
 
-            for imesh, mesh in enumerate(meshs[:1 if autocorr else 2]):
-                meshs[imesh] = _2c(mesh)
+            for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+                meshes[imesh] = _2c(mesh)
             if autocorr:
-                meshs[1] = meshs[0]
+                meshes[1] = meshes[0]
 
-            Q = _2r(meshs[0] * meshs[1].conj())
+            Q = _2r(meshes[0] * meshes[1].conj())
         else:
             Q = None
 
@@ -1577,15 +1835,15 @@ def compute_mesh2_spectrum_mean(*meshs: RealMeshField | ComplexMeshField | MeshA
 
         ellsin = [mode[0] for mode in poles]
 
-        if swap: meshs = meshs[::-1]
+        if swap: meshes = meshes[::-1]
 
         if periodic:
-            meshs = [mattrs.create(kind='real', fill=1.)]
+            meshes = [mattrs.create(kind='real', fill=1.)]
 
-        rmesh1 = _2r(meshs[0])
-        rmesh2 = rmesh1 if autocorr else _2r(meshs[1])
-        A0 = _2c(meshs[0] if autocorr else meshs[1])
-        del meshs
+        rmesh1 = _2r(meshes[0])
+        rmesh2 = rmesh1 if autocorr else _2r(meshes[1])
+        A0 = _2c(meshes[0] if autocorr else meshes[1])
+        del meshes
 
         # The real-space grid
         xhat = mattrs.xcoords(sparse=True)
