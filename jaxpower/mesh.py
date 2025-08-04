@@ -860,7 +860,8 @@ class MeshAttrs(object):
         Parameters
         ----------
         kind : str, default='wavenumber'
-            Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units).
+            Either 'circular' (in :math:`(-\pi, \pi)`) or 'wavenumber' (in ``spacing`` units),
+            or 'index' (index of Fourier mode).
 
         sparse : bool, default=None
             If ``None``, return a tuple of 1D-arrays.
@@ -876,6 +877,9 @@ class MeshAttrs(object):
             kind = 'separation'
         if kind == 'circular':
             spacing = 2. * np.pi / self.meshsize
+            kind = 'separation'
+        if kind == 'index':
+            spacing = 1
             kind = 'separation'
         axis_order = None
         if self.fft_engine == 'jaxdecomp':
@@ -1298,6 +1302,8 @@ class RealMeshField(BaseMeshField):
         sharding_mesh = self.attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         inverse = None
+        if isinstance(positions, ParticleField):
+            positions = positions.positions
         if with_sharding and exchange:
             positions, exchange, inverse = exchange_particles(self.attrs, positions, return_inverse=True, return_type='jax')
         toret = _read(self, positions, resampler=resampler, compensate=compensate, **kwargs)
@@ -1321,9 +1327,6 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
 
     if kernel_compensate is not None:
         mesh = mesh.r2c().apply(kernel_compensate).c2r()
-
-    if isinstance(positions, ParticleField):
-        positions = positions.positions
 
     value, attrs = mesh.value, mesh.attrs
     sharding_mesh = attrs.sharding_mesh

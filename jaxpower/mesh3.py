@@ -602,7 +602,7 @@ def _split_particles(*particles, seed=0):
         if particle is None:
             nsplits += 1
         else:
-            particles_to_split.append((particle, nsplits))
+            particles_to_split.append((particle, nsplits + 1))
             nsplits = 0
     # Reorder
     particles_to_split = particles_to_split[::-1]
@@ -612,10 +612,13 @@ def _split_particles(*particles, seed=0):
     seeds = random.split(seed, len(particles_to_split))
     toret = []
     for i, (particle, nsplits) in enumerate(particles_to_split):
-        x = create_sharded_random(random.uniform, seeds[i], particle.size, out_specs=0)
-        for isplit in range(nsplits):
-            mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
-            toret.append(particle.clone(weights=particle.weights * mask))
+        if nsplits == 1:
+            toret.append(particle)
+        else:
+            x = create_sharded_random(random.uniform, seeds[i], particle.size, out_specs=0)
+            for isplit in range(nsplits):
+                mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+                toret.append(particle.clone(weights=particle.weights * mask))
     return toret
 
 

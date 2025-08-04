@@ -1122,7 +1122,6 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     window = window.clone(num_zero=None)
 
     wmat_tmp = {}
-    spherical_jn = {ell: get_spherical_jn(ell) for ell in set(ells)}
 
     for ell1 in ellsin:
         wmat_tmp[ell1] = 0

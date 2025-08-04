@@ -58,6 +58,7 @@ with create_sharding_mesh() as sharding_mesh:  # distribute mesh and particles
     # Create MeshAttrs from positions (assumed already sharded across processes)
     attrs = get_mesh_attrs(data_positions, randoms_positions, boxpad=2., meshsize=128)
 
+    # Define FKP field = data - randoms
     data = ParticleField(data_positions, data_weights, attrs=attrs, exchange=True)
     randoms = ParticleField(randoms_positions, randoms_weights, attrs=attrs, exchange=True)
     fkp = FKPField(data, randoms)

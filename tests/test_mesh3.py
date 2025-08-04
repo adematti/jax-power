@@ -370,9 +370,12 @@ def test_normalization():
     size = int(1e5)
     data = generate_uniform_particles(attrs, size, seed=32)
     data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
-    randoms = generate_uniform_particles(attrs, size, seed=42)
+    randoms = generate_uniform_particles(attrs, size * 10, seed=42)
     fkp = FKPField(data, randoms)
-    norm = compute_fkp3_spectrum_normalization(fkp, split=42)
+    norm = compute_fkp3_spectrum_normalization(fkp, cellsize=20., split=None)
+    print('norm no split', norm)
+    norm_split = compute_fkp3_spectrum_normalization(fkp, cellsize=20., split=42)
+    print('norm split', norm_split)
 
 
 def survey_selection(size=int(1e7), seed=random.key(42), scale=0.25, paint=True):
@@ -417,5 +420,6 @@ if __name__ == '__main__':
     #test_normalization()
     #test_triumvirate_box()
     #test_triumvirate_survey()
-    test_binned_statistic()
+    #test_binned_statistic()
     #test_fisher()
+    test_normalization()
