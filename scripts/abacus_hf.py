@@ -116,7 +116,7 @@ def get_box_clustering_positions(fn, los='x', **kwargs):
 
     if mpicomm.size > 1:
         catalog = Catalog.scatter(catalog, mpicomm=mpicomm, mpiroot=mpiroot)
-    
+
     positions = np.column_stack([catalog['X'], catalog['Y'], catalog['Z']])
     velocities = np.column_stack([catalog['VX'], catalog['VY'], catalog['VZ']]) / scalev
     vlos = los
@@ -312,7 +312,7 @@ def compute_pypower_window(output_fn, get_randoms, spectrum_fn=None, output_wind
                 window = windows.deepcopy()
                 window.power_direct_nonorm[...] = 0.
                 for name in ['corr_direct_nonorm', 'sep_direct']: setattr(window, name, None)
-    
+
             # Let us compute the wide-angle and window function matrix
             ellsin = (0, 2, 4)  # input (theory) multipoles
             wa_orders = 1 # wide-angle order
@@ -405,12 +405,12 @@ def compute_theory(output_fn, spectrum_fns, window_fn, target_spectrum_fn=None):
     # Let's just do a spline interpolation of the "deconvolved" P(k)
     # (one could do something better, fitting some real model given a preliminary covariance matrix)
     from scipy import interpolate
-    
+
     def pk_theory_callable(k):
         # Insert 0 to enforce P(k=0) = 0
         x = jnp.insert(pk_box_deconvolved.x(0), 0, 0.)
         y = jnp.stack([jnp.insert(pk_box_deconvolved.view(projs=proj), 0, 0.) for proj in pk_box_deconvolved.projs])
-        return interpolate.interp1d(x, y, kind='cubic', axis=-1, bounds_error=False, fill_value=0., assume_sorted=True)(k) 
+        return interpolate.interp1d(x, y, kind='cubic', axis=-1, bounds_error=False, fill_value=0., assume_sorted=True)(k)
     if target_spectrum_fn is not None:
         spectrum = Spectrum2Poles.load(target_spectrum_fn)
         theory = spectrum.clone(value=pk_theory_callable(spectrum.xavg(0, method='mixed')))
@@ -461,7 +461,7 @@ def rotate(output_fn, window_fn, covariance_fn, Minit='momt', mock_fns=None, the
     covmatrix = covmatrix.clone(value=crotated)
     if rotation.with_momt:
         covmatrix.attrs['mo'] = [mo for mo in rotation.mmatrix[1]]
-        covmatrix.attrs['marg_prior_mo'] = rotation.marg_prior_mo 
+        covmatrix.attrs['marg_prior_mo'] = rotation.marg_prior_mo
     if output_window_fn is not None:
         wmatrix.save(output_window_fn)
     if output_covariance_fn is not None:
@@ -493,7 +493,7 @@ def rotate_old(output_fn, window_fn, covariance_fn, Minit='momt'):
     rotation = WindowRotation(wmatrix=wmatrix, covmatrix=covmatrix)
     rotation.fit(Minit=Minit, max_sigma_W=5, max_sigma_R=5, factor_diff_ell=10, csub=False)
     rotation.save(output_fn)
-    
+
 
 def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', los='local', **attrs):
     from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
@@ -505,6 +505,7 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     fkp = FKPField(data, randoms)
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
     bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
+    #norm = compute_fkp3_spectrum_normalization(fkp, cellsize=None)
     norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
     kw = dict(resampler='tsc', interlacing=3, compensate=True)
     num_shotnoise = compute_fkp3_spectrum_shotnoise(fkp, los=los, bin=bin, **kw)
@@ -515,19 +516,22 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
 
 
 def compute_box_bispectrum(output_fn, get_data, basis='scoccimarro', los='z', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum)
+    from jaxpower import (ParticleField, FKPField, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, BinMesh3Spectrum, get_mesh_attrs, compute_mesh3_spectrum, MeshAttrs)
     t0 = time.time()
     data = get_data()
     attrs = MeshAttrs(**attrs)
     data = ParticleField(data, attrs=attrs, exchange=True, backend='jax')
     mesh = data.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
+    mean = mesh.mean()
+    mesh = mesh - mean
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
-    bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
-    jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'], donate_argnums=[0])
+    bin = BinMesh3Spectrum(attrs, edges={'step': 0.01, 'max': 0.201}, basis=basis, ells=ells, buffer_size=2)
+    #jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'], donate_argnums=[0])
     kw = dict(resampler='tsc', interlacing=3, compensate=True)
     num_shotnoise = compute_fkp3_spectrum_shotnoise(data, los=los, bin=bin, **kw)
-    mesh = fkp.paint(**kw, out='real')
-    spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    mesh = data.paint(**kw, out='real')
+    spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    spectrum = spectrum.clone(norm=spectrum.norm * mean**3, num_shotnoise=num_shotnoise)
     spectrum.attrs.update(mesh=dict(mesh.attrs), los=los)
     jax.block_until_ready(spectrum)
     t1 = time.time()
@@ -539,20 +543,21 @@ def compute_box_bispectrum(output_fn, get_data, basis='scoccimarro', los='z', **
 if __name__ == '__main__':
 
     #catalog_args = dict(tracer='ELG_LOP', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
-    #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
-    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
+    catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))
+    #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.725, zrange=(0.6, 0.8))
     #catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.5, zrange=(0.4, 0.6))
     #catalog_args = dict(tracer='QSO', region='NGC', zsnap=1.400, zrange=(0.8, 2.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
-    box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
+    box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='z', ells=(0, 2, 4))
     setup_logging()
 
     todo = []
     #todo = ['spectrum-box']
-    todo = ['window-spectrum-box']
-    #todo = ['spectrum', 'window-spectrum'][1:]
+    #todo = ['window-spectrum-box']
+    #todo = ['spectrum', 'window-spectrum'][:1]
     #todo = ['rotate']
-    #todo = ['bispectrum']
+    todo = ['bispectrum']
+    #todo = ['bispectrum-box']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
@@ -560,7 +565,7 @@ if __name__ == '__main__':
     nmocks = 25
     t0 = time.time()
 
-    is_distributed = any(td in ['spectrum', 'thetacut', 'bispectrum', 'window-spectrum', 'window-thetacut', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
+    is_distributed = any(td in ['spectrum', 'bispectrum', 'thetacut', 'window-spectrum', 'window-thetacut', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum', 'bispectrum-box'] for td in todo)
     if is_distributed:
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
         import jax
@@ -570,9 +575,9 @@ if __name__ == '__main__':
 
     from jaxpower.mesh import create_sharding_mesh
 
-    for imock in range(nmocks):
+    for imock in range(12, nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
-        all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)]
+        all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)][:1]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
 
@@ -605,7 +610,7 @@ if __name__ == '__main__':
                 output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
                 with create_sharding_mesh() as sharding_mesh:
                     compute_spectrum_window(output_fn, get_randoms, spectrum_fn=spectrum_fn)
-        
+
             if 'window-thetacut' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
                 window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
@@ -662,7 +667,7 @@ if __name__ == '__main__':
                 data_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_thetacut') for imock in range(nmocks)]
                 output_fns = [get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum_thetacut_rotated') for imock in range(nmocks)]
                 postprocess_rotation(output_fns, rotation_fn, data_fns)
-                    
+
 
             if 'window-pypower' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='pypower')
@@ -681,17 +686,17 @@ if __name__ == '__main__':
         if 'bispectrum-box' in todo:
             output_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh3spectrum_scoccimarro')
             with create_sharding_mesh() as sharding_mesh:
-                args = cutsky_args | dict(basis='scoccimarro')
+                args = box_args | dict(basis='scoccimarro', meshsize=256)
                 args.pop('ells')
-                compute_box_bispectrum(output_fn, get_data, get_randoms, **args)
-        
+                compute_box_bispectrum(output_fn, get_data, **args)
+
         if imock == 0:
             if 'window-spectrum-box' in todo:
                 spectrum_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='mesh2spectrum')
                 output_fn = get_box_measurement_fn(imock=imock, **catalog_args, **box_args, kind='window_mesh2spectrum')
                 with create_sharding_mesh() as sharding_mesh:
                     compute_box_spectrum_window(output_fn, spectrum_fn=spectrum_fn)
-    
+
     if is_distributed:
         jax.distributed.shutdown()
     print('Elapsed time: {:.2f} s'.format(time.time() - t0))

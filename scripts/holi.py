@@ -255,9 +255,10 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     t0 = time.time()
     data, randoms = get_data(), get_randoms()
     attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
-    data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
-    randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
+    data = ParticleField(*data, attrs=attrs, exchange=True, backend='mpi')
+    randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='mpi')
     fkp = FKPField(data, randoms)
+
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
     bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
     norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
@@ -286,8 +287,9 @@ def get_proposal_boxsize(tracer):
 if __name__ == '__main__':
 
     #catalog_args = dict(tracer='QSO', region='NGC', zrange=(0.8, 2.1))
-    #catalog_args = dict(tracer='LRG', region='NGC', zrange=(0.8, 1.1))
-    catalog_args = dict(tracer='LRG', region='NGC', zrange=(0.4, 0.6))
+    #catalog_args = dict(tracer='LRG', region='NGC', zrange=(0.4, 0.6))
+    #catalog_args = dict(tracer='LRG', region='NGC', zrange=(0.6, 0.8))
+    catalog_args = dict(tracer='LRG', region='NGC', zrange=(0.8, 1.1))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
@@ -300,12 +302,10 @@ if __name__ == '__main__':
     #todo = ['covariance-spectrum']
 
     nmocks = 220
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
     t0 = time.time()
 
     is_distributed = any(td in ['spectrum', 'bispectrum', 'window-spectrum', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
     if is_distributed:
-        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
         import jax
         jax.distributed.initialize()
@@ -315,9 +315,10 @@ if __name__ == '__main__':
     from jaxpower.mesh import create_sharding_mesh
 
     randoms = None
-    for imock in range(nmocks):
+    for imock in range(214, nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
         if not Path(data_fn).exists(): continue
+        print(imock, flush=True)
         all_randoms_fn = [get_randoms_fn(imock=imock, iran=iran, **catalog_args) for iran in range(1)]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
@@ -360,7 +361,7 @@ if __name__ == '__main__':
                 output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
                 with create_sharding_mesh() as sharding_mesh:
                     compute_spectrum_window(output_fn, get_randoms, spectrum_fn=spectrum_fn)
-        
+
             if 'window-thetacut' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
                 window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')

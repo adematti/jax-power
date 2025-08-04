@@ -49,10 +49,16 @@ def get_clustering_rdzw(*fns, zrange=None, region=None, tracer=None, **kwargs):
         if mpicomm.rank == irank:  # Faster to read catalogs from one rank
             catalog = Catalog.read(fn, mpicomm=MPI.COMM_SELF)
             catalog.get(catalog.columns())  # Faster to read all columns at once
+            for name in catalog.columns():
+                array = catalog[name]
+                del catalog[name]
+                catalog[name.upper()] = array
             for name in ['WEIGHT', 'WEIGHT_FKP']:
                 if name not in catalog: catalog[name] = catalog.ones()
             if tracer is not None and 'Z' not in catalog:
-                catalog['Z'] = catalog[f'Z_{tracer}']
+                for name in ['ZOBS', f'Z_{tracer}']:
+                    if name in catalog:
+                        catalog['Z'] = catalog[name]
             catalog = catalog[['RA', 'DEC', 'Z', 'WEIGHT', 'WEIGHT_FKP']]
             if zrange is not None:
                 mask = (catalog['Z'] >= zrange[0]) & (catalog['Z'] <= zrange[1])
@@ -116,7 +122,7 @@ def get_box_clustering_positions(fn, los='x', **kwargs):
 
     if mpicomm.size > 1:
         catalog = Catalog.scatter(catalog, mpicomm=mpicomm, mpiroot=mpiroot)
-    
+
     positions = np.column_stack([catalog['X'], catalog['Y'], catalog['Z']])
     velocities = np.column_stack([catalog['VX'], catalog['VY'], catalog['VZ']]) / scalev
     vlos = los
@@ -128,15 +134,21 @@ def get_box_clustering_positions(fn, los='x', **kwargs):
     return (positions + boxsize / 2.) % boxsize - boxsize / 2.
 
 
-def get_data_fn(tracer='LRG1', imock=0, **kwargs):
+def get_data_fn(tracer='LRG1', imock=0, version='final', **kwargs):
+    if version == 'final':
+        return f'/pscratch/sd/e/efdez/Uchuu-GLAM/GLAM/final_mocks/GLAM-Uchuu_{tracer[:3]}_{imock:02d}_Y3_cut_sky_clustering.dat.fits'
     return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/GLAM-Uchuu/cut_skies/{tracer}/GLAM-Uchuu_{tracer[:3]}_{imock:02d}_Y3_cut_sky_clustering.dat.fits'
 
 
-def get_randoms_fn(tracer='LRG1', iran=0, **kwargs):
+def get_randoms_fn(tracer='LRG1', imock=0, iran=0, version='final', **kwargs):
+    if version == 'final':
+        return f'/pscratch/sd/e/efdez/Uchuu-GLAM/GLAM/final_mocks/randoms/GLAM-Uchuu_{tracer[:3]}_{imock:02d}_Y3_cut_sky_clustering.ran.fits'
     return f'/dvs_ro/cfs/cdirs/desi/mocks/cai/GLAM-Uchuu/cut_skies/{tracer}/GLAM-Uchuu_{tracer[:3]}_{iran:d}_Y3_cut_sky_clustering.ran.fits'
 
 
-def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', **kwargs):
+def get_measurement_fn(tracer='LRG1', imock=0, region='NGC', kind='mesh2spectrum', zrange=(0.8, 1.1), version='final', **kwargs):
+    if version == 'final':
+        return f'/global/cfs/projectdirs/desi/mocks/cai/GLAM-Uchuu/desipipe_test/final_mocks/{kind}_GLAM-Uchuu_{tracer[:3]}_{imock:03d}_Y3_cut_sky_z{zrange[0]:.1f}-{zrange[1]:.1f}_{region}.npy'
     return f'/global/cfs/projectdirs/desi/mocks/cai/GLAM-Uchuu/desipipe_test/cut_skies/{tracer}/{kind}_GLAM-Uchuu_{tracer[:3]}_{imock:03d}_Y3_{region}.npy'
 
 
@@ -147,6 +159,7 @@ def compute_spectrum(output_fn, get_data, get_randoms, ells=(0, 2, 4), los='firs
     attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
     data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
     randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
+    print(data.size, randoms.size, data.positions.sum(axis=0), randoms.positions.sum(axis=0))
     fkp = FKPField(data, randoms)
     norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
@@ -257,6 +270,7 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     fkp = FKPField(data, randoms)
     ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
     bin = BinMesh3Spectrum(attrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
+    #norm = compute_fkp3_spectrum_normalization(fkp, cellsize=None)
     norm = compute_fkp3_spectrum_normalization(fkp, split=42, cellsize=None)
     kw = dict(resampler='tsc', interlacing=3, compensate=True)
     num_shotnoise = compute_fkp3_spectrum_shotnoise(fkp, los=los, bin=bin, **kw)
@@ -282,7 +296,9 @@ def get_proposal_boxsize(tracer):
 
 if __name__ == '__main__':
 
-    catalog_args = dict(tracer='LRG1', region='NGC')
+    #catalog_args = dict(tracer='LRG1', region='NGC')
+    catalog_args = dict(version='final', tracer='LRG', region='NGC', zrange=(0.4, 0.6))
+    #catalog_args = dict(version='final', tracer='BGS', region='NGC', zrange=(0.1, 0.4))
     cutsky_args = dict(cellsize=10., boxsize=get_proposal_boxsize(catalog_args['tracer']), ells=(0, 2, 4))
     box_args = dict(boxsize=2000., boxcenter=0., meshsize=512, los='x')
     setup_logging()
@@ -290,14 +306,13 @@ if __name__ == '__main__':
     todo = []
     #todo = ['spectrum-box']
     #todo = ['window-spectrum-box']
-    #todo = ['spectrum', 'window-spectrum'][1:]
+    #todo = ['spectrum', 'window-spectrum'][:1]
     todo = ['bispectrum']
     #todo = ['thetacut', 'window-thetacut'][:1]
     #todo = ['pypower', 'window-pypower'][:1]
     #todo = ['covariance-spectrum']
 
-    nmocks = 5
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    nmocks = 20
     t0 = time.time()
 
     is_distributed = any(td in ['spectrum', 'bispectrum', 'window-spectrum', 'spectrum-box', 'window-spectrum-box', 'covariance-spectrum'] for td in todo)
@@ -316,7 +331,8 @@ if __name__ == '__main__':
         if not Path(data_fn).exists():
             print(data_fn)
             continue
-        all_randoms_fn = [get_randoms_fn(iran=iran + 1, **catalog_args) for iran in range(4)]
+        #all_randoms_fn = [get_randoms_fn(iran=iran + 1, **catalog_args) for iran in range(4)]
+        all_randoms_fn = [get_randoms_fn(imock=imock, **catalog_args)]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)
         get_randoms = lambda: get_clustering_positions_weights(*all_randoms_fn, **catalog_args)
 
@@ -345,7 +361,7 @@ if __name__ == '__main__':
                 output_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
                 with create_sharding_mesh() as sharding_mesh:
                     compute_spectrum_window(output_fn, get_randoms, spectrum_fn=spectrum_fn)
-        
+
             if 'window-thetacut' in todo:
                 spectrum_fn = get_measurement_fn(imock=imock, **catalog_args, kind='mesh2spectrum')
                 window_fn = get_measurement_fn(imock=imock, **catalog_args, kind='window_mesh2spectrum')
