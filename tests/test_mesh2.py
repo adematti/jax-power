@@ -10,7 +10,8 @@ from jax import numpy as jnp
 from jaxpower import (BinMesh2Spectrum, compute_mesh2_spectrum, Spectrum2Poles,
                       BinMesh2Correlation, compute_mesh2_correlation, Correlation2Poles,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
-                      BinnedStatistic, WindowMatrix, MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window, compute_fkp2_spectrum_normalization, compute_normalization, utils)
+                      BinnedStatistic, WindowMatrix, MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
+                      compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, compute_normalization, utils)
 
 
 dirname = Path('_tests')
@@ -858,7 +859,7 @@ def test_split():
         print(f'cache {_paint._cache_size()} {time.time() - t0:.2f}')
 
 
-def test_shard():
+def test_sharding():
 
     # Initialize JAX distributed environment
     #jax.distributed.initialize()
@@ -926,6 +927,85 @@ def test_shard():
 
     # Close JAX distributed environment
     #jax.distributed.shutdown()
+
+
+def test_pypower():
+
+    def get_random_catalog(mattrs, size=int(1e6), seed=42):
+        from jaxpower import create_sharded_random
+        seed = jax.random.key(seed)
+        particles = generate_uniform_particles(mattrs, size, seed=seed)
+        def sample(key, shape):
+            return jax.random.uniform(key, shape, dtype=mattrs.dtype)
+        weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=0)
+        return particles.clone(weights=weights)
+
+    def _identity_fn(x):
+        return x
+
+
+    def allgather(array):
+        from jaxpower.mesh import get_sharding_mesh
+        from jax.sharding import PartitionSpec as P
+        sharding_mesh = get_sharding_mesh()
+        if sharding_mesh.axis_names:
+            array = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding_mesh, P()))(array)
+            return array.addressable_data(0)
+        return array
+
+
+    def allgather_particles(particles):
+        from typing import NamedTuple
+
+        class Particles(NamedTuple):
+            positions: jax.Array
+            weights: jax.Array
+
+        return Particles(allgather(particles.positions), allgather(particles.weights))
+
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=600., meshsize=64)
+    pattrs = mattrs.clone(boxsize=800.)
+    data = get_random_catalog(pattrs, seed=42)
+    randoms = get_random_catalog(pattrs, seed=84)
+
+    edges = {'step': 0.01}
+    ells = (0, 2, 4)
+    kw_paint = dict(resampler='tsc', interlacing=3)
+    compensate = True
+    from pypower import CatalogFFTPower, CatalogMesh, MeshFFTPower, normalization, unnormalized_shotnoise
+
+    for los in ['firstpoint', 'x', 'y', 'z'][:1]:
+        print(los)
+        ref_data, ref_randoms = allgather_particles(data), allgather_particles(randoms)
+        # Option #1: double compensation applied to A0 only
+        #pk_py = CatalogFFTPower(data_positions1=ref_data.positions, data_weights1=ref_data.weights,
+        #                        randoms_positions1=ref_randoms.positions, randoms_weights1=ref_randoms.weights,
+        #                        boxsize=mattrs.boxsize, boxcenter=mattrs.boxcenter, nmesh=mattrs.meshsize,
+        #                        los=los, edges=edges, ells=ells, **kw_paint, position_type='pos', dtype='c16', mpiroot=0).poles
+        # Option #2: compensation applied to each mesh (what is done in jaxpower)
+        cmesh = CatalogMesh(data_positions=ref_data.positions, data_weights=ref_data.weights,
+                           randoms_positions=ref_randoms.positions, randoms_weights=ref_randoms.weights,
+                           boxsize=mattrs.boxsize, boxcenter=mattrs.boxcenter, nmesh=mattrs.meshsize, **kw_paint,
+                           position_type='pos', dtype='c16', mpiroot=0)
+        wnorm = normalization(cmesh)
+        shotnoise_nonorm = unnormalized_shotnoise(cmesh, cmesh)
+        pk_py = MeshFFTPower(cmesh.to_mesh(compensate=compensate), ells=ells, los=los, edges=edges, boxcenter=mattrs.boxcenter, wnorm=wnorm, shotnoise_nonorm=shotnoise_nonorm).poles
+
+        data = ParticleField(data.positions, data.weights, attrs=mattrs, exchange=True)  # or data.clone(exchange=True)
+        randoms = ParticleField(randoms.positions, randoms.weights, attrs=mattrs, exchange=True)
+        # Now data and randoms are exchanged given MeshAttrs attrs, we can proceed as normal
+        fkp = FKPField(data, randoms, attrs=mattrs)
+        norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
+        mesh = fkp.paint(**kw_paint, compensate=compensate, out='real')
+        del fkp
+        bin = BinMesh2Spectrum(mattrs, edges=edges, ells=ells)
+        pk_jax = compute_mesh2_spectrum(mesh, bin=bin, los=los)
+        pk_jax = pk_jax.clone(norm=norm, num_shotnoise=num_shotnoise)
+        assert np.allclose(pk_jax.norm, pk_py.wnorm)
+        assert np.allclose(pk_jax.shotnoise(projs=0), pk_py.shotnoise)
+        for ell in ells:
+            diff = np.abs(pk_jax.view(projs=ell) - pk_py(ell=ell, complex=False))
+            assert np.allclose(pk_jax.view(projs=ell), pk_py(ell=ell, complex=False), equal_nan=True, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == '__main__':

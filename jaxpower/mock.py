@@ -175,7 +175,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: BinnedStatistic
         return mesh
 
 
-def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42):
+def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42, exchange=False):
     """
     Generate uniformly distributed particles in the input box.
 
@@ -187,6 +187,8 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42):
         Number of particles to generate.
     seed : int, optional
         Random seed for particle generation.
+    exchange : bool, default=False
+        If ``True``, perform particle exchange for distributed computation.
 
     Returns
     -------
@@ -201,4 +203,4 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42):
 
     positions = create_sharded_random(sample, seed, shape=size, out_specs=0)
     #positions = exchange_particles(mattrs, positions=positions, return_inverse=False)[0]
-    return ParticleField(positions, attrs=mattrs, exchange=True)
+    return ParticleField(positions, attrs=mattrs, exchange=exchange)

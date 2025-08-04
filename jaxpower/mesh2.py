@@ -658,6 +658,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
         rmesh1 = meshes[0]
         A0 = _2c(rmesh1 if autocorr else meshes[1])
+        #print('jax', rmesh1.value.std(), A0.value.std())
         del meshes
 
         num, num_zero = [], []
@@ -679,16 +680,18 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
-                carry += _2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)).conj() * jax.lax.switch(im, Ylm, *kvec)
+                carry += _2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
                 return carry, im
 
             for ell in nonzeroells:
                 Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
                 #jax.debug.inspect_array_sharding(jnp.zeros_like(A0.value), callback=print)
                 xs = np.arange(len(Ylms))
-                Aell = jax.lax.scan(partial(f, Ylms), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=xs)[0] * A0
+                #print('jax', ell, jax.lax.scan(partial(f, Ylms), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=xs)[0].value.std())
+                Aell = jax.lax.scan(partial(f, Ylms), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=xs)[0].conj() * A0
                 #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
+                #print('jax', ell, A0.value.std(), Aell.value.std())
                 num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2), remove_zero=True))
                 num_zero.append(4. * jnp.pi * 0.)
                 del Aell

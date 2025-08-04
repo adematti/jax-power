@@ -1570,20 +1570,50 @@ def _local_concatenate(arrays, axis=0, sharding_mesh: jax.sharding.Mesh=None):
 @dataclass(init=False, frozen=True)
 class ParticleField(object):
     """
-    Representation of a N-dim field as a collection of particles / weights in N-dim space.
-    We can e.g. add two :class:`ParticleField`'s like:
+    Representation of a field as a collection of particles and associated weights.
 
-    >>> pf1 + pf2
+    This class is used to represent a set of particles (e.g., galaxies, simulation particles, or random points)
+    with positions and weights, and provides utilities for distributed computation and painting to mesh grids.
 
-    I also started an implementation to concatenate ``positions`` and ``weights`` arrays only if needed.
-    Note sure it's worth the complexity.
+    Parameters
+    ----------
+    positions : jax.Array
+        Array of particle positions, shape (N, ndim).
+        Important: in case of parellel computation, assumed scattered (sharded) over the different processes.
+    weights : jax.Array, optional
+        Array of particle weights, shape (N,). If None, defaults to 1 for all particles.
+        Important: in case of parellel computation, assumed scattered (sharded) over the different processes.
+    attrs : MeshAttrs or dict, optional
+        Mesh attributes.
+    exchange : bool, default=False
+        If ``True``, perform particle exchange for distributed computation.
+    backend : {'auto', 'jax', 'mpi'}, default='auto'
+        Backend particle exchange.
+    **kwargs
+        Additional keyword arguments for mesh or sharding setup.
+
+    Attributes
+    ----------
+    positions : jax.Array
+        Particle positions.
+    weights : jax.Array
+        Particle weights.
+    attrs : MeshAttrs
+        Mesh attributes.
+
+    Examples
+    --------
+    >>> p1 = ParticleField(positions, weights, attrs, exchange=True)
+    >>> p2 = ParticleField(other_positions, other_weights, attrs, exchange=True)
+    >>> p_sum = p1 + p2
+    >>> mesh = p_sum.paint(resampler='cic')
     """
-
     positions: jax.Array = field(repr=False)
     weights: jax.Array = field(repr=False)
     attrs: MeshAttrs | None = field(init=False, repr=False)
 
     def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, backend='auto', **kwargs):
+
         if attrs is None: raise ValueError('attrs must be provided')
         if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
         sharding_mesh = attrs.sharding_mesh
