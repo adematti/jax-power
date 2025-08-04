@@ -546,7 +546,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
             for ill3, ell3 in enumerate(ells):
                 tmp = meshes[:2] + [meshes[2] * get_legendre(ell3)(mu)]
-                tmp = (2 * ell3 + 1) * bin(*tmp) / bin.nmodes[ill3]
+                tmp = (2 * ell3 + 1) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
                 num.append(tmp)
                 num_zero.append(jnp.real(prod(map(_get_zero, meshes))) if ell3 == 0 else 0.)
 

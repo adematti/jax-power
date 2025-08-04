@@ -192,7 +192,7 @@ def test_polybin3d():
 
     bin = BinMesh3Spectrum(attrs, edges=edges, basis='scoccimarro', ells=[0, 2], buffer_size=4)
 
-    for los in ['z', 'local'][1:]:
+    for los in ['z', 'local'][:1]:
 
         kw = dict(gridsize=attrs.meshsize, boxsize=attrs.boxsize, boxcenter=attrs.boxcenter * (0. if los == 'z' else 1.))
         base = PolyBin3D(sightline='global' if los == 'z' else los, **kw, backend='jax', real_fft=False)
@@ -228,13 +228,6 @@ def test_polybin3d():
                 for proj in [0, 2]:
                     ax.plot(weight * spectrum_raw.view(projs=proj), color='C1')
                     ax.plot(weight * spectrum.view(projs=proj), color='C1', linestyle='--')
-                plt.show()
-
-
-                ax = plt.gca()
-                weight = k123.prod(axis=0)
-                for proj in [0, 2]:
-                    ax.plot(weight * (spectrum.view(projs=proj) - spectrum_raw.view(projs=proj)), color='C0', linestyle='-')
                 plt.show()
 
 
@@ -416,10 +409,10 @@ if __name__ == '__main__':
     #test_timing()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
-    #test_polybin3d()
+    test_polybin3d()
     #test_normalization()
     #test_triumvirate_box()
     #test_triumvirate_survey()
     #test_binned_statistic()
     #test_fisher()
-    test_normalization()
+    #test_normalization()
