@@ -118,7 +118,7 @@ def read(mesh: jax.Array, positions, order: int=2, out=None):
     def step(carry, ishift):
         idx = id0 + ishift
         s = jnp.abs(idx - positions)
-        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(-1)
+        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(axis=-1)
 
         idx = jnp.unstack(idx, axis=-1)
         # idx = tuple(jnp.moveaxis(idx, -1, 0)) # TODO: JAX >= 0.4.28 for unstack
@@ -129,6 +129,7 @@ def read(mesh: jax.Array, positions, order: int=2, out=None):
         out = jnp.zeros_like(positions, shape=positions.shape[:1])
     out = jax.lax.scan(step, out, ishifts)[0]
     return out
+
 
 # Define resampler namespaces, resampler.paint, resampler.read, resampler.compensate, resampler.aliasing_shotnoise, resampler.order
 for i, name in enumerate(['ngp', 'cic', 'tsc', 'pcs']):

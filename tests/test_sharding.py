@@ -117,11 +117,12 @@ def test_exchange_array():
                 assert np.allclose(array2, array)
 
             if True:
-                positions = np.random.uniform(size=(int(1e7), 3))
+                positions = np.random.uniform(size=(int(1e4) + jax.process_index(), 3))
                 weights = np.random.uniform(size=positions.shape[0])
                 attrs = MeshAttrs(boxsize=1., boxcenter=0.5, meshsize=4)
-                positions, exchange = exchange_particles(attrs, positions, backend='mpi', return_type='jax')
-                weights = exchange(weights)
+                positions, exchange, inverse = exchange_particles(attrs, positions, backend='mpi', return_type='jax', return_inverse=True)
+                weights2 = inverse(exchange(weights))
+                assert np.allclose(weights2, weights)
 
     if test == 2:
         device_mesh_shape = (4,)
@@ -227,7 +228,7 @@ def test_particles():
     attrs = MeshAttrs(meshsize=[8, 16, 32], boxsize=1000.)
     per_host_positions = attrs.boxsize * random.uniform(random.key(rank), (size, len(attrs.boxsize))) - attrs.boxsize / 2. + attrs.boxcenter
 
-    mesh = ParticleField(positions=per_host_positions, attrs=attrs).paint(resmpler='tsc', interlacing=3, compensate=True, pexchange=True)
+    mesh = ParticleField(positions=per_host_positions, attrs=attrs, exchange=True).paint(resmpler='tsc', interlacing=3, compensate=True)
     ells = (0, 2, 4)
     bin = BinMesh2Spectrum(attrs, edges={'step': 0.01})
     compute_mesh2_spectrum(mesh, los='firstpoint', bin=bin)
@@ -304,8 +305,8 @@ def compute_power_spectrum():
         #positions, weights = make_particles_from_local(**load(kind='data'))
         #jax.debug.inspect_array_sharding(positions, callback=print)
         #print(positions.shape)
-        data = ParticleField(*make_particles_from_local(**load(kind='data')), attrs=attrs)
-        randoms = ParticleField(*make_particles_from_local(**load(kind='randoms')), attrs=attrs)
+        data = ParticleField(**load(kind='data'), attrs=attrs, exchange=True)
+        randoms = ParticleField(**load(kind='randoms'), attrs=attrs, exchange=True)
         #data = ParticleField(**load(kind='data'), attrs=attrs)
         #randoms = ParticleField(**load(kind='randoms'), attrs=attrs)
         #print(data.weights.min(), data.weights.max())

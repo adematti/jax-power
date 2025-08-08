@@ -62,6 +62,10 @@ with create_sharding_mesh() as sharding_mesh:  # distribute mesh and particles
     data = ParticleField(data_positions, data_weights, attrs=attrs, exchange=True)
     randoms = ParticleField(randoms_positions, randoms_weights, attrs=attrs, exchange=True)
     fkp = FKPField(data, randoms)
+    # Warning!
+    # If you access data.positions, data.weights (same for randoms) in a distributed context,
+    # You'll see they are reordered w.r.t. data_positions, data_weights
+    # This is such that the local portion of the 3D mesh receives the relevant particles
 
     # Compute normalization and shot noise terms
     norm = compute_fkp2_spectrum_normalization(fkp)

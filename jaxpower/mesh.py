@@ -266,9 +266,9 @@ def mesh_shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
-def pad_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
-    pad_width = [(2 * halo_size if sharding_mesh.devices.shape[axis] > 1 else 0,) * 2 for axis in range(len(sharding_mesh.axis_names))]
+@partial(jax.jit, static_argnames=['halo_size', 'factor', 'sharding_mesh'])
+def pad_halo(value, halo_size=0, factor=2, sharding_mesh: jax.sharding.Mesh=None):
+    pad_width = [(factor * halo_size if sharding_mesh.devices.shape[axis] > 1 else 0,) * 2 for axis in range(len(sharding_mesh.axis_names))]
     pad_width += [(0,) * 2] * len(value.shape[len(sharding_mesh.axis_names):])
 
     def pad(value):
@@ -485,7 +485,7 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
         return positions, exchange
 
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
-    size_devices = shape_devices.prod(dtype='i4')
+    #size_devices = shape_devices.prod(dtype='i4')
 
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
@@ -610,7 +610,6 @@ def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
         per_host_indices = np.concatenate(per_host_indices, axis=0)
         return final, (per_host_indices, slices)
     return final
-
 
 
 def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
@@ -1333,8 +1332,13 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
     with_sharding = bool(sharding_mesh.axis_names)
 
     positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
-    out = jnp.zeros_like(positions, shape=positions.shape[:1])
+    out = jnp.zeros_like(positions, shape=positions.shape[:1], dtype=mesh.value.dtype)
     _read = lambda mesh, positions, out: resampler.read(mesh, positions, out=out)
+
+    #order = resampler.order
+    #ishifts = np.arange(order) - (order - 1) // 2
+    #from itertools import product
+    #ishifts = np.array(list(product(ishifts, ishifts, ishifts)), dtype=int)
 
     if with_sharding:
         shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
@@ -1345,13 +1349,23 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
 
+        #idx = jnp.round(positions[12]).astype(int)
+        #print('1', positions[12], idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
+        #print('2', positions[12])
 
-        kw_sharding = kwargs | dict(halo_size=resampler.order, sharding_mesh=sharding_mesh)
-        value, offset = pad_halo(value, **kw_sharding)
-        value = exchange_halo(value, **kw_sharding)
+        kw_sharding = dict(halo_size=resampler.order, sharding_mesh=sharding_mesh) | kwargs
+        value, offset = pad_halo(value, **kw_sharding, factor=1)
         positions = positions + offset
+        #idx = jnp.round(positions[12]).astype(int)
+        #idx = idx + jnp.array([44, 0, 0], dtype=int)
+        #print('3', positions[12], jnp.round(positions[12]).astype(int), idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
+        value = exchange_halo(value, **kw_sharding)
         _read = shard_map(_read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names))
+    #else:
+    #    idx = jnp.round(positions[8]).astype(int)
+    #    print('0', positions[8], idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
+
     return _read(value, positions, out)
 
 
@@ -1630,6 +1644,7 @@ class ParticleField(object):
         input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
         input_is_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is not None
 
+        inverse = tuple()
         if with_sharding and exchange:
             if backend == 'mpi' and input_is_sharded:
 
@@ -1645,7 +1660,7 @@ class ParticleField(object):
             if backend == 'jax':
                 positions, weights = jax.device_put((positions, weights), sharding)
 
-            positions, exchange = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
+            positions, exchange, *inverse = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
             weights = exchange(weights)
 
         # If sharding and not exchange, but input arrays aren't sharded, assume input arrays are local and shard them here
@@ -1656,6 +1671,7 @@ class ParticleField(object):
                 positions, weights = jax.device_put((positions, weights), sharding)
 
         self.__dict__.update(positions=positions, weights=weights, attrs=attrs)
+        if inverse: self.__dict__.update(exchange_inverse=inverse[0])
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""

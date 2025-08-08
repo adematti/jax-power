@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 
@@ -5,9 +6,10 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 from jax import random
+from jax.sharding import PartitionSpec as P
 
 from jaxpower import resamplers
-from jaxpower.mesh import staticarray, MeshAttrs, BaseMeshField, RealMeshField, ParticleField, get_mesh_attrs
+from jaxpower.mesh import staticarray, MeshAttrs, BaseMeshField, RealMeshField, ParticleField, get_sharding_mesh, create_sharding_mesh, get_mesh_attrs
 
 
 dirname = Path('_tests')
@@ -99,6 +101,69 @@ def test_resamplers():
             weights = getattr(resamplers, resampler).read(mesh, positions)
 
 
+
+def get_random_catalog(mattrs, size=10000, seed=42):
+    from jaxpower import create_sharded_random, generate_uniform_particles
+    seed = jax.random.key(seed)
+    particles = generate_uniform_particles(mattrs, size, seed=seed, exchange=False)
+    def sample(key, shape):
+        return jax.random.uniform(key, shape, dtype=mattrs.dtype)
+    weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=0)
+    return particles.clone(weights=weights)
+
+
+
+def _identity_fn(x):
+    return x
+
+
+def allgather(array):
+    sharding_mesh = get_sharding_mesh()
+    if sharding_mesh.axis_names:
+        array = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding_mesh, P()))(array)
+        return array.addressable_data(0)
+    return array
+
+
+def allgather_particles(particles):
+    from typing import NamedTuple
+
+    class Particles(NamedTuple):
+        positions: jax.Array
+        weights: jax.Array
+
+    return Particles(allgather(particles.positions), allgather(particles.weights))
+
+
+def test_sharded_paint_read():
+
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=0., meshsize=64)
+    pattrs = mattrs.clone(boxsize=800.)
+
+    def f(data, positions, exchange=False):
+        mesh = data.paint(resampler=resampler, compensate=False, interlacing=0)
+        #print(mesh.std())
+        return mesh.read(positions, resampler=resampler, compensate=False, exchange=exchange)
+
+    for resampler in ['ngp', 'cic', 'tsc', 'pcs']:
+        with create_sharding_mesh():
+            data = get_random_catalog(pattrs, seed=42).clone(attrs=mattrs).exchange(backend='jax')
+            randoms = get_random_catalog(pattrs, size=12000, seed=43).clone(attrs=mattrs)
+            ref_data = allgather_particles(data)
+            ref_randoms = allgather_particles(randoms)
+            rweights = randoms.weights
+            randoms = randoms.exchange(backend='jax', return_inverse=True)
+            #print(jnp.argmin(diff), diff.min())
+            weights = allgather(randoms.exchange_inverse(f(data, randoms.positions)))
+            #diff = jnp.abs(randoms.exchange_inverse(randoms.weights) - rweights)
+            rweights = allgather(randoms.exchange_inverse(randoms.weights))
+
+        ref_data = ParticleField(ref_data.positions, ref_data.weights, attrs=mattrs, exchange=False)
+        ref_weights = f(ref_data, ref_randoms.positions)
+        assert np.allclose(ref_randoms.weights, rweights)
+        assert np.allclose(weights, ref_weights)
+
+
 def test_paint_jit():
 
     from jaxpower.resamplers import tsc
@@ -188,3 +253,5 @@ if __name__ == '__main__':
     test_static_array()
     test_particle_field()
     test_dtype()
+    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
+    test_sharded_paint_read()
