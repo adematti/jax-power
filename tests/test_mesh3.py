@@ -403,16 +403,16 @@ if __name__ == '__main__':
     #os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
     #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.99'
 
-    from jax import config
-    config.update('jax_enable_x64', True)
+    #from jax import config
+    #config.update('jax_enable_x64', True)
 
     #test_timing()
     #test_mesh3_spectrum(plot=False)
     #test_timing()
-    test_polybin3d()
+    #test_polybin3d()
     #test_normalization()
     #test_triumvirate_box()
-    #test_triumvirate_survey()
+    test_triumvirate_survey()
     #test_binned_statistic()
     #test_fisher()
     #test_normalization()
