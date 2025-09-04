@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
 from .mesh2 import _get_los_vector, _get_zero, FKPField
-from .utils import real_gaunt, BinnedStatistic, WindowMatrix, get_legendre, get_spherical_jn, get_real_Ylm, plotter, register_pytree_dataclass
+from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, WindowMatrix
+from .utils import real_gaunt, get_legendre, get_spherical_jn, get_real_Ylm, register_pytree_dataclass
 
 
 prod = functools.partial(functools.reduce, operator.mul)
@@ -19,7 +20,7 @@ prod = functools.partial(functools.reduce, operator.mul)
 
 @partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
 @dataclass(init=False, frozen=True)
-class BinMesh3Spectrum(object):
+class BinMesh3SpectrumPoles(object):
     """
     Binning operator for 3D mesh to bispectrum.
 
@@ -257,159 +258,6 @@ class BinMesh3Spectrum(object):
         return self.bin_reduce_meshs(bin, reduce) * norm
 
 
-@jax.tree_util.register_pytree_node_class
-class Spectrum3Poles(BinnedStatistic):
-    """
-    Bispectrum multipoles estimate.
-
-    Parameters
-    ----------
-    k : jax.Array
-        Wavenumber bin centers.
-    num : jax.Array
-        Bispectrum values (with shot noise not subtracted).
-    ells : tuple
-        Multipole orders.
-    nmodes : jax.Array, optional
-        Number of modes per bin.
-    edges : jax.Array, optional
-        Bin edges.
-    norm : jax.Array, optional
-        Normalization factor.
-    num_shotnoise : jax.Array, optional
-        Shot noise per multipole.
-    num_zero : jax.Array, optional
-        Zero mode per multipole.
-    name : str, optional
-        Name of the statistic.
-    basis : str, optional
-        Binning basis.
-    attrs : dict, optional
-        Additional attributes.
-    """
-    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero']
-    _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero']
-    _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
-    _meta_fields = BinnedStatistic._meta_fields + ['basis']
-    _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
-                    'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'basis': 'basis', 'attrs': 'attrs'}
-
-
-    def __init__(self, k: jax.Array, num: jax.Array, ells: tuple, nmodes: jax.Array=None, edges: jax.Array=None, norm: jax.Array=1.,
-                 num_shotnoise: jax.Array=None, num_zero: jax.Array=None, name: str=None, basis: str=None, attrs: dict=None):
-
-        def _tuple(item):
-            if item is None:
-                return None
-            if not isinstance(item, (tuple, list)):
-                item = (item,) * len(ells)
-            return tuple(item)
-
-        kw = dict()
-        if 'scoccimarro' in basis:
-            kw.update(_label_x=r'$k_1, k_2, k_3$ [$h/\mathrm{Mpc}$]', _label_proj=r'$\ell_3$', _label_value=r'$B_{\ell_3}(k_3)$ [$(\mathrm{Mpc}/h)^{6}$]')
-        else:
-            kw.update(_label_x=r'$k_1, k_2$ [$h/\mathrm{Mpc}$]', _label_proj=r'$\ell_1, \ell_2, \ell_3$', _label_value=r'$B_{\ell_1, \ell_2, \ell_3}(k_1, k_2)$ [$(\mathrm{Mpc}/h)^{6}$]')
-
-        super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num, weights=_tuple(nmodes), name=name, attrs=attrs)
-        if num_shotnoise is None: num_shotnoise = tuple(jnp.zeros_like(num) for num in num)
-        if num_zero is None: num_zero = _tuple(0.)
-        num_zero = list(num_zero)
-        for ill, value in enumerate(num_zero):
-            if jnp.size(value) <= 1: num_zero[ill] = jnp.where(jnp.all((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), axis=1), value, 0.)
-        num_zero = tuple(num_zero)
-        self.__dict__.update(_norm=jnp.asarray(norm), _num_shotnoise=num_shotnoise, _num_zero=num_zero, basis=basis, **kw)
-
-    @property
-    def norm(self):
-        """Bispectrum normalization."""
-        return self._norm
-
-    @property
-    def num(self):
-        """Return the raw bispectrum mutipoles, with shot noise not subtracted and not normalized."""
-        return self._value
-
-    k = BinnedStatistic.x
-    kavg = BinnedStatistic.xavg
-    nmodes = BinnedStatistic.weights
-
-    @property
-    def ells(self):
-        """Multipole orders."""
-        return self._projs
-
-    def shotnoise(self, projs: int | tuple | list=Ellipsis):
-        """
-        Return the shot noise for each multipole.
-
-        Parameters
-        ----------
-        projs : int, list, tuple, or Ellipsis
-            Multipole(s) to return.
-
-        Returns
-        -------
-        shotnoise : array or list
-        """
-        iprojs = self._index_projs(projs)
-        isscalar = not isinstance(iprojs, list)
-        num_shotnoise = [s / self._norm for s in self._num_shotnoise]
-        if isscalar: return num_shotnoise[iprojs]
-        return [num_shotnoise[iproj] for iproj in iprojs]
-
-    @property
-    def value(self):
-        """Return the shot-noise and zero-mode subtracted bispectrum estimate."""
-        toret = list(self.num)
-        for ill, ells in enumerate(self._projs):
-            toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]) / self.norm
-        return tuple(toret)
-
-    @plotter
-    def plot(self, fig=None):
-        r"""
-        Plot the bispectrum multipoles.
-
-        Parameters
-        ----------
-        fig : matplotlib.figure.Figure, default=None
-            Optionally, a figure with at least 1 axis.
-
-        fn : str, Path, default=None
-            Optionally, path where to save figure.
-            If not provided, figure is not saved.
-
-        kw_save : dict, default=None
-            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
-
-        show : bool, default=False
-            If ``True``, show figure.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            Figure object.
-        """
-        from matplotlib import pyplot as plt
-        if fig is None:
-            fig, ax = plt.subplots()
-        else:
-            ax = fig.axes[0]
-        for ill, ell in enumerate(self.ells):
-            ax.plot(np.arange(len(self._x[ill])), self._x[ill].prod(axis=-1) * self.value[ill].real, label=self._get_label_proj(ell))
-        ax.legend()
-        ax.grid(True)
-        ax.set_xlabel('bin index')
-        if 'scoccimarro' in self.basis:
-            ax.set_ylabel(r'$k_1 k_2 k_3 B_{\ell_1 \ell_2 \ell_3}(k_1, k_2, k_3)$ [$(\mathrm{Mpc}/h)^{6}$]')
-        else:
-            ax.set_ylabel(r'$k_1 k_2 B_{\ell_1 \ell_2 \ell_3}(k_1, k_2)$ [$(\mathrm{Mpc}/h)^{4}$]')
-        return fig
-
-
-
 def _format_meshs(*meshes):
     """Format input meshes for autocorrelation/cross-correlation: return list of 3 meshes,
     and a list of indices corresponding to the mesh they are equal to."""
@@ -476,7 +324,7 @@ def _iter_triposh(*ells, los='local'):
     return [jnp.array(xx) for xx in zip(*toret)]
 
 
-def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh3Spectrum=None, los: str | np.ndarray='x'):
+def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh3SpectrumPoles=None, los: str | np.ndarray='x'):
     """
     Compute the bispectrum multipoles from mesh.
 
@@ -484,7 +332,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     ----------
     meshes : RealMeshField or ComplexMeshField
         Input meshes.
-    bin : BinMesh3Spectrum
+    bin : BinMesh3SpectrumPoles
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
@@ -494,7 +342,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
     Returns
     -------
-    result : Spectrum3Poles
+    result : Mesh3SpectrumPoles
     """
     meshes, same = _format_meshs(*meshes)
     rdtype = meshes[0].real.dtype
@@ -520,7 +368,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     # The Fourier-space grid
     kvec = mattrs.kcoords(sparse=True)
 
-    num, num_zero = [], []
+    num = []
     if 'scoccimarro' in bin.basis:
 
         if vlos is None:
@@ -537,7 +385,6 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 tmp = tuple(meshes[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshes[0].clone(value=jnp.zeros_like(meshes[0].value)), xs=xs)[0],)
                 tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
                 num.append(tmp)
-                num_zero.append(jnp.real(prod(map(_get_zero, meshes))) if ell3 == 0 else 0.)
 
         else:
 
@@ -548,7 +395,6 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 tmp = meshes[:2] + [meshes[2] * get_legendre(ell3)(mu)]
                 tmp = (2 * ell3 + 1) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
                 num.append(tmp)
-                num_zero.append(jnp.real(prod(map(_get_zero, meshes))) if ell3 == 0 else 0.)
 
     else:
 
@@ -569,11 +415,11 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             xs = _iter_triposh(ell1, ell2, ell3, los=los)
             num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
             #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
-            num_zero.append(jnp.real(prod(map(_get_zero, meshes[:2])) * meshes[2].sum()) if (ell1, ell2, ell3) == (0, 0, 0) else 0.)
 
-    # FIXME: computing num_zero is a bit involved
-    num_zero = jnp.array(num_zero) * 0. # / bin.nmodes[0][0]
-    return Spectrum3Poles(k=bin.xavg, num=num, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs, basis=bin.basis)
+    spectrum = []
+    for ill, ell in enumerate(ells):
+        spectrum.append(Mesh3SpectrumPole(k=bin.xavg, ell=ell, num=num[ill], nmodes=bin.nmode, edges=bin.edges, norm=norm, attrs=attrs, basis=bin.basis))
+    return Mesh3SpectrumPoles(spectrum)
 
 
 from .mesh2 import compute_normalization
@@ -664,7 +510,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     ----------
     fkps : FKPField
         FKP fields.
-    bin : BinMesh3Spectrum, optional
+    bin : BinMesh3SpectrumPoles, optional
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
@@ -1084,8 +930,10 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
         fisher = compute_Q('Sinv', cmaps, Q_Ainv=Q_Ainv)
         fisher = 1. / 2. * fisher / norm
 
-    observable = BinnedStatistic(x=[bin.xavg] * len(bin.ells), value=[jnp.zeros_like(bin.xavg)] * len(bin.ells), edges=[bin.edges] * len(bin.ells),
-                                 weights=[bin.nmodes] * len(bin.ells), projs=bin.ells)
-    theory = observable.clone(weights=[jnp.ones_like(bin.nmodes)] * len(bin.ells))
-    wmat = WindowMatrix(observable, theory, fisher, attrs={'norm': norm})
-    return wmat
+    spectrum = []
+    for ill, ell in enumerate(bin.ells):
+        spectrum.append(Mesh3SpectrumPole(k=bin.xavg, ell=ell, num=jnp.zeros_like(bin.xavg), nmodes=bin.nmode, edges=bin.edges, norm=norm * jnp.ones_like(bin.xavg), attrs=dict(los=vlos if vlos is not None else los), basis=bin.basis))
+    observable = Mesh3SpectrumPoles(spectrum)
+    theory = observable.at().clone(num=[jnp.ones_like(bin.xavg)] * len(bin.ells))
+    window = WindowMatrix(observable=observable, theory=theory, fisher=fisher)
+    return window

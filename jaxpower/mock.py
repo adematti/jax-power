@@ -7,7 +7,8 @@ from jax import numpy as jnp
 
 from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
 from .mesh2 import _get_los_vector
-from .utils import BinnedStatistic, get_legendre, get_real_Ylm
+from .utils import get_legendre, get_real_Ylm
+from .types import Mesh2SpectrumPoles
 
 
 def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
@@ -47,7 +48,7 @@ def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
     return mesh.c2r()
 
 
-def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: BinnedStatistic | dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
+def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: Mesh2SpectrumPoles | dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
     """
     Generate a Gaussian random field mesh with input power spectrum multipoles.
 
@@ -55,8 +56,8 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: BinnedStatistic
     ----------
     mattrs : MeshAttrs
         Mesh attributes (box size, mesh size, etc.).
-    poles : dict or BinnedStatistic or list
-        Dictionary of multipole order to power spectrum function, or :class:`BinnedStatistic`, or list of power spectra.
+    poles : dict or Mesh2SpectrumPoles or list
+        Dictionary of multipole order to power spectrum function, or :class:`Mesh2SpectrumPoles`, or list of power spectra.
     seed : int, default=42
         Random seed for mesh generation.
     los : str, optional
@@ -73,8 +74,10 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: BinnedStatistic
     """
     ells = (0, 2, 4)
     kin = None
-    if isinstance(poles, BinnedStatistic):
-        kin, poles = jnp.append(poles._edges[0][..., 0], poles._edges[0][-1, 1]), {proj: poles.view(projs=proj) for proj in poles.projs}
+    if isinstance(poles, Mesh2SpectrumPoles):
+        edges = next(iter(poles)).edges('k')
+        kin = jnp.append(edges[0][..., 0], edges[0][-1, 1])
+        poles = {ell: poles.get(ell) for ell in poles.ells}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip(ells, poles)}
     ells = list(poles)

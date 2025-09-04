@@ -9,372 +9,14 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 
-from .utils import get_legendre, get_spherical_jn, get_real_Ylm, real_gaunt, plotter, BinnedStatistic, WindowMatrix, register_pytree_dataclass
+from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles
+from .utils import get_legendre, get_spherical_jn, get_real_Ylm, real_gaunt, register_pytree_dataclass
 from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
-
-
-@jax.tree_util.register_pytree_node_class
-class Spectrum2Poles(BinnedStatistic):
-    r"""
-    Power spectrum multipoles estimate.
-
-    Parameters
-    ----------
-    k : jax.Array
-        Wavenumber bin centers.
-    num : jax.Array or tuple
-        Power spectrum values (with shot noise not subtracted) for each multipole.
-    ells : tuple
-        Multipole orders.
-    nmodes : jax.Array, optional
-        Number of modes per bin.
-    edges : jax.Array, optional
-        Bin edges.
-    volume : jax.Array, optional
-        Volume per bin.
-    norm : jax.Array, optional
-        Normalization factor.
-    num_shotnoise : jax.Array, optional
-        Shot noise per multipole.
-    num_zero : jax.Array, optional
-        Zero mode (i.e. :math:`k = 0`) per multipole.
-    name : str, optional
-        Name of the estimate.
-    attrs : dict, optional
-        Additional attributes.
-    """
-    _label_x = r'$k$ [$h/\mathrm{Mpc}$]'
-    _label_proj = r'$\ell$'
-    _label_value = r'$P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{3}$]'
-    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
-    _init_fields = {'k': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'ells': '_projs', 'norm': '_norm',
-                    'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
-
-    def __init__(self, k: jax.Array, num: jax.Array | tuple, ells: tuple, nmodes: jax.Array=None, edges: jax.Array=None, volume: jax.Array=None, norm: jax.Array=1.,
-                 num_shotnoise: jax.Array=0., num_zero: jax.Array=None, name: str=None, attrs: dict=None):
-
-        def _tuple(item):
-            if item is None:
-                return None
-            if not isinstance(item, (tuple, list)):
-                item = (item,) * len(ells)
-            return tuple(item)
-        super().__init__(x=_tuple(k), edges=_tuple(edges), projs=ells, value=num,
-                         weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
-        if volume is None: volume = tuple(nmodes.copy() for nmodes in self.nmodes())
-        else: volume = _tuple(volume)
-        if num_zero is None: num_zero = _tuple(0.)
-        num_zero = list(num_zero)
-        for ill, value in enumerate(num_zero):
-            if jnp.size(value) <= 1: num_zero[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
-        num_zero = tuple(num_zero)
-        if num_shotnoise is None: num_shotnoise = 0.
-        if not isinstance(num_shotnoise, (tuple, list)): num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
-        num_shotnoise = list(num_shotnoise)
-        for ill, value in enumerate(num_shotnoise):
-            if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.zeros_like(self._value[ill]).at[...].set(value)
-        num_shotnoise = tuple(num_shotnoise)
-        self.__dict__.update(_volume=volume, _num_shotnoise=num_shotnoise, _num_zero=num_zero)
-
-    @property
-    def num(self):
-        """Return the raw power spectrum mutipoles, with shot noise and zero-mode not subtracted and not normalized."""
-        return self._value
-
-    k = BinnedStatistic.x
-    kavg = BinnedStatistic.xavg
-    nmodes = BinnedStatistic.weights
-
-    def shotnoise(self, projs: int | list=Ellipsis):
-        """
-        Return the shot noise for each multipole.
-
-        Parameters
-        ----------
-        projs : int, list, or Ellipsis
-            Multipole(s) to return.
-
-        Returns
-        -------
-        shotnoise : array or list
-        """
-        iprojs = self._index_projs(projs)
-        isscalar = not isinstance(iprojs, list)
-        num_shotnoise = [s / self._norm for s in self._num_shotnoise]
-        if isscalar: return num_shotnoise[iprojs]
-        return [num_shotnoise[iproj] for iproj in iprojs]
-
-    def volume(self, projs: int | list=Ellipsis):
-        """
-        Return the volume for each multipole.
-
-        Parameters
-        ----------
-        projs : int, list, or Ellipsis
-            Multipole(s) to return.
-
-        Returns
-        -------
-        volume : array or list
-        """
-        iprojs = self._index_projs(projs)
-        isscalar = not isinstance(iprojs, list)
-        if isscalar: return self._volume[iprojs]
-        return [self._volume[iproj] for iproj in iprojs]
-
-    @property
-    def ells(self):
-        """Return the multipole orders."""
-        return self._projs
-
-    @property
-    def value(self):
-        """Return the shot-noise and zero-mode subtracted power spectrum estimate."""
-        toret = list(self.num)
-        for ill, ell in enumerate(self.ells):
-            toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]).real / self._norm
-        return tuple(toret)
-
-    @plotter
-    def plot(self, fig=None):
-        r"""
-        Plot the power spectrum multipoles.
-
-        Parameters
-        ----------
-        fig : matplotlib.figure.Figure, default=None
-            Optionally, a figure with at least 1 axis.
-        fn : str, Path, default=None
-            Optionally, path where to save figure.
-            If not provided, figure is not saved.
-        kw_save : dict, default=None
-            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
-        show : bool, default=False
-            If ``True``, show figure.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            Figure object.
-        """
-        from matplotlib import pyplot as plt
-        if fig is None:
-            fig, ax = plt.subplots()
-        else:
-            ax = fig.axes[0]
-        for ill, ell in enumerate(self.ells):
-            ax.plot(self._x[ill], self._x[ill] * self.value[ill].real, label=self._get_label_proj(ell))
-        ax.legend()
-        ax.grid(True)
-        ax.set_xlabel(self._label_x)
-        ax.set_ylabel(r'$k P_{\ell}(k)$ [$(\mathrm{Mpc}/h)^{2}$]')
-        return fig
-
-
-@jax.tree_util.register_pytree_node_class
-class Correlation2Poles(BinnedStatistic):
-    """
-    Correlation function multipoles estimator.
-
-    Parameters
-    ----------
-    s : jax.Array
-        Separation bin centers.
-    num : jax.Array
-        Correlation function values (with shot noise not subtracted) for each multipole.
-    ells : tuple
-        Multipole orders.
-    nmodes : jax.Array, optional
-        Number of modes per bin.
-    edges : jax.Array, optional
-        Bin edges.
-    volume : jax.Array, optional
-        Volume per bin.
-    norm : jax.Array, optional
-        Normalization factor.
-    num_shotnoise : jax.Array, optional
-        Shot noise per multipole.
-    num_zero : jax.Array, optional
-        Zero mode per multipole.
-    name : str, optional
-        Name of the statistic.
-    attrs : dict, optional
-        Additional attributes.
-    """
-    _label_x = r'$s$ [$\mathrm{Mpc}/h$]'
-    _label_proj = r'$\ell$'
-    _label_value = r'$\xi_{\ell}(s)$'
-    _data_fields = BinnedStatistic._data_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _select_x_fields = BinnedStatistic._select_x_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _select_proj_fields = BinnedStatistic._select_proj_fields + ['_num_shotnoise', '_num_zero', '_volume']
-    _sum_fields = BinnedStatistic._sum_fields + ['_num_shotnoise', '_num_zero']
-    _init_fields = {'s': '_x', 'num': '_value', 'nmodes': '_weights', 'edges': '_edges', 'volume': '_volume', 'ells': '_projs', 'norm': '_norm',
-                    'num_shotnoise': '_num_shotnoise', 'num_zero': '_num_zero', 'name': 'name', 'attrs': 'attrs'}
-
-    def __init__(self, s: jax.Array, num: jax.Array, ells: tuple, nmodes: jax.Array=None, edges: jax.Array=None, volume: jax.Array=None, norm: jax.Array=1.,
-                 num_shotnoise: jax.Array=0., num_zero: jax.Array=None, name: str=None, attrs: dict=None):
-
-        def _tuple(item):
-            if item is None:
-                return None
-            if not isinstance(item, (tuple, list)):
-                item = (item,) * len(ells)
-            return tuple(item)
-
-        super().__init__(x=_tuple(s), edges=_tuple(edges), projs=ells, value=num,
-                         weights=_tuple(nmodes), norm=norm, name=name, attrs=attrs)
-        if volume is None: volume = tuple(nmodes.copy() for nmodes in self.nmodes())
-        else: volume = _tuple(volume)
-        if num_zero is None: num_zero = _tuple(0.)
-        num_zero = list(num_zero)
-        for ill, value in enumerate(num_zero):
-            if jnp.size(value) <= 1: num_zero[ill] = jnp.zeros_like(self._value[ill]).at[...].set(value)
-        num_zero = tuple(num_zero)
-        if num_shotnoise is None: num_shotnoise = 0.
-        if not isinstance(num_shotnoise, (tuple, list)): num_shotnoise = (num_shotnoise,) + (0,) * (len(ells) - 1)
-        num_shotnoise = list(num_shotnoise)
-        for ill, value in enumerate(num_shotnoise):
-            if jnp.size(value) <= 1: num_shotnoise[ill] = jnp.where((self._edges[ill][..., 0] <= 0.) & (self._edges[ill][..., 1] >= 0.), value, 0.)
-        num_shotnoise = tuple(num_shotnoise)
-        self.__dict__.update(_volume=volume, _num_shotnoise=num_shotnoise, _num_zero=num_zero)
-
-    @property
-    def num(self):
-        """Return the raw correlation function mutipoles, with shot noise and zero-mode not subtracted and not normalized."""
-        return self._value
-
-    s = BinnedStatistic.x
-    savg = BinnedStatistic.xavg
-    nmodes = BinnedStatistic.weights
-
-    def shotnoise(self, projs: int | list=Ellipsis):
-        """
-        Return the shot noise for each multipole.
-
-        Parameters
-        ----------
-        projs : int, list, or Ellipsis
-            Multipole(s) to return.
-
-        Returns
-        -------
-        shotnoise : array or list
-        """
-        iprojs = self._index_projs(projs)
-        isscalar = not isinstance(iprojs, list)
-        num_shotnoise = [s / self._norm for s in self._num_shotnoise]
-        if isscalar: return num_shotnoise[iprojs]
-        return [num_shotnoise[iproj] for iproj in iprojs]
-
-    def volume(self, projs: int | list=Ellipsis):
-        """
-        Return the volume for each multipole.
-
-        Parameters
-        ----------
-        projs : int, list, or Ellipsis
-            Multipole(s) to return.
-
-        Returns
-        -------
-        volume : array or list
-        """
-        iprojs = self._index_projs(projs)
-        isscalar = not isinstance(iprojs, list)
-        if isscalar: return self._volume[iprojs]
-        return [self._volume[iproj] for iproj in iprojs]
-
-    @property
-    def ells(self):
-        """Return the multipole orders."""
-        return self._projs
-
-    @property
-    def value(self):
-        """Correlation function estimate."""
-        toret = list(self.num)
-        for ill, ell in enumerate(self.ells):
-            toret[ill] = (toret[ill] - self._num_zero[ill] - self._num_shotnoise[ill]).real / self._norm
-        return tuple(toret)
-
-    def to_spectrum(self, k):
-        """
-        Convert the correlation function multipoles to power spectrum multipoles.
-
-        Parameters
-        ----------
-        k : array-like or BinnedStatistic
-            Wavenumber bin centers or :class:`BinnedStatistic` instance.
-
-        Returns
-        -------
-        Spectrum2Poles
-        """
-        from .utils import BesselIntegral
-        num = []
-        for ill, ell in enumerate(self.ells):
-            if isinstance(k, BinnedStatistic):
-                kk = k._x[ill]
-            elif isinstance(k, (tuple, list)):
-                kk = k[ill]
-            else:
-                kk = k
-            #integ = BesselIntegral(self.edges(projs=ell), kk, ell=ell, method='trapz', mode='forward', edges=True, volume=False)
-            integ = BesselIntegral(self.x(projs=ell), kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
-            #num.append(integ(self._value[ill]))
-            # self.weights = volume factor
-            volume = self.volume(projs=ell)
-            xi = jnp.where(volume == 0., 0., self.view(projs=ell))
-            num.append(integ(volume * xi))
-        num = tuple(num)
-        if isinstance(k, BinnedStatistic):
-            return k.clone(num=num)
-        else:
-            return Spectrum2Poles(k=k, num=num, ells=self.ells, norm=self._norm, num_shotnoise=self._num_shotnoise, num_zero=self._num_zero, attrs=self.attrs)
-
-    @plotter
-    def plot(self, fig=None):
-        r"""
-        Plot the correlation function multipoles.
-
-        Parameters
-        ----------
-        fig : matplotlib.figure.Figure, default=None
-            Optionally, a figure with at least 1 axis.
-        fn : str, Path, default=None
-            Optionally, path where to save figure.
-            If not provided, figure is not saved.
-        kw_save : dict, default=None
-            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
-        show : bool, default=False
-            If ``True``, show figure.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            Figure object.
-        """
-        from matplotlib import pyplot as plt
-        if fig is None:
-            fig, ax = plt.subplots()
-        else:
-            ax = fig.axes[0]
-        for ill, ell in enumerate(self.ells):
-            ax.plot(self._x[ill], self._x[ill]**2 * self.value[ill].real, label=self._get_label_proj(ell))
-            #ax.plot(self._x[ill], self.value[ill].real, label=self._get_label_proj(ell))
-        ax.legend()
-        ax.grid(True)
-        ax.set_xlabel(self._label_x)
-        ax.set_ylabel(r'$s^2 \xi_{\ell}(s)$ [$(\mathrm{Mpc}/h)^{2}$]')
-        return fig
 
 
 @partial(register_pytree_dataclass, meta_fields=['ells'])
 @dataclass(init=False, frozen=True)
-class BinMesh2Spectrum(object):
+class BinMesh2SpectrumPoles(object):
     """
     Binning operator for mesh to power spectrum.
 
@@ -461,7 +103,7 @@ class BinMesh2Spectrum(object):
 
 @partial(register_pytree_dataclass, meta_fields=['ells'])
 @dataclass(init=False, frozen=True)
-class BinMesh2Correlation(object):
+class BinMesh2CorrelationPoles(object):
     """
     Binning operator for mesh to correlation function.
 
@@ -583,7 +225,7 @@ def _format_los(los, ndim=3):
     return los, vlos, swap
 
 
-def compute_mesh2(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum | BinMesh2Correlation=None, los: str | np.ndarray='z'):
+def compute_mesh2(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, los: str | np.ndarray='z'):
     """
     Dispatch to :func:`compute_mesh2_spectrum` or :func:`compute_mesh2_correlation`
     depending on type of input ``bin``.
@@ -592,7 +234,7 @@ def compute_mesh2(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Spectr
     ----------
     meshes : RealMeshField or ComplexMeshField
         Input meshes.
-    bin : BinMesh2Spectrum or BinMesh2Correlation
+    bin : BinMesh2SpectrumPoles or BinMesh2CorrelationPoles
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
@@ -602,16 +244,16 @@ def compute_mesh2(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Spectr
 
     Returns
     -------
-    result : Spectrum2Poles or Correlation2Poles
+    result : Mesh2SpectrumPoles or Mesh2CorrelationPoles
     """
-    if isinstance(bin, BinMesh2Spectrum):
+    if isinstance(bin, BinMesh2SpectrumPoles):
         return compute_mesh2_spectrum(*meshes, bin=bin, los=los)
-    elif isinstance(bin, BinMesh2Correlation):
+    elif isinstance(bin, BinMesh2CorrelationPoles):
         return compute_mesh2_correlation(*meshes, bin=bin, los=los)
-    raise ValueError(f'bin must be either BinMesh2Spectrum or BinMesh2Correlation, not {type(bin)}')
+    raise ValueError(f'bin must be either BinMesh2SpectrumPoles or BinMesh2CorrelationPoles, not {type(bin)}')
 
 
-def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
+def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2SpectrumPoles=None, los: str | np.ndarray='z') -> Mesh2SpectrumPoles:
     r"""
     Compute the power spectrum multipoles from mesh.
 
@@ -619,7 +261,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     ----------
     meshs : RealMeshField or ComplexMeshField
         Input mesh(es).
-    bin : BinMesh2Spectrum
+    bin : BinMesh2SpectrumPoles
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
@@ -629,7 +271,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
     Returns
     -------
-    result : Spectrum2Poles
+    result : Mesh2SpectrumPoles
     """
 
     meshes, autocorr = _format_meshs(*meshes)
@@ -661,14 +303,13 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         #print('jax', rmesh1.value.std(), A0.value.std())
         del meshes
 
-        num, num_zero = [], []
+        num = []
         if 0 in ells:
             if autocorr:
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
                 Aell = _2c(rmesh1) * A0.conj()
             num.append(bin(Aell, antisymmetric=False))
-            num_zero.append(_get_zero(Aell))
             del Aell
 
         if nonzeroells:
@@ -693,15 +334,16 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 #print('jax', ell, A0.value.std(), Aell.value.std())
                 num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2), remove_zero=True))
-                num_zero.append(4. * jnp.pi * 0.)
                 del Aell
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        num, num_zero = map(jnp.array, (num, num_zero))
-        if swap: num, num_zero = map(jnp.conj, (num, num_zero))
-        # Format the num results into :class:`Spectrum2Poles` instance
-        num_zero /= bin.nmodes[0]
-        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        if swap: num = list(map(jnp.conj, num))
+        # Format the num results into :class:`Mesh2SpectrumPoles` instance
+        spectrum = []
+        for ill, ell in enumerate(ells):
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm, nmodes=bin.nmodes,
+                                              volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2SpectrumPoles(spectrum)
 
     else:  # fixed line-of-sight
 
@@ -716,24 +358,25 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
 
-        num, num_zero = [], []
+        num = []
         if 0 in ells:
             num.append(bin(Aell, antisymmetric=False))
-            num_zero.append(_get_zero(Aell))
 
         if nonzeroells:
             kvec = Aell.coords(sparse=True)
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
                 num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), antisymmetric=bool(ell % 2), remove_zero=True))
-                num_zero.append(0.)
 
-        num, num_zero = map(jnp.array, (num, num_zero))
-        num_zero /= bin.nmodes[0]
-        return Spectrum2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.kfun.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        spectrum = []
+        for ill, ell in enumerate(ells):
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm, nmodes=bin.nmodes,
+                                              volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2SpectrumPoles(spectrum)
 
 
-def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2Correlation=None, los: str | np.ndarray='z') -> Correlation2Poles:
+
+def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2CorrelationPoles=None, los: str | np.ndarray='z') -> Mesh2CorrelationPoles:
     """
     Compute the correlation function multipoles from mesh.
 
@@ -741,7 +384,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     ----------
     meshs : RealMeshField or ComplexMeshField
         Input meshes.
-    bin : BinMesh2Correlation
+    bin : BinMesh2CorrelationPoles
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
@@ -751,7 +394,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
 
     Returns
     -------
-    result : Correlation2Poles
+    result : Mesh2CorrelationPoles
     """
     meshes, autocorr = _format_meshs(*meshes)
     rdtype = meshes[0].real.dtype
@@ -781,7 +424,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         A0 = _2c(rmesh1 if autocorr else meshes[1])
         del meshes
 
-        num, num_zero = [], []
+        num = []
         if 0 in ells:
             if autocorr:
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
@@ -789,7 +432,6 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
                 Aell = _2c(rmesh1) * A0.conj()
             Aell = Aell.c2r()  # convert to real space
             num.append(bin(Aell))
-            num_zero.append(Aell.mean())
             del Aell
 
         if nonzeroells:
@@ -809,14 +451,15 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
                 xs = np.arange(len(Ylms))
                 Aell = jax.lax.scan(partial(f, Ylms), init=rmesh1.clone(value=jnp.zeros_like(rmesh1.value)), xs=xs)[0]
                 num.append(4. * jnp.pi * bin(Aell, remove_zero=True))
-                num_zero.append(4. * jnp.pi * 0.)
                 del Aell
 
-        num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
-        if swap: num, num_zero = map(jnp.conj, (num, num_zero))
-        # Format the num results into :class:`Correlation2Poles` instance
-        num_zero /= bin.nmodes[0]
-        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.cellsize.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        if swap: num = list(map(jnp.conj, num))
+        # Format the num results into :class:`Mesh2CorrelationPoles` instance
+        correlation = []
+        for ill, ell in enumerate(ells):
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, value=num[ill] / mattrs.cellsize.prod(), nmodes=bin.nmodes, norm=norm,
+                                                    volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2CorrelationPoles(correlation)
 
     else:  # fixed line-of-sight
 
@@ -832,21 +475,21 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         nonzeroells = ells
         if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
 
-        num, num_zero = [], []
+        num = []
         if 0 in ells:
             num.append(bin(Aell))
-            num_zero.append(Aell.mean())
 
         if nonzeroells:
             svec = Aell.coords(kind='separation', sparse=True)
             mu = sum(ss * ll for ss, ll in zip(svec, vlos)) / jnp.sqrt(sum(ss**2 for ss in svec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
                 num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), remove_zero=True))
-                num_zero.append(0.)
 
-        num, num_zero = map(lambda array: jnp.array(array) / mattrs.cellsize.prod(), (num, num_zero))
-        num_zero /= bin.nmodes[0]
-        return Correlation2Poles(bin.xavg, num=num, nmodes=bin.nmodes, volume=mattrs.cellsize.prod() * bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=num_zero, attrs=attrs)
+        correlation = []
+        for ill, ell in enumerate(ells):
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, value=num[ill] / mattrs.cellsize.prod(), nmodes=bin.nmodes, norm=norm,
+                                                    volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2CorrelationPoles(correlation)
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
@@ -1088,7 +731,7 @@ def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
     return toret
 
 
-def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2Spectrum=None) -> WindowMatrix:
+def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) power spectrum window matrix.
 
@@ -1100,7 +743,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         Input bin edges.
     ellsin : tuple, optional
         Input multipole orders.
-    bin : BinMesh2Spectrum, optional
+    bin : BinMesh2SpectrumPoles, optional
         Output binning.
 
     Returns
@@ -1111,9 +754,9 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     tophat_method = 'rect'
     ells = bin.ells
 
-    if isinstance(edgesin, BinnedStatistic):
-        kin = edgesin._edges[0]
-        ellsin = edgesin.projs
+    if isinstance(edgesin, Mesh2SpectrumPoles):
+        kin = next(iter(edgesin)).edges('k')
+        ellsin = edgesin.ells
 
     if edgesin.ndim == 2:
         kin = edgesin
@@ -1122,18 +765,21 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
 
     kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
-    window = window.clone(num_zero=None)
 
     wmat_tmp = {}
 
     for ell1 in ellsin:
         wmat_tmp[ell1] = 0
         for ill, ell in enumerate(ells):
-            Qs = sum(legendre_product(ell, ell1, q) * window.view(projs=q).real if q in window.projs else jnp.zeros(()) for q in list(range(abs(ell - ell1), ell + ell1 + 1)))
-            snmodes = window.volume()[0]
-            savg = jnp.where(snmodes == 0, 0., window.x()[0])
+            Qs = sum(legendre_product(ell, ell1, q) * window.get(q).value().real if q in window.ells else jnp.zeros(()) for q in list(range(abs(ell - ell1), ell + ell1 + 1)))
+            tmpw = next(iter(window))
+            if 'volume' in tmpw.values():
+                snmodes = tmpw.values('volume')
+            else:
+                snmodes = jnp.ones_like(tmpw.value())
+            savg = jnp.where(snmodes == 0, 0., tmpw.coords('s'))
             Qs = jnp.where(snmodes == 0, 0., Qs)
-            #integ = BesselIntegral(window.edges(projs=0), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
+            #integ = BesselIntegral(window.get(0).edges('s'), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
 
             def f(kin):
                 tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
@@ -1152,15 +798,23 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
 
     wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
 
-    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells), projs=ells)
-    xin = np.mean(kin, axis=-1)
-    theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[kin] * len(ellsin), projs=ellsin)
-    wmat = WindowMatrix(observable, theory, wmat)
-    return wmat
+    observable = []
+    for ill, ell in enumerate(ells):
+        observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=jnp.zeros_like(bin.xavg), nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg), ell=ell))
+    observable = Mesh2SpectrumPoles(observable)
+
+    theory = []
+    kin, kin_edges = jnp.mean(kin, axis=-1), kin
+    for ill, ell in enumerate(ellsin):
+        theory.append(Mesh2SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin), nmodes=jnp.ones_like(kin), norm=jnp.ones_like(kin), ell=ell))
+    theory = Mesh2SpectrumPoles(theory)
+
+    return WindowMatrix(observable=observable, theory=theory, value=wmat)
+
 
 
 def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
-                                  bin: BinMesh2Spectrum=None, los: str | np.ndarray='z',
+                                  bin: BinMesh2SpectrumPoles=None, los: str | np.ndarray='z',
                                   buffer=None, batch_size=None, pbar=False, norm=None, flags=tuple()) -> WindowMatrix:
     r"""
     Compute the power spectrum window matrix from mesh.
@@ -1174,7 +828,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         Input bin edges.
     ellsin : tuple
         Input multipole orders.
-    bin : BinMesh2Spectrum
+    bin : BinMesh2SpectrumPoles
         Output binning.
     los : str, array, default=None
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
@@ -1229,9 +883,9 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
             mesh = mesh.r2c()
         return mesh
 
-    if isinstance(edgesin, BinnedStatistic):
-        kin = edgesin._edges[0]
-        ellsin = edgesin.projs
+    if isinstance(edgesin, Mesh2SpectrumPoles):
+        kin = next(iter(edgesin)).edges('k')
+        ellsin = edgesin.ells
 
     if edgesin.ndim == 2:
         kin = edgesin
@@ -1296,7 +950,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
             spherical_jn = {ell: get_spherical_jn(ell) for ell in set(ells)}
             sedges = None
             #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
-            sbin = BinMesh2Correlation(mattrs, edges=sedges)
+            sbin = BinMesh2CorrelationPoles(mattrs, edges=sedges)
             kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
             for ellin in ellsin:
@@ -1441,7 +1095,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
             if 'smooth' in flags:
                 sedges = None
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
-                sbin = BinMesh2Correlation(rmesh1, edges=sedges)
+                sbin = BinMesh2CorrelationPoles(rmesh1, edges=sedges)
                 kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
                 for ell1, wa1 in ellsin:
@@ -1565,7 +1219,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
             if 'smooth' in flags:
                 sedges = None
                 #sedges = np.arange(0., rmesh1.boxsize.max() / 2., rmesh1.cellsize.min() / 4.)
-                sbin = BinMesh2Correlation(rmesh1, edges=sedges)
+                sbin = BinMesh2CorrelationPoles(rmesh1, edges=sedges)
                 kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
                 for ell1, ell2 in itertools.product((2, 0), (2, 0)):
@@ -1704,17 +1358,23 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         else:
             raise NotImplementedError(f'theory los {theory_los} not implemented')
 
-    observable = BinnedStatistic(x=[bin.xavg] * len(ells), value=[jnp.zeros_like(bin.xavg)] * len(ells), edges=[bin.edges] * len(ells),
-                                 weights=[bin.nmodes] * len(ells), projs=ells)
-    xin = np.mean(kin, axis=-1)
-    theory = BinnedStatistic(x=[xin] * len(ellsin), value=[jnp.zeros_like(xin)] * len(ellsin), edges=[kin] * len(ellsin), projs=ellsin)
-    wmat = WindowMatrix(observable, theory, wmat, attrs={'norm': norm})
-    return wmat
+    observable = []
+    for ill, ell in enumerate(ells):
+        observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=jnp.zeros_like(bin.xavg), nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg) * norm, ell=ell))
+    observable = Mesh2SpectrumPoles(observable)
+
+    theory = []
+    kin, kin_edges = jnp.mean(kin, axis=-1), kin
+    for ill, ell in enumerate(ellsin):
+        theory.append(Mesh2SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin), nmodes=jnp.ones_like(kin), norm=jnp.ones_like(kin), ell=ell))
+    theory = Mesh2SpectrumPoles(theory)
+
+    return WindowMatrix(observable=observable, theory=theory, value=wmat)
 
 
 
 def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
-                                bin: BinMesh2Spectrum=None, los: str | np.ndarray='z') -> Spectrum2Poles:
+                                bin: BinMesh2SpectrumPoles=None, los: str | np.ndarray='z') -> Mesh2SpectrumPoles:
     r"""
     Compute the mean power spectrum from mesh and theory.
 
@@ -1723,12 +1383,12 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
     meshes : RealMeshField, ComplexMeshField, ComplexMeshField, MeshAttrs
         Input mesh(es).
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
-    theory : Callable, dict[Callable], BinnedStatistic, Spectrum2Poles
+    theory : Callable, dict[Callable], BinnedStatistic, Mesh2SpectrumPoles
         Mean theory power spectrum. Either a callable (if ``los`` is an axis),
         or a dictionary of callables, with keys the multipole orders :math:`\ell`.
         Also possible to add wide-angle order :math:`n`, such that the key is the tuple :math:`(\ell, n)`.
-        One can also directly provided a :class:`BinnedStatistic` or :class:`Spectrum2Poles` instance.
-    bin : BinMesh2Spectrum
+        One can also directly provided a :class:`BinnedStatistic` or :class:`Mesh2SpectrumPoles` instance.
+    bin : BinMesh2SpectrumPoles
         Output binning.
     los : str, array, default=None
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
@@ -1737,7 +1397,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
     Returns
     -------
-    power : Spectrum2Poles
+    power : Mesh2SpectrumPoles
     """
     meshes, autocorr = _format_meshs(*meshes)
     periodic = isinstance(meshes[0], MeshAttrs)
@@ -1774,8 +1434,10 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         else: poles = poles[:-1]
     if isinstance(poles, tuple):
         kin, poles = poles
-    if isinstance(poles, BinnedStatistic):
-        kin, poles = jnp.append(poles._edges[0][..., 0], poles._edges[0][-1, 1]) if poles._edges[0] is not None else poles._x[0], {proj: poles.view(projs=proj) for proj in poles.projs}
+    if isinstance(poles, Mesh2SpectrumPoles):
+        edges = next(iter(poles)).edges('k')
+        kin = jnp.append(edges[..., 0], edges[-1, 1])
+        poles = {ell: poles.get(ell) for ell in poles.ells}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip((0, 2, 4), poles)}
     kvec = mattrs.kcoords(sparse=True)
@@ -1820,17 +1482,18 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         if Q is not None: Aell = _2c(Q * _2r(Aell))
         else: Aell *= mattrs.meshsize.prod(dtype=rdtype)
 
-        power, power_zero = [], []
+        num = []
         for ell in ells:
             leg = get_legendre(ell)(mu)
             odd = ell % 2
             if odd: leg += get_legendre(ell)(-mu)
-            power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg))
-            power_zero.append(0.)
-            if ell == 0:
-                power_zero[-1] += _get_zero(Aell)
+            num.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg))
 
-        return Spectrum2Poles(bin.xavg, num=power, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm, num_zero=power_zero, attrs=mattrs)
+        spectrum = []
+        for ill, ell in enumerate(ells):
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg) * norm,
+                                              volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2SpectrumPoles(spectrum)
 
     else:
         poles = {ell if isinstance(ell, tuple) else (ell, 0): pole for ell, pole in poles.items()} # wide-angle = 0 as a default
@@ -1859,7 +1522,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
         Ylms = {ell: [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
 
-        power, power_zero = [], []
+        num = []
         for ell in ells:
             Aell = 0.
             for Ylm in Ylms[ell]:
@@ -1892,14 +1555,13 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
                 Aell += _2c(Q) * Ylm(*khat)
             # Project on to 1d k-basis (averaging over mu=[-1, 1])
-            power.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
-            power_zero.append(0.)
-            if ell == 0:
-                power_zero[-1] += 4. * jnp.pi * _get_zero(Aell)
+            num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
-        power, power_zero = jnp.array(power), jnp.array(power_zero)
-        if swap: power, power_zero = power.conj(), power_zero.conj()
-        # Format the power results into :class:`Spectrum2Poles` instance
-        return Spectrum2Poles(bin.xavg, num=power, nmodes=bin.nmodes, edges=bin.edges, ells=ells, norm=norm,
-                              num_zero=power_zero, attrs=attrs)
+        if swap: num = list(map(jnp.conj, num))
+        # Format the power results into :class:`Mesh2SpectrumPoles` instance
+        spectrum = []
+        for ill, ell in enumerate(ells):
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg) * norm,
+                                              volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2SpectrumPoles(spectrum)

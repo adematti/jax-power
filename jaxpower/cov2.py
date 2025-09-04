@@ -5,8 +5,9 @@ import jax
 from jax import numpy as jnp
 
 from .mesh import MeshAttrs, RealMeshField
-from .mesh2 import BinMesh2Spectrum, BinMesh2Correlation, compute_mesh2, FKPField
-from .utils import CovarianceMatrix, BinnedStatistic, legendre_product, get_spherical_jn
+from .mesh2 import BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, compute_mesh2, FKPField
+from .types import CovarianceMatrix, Mesh2SpectrumPoles, ObservableTree
+from .utils import legendre_product, get_spherical_jn
 
 
 class Correlation2Spectrum(object):
@@ -56,7 +57,7 @@ class Correlation2Spectrum(object):
         return self.k, self._postfactor * fun
 
 
-def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kwargs):
+def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, tracers=None, **kwargs):
     """
     Compute the window matrices (WW, WS, SS) for the FKP 2-point covariance.
 
@@ -64,7 +65,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kw
     ----------
     fkps : (list of) FKPField, ParticleField
         (List of) FKP or Particle fields.
-    bin : BinMesh2Correlation, optional
+    bin : BinMesh2CorrelationPoles, optional
         Binning operator.
     los : str, optional
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
@@ -72,6 +73,8 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kw
         Else, a 3-vector.
     alpha : float, optional
         Normalization factor for the randoms: sum(data_weights) / sum(randoms_weights).
+    tracers : list of str, optional
+        List of tracer name for each field (default: [0, 1, 2, ...]).
     kwargs : dict
         Additional arguments for mesh painting, see :meth:`ParticleField.paint`.
 
@@ -93,7 +96,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kw
         edges = kw.pop('edges', None) or {}
         if isinstance(edges, dict):
             edges.setdefault('max', np.sqrt(np.sum((mattrs.boxsize / 2)**2)))
-        bin = BinMesh2Correlation(mattrs, edges=edges, **kw)
+        bin = BinMesh2CorrelationPoles(mattrs, edges=edges, **kw)
 
     def get_alpha(fkp):
         if alpha is None:
@@ -124,7 +127,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kw
             norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) * sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
             norm = norm / mattrs.cellsize.prod()**2
-            update = dict(norm=norm, attrs={'mattrs': dict(mattrs)})
+            update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells), attrs={'mattrs': dict(mattrs)})
             WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(**update)
             if iW[3] == iW[2]:
                 WS[iW] = compute_mesh2(W[0], Ss[iW[2]], bin=bin, los=los).clone(**update)
@@ -135,6 +138,9 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, **kw
                 if iW[2] != iW[0]:
                     S.append(Ss[iW[2]])
                 SS[iW] = compute_mesh2(*S, bin=bin, los=los).clone(**update)
+    if tracers is None: tracers = list(range(len(fkps)))
+    tuple_tracers = [(tracers[iW[0]], tracers[iW[1]]) for iW in WW]
+    WW, WS, SS = [ObservableTree(_, tracers=tuple_tracers) for _ in (WW, WS, SS)]
     return WW, WS, SS
 
 
@@ -146,7 +152,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', **kwargs):
     ----------
     meshes : (list of) RealMeshField
         (List of) mesh fields.
-    bin : BinMesh2Correlation, optional
+    bin : BinMesh2CorrelationPoles, optional
         Binning operator.
     los : str, optional
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
@@ -176,7 +182,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', **kwargs):
         edges = kw.pop('edges', None) or {}
         if isinstance(edges, dict):
             edges.setdefault('max', np.sqrt(np.sum((mattrs.boxsize / 2)**2)))
-        bin = BinMesh2Correlation(mattrs, edges=edges, **kw)
+        bin = BinMesh2CorrelationPoles(mattrs, edges=edges, **kw)
 
     def get_W(mesh):
         return mesh / mesh.cellsize.prod()
@@ -194,7 +200,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', **kwargs):
             norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
             norm = norm / mattrs.cellsize.prod()**2
-            update = dict(norm=norm, attrs={'mattrs': dict(mattrs)})
+            update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells), attrs={'mattrs': dict(mattrs)})
             WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(**update)
     return WW
 
@@ -208,8 +214,8 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
     window2 : dict or MeshAttrs
         Window matrices (WW, WS, SS).
         A :class:`MeshAttrs` instance can be directly provided instead, in case the selection function is trivial (constant).
-    poles : dict or BinnedStatistic
-        Dictionary of BinnedStatistic objects for each observable, or a single :class:`BinnedStatistic` instance.
+    poles : ObservableTree or Mesh2SpectrumPoles
+        Dictionary of Mesh2SpectrumPoles objects for each observable, or a single :class:`Mesh2SpectrumPoles` instance.
     delta : float, optional
         Maximum :math:`|k_i - k_j|` (in :math:`k`-bin units) for which to compute the covariance.
     flags : tuple, optional
@@ -225,62 +231,58 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
     # TODO: check for multiple fields
 
     def finalize(cov):
-        observables = [poles[key].clone() for key in keys]
-        names = [observable.name for observable in observables]
-        if len(set(names)) < len(keys):
-            for iobs, observable in enumerate(observables):
-                observables[iobs] = observable.clone(name=observable.name + f'{key[0]:d}_{key[1]:d}')  # set different names
-        nobs = len(observables)
-        value = [[None for i in range(nobs)] for i in range(nobs)]
-        for iobs1, iobs2 in itertools.combinations_with_replacement(range(nobs), 2):
-            key = keys[iobs1] + keys[iobs2]
-            value[iobs1][iobs2] = np.block(cov[key])
+        ntracers = len(tracers)
+        value = [[None for i in range(ntracers)] for i in range(ntracers)]
+        for iobs1, iobs2 in itertools.combinations_with_replacement(range(ntracers), 2):
+            tracer = tracers[iobs1] + tracers[iobs2]
+            value[iobs1][iobs2] = np.block(cov[tracer])
             if iobs2 > iobs1:
                 value[iobs2][iobs1] = value[iobs1][iobs2].T
         value = np.block(value)
-        return CovarianceMatrix(observables=observables, value=value)
+        observable = ObservableTree([poles.get(tracer) for tracer in tracers], tracers=tracers)
+        return CovarianceMatrix(observable=observable, value=value)
 
     if isinstance(window2, MeshAttrs):
         mattrs = window2
-        if not isinstance(poles, dict):
-            poles = {(0, 0): poles}
-        keys = []
-        for key in poles:
-            if key not in keys:
-                keys.append(key)
+        if isinstance(poles, Mesh2SpectrumPoles):
+            poles = ObservableTree([poles], tracers=[(0, 0)])
+        tracers = []
+        for tracer in poles.tracers:
+            if tracer not in tracers:
+                tracers.append(tracer)
 
         cov = {}
-        for key in itertools.combinations_with_replacement(keys, 2):
-            key = key[0] + key[1]
-            pole1, pole2 = poles[key[:2]], poles[key[2:]]
-            assert pole1.projs == pole2.projs
-            ills = list(range(len(pole1.projs)))
+        for tracer in itertools.combinations_with_replacement(tracers, 2):
+            tracer = tracer[0] + tracer[1]
+            pole1, pole2 = poles.get(tracers=tracer[:2]), poles.get(tracers=tracer[2:])
+            assert pole1.ells == pole2.ells
+            ills = list(range(len(pole1.ells)))
 
             def init():
-                return [[np.zeros((len(pole1.x(pole1.projs[ill])),) * 2) for ill in ills] for ill in ills]
+                return [[np.zeros((len(pole1.get(pole1.ells[ill]).coords('k')),) * 2) for ill in ills] for ill in ills]
 
-            cov[key] = init()
+            cov[tracer] = init()
 
             from scipy import special
             if 'smooth' not in flags:
-                bin = BinMesh2Spectrum(mattrs, edges=pole1.edges()[0], ells=(0,))
+                bin = BinMesh2SpectrumPoles(mattrs, edges=next(iter(pole1)).edges('k'), ells=(0,))
                 kvec = mattrs.kcoords(sparse=True)
                 vlos = (0, 0, 1)  # doesn't matter
                 mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
 
             for ill1, ill2 in itertools.product(ills, ills):
-                ell1, ell2 = pole1.projs[ill1], pole2.projs[ill2]
-                for p1, p2 in itertools.product(pole1.projs, pole2.projs):
-                    p12 = 1. / mattrs.boxsize.prod() * 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * pole1.view(projs=p1) * pole2.view(projs=p2)
+                ell1, ell2 = pole1.ells[ill1], pole2.ells[ill2]
+                for p1, p2 in itertools.product(pole1.ells, pole2.ells):
+                    p12 = 1. / mattrs.boxsize.prod() * 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * pole1.get(p1).value() * pole2.get(p2).value()
                     if 'smooth' in flags:
                         coeff = sum((2 * q + 1) * legendre_product(ell1, p1, q) * legendre_product(ell2, p2, q) for q in range(abs(ell1 - p1), ell1 + p1 + 1))
-                        vol = 4. / 3. * np.pi * np.diff(pole1.edges(projs=ell1)**3, axis=-1)[..., 0]
+                        vol = 4. / 3. * np.pi * np.diff(pole1.get(ell1).edges('k')**3, axis=-1)[..., 0]
                     else:
                         poly = 1.
                         for ell in [ell1, ell2, p1, p2]: poly *= special.legendre(ell)
                         coeff = bin(poly(mu))
                         vol = bin.nmodes * mattrs.kfun.prod()
-                    cov[key][ill1][ill2] += np.diag((2. * np.pi)**3 / vol * coeff * p12)
+                    cov[tracer][ill1][ill2] += np.diag((2. * np.pi)**3 / vol * coeff * p12)
 
         return finalize(cov)
 
@@ -291,28 +293,28 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             WW, WS, SS = window2
         else:
             WW = window2
-        keys = []
-        for key in WW:
-            key = key[:2]
-            if key not in keys:
-                keys.append(key)
+        tracers = []
+        for tracer in WW.tracers:
+            tracer = tracer[:2]
+            if tracer not in tracers:
+                tracers.append(tracer)
 
-        if not isinstance(poles, dict):
-            assert len(WW) == 1, 'non-dict poles can be provided if only one window (field)'
-            for key in WW: break
-            poles = {key[::2]: poles}
-        for key, pole in poles.items():
-            assert isinstance(pole, BinnedStatistic), 'input poles must be BinnedStatistic'
-        for key in keys:
-            assert key in poles, f'input pole {key} is required'
+        if isinstance(poles, Mesh2SpectrumPoles):
+            assert len(WW.tracers) == 1, 'non-dict poles can be provided if only one window (field)'
+            tracer = WW.tracers[0]
+            poles = ObservableTree([poles], tracers=[tracer[::2]])
+        for pole in poles:
+            assert isinstance(pole, Mesh2SpectrumPoles), 'input poles must be Mesh2SpectrumPoles'
+        for tracer in tracers:
+            assert tracer in poles.tracers, f'input pole {tracer} is required'
 
         def get_wj(ww, k, q1, q2):
             shape = k.shape * 2
-            ww = ww.clone(num_zero=None)
-            w = sum(legendre_product(q1, q2, q) * ww.view(projs=q).real if q in ww.projs else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
+            w = sum(legendre_product(q1, q2, q) * ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
             if w.size <= 1:
                 return np.zeros(shape)
-            s = ww.x()[0]
+            tmpw = next(iter(ww))
+            s = tmpw.coords('s')
 
             if 'fftlog' in flags:
                 fftlog = Correlation2Spectrum(np.logspace(-6, 2, num=3645, endpoint=False), (q1, q2))
@@ -331,10 +333,11 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                     kmask = np.abs(k2 - k1) <= delta
                     k1, k2 = k1[kmask], k2[kmask]
 
-                vol = ww.volume()[0]
-                #vol = 4. / 3. * np.pi * np.diff(ww.edges(projs=q1)**3, axis=-1)[..., 0]
-                w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
-                w *= vol
+                if 'volume' in tmpw.values():
+                    vol = tmpw.values('volume')
+                    #vol = 4. / 3. * np.pi * np.diff(ww.edges(projs=q1)**3, axis=-1)[..., 0]
+                    w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
+                    w *= vol
 
                 def f(k12):
                     k1, k2 = k12
@@ -348,20 +351,20 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                 return toret
 
         cov_WW, cov_WS, cov_SS = {}, {}, {}
-        for key in WW:
-            pole1, pole2 = poles[key[:2]], poles[key[2:]]
-            assert pole1.projs == pole2.projs
-            ills = list(range(len(pole1.projs)))
+        for tracer in WW.tracers:
+            pole1, pole2 = poles.get(tracer[:2]), poles.get(tracer[2:])
+            assert pole1.ells == pole2.ells
+            ills = list(range(len(pole1.ells)))
 
             def init():
-                return [[np.zeros((len(pole1.x(pole1.projs[ill])),) * 2) for ill in ills] for ill in ills]
+                return [[np.zeros((len(pole1.get(pole1.ells[ill]).coords('k')),) * 2) for ill in ills] for ill in ills]
 
-            cov_WW[key] = init()
-            if has_shotnoise: cov_WS[key], cov_SS[key] = init(), init()
+            cov_WW[tracer] = init()
+            if has_shotnoise: cov_WS[tracer], cov_SS[tracer] = init(), init()
             cache_WW, cache_WS1, cache_WS2 = {}, {}, {}
             for ill1, ill2 in itertools.product(ills, ills):
-                ell1, ell2 = pole1.projs[ill1], pole2.projs[ill2]
-                for p1, p2 in itertools.product(pole1.projs, pole2.projs):
+                ell1, ell2 = pole1.ells[ill1], pole2.ells[ill2]
+                for p1, p2 in itertools.product(pole1.ells, pole2.ells):
                     q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
                     q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
                     # WW
@@ -371,12 +374,12 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, q2) in cache_WW:
                             tmp = cache_WW[q1, q2]
                         else:
-                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW[key], pole1.xavg(p1, method='mixed'), q1, q2)
+                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW.get(tracer), pole1.get(p1).coords('k', center='mid_if_edges_and_nan'), q1, q2)
                             cache_WW[q1, q2] = tmp
-                        cov_WW[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.view(projs=p1)[..., None] * pole2.view(projs=p2)
+                        cov_WW[tracer][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()[..., None] * pole2.get(p2).value()
                 if not has_shotnoise: continue
                 # WS
-                for p1 in pole1.projs:
+                for p1 in pole1.ells:
                     q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
                     for q1 in q1:
                         q2 = q1
@@ -385,11 +388,11 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, ell2) in cache_WS1:
                             tmp = cache_WS1[q1, ell2]
                         else:
-                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS[key], pole1.xavg(ell1, method='mixed'), q1, ell2)
+                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS.get(tracer), pole1.get(ell1).coords('k', center='mid_if_edges_and_nan'), q1, ell2)
                             cache_WS1[q1, ell2] = tmp
-                        cov_WS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.view(projs=p1)
+                        cov_WS[tracer][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()
                 # WS swap
-                for p2 in pole2.projs:
+                for p2 in pole2.ells:
                     q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
                     for q2 in q2:
                         q1 = q2
@@ -398,11 +401,11 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q2, ell1) in cache_WS2:
                             tmp = cache_WS2[q2, ell1]
                         else:
-                            tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(WS[key], pole2.xavg(ell2, method='mixed'), q2, ell1)
+                            tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(WS.get(tracer), pole2.get(ell2).coords('k', center='mid_if_edges_and_nan'), q2, ell1)
                             cache_WS2[q2, ell1] = tmp
-                        cov_WS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole2.view(projs=p2)
+                        cov_WS[tracer][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole2.get(p2).value()
                 # SS
-                cov_SS[key][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(SS[key], pole1.xavg(ell1, method='mixed'), ell1, ell2)
+                cov_SS[tracer][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(SS.get(tracer), pole1.get(ell1).coords('k', method='mid_if_edges_and_nan'), ell1, ell2)
 
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))

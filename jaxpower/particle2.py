@@ -9,8 +9,9 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 from .mesh import MeshAttrs, staticarray, ParticleField, _identity_fn
-from .mesh2 import _format_ells, Spectrum2Poles, Correlation2Poles
-from .utils import get_legendre, get_spherical_jn, BinnedStatistic, plotter, set_env
+from .mesh2 import _format_ells
+from .utils import get_legendre, get_spherical_jn, set_env
+from .types import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles
 
 
 def _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=None, boxsize=None, los='x'):
@@ -112,7 +113,7 @@ def _scancount(bin, *particles, los='firstpoint'):
     neighbors, *sorted_particles = _sort_particles(*particles)
     num = jnp.zeros((len(ells), len(bin.edges)), dtype=particles[0][0].dtype)
 
-    if isinstance(bin, BinParticle2Spectrum):
+    if isinstance(bin, BinParticle2SpectrumPoles):
         def _slab(self, positions1, weights1, positions2, weights2, los='firstpoint'):
             dist, mu, weight = _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=self.selection, boxsize=self.boxsize, los=los)
             toret = []
@@ -196,7 +197,7 @@ def _slice_particles(particles, nslices=None, sharding_mesh=None):
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
-class BinParticle2Spectrum(object):
+class BinParticle2SpectrumPoles(object):
     """
     Binning class for estimating the 2-point power spectrum from particle pairs.
 
@@ -241,7 +242,7 @@ class BinParticle2Spectrum(object):
             edges = np.arange(edges.get('min', 0.), edges['max'], edges['step'])
         boxsize = getattr(mattrs, 'boxsize', None)
         edges = np.asarray(edges)
-        if edges.ndim == 2:  # coming from BinnedStatistic
+        if edges.ndim == 2:  # coming from Observable
             assert np.allclose(edges[1:, 0], edges[:-1, 1])
             edges = np.append(edges[:, 0], edges[-1, 1])
         edges = np.column_stack([edges[:-1], edges[1:]])
@@ -318,7 +319,7 @@ class BinParticle2Spectrum(object):
 
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
-class BinParticle2Correlation(object):
+class BinParticle2CorrelationPoles(object):
     """
     Binning class for estimating the 2-point correlation function from particle pairs.
 
@@ -448,7 +449,7 @@ class BinParticle2Correlation(object):
         return new
 
 
-def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | BinParticle2Correlation=None, los='firstpoint'):
+def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles | BinParticle2CorrelationPoles=None, los='firstpoint'):
     """
     Compute the 2-point spectrum or correlation function from particles.
 
@@ -456,7 +457,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
     ----------
     *particles : ParticleField
         Particles to correlate (autocorrelation if one provided).
-    bin : BinParticle2Spectrum or BinParticle2Correlation
+    bin : BinParticle2SpectrumPoles or BinParticle2CorrelationPoles
         Binning object specifying edges, selection, and multipoles.
     los : str, optional
         Line-of-sight definition.
@@ -469,7 +470,6 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
     ells = bin.ells
     autocorr = len(particles) == 1
     # Can't be computed easily in general because of the selection
-    num_zero = 0.  #jnp.sum(particles[0].weights)**2 if autocorr else jnp.sum(particles[0].weights) * jnp.sum(particles[1].weights)
     num_shotnoise = 0.
     particles = list(particles)
     if autocorr:
@@ -477,12 +477,15 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2Spectrum | Bin
         num_shotnoise = jnp.sum(particles[0].weights**2)
 
     num = bin(*particles, los=los)
-    num_zero = jnp.zeros_like(num[..., 0]).at[0].set(num_zero)
     num_shotnoise = [(2 * ell + 1) * get_legendre(ell)(0.) * num_shotnoise for ell in ells]
 
-    if isinstance(bin, BinParticle2Correlation):
-        return Correlation2Poles(s=bin.xavg, num=num, ells=ells, edges=bin.edges,
-                                 norm=1., num_shotnoise=num_shotnoise, num_zero=num_zero)
+    if isinstance(bin, BinParticle2CorrelationPoles):
+        correlation = []
+        for ill, ell in enumerate(ells):
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, ell=ell, num=num[ill], edges=bin.edges, norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill]))
+        return Mesh2CorrelationPoles(correlation)
     else:  # 'complex'
-        return Spectrum2Poles(k=bin.xavg, num=num, ells=ells, edges=bin.edges,
-                              norm=1., num_shotnoise=num_shotnoise, num_zero=num_zero)
+        spectrum = []
+        for ill, ell in enumerate(ells):
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, ell=ell, num=num[ill], edges=bin.edges, norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill]))
+        return Mesh2SpectrumPoles(spectrum)
