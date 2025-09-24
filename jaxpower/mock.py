@@ -8,7 +8,7 @@ from jax import numpy as jnp
 from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
 from .mesh2 import _get_los_vector
 from .utils import get_legendre, get_real_Ylm
-from .types import Mesh2SpectrumPoles
+from .types import ObservableTree
 
 
 def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
@@ -48,7 +48,7 @@ def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
     return mesh.c2r()
 
 
-def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: Mesh2SpectrumPoles | dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
+def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
     """
     Generate a Gaussian random field mesh with input power spectrum multipoles.
 
@@ -74,10 +74,10 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: Mesh2SpectrumPo
     """
     ells = (0, 2, 4)
     kin = None
-    if isinstance(poles, Mesh2SpectrumPoles):
+    if isinstance(poles, ObservableTree):
         edges = next(iter(poles)).edges('k')
-        kin = jnp.append(edges[0][..., 0], edges[0][-1, 1])
-        poles = {ell: poles.get(ell) for ell in poles.ells}
+        kin = jnp.append(edges[..., 0], edges[-1, 1])
+        poles = {ell: poles.get(ell).value() for ell in poles.ells}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip(ells, poles)}
     ells = list(poles)
@@ -107,7 +107,6 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: Mesh2SpectrumPo
             return pole(knorm)
         else:
             return interp(pole)
-
 
     if los == 'local':
 

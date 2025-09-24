@@ -12,7 +12,7 @@ from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
                       MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
                       compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, compute_normalization,
-                      Mesh2SpectrumPoles, Mesh2CorrelationPoles, WindowMatrix, utils)
+                      Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils)
 
 
 dirname = Path('_tests')
@@ -30,25 +30,25 @@ def test_mesh2_spectrum(plot=False):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'endpoint']
-    attrs = MeshAttrs(meshsize=128, boxsize=1000.)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    mattrs = MeshAttrs(meshsize=128, boxsize=1000.)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
     @partial(jax.jit, static_argnames=['los'])
-    def mock(attrs, bin, seed, los='x'):
-        mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
+    def mock(mattrs, bin, seed, los='x'):
+        mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
         return compute_mesh2_spectrum(mesh, los=los, bin=bin)
 
     for los in list_los:
 
         nmock = 5
         t0 = time.time()
-        spectrum = mock(attrs, bin, random.key(43), los=los)
+        spectrum = mock(mattrs, bin, random.key(43), los=los)
         #print(spectrum)
         jax.block_until_ready(spectrum)
         print(f'time for jit {time.time() - t0:.2f}')
         t0 = time.time()
         for i in range(nmock):
-            spectrum = mock(attrs, bin, random.key(i + 42), los=los)
+            spectrum = mock(mattrs, bin, random.key(i + 42), los=los)
             jax.block_until_ready(spectrum)
         print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
         spectrum.write(get_fn(los))
@@ -60,7 +60,7 @@ def test_mesh2_spectrum(plot=False):
         from matplotlib import pyplot as plt
 
         for los in list_los:
-            power = Mesh2SpectrumPoles.read(get_fn(los=los))
+            power = read(get_fn(los=los))
             ax = power.plot().axes[0]
             k = power.get(0).coords('k')
             ax.plot(k, k * pk(k))
@@ -72,14 +72,14 @@ def test_mesh2_correlation(plot=False):
 
     from cosmoprimo.fiducial import DESI
 
-    attrs = MeshAttrs(boxsize=500., boxcenter=[1300., 0., 0.], meshsize=32)
+    mattrs = MeshAttrs(meshsize=128, boxsize=1000.)
 
     cosmo = DESI(engine='eisenstein_hu')
     pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
     ellsin = (0, 2, 4)
-    edgesin = np.arange(0., jnp.sqrt(3.) * attrs.knyq.max() + 0.2, 0.001)
+    edgesin = np.arange(0., jnp.sqrt(3.) * mattrs.knyq.max() + 0.001, 0.001)
     edgesin = np.column_stack([edgesin[:-1], edgesin[1:]])
-    kin = (edgesin[..., 0] + edgesin[..., 1]) / 2.
+    kin = np.mean(edgesin, axis=-1)
     f, b = 0.8, 1.5
     beta = f / b
 
@@ -89,48 +89,43 @@ def test_mesh2_correlation(plot=False):
                           0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
                           8. / 35 * beta ** 2 * pk])
 
-    poles = BinnedStatistic(x=[kin] * len(ellsin), edges=[edgesin] * len(ellsin), value=list(get_pk(kin, pk)), projs=ellsin)
-
-    def pkvec(kvec):
-        from jaxpower.utils import get_legendre
-        knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-        vlos = (1, 0, 0)
-        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / knorm
-        p = jnp.sum(get_pk(knorm, pk) * jnp.stack([get_legendre(ell)(mu) for ell in ellsin]), axis=0)
-        return jnp.where(knorm == 0., 0., p)
-
     def get_xi(s, pk):
         return np.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk.to_xi(fftlog_kwargs={'ell': 0})(s),
                         0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk.to_xi(fftlog_kwargs={'ell': 2})(s),
                         8. / 35 * beta ** 2 * pk.to_xi(fftlog_kwargs={'ell': 4})(s)])
 
+    poles = []
+    for ell, value in zip(ellsin, get_pk(kin, pk)):
+        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, ell=ell))
+    poles = Mesh2SpectrumPoles(poles)
+
     def get_fn(los='x'):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'local'][:1]
-    attrs = MeshAttrs(meshsize=128, boxsize=1000.)
-    bin = BinMesh2CorrelationPoles(attrs, edges={'step': 4, 'max': 200}, ells=(0, 2, 4))
+    bin = BinMesh2CorrelationPoles(mattrs, edges={'step': 4, 'max': 200}, ells=(0, 2, 4))
 
     #@partial(jax.jit, static_argnames=['los'])
-    def mock(attrs, bin, seed, los='x'):
-        mesh = generate_anisotropic_gaussian_mesh(attrs, poles, los=los, seed=seed, unitary_amplitude=True, order=1)
-        #mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
+    def mock(mattrs, bin, seed, los='x'):
+        mesh = generate_anisotropic_gaussian_mesh(mattrs, poles, los=los, seed=seed, unitary_amplitude=True, order=1)
+        #mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
         return compute_mesh2_correlation(mesh, los=los, bin=bin)
 
     for los in list_los:
-        corr = mock(attrs, bin, random.key(43), los=los)
+        corr = mock(mattrs, bin, random.key(43), los=los)
+        corr = corr.select(s=(30., 140.))
         corr.write(get_fn(los))
 
     if plot:
         from matplotlib import pyplot as plt
 
         for los in list_los:
-            corr = Mesh2CorrelationPoles.read(get_fn(los=los))
-            corr = corr.select(xlim=(30., 140.))
+            corr = read(get_fn(los=los))
+            corr = corr.select(s=(30., 140.))
             ax = corr.plot().axes[0]
-            s = corr.x(projs=0)
+            s = corr.get(ells=0).s
             xi = get_xi(s, pk)
-            for ill, ell in enumerate(corr.projs):
+            for ill, ell in enumerate(corr.ells):
                 ax.plot(s, s**2 * xi[ill], color='C{:d}'.format(ill), linestyle='--')
             ax.set_title(los)
             plt.show()
@@ -147,42 +142,46 @@ def test_fkp2_spectrum(plot=False):
     def get_fn(los='x'):
         return dirname / 'tmp_{}.h5'.format(los)
 
-    list_los = ['x', 'endpoint']
+    list_los = ['x', 'endpoint'][:1]
     boxcenter = [1300., 0., 0.]
-    attrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=128)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=128)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
     for los in list_los:
         @partial(jax.jit, static_argnames=['los'])
         def mock(seed, los='x'):
-            mesh = generate_gaussian_mesh(attrs, pkvec, seed=seed, unitary_amplitude=True)
+            mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
             size = int(1e5)
-            data = generate_uniform_particles(attrs, size, seed=32)
+            data = generate_uniform_particles(mattrs, size, seed=32)
             data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
-            randoms = generate_uniform_particles(attrs, size, seed=42)
+            randoms = generate_uniform_particles(mattrs, size, seed=42)
             fkp = FKPField(data, randoms)
             mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='complex')
-            return compute_mesh2_spectrum(mesh, bin=bin, los=los)
+            spectrum = compute_mesh2_spectrum(mesh, bin=bin, los=los)
+            norm = compute_fkp2_spectrum_normalization(fkp, bin=bin, cellsize=None)
+            num_shotnoise = compute_fkp2_spectrum_shotnoise(fkp, bin=bin)
+            return spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
 
         nmock = 5
         t0 = time.time()
-        power = mock(random.key(43), los=los)
-        jax.block_until_ready(power)
+        spectrum = mock(random.key(43), los=los)
+        jax.block_until_ready(spectrum)
         print(f'time for jit {time.time() - t0:.2f}')
         t0 = time.time()
         for i in range(nmock):
             jax.block_until_ready(mock(random.key(i + 42), los=los))
         print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
-        power.write(get_fn(los))
+        spectrum.write(get_fn(los))
 
     if plot:
         from matplotlib import pyplot as plt
 
         for los in list_los:
-            power = Mesh2SpectrumPoles.read(get_fn(los=los))
-            ax = power.plot().axes[0]
-            k = power.x(projs=0)
-            ax.plot(k, k * pk(k))
+            spectrum = read(get_fn(los=los))
+            spectrum.select(k=(0., 0.2))
+            ax = spectrum.plot().axes[0]
+            k = spectrum.get(ells=0).coords('k')
+            ax.plot(k, k * pk(k), color='k')
             ax.set_title(los)
             plt.show()
 
@@ -200,21 +199,21 @@ def test_mesh2_spectrum_mean(plot=False):
              4: lambda k: 8. / 35 * beta ** 2 * pk(k)}
 
     list_los = [('x', None), ('endpoint', None), ('endpoint', 'local')][1:2]
-    attrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    mattrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=1000.)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
     @partial(jax.jit, static_argnames=['los', 'thlos'])
     def mean(los='x', thlos=None):
         theory = poles
         if thlos is not None:
             theory = (poles, thlos)
-        return compute_mesh2_spectrum_mean(attrs, theory=theory, los=los, bin=bin)
+        return compute_mesh2_spectrum_mean(mattrs, theory=theory, los=los, bin=bin)
 
     for los, thlos in list_los:
 
         #power_mock = mock(random.key(43), los=los)
         t0 = time.time()
-        power_mean = mean(los=los, thlos=thlos)
+        spectrum_mean = mean(los=los, thlos=thlos)
         print(f'time for jit {time.time() - t0:.2f}')
         nmock = 2
         t0 = time.time()
@@ -224,9 +223,9 @@ def test_mesh2_spectrum_mean(plot=False):
 
         if plot:
             from matplotlib import pyplot as plt
-            ax = power_mean.plot().axes[0]
-            for ell in power_mean.projs:
-                k = power_mean.x(projs=ell)
+            ax = spectrum_mean.plot().axes[0]
+            for ell in spectrum_mean.ells:
+                k = spectrum_mean.get(ells=ell).coords('k')
                 ax.plot(k, k * poles[ell](k), color='k', linestyle='--')
             ax.set_title(los)
             plt.show()
@@ -248,8 +247,8 @@ def test_checkpoint():
                         0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
                         8. / 35 * beta ** 2 * pk(kin)])
 
-    attrs = MeshAttrs(boxsize=2000., meshsize=350, boxcenter=1000.)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=ells)
+    mattrs = MeshAttrs(boxsize=2000., meshsize=350, boxcenter=1000.)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=ells)
 
     def make_callable(poles):
         def get_fun(ill):
@@ -257,7 +256,7 @@ def test_checkpoint():
         return {ell: get_fun(ill) for ill, ell in enumerate(ells)}
 
     def make_callable(poles):
-        knorm = jnp.sqrt(sum(kk**2 for kk in attrs.kcoords(sparse=True, hermitian=True))).ravel()
+        knorm = jnp.sqrt(sum(kk**2 for kk in mattrs.kcoords(sparse=True, hermitian=True))).ravel()
         interp = Interpolator1D(kin, knorm)
         del knorm
         def get_fun(ill):
@@ -269,27 +268,27 @@ def test_checkpoint():
         if los == 'local':
             theory = (theory, los)
             los = 'firstpoint'
-        return compute_mesh2_spectrum_mean(attrs, theory=theory, bin=bin, los=los)
+        return compute_mesh2_spectrum_mean(mattrs, theory=theory, bin=bin, los=los)
 
     #print(jax.grad(lambda poles: mean(poles).view()[2])(poles))
     from jax.ad_checkpoint import checkpoint_name
 
     def mock(poles, los='local', seed=42):
-        mesh = generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los=los, seed=seed)
-        #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
+        mesh = generate_anisotropic_gaussian_mesh(mattrs, make_callable(poles), los=los, seed=seed)
+        #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(mattrs, make_callable(poles), los='x', seed=seed))(poles)
         return compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
 
     def power(mesh, los='local'):
         return compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
 
-    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
+    def gaussian_survey(mattrs, size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
         # Generate Gaussian-distributed positions
-        positions = scale * attrs.boxsize * random.normal(seed, shape=(size, 3))
-        toret = ParticleField(positions + attrs.boxcenter, attrs=attrs)
+        positions = scale * mattrs.boxsize * random.normal(seed, shape=(size, 3))
+        toret = ParticleField(positions + mattrs.boxcenter, attrs=mattrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(attrs, paint=True)
+    selection = gaussian_survey(mattrs, paint=True)
 
     #@partial(jax.checkpoint, static_argnums=(2,))
     policy = jax.checkpoint_policies.write_only_these_names('save')
@@ -311,17 +310,17 @@ def test_checkpoint():
         return mesh
 
     def mock_diff(theory, selection, los='local', seed=42, unitary_amplitude=True):
-        mesh = generate_anisotropic_gaussian_mesh(selection.attrs, (kinedges, list(theory)), los=los, seed=seed,
+        mesh = generate_anisotropic_gaussian_mesh(selection.mattrs, (kinedges, list(theory)), los=los, seed=seed,
                                                   unitary_amplitude=unitary_amplitude)
         los = {'local': 'firstpoint'}.get(los, los)
         #return compute_mesh2_spectrum(apply_selection(mesh, selection, False), bin=bin, los=los).view()[-3]
         toret = [compute_mesh2_spectrum(apply_selection(mesh, selection, cv=cv), bin=bin, los=los) for cv in [False, True]]
-        return toret[0].clone(value=toret[0].view() - toret[1].view()).view()[-3]
+        return toret[0].clone(value=toret[0].value() - toret[1].value()).value()[-3]
 
     def mock_vmap(poles, los='local'):
         seeds = random.split(random.key(42), 4)
         def func(seed):
-            mesh = generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los=los, seed=seed)
+            mesh = generate_anisotropic_gaussian_mesh(mattrs, make_callable(poles), los=los, seed=seed)
             #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
             return compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()
         return jnp.mean(jax.vmap(func)(seeds), axis=0)
@@ -418,8 +417,6 @@ def test_gaunt():
 
 def test_window_box(plot=False):
 
-    from jaxpower.mesh2 import compute_normalization
-
     def get_theory(kmax=0.3, dk=0.005):
         # Return theory power spectrum
         from cosmoprimo.fiducial import DESI
@@ -429,15 +426,19 @@ def test_window_box(plot=False):
         ellsin = (0, 2, 4)
         edgesin = jnp.arange(0., kmax, dk)
         edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
-        kin = (edgesin[..., 0] + edgesin[..., 1]) / 2.
+        kin = np.mean(edgesin, axis=-1)
         f, b = cosmo.growth_rate(z), 1.5
         beta = f / b
         shotnoise = (1e-3)**(-1)
         pk = pk1d(kin)
-        poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
-                            (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
-                            8. / 35 * beta ** 2 * pk])
-        return Mesh2SpectrumPoles(k=[kin] * len(ellsin), edges=[edgesin] * len(ellsin), num=list(poles), num_shotnoise=shotnoise, ells=ellsin)
+        theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
+                    (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                    8. / 35 * beta ** 2 * pk]
+
+        poles = []
+        for ell, value in zip(ellsin, theory):
+            poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, num_shotnoise=shotnoise * np.ones_like(kin) * (ell == 0), ell=ell))
+        return Mesh2SpectrumPoles(poles)
 
     mattrs = MeshAttrs(boxsize=1000., meshsize=64)
     bin = BinMesh2SpectrumPoles(mattrs, edges={'min': 0, 'step': 0.01}, ells=(0, 2, 4))
@@ -449,23 +450,25 @@ def test_window_box(plot=False):
     mean = compute_mesh2_spectrum(mesh, bin=bin, los=los)
 
     # edges and ells for input theory
-    edgesin = theory.edges(projs=0)
+    edgesin = theory.get(ells=0).edges('k')
     ellsin = (0, 2, 4)
     # bin is still the binning operator
     wmat = compute_mesh2_spectrum_window(mattrs, edgesin=edgesin, ellsin=ellsin, bin=bin, los=los, pbar=True)
     test = wmat.dot(theory, return_type=None)
-    wmat_rebin = wmat.slice(slice(0, None, 2), axis='t').slice(slice(0, -1), axis='t')
-    test_rebin = wmat_rebin.dot(theory.slice(slice(0, None, 2)).slice(slice(0, -1)), return_type=None)
-    #test_rebin = wmat_rebin.dot(get_theory(kmax=wmat_rebin.theory.edges()[0].max() + 1e-4, dk=0.01), return_type=None)
+    wmat_rebin = wmat.at.theory.select(k=slice(0, None, 2)).at.theory.select(k=slice(0, -1))
+    test_rebin = wmat_rebin.dot(theory.select(k=slice(0, None, 2)).select(k=slice(0, -1)), return_type=None)
 
     if plot:
         from matplotlib import pyplot as plt
         ax = plt.gca()
-        for ill, ell in enumerate(test.projs):
+        for ill, ell in enumerate(test.ells):
             color = 'C{:d}'.format(ill)
-            ax.plot(mean.x(ell), mean.x(ell) * mean.view(projs=ell), color=color, linestyle='-')
-            ax.plot(test.x(ell), test.x(ell) * test.view(projs=ell), color=color, linestyle='--')
-            ax.plot(test_rebin.x(ell), test_rebin.x(ell) * test_rebin.view(projs=ell), color=color, linestyle=':')
+            pole = mean.get(ells=ell)
+            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle='-')
+            pole = test.get(ells=ell)
+            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle='--')
+            pole = test_rebin.get(ells=ell)
+            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle=':')
         plt.show()
 
 
@@ -475,24 +478,29 @@ def test_window(plot=False):
 
     ellsin = (0, 2, 4)
     edgesin = np.array([0.1, 0.11])
-    xin = (edgesin[:-1] + edgesin[1:]) / 2.
-    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[np.array(list(zip(edgesin[:-1], edgesin[1:])))] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
+    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+    kin = np.mean(edgesin, axis=-1)
 
-    attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    poles = []
+    for ell in ellsin:
+        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=np.ones_like(kin), ell=ell))
+    theory = Mesh2SpectrumPoles(poles)
 
-    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
+    mattrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
+
+    def gaussian_survey(mattrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
         positions = jnp.array([1., 0.2, 0.2]) * scale * random.normal(seed, shape=(size, 3))
         bscale = scale
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * attrs.boxsize + attrs.boxcenter
-        toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
+        positions = positions * mattrs.boxsize + mattrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(attrs, paint=True)
-    norm = compute_normalization(selection, selection)
+    selection = gaussian_survey(mattrs, paint=True)
+    norm = compute_normalization(selection, selection, bin=bin)
 
     for flag in ['smooth', 'infinite']:
         for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')]:
@@ -502,11 +510,14 @@ def test_window(plot=False):
             if plot:
                 from matplotlib import pyplot as plt
                 ax = plt.gca()
-                for iproj, proj in enumerate(mean.projs):
-                    color = 'C{:d}'.format(iproj)
-                    ax.plot(mean.x(projs=proj), mean.view(projs=proj).real, color=color, linestyle='-')
-                    projin = (0, 0) if thlos == 'firstpoint' else 0
-                    ax.plot(mean.x(projs=proj), wmatrix.select(projs=proj, select_projs=True, axis='o').select(projs=projin, select_projs=True, axis='t').view().real, color=color, linestyle='--')
+                for ill, ell in enumerate(mean.ells):
+                    color = 'C{:d}'.format(ill)
+                    pole = mean.get(ells=ell)
+                    ax.plot(pole.coords('k'), pole.value().real, color=color, linestyle='-')
+                    kw = dict(ells=0)
+                    if thlos == 'firstpoint': kw.update(wa_orders=0)
+                    tmp = wmatrix.at.observable.get(ells=ell).at.theory.get(**kw).value().real
+                    ax.plot(pole.coords('k'), tmp, color=color, linestyle='--')
                 plt.show()
 
 
@@ -517,23 +528,23 @@ def test_window_timing():
 
     ellsin = (0, 2, 4)
     edgesin = np.linspace(0.01, 0.1, 20)
-    xin = (edgesin[:-1] + edgesin[1:]) / 2.
-    theory = BinnedStatistic(x=[xin] * len(ellsin), edges=[np.array(list(zip(edgesin[:-1], edgesin[1:])))] * len(ellsin), value=[np.ones_like(xin)] + [np.ones_like(xin)] * (len(ellsin) - 1), projs=ellsin)
+    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+    kin = np.mean(edgesin, axis=-1)
 
-    attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    mattrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
-    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
+    def gaussian_survey(mattrs, size=int(1e6), seed=random.key(42), scale=0.2, paint=False):
         # Generate Gaussian-distributed positions
         positions = jnp.array([1., 0.2, 0.2]) * scale * random.normal(seed, shape=(size, 3))
         bscale = scale
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * attrs.boxsize + attrs.boxcenter
-        toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
+        positions = positions * mattrs.boxsize + mattrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    selection = gaussian_survey(attrs, paint=True)
+    selection = gaussian_survey(mattrs, paint=True)
     norm = compute_fkp2_spectrum_normalization(selection, selection)
 
     for flag in ['smooth', 'infinite'][-1:]:
@@ -544,18 +555,18 @@ def test_window_timing():
             print(f'{time.time() - t0:.2f}')
 
 
-def test_smooth_window():
+def test_smooth_window(plot=False):
     from matplotlib import pyplot as plt
     from cosmoprimo.fiducial import DESI
 
     cosmo = DESI(engine='eisenstein_hu')
     pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
 
-    attrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
+    mattrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
     ells = (0, 2, 4)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=ells)
-    #edgesin = np.arange(0., 1.1 * attrs.knyq.max(), 0.002)
-    edgesin = np.arange(0., attrs.knyq.max(), 0.005)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=ells)
+    #edgesin = np.arange(0., 1.1 * mattrs.knyq.max(), 0.002)
+    edgesin = np.arange(0., mattrs.knyq.max(), 0.005)
     kin = (edgesin[:-1] + edgesin[1:]) / 2.
     ellsin = (0, 2, 4)
     f, b = 0.8, 1.5
@@ -567,33 +578,17 @@ def test_smooth_window():
     #klim = (0.1, 0.106)
     #poles = poles.at[..., (kin < klim[0]) | (kin > klim[1])].set(0.)
 
-    def gaussian_survey(attrs, size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
+    def gaussian_survey(mattrs, size=int(1e6), seed=random.key(42), scale=0.1, paint=False):
         # Generate Gaussian-distributed positions
         positions = scale * random.normal(seed, shape=(size, 3))
         bscale = 2. * scale  # cut at 2 sigmas
         mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
-        positions = positions * attrs.boxsize + attrs.boxcenter
-        toret = ParticleField(positions, weights=1. * mask, attrs=attrs)
+        positions = positions * mattrs.boxsize + mattrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
         if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
         return toret
 
-    if False:
-        selection = gaussian_survey(attrs, size=int(1e7), paint=True)
-        norm = compute_fkp2_spectrum_normalization(selection, selection)
-        selection = selection.r2c()
-        selection = (selection * selection.conj()).c2r()
-        edges = np.arange(0., selection.boxsize.max(), selection.cellsize.min())
-        bin = BinMesh2SpectrumPoles(selection, edges=edges)
-        pole = bin(selection) / norm / selection.cellsize.prod()
-        print(pole)
-
-        from matplotlib import pyplot as plt
-        ax = plt.gca()
-        ax.plot(bin.xavg, pole)
-        ax.set_xscale('log')
-        plt.show()
-
-    selection = gaussian_survey(attrs, paint=True)
+    selection = gaussian_survey(mattrs, paint=True)
     norm = compute_normalization(selection, selection)
     #selection = selection.clone(value=selection.value.at[...].set(1.))
     #sbin = BinMesh2CorrelationPoles(selection, edges={'step': selection.attrs.cellsize.min()}, ells=(0,))
@@ -609,118 +604,35 @@ def test_smooth_window():
         else:
             ax = fig.axes[0]
         for ill, ell in enumerate(self.ells):
-            ax.plot(self._x[ill], self.value[ill].real, label=self._get_label_proj(ell))
+            pole = self.get(ells=ell)
+            ax.plot(pole.coords('s'), pole.value().real)
         ax.legend()
         ax.grid(True)
-        ax.set_xlabel(self._label_x)
         #ax.set_xscale('log')
         return fig
 
     for (los, thlos) in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')][1:2]:
         mean = compute_mesh2_spectrum_mean(selection, theory=(edgesin, list(poles)) if thlos is None else (edgesin, list(poles), thlos),
-                                           bin=bin, los=los).clone(norm=norm)
+                                           bin=bin, los=los).clone(norm=[norm] * len(bin.ells))
         wmatrix = compute_mesh2_spectrum_window(selection, edgesin=edgesin, ellsin=ellsin if thlos is None else (ellsin, thlos),
                                                 bin=bin, los=los, norm=norm, flags=['smooth'])
-        xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=norm, num_zero=None)
+        xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
         #plot(xi, show=True)
 
         wmatrix2 = compute_smooth2_spectrum_window(xi, edgesin=edgesin, ellsin=ellsin, bin=bin)
         #wmatrix2.plot(show=True)
-        wpoles = wmatrix.dot(poles, return_type=None)
-        wpoles2 = wmatrix2.dot(poles, return_type=None)
-        ax = plt.gca()
-        for iproj, proj in enumerate(wpoles2.projs):
-            ax.plot(kin, kin * poles[iproj], color='k')
-            k = wpoles2.x(projs=proj)
-            ax.plot(k, k * mean.view(projs=proj), color='C0')
-            ax.plot(k, k * wpoles.view(projs=proj), color='C1')
-            ax.plot(k, k * wpoles2.view(projs=proj), color='C2')
-        plt.show()
+        wpoles = wmatrix.dot(poles.ravel(), return_type=None)
+        wpoles2 = wmatrix2.dot(poles.ravel(), return_type=None)
+        if plot:
+            ax = plt.gca()
+            for ill, ell in enumerate(wpoles2.ells):
+                ax.plot(kin, kin * poles[ill], color='k')
+                k = wpoles2.get(ells=ell).coords('k')
+                ax.plot(k, k * mean.get(ells=ell).value(), color='C0')
+                ax.plot(k, k * wpoles.get(ells=ell).value(), color='C1')
+                ax.plot(k, k * wpoles2.get(ells=ell).value(), color='C2')
+            plt.show()
 
-
-def test_box_window():
-
-    ellsin = (0, 2, 4)
-
-    attrs = MeshAttrs(boxsize=500., meshsize=64, boxcenter=1000.)
-    bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
-    edgesin = jnp.arange(0., attrs.knyq.max() * 1.2, 0.01)
-
-    wmatrix = compute_mesh2_spectrum_window(attrs, edgesin=edgesin, ellsin=ellsin, bin=bin, los='x')
-    wmatrix.plot(show=True)
-
-
-def test_wmatrix(plot=False):
-    ellsin = (0, 2)
-    ells = (0, 2)
-    theory = BinnedStatistic(x=[np.linspace(0., 0.2, 41)] * len(ellsin), projs=ellsin)
-    observable = BinnedStatistic(x=[np.linspace(0., 0.2, 21)] * len(ells), projs=ells)
-    theory2 = BinnedStatistic(x=[np.linspace(0., 0.3, 61)] * len(ellsin), projs=ellsin)
-    observable2 = BinnedStatistic(x=[np.linspace(0., 0.3, 61)] * len(ells), projs=ells)
-
-    def f(xo, xt):
-        sigma = 0.02
-        delta = (xo - xt) / sigma
-        return np.exp(-delta**2)
-
-    value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
-    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
-    #if plot: wmatrix.plot(show=True)
-
-    wmatrix1 = wmatrix.slice(slice(0, -1), axis='o')
-    assert wmatrix1.shape[0] == wmatrix.shape[0] - 1 * len(ellsin)
-    wmatrix1 = wmatrix1.select(axis='o', xlim=(0., 0.081))
-    wmatrix2 = wmatrix.select(axis='o', xlim=(0.081, 0.5))
-    wmatrixc = wmatrix.concatenate([wmatrix1, wmatrix2], axis='o')
-
-    assert np.allclose(wmatrixc._value, wmatrix._value)
-    wmatrixs = wmatrix.sum([wmatrix] * 3)
-    assert np.allclose(wmatrixs._value, wmatrix._value * 3)
-
-    wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
-    wmatrix3 = wmatrix.interp(observable2, axis='o', extrap=True)
-
-    fn = dirname / 'tmp.h5'
-    wmatrix3.write(fn)
-    wmatrix3 = WindowMatrix.read(fn)
-
-    if plot:
-        wmatrix2.plot(show=True)
-        wmatrix3.plot(show=True)
-        wmatrix3.plot_slice(indices=5, show=True)
-
-
-    theory = BinnedStatistic(x=[np.linspace(0., 0.2, 41)] * len(ellsin), projs=ellsin)
-    observable = BinnedStatistic(x=[np.linspace(0., 0.2, 21)] * len(ells), projs=ells)
-    value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
-    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
-    wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
-    #wmatrix2.plot(show=True)
-
-    def value(xx):
-        return jnp.ones_like(xx)
-
-    theory = BinnedStatistic(x=[np.geomspace(0.001, 0.3, 101)] * len(ellsin), projs=ellsin)
-    observable = BinnedStatistic(x=[np.linspace(0., 0.2, 21)] * len(ells), projs=ells)
-    value = np.block([[f(*np.meshgrid(xo, xt, indexing='ij')) for xt in theory.x()] for xo in observable.x()])
-    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
-    wmatrix2 = wmatrix.interp(theory2, axis='t', extrap=True)
-    wmatrix2.plot(show=True)
-
-    def value(xx):
-        return xx**2
-
-    v = theory.clone(value=[value(xx) for xx in theory.x()])
-    vw = wmatrix.dot(v, zpt=False, return_type=None)
-    v2 = theory2.clone(value=[value(xx) for xx in theory2.x()])
-    vw2 = wmatrix2.dot(v2, zpt=False, return_type=None)
-    if plot:
-        from matplotlib import pyplot as plt
-        ax = plt.gca()
-        proj = 0
-        ax.plot(vw.x(proj), vw.view(projs=proj), color='C0')
-        ax.plot(vw2.x(proj), vw2.view(projs=proj), color='C1')
-        plt.show()
 
 
 def test_sympy():
@@ -753,10 +665,10 @@ def test_mem():
 
     from jaxpower import MeshAttrs, create_sharded_random, create_sharding_mesh
     with create_sharding_mesh() as sharding_mesh:
-        attrs = MeshAttrs(meshsize=1600, boxsize=1000.)
-        #attrs = MeshAttrs(meshsize=850, boxsize=1000.)
-        bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.001}, ells=(0, 2, 4))
-        mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
+        mattrs = MeshAttrs(meshsize=1600, boxsize=1000.)
+        #mattrs = MeshAttrs(meshsize=850, boxsize=1000.)
+        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.001}, ells=(0, 2, 4))
+        mesh = mattrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=mattrs.meshsize))
         compute = partial(compute_mesh2_spectrum, bin=bin, los='firstpoint')
         compute = jax.jit(compute)
         t0 = time.time()
@@ -775,29 +687,35 @@ def test_split():
 
     from cosmoprimo.fiducial import DESI
     from jaxpower import (compute_mesh2_spectrum, Mesh2SpectrumPoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                          BinnedStatistic, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_spectrum_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
+                          WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_spectrum_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
 
-    attrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1000., boxcenter=1200.)
-    size = int(1e-4 * attrs.boxsize.prod())
-    data = generate_uniform_particles(attrs, size + 1, seed=42)
-    randoms = generate_uniform_particles(attrs, 4 * size + 1, seed=43)
+    mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1000., boxcenter=1200.)
+    size = int(1e-4 * mattrs.boxsize.prod())
+    data = generate_uniform_particles(mattrs, size + 1, seed=42)
+    randoms = generate_uniform_particles(mattrs, 4 * size + 1, seed=43)
 
     cosmo = DESI()
     pk = cosmo.get_fourier().pk_interpolator().to_1d(z=1.)
 
     f, b = 0.8, 1.5
     beta = f / b
-    kinedges = np.linspace(0.001, 0.7, 100)
-    kin = (kinedges[:-1] + kinedges[1:]) / 2.
-    ells = (0, 2, 4)
-    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
-                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
-                        8. / 35 * beta ** 2 * pk(kin)])
-    theory = BinnedStatistic(x=[kin] * len(ells), edges=[np.array(list(zip(kinedges[:-1], kinedges[1:])))] * len(ells), value=poles, projs=ells)
-    mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=random.key(42), los='local', unitary_amplitude=True)
+    edgesin = np.linspace(0.001, 0.7, 100)
+    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+    kin = np.mean(edgesin, axis=-1)
+    ellsin = (0, 2, 4)
+    theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk,
+                        (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                        8. / 35 * beta ** 2 * pk]
+
+    poles = []
+    for ell, value in zip(ellsin, theory):
+        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, ell=ell))
+    theory = Mesh2SpectrumPoles(poles)
+
+    mesh = generate_anisotropic_gaussian_mesh(mattrs, theory, seed=random.key(42), los='local', unitary_amplitude=True)
     data = data.clone(weights=1. + mesh.read(data.positions))
 
-    fkp = FKPField(data, randoms, attrs=attrs.clone(boxsize=2. * attrs.boxsize))  # x2 padding
+    fkp = FKPField(data, randoms, attrs=mattrs.clone(boxsize=2. * mattrs.boxsize))  # x2 padding
     from jaxpower.mesh import _paint
     for split_fkp in fkp.split(nsplits=2):
         t0 = time.time()
@@ -829,16 +747,19 @@ def test_sharding():
         ellsin = (0, 2, 4)
         edgesin = jnp.arange(0., kmax, dk)
         edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
-        kin = (edgesin[..., 0] + edgesin[..., 1]) / 2.
+        kin = np.mean(edgesin, axis=-1)
         f, b = cosmo.growth_rate(z), 1.5
         beta = f / b
         shotnoise = (1e-3)**(-1)
         pk = pk1d(kin)
-        poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
-                            0.99 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
-                            8. / 35 * beta ** 2 * pk])
-        return Mesh2SpectrumPoles(k=[kin] * len(ellsin), edges=[edgesin] * len(ellsin), num=list(poles), num_shotnoise=shotnoise, ells=ellsin)
+        theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
+                    (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                    8. / 35 * beta ** 2 * pk]
 
+        poles = []
+        for ell, value in zip(ellsin, theory):
+            poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, num_shotnoise=shotnoise * np.ones_like(kin) * (ell == 0), ell=ell))
+        return Mesh2SpectrumPoles(poles)
 
     attrs = MeshAttrs(boxsize=1000., meshsize=meshsize)
     poles = get_theory(4 * attrs.knyq.max())
@@ -889,7 +810,6 @@ def test_pypower():
 
     def _identity_fn(x):
         return x
-
 
     def allgather(array):
         from jaxpower.mesh import get_sharding_mesh
@@ -942,17 +862,17 @@ def test_pypower():
         randoms = ParticleField(randoms.positions, randoms.weights, attrs=mattrs, exchange=True)
         # Now data and randoms are exchanged given MeshAttrs attrs, we can proceed as normal
         fkp = FKPField(data, randoms, attrs=mattrs)
-        norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
+        bin = BinMesh2SpectrumPoles(mattrs, edges=edges, ells=ells)
+        norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp, bin=bin), compute_fkp2_spectrum_shotnoise(fkp, bin=bin)
         mesh = fkp.paint(**kw_paint, compensate=compensate, out='real')
         del fkp
-        bin = BinMesh2SpectrumPoles(mattrs, edges=edges, ells=ells)
         pk_jax = compute_mesh2_spectrum(mesh, bin=bin, los=los)
         pk_jax = pk_jax.clone(norm=norm, num_shotnoise=num_shotnoise)
-        assert np.allclose(pk_jax.norm, pk_py.wnorm)
-        assert np.allclose(pk_jax.shotnoise(projs=0), pk_py.shotnoise)
+        assert np.allclose(pk_jax.get(ells=0).values('norm'), pk_py.wnorm)
+        assert np.allclose(pk_jax.get(ells=0).values('shotnoise'), pk_py.shotnoise)
         for ell in ells:
-            diff = np.abs(pk_jax.view(projs=ell) - pk_py(ell=ell, complex=False))
-            assert np.allclose(pk_jax.view(projs=ell), pk_py(ell=ell, complex=False), equal_nan=True, atol=1e-5, rtol=1e-5)
+            #diff = np.abs(pk_jax.get(ells=ell).value() - pk_py(ell=ell, complex=False))
+            assert np.allclose(pk_jax.get(ells=ell).value(), pk_py(ell=ell, complex=False), equal_nan=True, atol=1e-5, rtol=1e-5)
 
 
 if __name__ == '__main__':
@@ -960,24 +880,11 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_mesh2_spectrum()
-    exit()
-
-    #import warnings
-    #warnings.simplefilter("error")
-    #test_window_timing()
-    #test_sympy()
-    #test_window()
-    #test_gaunt()
-    test_smooth_window()
-    #test_checkpoint()
-    #test_gaunt()
-    test_window_box(plot=False)
-    test_binned_statistic()
-    test_wmatrix()
     test_mesh2_spectrum(plot=False)
-    #test_fkp2_spectrum(plot=False)
-    test_mesh2_spectrum_mean(plot=False)
     test_mesh2_correlation(plot=False)
-    test_window()
-    #test_split()
+    test_fkp2_spectrum(plot=False)
+    test_mesh2_spectrum_mean(plot=False)
+    test_window_box(plot=False)
+    test_window(plot=False)
+    test_smooth_window(plot=False)
+    test_pypower()

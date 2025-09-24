@@ -6,4 +6,4 @@ from .cov2 import compute_fkp2_covariance_window, compute_mesh2_covariance_windo
 from .rotation import WindowRotationSpectrum2
 from .mock import generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles
 from .utils import setup_logging
-from .types import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, CovarianceMatrix, WindowMatrix
+from .types import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, Mesh3SpectrumPoles, Mesh3SpectrumPoles, CovarianceMatrix, WindowMatrix, read, write

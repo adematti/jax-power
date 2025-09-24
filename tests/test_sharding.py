@@ -9,8 +9,8 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-from jaxpower import (compute_mesh2_spectrum, Spectrum2Poles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                      compute_fkp2_spectrum, BinnedStatistic, WindowMatrix, MeshAttrs, BinMesh2Spectrum, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
+from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read,
+                      compute_fkp2_spectrum, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
 
 
 dirname = Path('_tests')
@@ -18,8 +18,8 @@ dirname = Path('_tests')
 
 def test_jaxdecomp():
     import jaxdecomp
-    attrs = MeshAttrs(meshsize=[8, 16, 32], boxsize=1000.)
-    mesh = attrs.create(kind='real', fill=partial(random.normal, key=random.key(43)))
+    mattrs = MeshAttrs(meshsize=[8, 16, 32], boxsize=1000.)
+    mesh = mattrs.create(kind='real', fill=partial(random.normal, key=random.key(43)))
     delta = mesh.value
     delta_k = jaxdecomp.fft.pfft3d(delta) #.astype(jnp.complex64))
     jax.block_until_ready(delta_k)
@@ -46,16 +46,16 @@ def test_sharding():
         return x
 
     with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
-        attrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
+        mattrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
         if False:
             t0 = time.time()
             n = 5
             for i in range(n):
-                attrs.kcoords(sparse=True)
+                mattrs.kcoords(sparse=True)
             print((time.time() - t0) / n)
 
         if False:
-            knorm = sum(xx**2 for xx in attrs.kcoords(sparse=True))
+            knorm = sum(xx**2 for xx in mattrs.kcoords(sparse=True))
             jax.debug.inspect_array_sharding(knorm, callback=print)
             tmp = spherical_jn(2)(knorm)
             jax.debug.inspect_array_sharding(tmp, callback=print)
@@ -119,8 +119,8 @@ def test_exchange_array():
             if True:
                 positions = np.random.uniform(size=(int(1e4) + jax.process_index(), 3))
                 weights = np.random.uniform(size=positions.shape[0])
-                attrs = MeshAttrs(boxsize=1., boxcenter=0.5, meshsize=4)
-                positions, exchange, inverse = exchange_particles(attrs, positions, backend='mpi', return_type='jax', return_inverse=True)
+                mattrs = MeshAttrs(boxsize=1., boxcenter=0.5, meshsize=4)
+                positions, exchange, inverse = exchange_particles(mattrs, positions, backend='mpi', return_type='jax', return_inverse=True)
                 weights2 = inverse(exchange(weights))
                 assert np.allclose(weights2, weights)
 
@@ -172,26 +172,28 @@ def test_mesh_power():
 
     f, b = 0.8, 1.5
     beta = f / b
-    kinedges = np.linspace(0.001, 0.7, 30)
-    kin = (kinedges[:-1] + kinedges[1:]) / 2.
-    ells = (0, 2, 4)
-    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+    edgesin = np.linspace(0.001, 0.7, 100)
+    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+    kin = np.mean(edgesin, axis=-1)
+    ellsin = (0, 2, 4)
+    theory = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
                         0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
                         8. / 35 * beta ** 2 * pk(kin)])
-    theory = BinnedStatistic(x=[kin] * len(ells), edges=[np.array(list(zip(kinedges[:-1], kinedges[1:])))] * len(ells), value=poles, projs=ells)
 
-    list_los = ['x', 'endpoint']
+    poles = []
+    for ell, value in zip(ellsin, theory):
+        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, ell=ell))
+    theory = Mesh2SpectrumPoles(poles)
 
     meshsize = (32,) * 3
     with create_sharding_mesh(meshsize=meshsize) as mesh:
 
-        attrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
-        bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
-        ellsin = ells
+        mattrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
+        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
         @partial(jax.jit, static_argnames=['los', 'ells'])
         def mock(seed, los='x'):
-            mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=seed, los=los, unitary_amplitude=True)
+            mesh = generate_anisotropic_gaussian_mesh(mattrs, theory, seed=seed, los=los, unitary_amplitude=True)
             return compute_mesh2_spectrum(mesh, los={'local': 'firstpoint'}.get(los, los), bin=bin)
 
         #mock(random.key(43), los='x')
@@ -200,8 +202,8 @@ def test_mesh_power():
         for flag in ['smooth', 'infinite'][1:]:
             for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')]:
                 print(flag, los, thlos, flush=True)
-                mean = compute_mesh2_spectrum_mean(attrs, theory=(theory, thlos) if thlos is not None else theory, bin=bin, los=los)
-                wmatrix = compute_mesh2_spectrum_window(attrs, edgesin=kinedges, ellsin=(ellsin, thlos) if thlos is not None else ellsin, bin=bin, los=los, pbar=True, flags=(flag,))
+                mean = compute_mesh2_spectrum_mean(mattrs, theory=(theory, thlos) if thlos is not None else theory, bin=bin, los=los)
+                wmatrix = compute_mesh2_spectrum_window(mattrs, edgesin=edgesin, ellsin=(ellsin, thlos) if thlos is not None else ellsin, bin=bin, los=los, pbar=True, flags=(flag,))
 
 
 def test_mem():
@@ -225,12 +227,12 @@ def test_mem():
 def test_particles():
     rank = jax.process_index()
     size = 1000
-    attrs = MeshAttrs(meshsize=[8, 16, 32], boxsize=1000.)
-    per_host_positions = attrs.boxsize * random.uniform(random.key(rank), (size, len(attrs.boxsize))) - attrs.boxsize / 2. + attrs.boxcenter
+    mattrs = MeshAttrs(meshsize=[8, 16, 32], boxsize=1000.)
+    per_host_positions = mattrs.boxsize * random.uniform(random.key(rank), (size, len(mattrs.boxsize))) - mattrs.boxsize / 2. + mattrs.boxcenter
 
-    mesh = ParticleField(positions=per_host_positions, attrs=attrs, exchange=True).paint(resmpler='tsc', interlacing=3, compensate=True)
+    mesh = ParticleField(positions=per_host_positions, attrs=mattrs, exchange=True).paint(resmpler='tsc', interlacing=3, compensate=True)
     ells = (0, 2, 4)
-    bin = BinMesh2Spectrum(attrs, edges={'step': 0.01})
+    bin = BinMesh2SpectrumPoles(mattrs, ells=ells, edges={'step': 0.01})
     compute_mesh2_spectrum(mesh, los='firstpoint', bin=bin)
 
 
@@ -242,10 +244,10 @@ def get_mock_fn(kind='data'):
 
 
 def save_reference_mock():
-    attrs = MeshAttrs(meshsize=(32, 64, 100), boxsize=1000., boxcenter=1200.)
+    mattrs = MeshAttrs(meshsize=(32, 64, 100), boxsize=1000., boxcenter=1200.)
     size = 128**2
-    data_positions = generate_uniform_particles(attrs, size + 1, seed=42).positions
-    randoms_positions = generate_uniform_particles(attrs, 4 * size + 1, seed=43).positions
+    data_positions = generate_uniform_particles(mattrs, size + 1, seed=42).positions
+    randoms_positions = generate_uniform_particles(mattrs, 4 * size + 1, seed=43).positions
 
     def pk(k):
         kp = 0.03
@@ -253,14 +255,20 @@ def save_reference_mock():
 
     f, b = 0.8, 1.5
     beta = f / b
-    kinedges = np.linspace(0.001, 0.7, 30)
-    kin = (kinedges[:-1] + kinedges[1:]) / 2.
-    ells = (0, 2, 4)
-    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+    edgesin = np.linspace(0.001, 0.7, 100)
+    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+    kin = np.mean(edgesin, axis=-1)
+    ellsin = (0, 2, 4)
+    theory = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
                         0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
                         8. / 35 * beta ** 2 * pk(kin)])
-    theory = BinnedStatistic(x=[kin] * len(ells), edges=[kinedges] * len(ells), value=poles, projs=ells)
-    mesh = generate_anisotropic_gaussian_mesh(attrs, theory, seed=random.key(42), los='x', unitary_amplitude=True)
+
+    poles = []
+    for ell, value in zip(ellsin, theory):
+        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, ell=ell))
+    theory = Mesh2SpectrumPoles(poles)
+
+    mesh = generate_anisotropic_gaussian_mesh(mattrs, theory, seed=random.key(42), los='x', unitary_amplitude=True)
     data_weights = mesh.read(data_positions).real
 
     utils.mkdir(get_mock_fn().parent)
@@ -269,16 +277,16 @@ def save_reference_mock():
     np.save(get_mock_fn('data'), data, allow_pickle=True)
     np.save(get_mock_fn('randoms'), randoms, allow_pickle=True)
 
-    data = ParticleField(**data, attrs=attrs)
-    randoms = ParticleField(**randoms, attrs=attrs)
+    data = ParticleField(**data, attrs=mattrs)
+    randoms = ParticleField(**randoms, attrs=mattrs)
     fkp = FKPField(data, randoms)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
-    mesh.save(get_mock_fn('mesh'))
-    bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    mesh.write(get_mock_fn('mesh'))
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
     power = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
-    power.save(get_mock_fn('mesh_power'))
+    power.write(get_mock_fn('mesh_power'))
     power = compute_fkp2_spectrum(fkp, resampler='tsc', interlacing=3, bin=bin, los='firstpoint')
-    power.save(get_mock_fn('fkp_power'))
+    power.write(get_mock_fn('fkp_power'))
 
 
 def compute_power_spectrum():
@@ -294,21 +302,21 @@ def compute_power_spectrum():
         sl = slice(rank * total_size // size, (rank + 1) * total_size // size)
         return {name: catalog[name][sl] for name in ['positions', 'weights']}
 
-    ref_mesh_power = Spectrum2Poles.load(get_mock_fn('mesh_power'))
+    ref_mesh_power = read(get_mock_fn('mesh_power'))
     los = ref_mesh_power.attrs.pop('los')
     ref_mesh_power.attrs.pop('dtype')
-    attrs = MeshAttrs(**ref_mesh_power.attrs)
-    bin = BinMesh2Spectrum(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
-    ref_fkp_power = Spectrum2Poles.load(get_mock_fn('fkp_power'))
+    mattrs = MeshAttrs(**ref_mesh_power.attrs)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
+    ref_fkp_power = read(get_mock_fn('fkp_power'))
 
-    with create_sharding_mesh(meshsize=attrs.meshsize) as sharding_mesh:
+    with create_sharding_mesh(meshsize=mattrs.meshsize) as sharding_mesh:
         #positions, weights = make_particles_from_local(**load(kind='data'))
         #jax.debug.inspect_array_sharding(positions, callback=print)
         #print(positions.shape)
-        data = ParticleField(**load(kind='data'), attrs=attrs, exchange=True)
-        randoms = ParticleField(**load(kind='randoms'), attrs=attrs, exchange=True)
-        #data = ParticleField(**load(kind='data'), attrs=attrs)
-        #randoms = ParticleField(**load(kind='randoms'), attrs=attrs)
+        data = ParticleField(**load(kind='data'), attrs=mattrs, exchange=True)
+        randoms = ParticleField(**load(kind='randoms'), attrs=mattrs, exchange=True)
+        #data = ParticleField(**load(kind='data'), attrs=mattrs)
+        #randoms = ParticleField(**load(kind='randoms'), attrs=mattrs)
         #print(data.weights.min(), data.weights.max())
         #jax.debug.inspect_array_sharding(data.positions, callback=print)
         fkp = FKPField(data, randoms)
@@ -324,12 +332,12 @@ def compute_power_spectrum():
         #mesh = mesh.clone(value=jax.device_put(mesh.value, jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names))))
         mesh_power = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
         fkp_power = compute_fkp2_spectrum(fkp, bin=bin, resampler='tsc', interlacing=3, los='firstpoint')
-    diff = jnp.abs(mesh_power.view() - ref_mesh_power.view())
+    diff = jnp.abs(mesh_power.value() - ref_mesh_power.value())
     print(diff)
-    diff = jnp.abs(fkp_power.view() - ref_fkp_power.view())
+    diff = jnp.abs(fkp_power.value() - ref_fkp_power.value())
     print(diff)
-    assert np.allclose(mesh_power.view(), ref_mesh_power.view(), rtol=1e-6, atol=1e-2)
-    assert np.allclose(fkp_power.view(), ref_fkp_power.view(), rtol=1e-6, atol=1e-2)
+    assert np.allclose(mesh_power.value(), ref_mesh_power.value(), rtol=1e-6, atol=1e-2)
+    assert np.allclose(fkp_power.value(), ref_fkp_power.value(), rtol=1e-6, atol=1e-2)
     #print(power.view().sum(), ref.view().sum(), diff, diff[~jnp.isnan(diff)].max())
 
 
@@ -337,8 +345,8 @@ def test_scaling():
 
     with create_sharding_mesh() as sharding_mesh:
         from jaxpower import MeshAttrs, create_sharded_random
-        attrs = MeshAttrs(meshsize=600, boxsize=1000.)
-        mesh = attrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=attrs.meshsize))
+        mattrs = MeshAttrs(meshsize=600, boxsize=1000.)
+        mesh = mattrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=mattrs.meshsize))
 
         @jax.jit
         def f(mesh):

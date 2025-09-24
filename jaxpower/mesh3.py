@@ -418,7 +418,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
     spectrum = []
     for ill, ell in enumerate(ells):
-        spectrum.append(Mesh3SpectrumPole(k=bin.xavg, ell=ell, num=num[ill], nmodes=bin.nmode, edges=bin.edges, norm=norm, attrs=attrs, basis=bin.basis))
+        spectrum.append(Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], norm=norm, attrs=attrs, basis=bin.basis, ell=ell))
     return Mesh3SpectrumPoles(spectrum)
 
 

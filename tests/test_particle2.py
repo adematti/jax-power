@@ -3,7 +3,7 @@ import jax
 from jax import numpy as jnp
 from scipy import special
 
-from jaxpower import MeshAttrs, generate_uniform_particles, compute_particle2, BinParticle2Spectrum, BinParticle2Correlation, Spectrum2Poles, Correlation2Poles, utils
+from jaxpower import MeshAttrs, generate_uniform_particles, compute_particle2, BinParticle2SpectrumPoles, BinParticle2CorrelationPoles, Mesh2SpectrumPoles, Mesh2CorrelationPoles, utils
 
 
 @np.vectorize
@@ -224,22 +224,22 @@ def ref_theta_power(modes, data1, data2=None, boxsize=None, los='midpoint', ells
 def test_particle2(plot=False):
     import time
 
-    attrs = MeshAttrs(meshsize=(128,) * 3, boxsize=100., boxcenter=1200.)
-    size = int(1e-3 * attrs.boxsize.prod())
-    data = generate_uniform_particles(attrs, size + 1, seed=42)
+    mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=100., boxcenter=1200.)
+    size = int(1e-3 * mattrs.boxsize.prod())
+    data = generate_uniform_particles(mattrs, size + 1, seed=42)
     ells = (0, 2, 4)
     kw = dict(ells=ells, selection={'theta': (0., 0.05)})
-    bin = BinParticle2Correlation(attrs, edges={'step': 0.1, 'max': 100.}, **kw)
+    bin = BinParticle2CorrelationPoles(mattrs, edges={'step': 0.1, 'max': 100.}, **kw)
     #with jax.disable_jit():
     t0 = time.time()
     pcount = compute_particle2(data, bin=bin)
     pcount = jax.block_until_ready(pcount)
     print(time.time() - t0)
-    assert isinstance(pcount, Correlation2Poles)
+    assert isinstance(pcount, Mesh2CorrelationPoles)
     pcount.to_spectrum(jnp.linspace(0.01, 0.1, 20))
-    bin = BinParticle2Spectrum(attrs, edges={'step': 0.01, 'max': 0.2}, **kw)
+    bin = BinParticle2SpectrumPoles(mattrs, edges={'step': 0.01, 'max': 0.2}, **kw)
     power = compute_particle2(data, bin=bin)
-    assert isinstance(power, Spectrum2Poles)
+    assert isinstance(power, Mesh2SpectrumPoles)
     power2 = pcount.to_spectrum(power)
 
     if plot:
@@ -278,7 +278,6 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-    #test_particle2(plot=True)
-    jax.distributed.initialize()
-    test()
-    jax.distributed.shutdown()
+    test_particle2(plot=True)
+    #jax.distributed.initialize()
+    #jax.distributed.shutdown()

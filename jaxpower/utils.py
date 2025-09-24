@@ -475,12 +475,13 @@ class Interpolator1D(object):
     def __init__(self, x: jax.Array, xeval: jax.Array, order: int=0, edges=False, extrap=False):
         self.order = order
         self.mask = 1
+        if edges:
+            edges = x
+            x = (edges[:-1] + edges[1:]) / 2.
+        else:
+            tmp = (x[:-1] + x[1:]) / 2.
+            edges = np.concatenate([[tmp[0] - (x[1] - x[0])], tmp, [tmp[-1] + (x[-1] - x[-2])]])
         if self.order == 0:  # simple bins
-            if edges:
-                edges = x
-            else:
-                tmp = (x[:-1] + x[1:]) / 2.
-                edges = np.concatenate([[tmp[0] - (x[1] - x[0])], tmp, [tmp[-1] + (x[-1] - x[-2])]])
             self.idx = jnp.digitize(xeval, edges, right=False) - 1
             if not extrap: self.mask = (self.idx >= 0) & (self.idx <= len(edges) - 2)
             self.idx = jnp.where(self.mask, self.idx, 0)

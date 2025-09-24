@@ -9,7 +9,7 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 
-from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles
+from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, ObservableLeaf, ObservableTree
 from .utils import get_legendre, get_spherical_jn, get_real_Ylm, real_gaunt, register_pytree_dataclass
 from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
 
@@ -277,7 +277,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     meshes, autocorr = _format_meshs(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
+    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
     attrs = dict(los=vlos if vlos is not None else los)
@@ -341,7 +341,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         # Format the num results into :class:`Mesh2SpectrumPoles` instance
         spectrum = []
         for ill, ell in enumerate(ells):
-            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm, nmodes=bin.nmodes,
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm,
                                               volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
         return Mesh2SpectrumPoles(spectrum)
 
@@ -370,7 +370,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
         spectrum = []
         for ill, ell in enumerate(ells):
-            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm, nmodes=bin.nmodes,
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm,
                                               volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
         return Mesh2SpectrumPoles(spectrum)
 
@@ -399,7 +399,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     meshes, autocorr = _format_meshs(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
+    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
     attrs = dict(los=vlos if vlos is not None else los)
@@ -457,7 +457,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         # Format the num results into :class:`Mesh2CorrelationPoles` instance
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, value=num[ill] / mattrs.cellsize.prod(), nmodes=bin.nmodes, norm=norm,
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
                                                     volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
         return Mesh2CorrelationPoles(correlation)
 
@@ -487,7 +487,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
 
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, value=num[ill] / mattrs.cellsize.prod(), nmodes=bin.nmodes, norm=norm,
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
                                                     volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
         return Mesh2CorrelationPoles(correlation)
 
@@ -590,7 +590,7 @@ class FKPField(object):
         return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
 
 
-def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic', **kwargs) -> jax.Array:
+def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, resampler='cic', **kwargs) -> jax.Array:
     """
     Compute normalization for input fields, in volume**(1 - len(inputs)) unit.
 
@@ -629,10 +629,13 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, resampler='cic
         normalization *= mesh
     for particle in particles:
         normalization *= particle.paint(resampler=resampler, interlacing=0, compensate=False)
-    return normalization.sum() * normalization.cellsize.prod()**(1 - len(inputs))
+    norm = normalization.sum() * normalization.cellsize.prod()**(1 - len(inputs))
+    if bin is not None:
+        return [norm] * len(bin.ells)
+    return norm
 
 
-def compute_fkp2_spectrum_normalization(*fkps: FKPField, cellsize: float=10.):
+def compute_fkp2_spectrum_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10.):
     """
     Compute the FKP normalization for the power spectrum.
 
@@ -668,10 +671,12 @@ def compute_fkp2_spectrum_normalization(*fkps: FKPField, cellsize: float=10.):
         alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
         norm += alpha2 * compute_normalization(*randoms, **kw)
         norm = norm / 2
+    if bin is not None:
+        return [norm] * len(bin.ells)
     return norm
 
 
-def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField):
+def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None):
     """
     Compute the FKP shot noise for the power spectrum.
 
@@ -693,6 +698,8 @@ def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField):
         shotnoise = jnp.sum(particles.weights**2)
     else:
         shotnoise = 0.
+    if bin is not None:
+        return [shotnoise * (ell == 0) * jnp.ones_like(bin.xavg) for ell in bin.ells]
     return shotnoise
 
 
@@ -754,7 +761,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     tophat_method = 'rect'
     ells = bin.ells
 
-    if isinstance(edgesin, Mesh2SpectrumPoles):
+    if isinstance(edgesin, ObservableTree):
         kin = next(iter(edgesin)).edges('k')
         ellsin = edgesin.ells
 
@@ -765,7 +772,6 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
 
     kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
-
     wmat_tmp = {}
 
     for ell1 in ellsin:
@@ -800,14 +806,19 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
 
     observable = []
     for ill, ell in enumerate(ells):
-        observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=jnp.zeros_like(bin.xavg), nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg), ell=ell))
+        observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=jnp.zeros_like(bin.xavg), num_shotnoise=jnp.zeros_like(bin.xavg), norm=jnp.ones_like(bin.xavg), ell=ell))
     observable = Mesh2SpectrumPoles(observable)
 
     theory = []
     kin, kin_edges = jnp.mean(kin, axis=-1), kin
     for ill, ell in enumerate(ellsin):
-        theory.append(Mesh2SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin), nmodes=jnp.ones_like(kin), norm=jnp.ones_like(kin), ell=ell))
-    theory = Mesh2SpectrumPoles(theory)
+        #theory.append(ObservableLeaf(k=kin, k_edges=kin_edges, value=jnp.zeros_like(kin), coords=['k']))
+        theory.append(Mesh2SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin)))
+    #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
+    kw = dict(ells=list(ellsin))
+    if isinstance(ellsin[0], tuple):  # ell, wide-angle order
+        kw = dict(ells=[ell[0] for ell in ellsin], wa=[ell[1] for ell in ellsin])
+    theory = ObservableTree(theory, **kw)
 
     return WindowMatrix(observable=observable, theory=theory, value=wmat)
 
@@ -826,7 +837,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         A :class:`MeshAttrs` instance can be directly provided, in case the selection function is trivial (constant).
     edgesin : np.ndarray
         Input bin edges.
-    ellsin : tuple
+    ellsin : tuple, list
         Input multipole orders.
     bin : BinMesh2SpectrumPoles
         Output binning.
@@ -868,6 +879,9 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
     _norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod()
     if norm is None: norm = _norm
+    norm = jnp.array(norm)
+    if norm.ndim <= 1:
+        norm = norm * jnp.ones(len(bin.ells), dtype=rdtype)
     rnorm = _norm / norm / mattrs.meshsize.prod(dtype=rdtype)
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
@@ -883,15 +897,15 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
             mesh = mesh.r2c()
         return mesh
 
-    if isinstance(edgesin, Mesh2SpectrumPoles):
+    if isinstance(edgesin, ObservableTree):
         kin = next(iter(edgesin)).edges('k')
         ellsin = edgesin.ells
-
-    if edgesin.ndim == 2:
-        kin = edgesin
-        edgesin = None
     else:
-        kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+        if edgesin.ndim == 2:
+            kin = edgesin
+            edgesin = None
+        else:
+            kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
 
     def np_map(f, xs):
         return jnp.array(list(map(f, xs)))
@@ -931,11 +945,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
         def _bin(Aell):
             power = []
-            for ell in ells:
+            for ill, ell in enumerate(ells):
                 leg = get_legendre(ell)(mu)
                 odd = ell % 2
                 if odd: leg += get_legendre(ell)(-mu)
-                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=True))
+                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=True) * rnorm[ill])
             return jnp.concatenate(power)
 
         def my_map(f, xs):
@@ -968,7 +982,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                     del snorm
 
                     def f(kin):
-                        tophat_Qs = BesselIntegral(kin, savg, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * rnorm * mattrs.boxsize.prod() * Qs
+                        tophat_Qs = BesselIntegral(kin, savg, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * mattrs.boxsize.prod() * Qs
 
                         def f2(kout):
                             return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
@@ -978,7 +992,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
                         if pbar:
                             t.update(n=round(1 / len(ells) / len(ellsin)))
-                        return (2 * ell + 1) * power
+                        return (2 * ell + 1) * power* rnorm[ill]
 
                     wmat_tmp.append(my_map(f, kin))
                 wmat.append(jnp.concatenate(wmat_tmp, axis=-1))
@@ -991,7 +1005,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                 legin = get_legendre(ellin)(smu)
 
                 def f(kin):
-                    Aell = BesselIntegral(kin, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * legin * rnorm * mattrs.boxsize.prod(dtype=rdtype)
+                    Aell = BesselIntegral(kin, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * legin * mattrs.boxsize.prod(dtype=rdtype)
                     Aell = mattrs.create(kind='real', fill=Aell)
                     if Q is not None: Aell *= Q
                     power = _bin(_2c(Aell))
@@ -1007,7 +1021,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                 legin = get_legendre(ellin)(mu)
 
                 if common:
-                    Aell = mattrs.create(kind='complex', fill=legin * rnorm * mattrs.meshsize.prod(dtype=rdtype))
+                    Aell = mattrs.create(kind='complex', fill=legin * mattrs.meshsize.prod(dtype=rdtype))
                     power = _bin(Aell)
                     wmat_ellin = jnp.zeros_like(power, shape=(kin.shape[0], power.size))
                     wmat_ellin = wmat_ellin.at[jnp.tile(jnp.flatnonzero(mask_kin), len(bin.ells)), jnp.tile(mask_edges, len(bin.ells))].set(power)
@@ -1015,7 +1029,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                 else:
 
                     def f(kin):
-                        Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * rnorm * mattrs.meshsize.prod(dtype=rdtype))
+                        Aell = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm < kin[-1])) * legin * mattrs.meshsize.prod(dtype=rdtype))
                         if Q is not None: Aell = _2c(Q * _2r(Aell))
                         power = _bin(Aell)
                         if pbar:
@@ -1107,7 +1121,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                         for im1, Yl1m1 in enumerate(Ylms[ell1]):
                             for im, Ylm in enumerate(Ylms[ell]):
                                 Q = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
-                                Qs += 4. * np.pi * sbin(Q * Ylm(*svec) * Yl1m1(*svec)) * rnorm * mattrs.cellsize.prod()
+                                Qs += 4. * np.pi * sbin(Q * Ylm(*svec) * Yl1m1(*svec)) * mattrs.cellsize.prod()
 
                         if ell != 0: Qs = Qs.at[0].set(0.)
                         Qs = jnp.where(sbin.nmodes == 0, 0., Qs)
@@ -1123,7 +1137,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                 return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
 
                             batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
-                            power = jax.lax.map(f2, kout, batch_size=batch_size)
+                            power = jax.lax.map(f2, kout, batch_size=batch_size) * rnorm[ill]
 
                             if pbar:
                                 t.update(n=round(1 / len(ells) / len(ellsin)))
@@ -1142,12 +1156,12 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             Qs = 0.
                             for im1, Yl1m1 in enumerate(Ylms[ell1]):
                                 Q = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
-                                Qs += Yl1m1(*svec) * Q * rnorm * mattrs.cellsize.prod()
+                                Qs += Yl1m1(*svec) * Q * mattrs.cellsize.prod()
                             del xnorm
 
                             def f(kin):
                                 tophat_Qs = BesselIntegral(kin, snorm, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
-                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
                                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
@@ -1172,12 +1186,12 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                 def f(kin):
                                     Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
                                     knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
-                                    xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec)).c2r()
+                                    xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * Yl1m1(*kvec)).c2r()
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                    power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                    power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                     del Aell[ell]
                                     if pbar:
                                         t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell in ells)) / sum(len(Ylms[ell]) for ell, _ in ellsin))
@@ -1191,11 +1205,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
                             knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
                             for im1, Yl1m1 in enumerate(Ylms[ell1]):
-                                def kernel(*args):
-                                    kmask = (knorm >= kin[0]) & (knorm <= kin[-1])
-                                    return kmask * rnorm * Yl1m1(*kvec)
-
-                                xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec)).c2r()
+                                xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * Yl1m1(*kvec)).c2r()
                                 for ell in Aell:
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
@@ -1203,7 +1213,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             power = []
                             for ill, ell in enumerate(ells):
                                 Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0))
+                                power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
                                 del Aell[ell]
                             if pbar:
                                 t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell, _ in ellsin)))
@@ -1238,7 +1248,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                         if rg:  # rg != 0
                                             tmp += rg * Ylm(*svec) * Ypmp(*svec) * Q
                                     if hasattr(tmp, 'shape'):
-                                        tmp = 4. * np.pi * sbin(tmp) * rnorm * mattrs.cellsize.prod()
+                                        tmp = 4. * np.pi * sbin(tmp) * mattrs.cellsize.prod()
                                         Qs[key] += dump_to_buffer(tmp, key)
 
                         for p in ps:
@@ -1255,7 +1265,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Q)
 
                                 batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
-                                power = jax.lax.map(f2, kout, batch_size=batch_size)
+                                power = jax.lax.map(f2, kout, batch_size=batch_size) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1 / len(ells) / 6))
                                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
@@ -1279,7 +1289,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                         if rg:  # rg != 0
                                             Qs[p] += rg * Ypmp(*svec) * Q
                             for p in Qs:
-                                Qs[p] = dump_to_buffer(Qs[p] * rnorm * mattrs.cellsize.prod(), p)
+                                Qs[p] = dump_to_buffer(Qs[p] * mattrs.cellsize.prod(), p)
 
                             def f(kin):
                                 xi = 0.
@@ -1287,7 +1297,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     tophat = BesselIntegral(kin, snorm, ell=p, edges=True, method=tophat_method, mode='backward').w[..., 0]
                                     Q = load_from_buffer(Qs[p])
                                     xi += tophat * Q
-                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1 / sum(len(Ylms[ell]) for ell in ells) / 4))
                                 power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
@@ -1310,11 +1320,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                 def f(kin):
                                     knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
                                     Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
-                                    xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])).c2r()
+                                    xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])).c2r()
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                    power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0)
+                                    power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                     if pbar:
                                         t.update(n=round((im + 1) / sum(len(Ylms[ell]) for ell in ells) / 36))
                                     power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
@@ -1327,7 +1337,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                         def f(kin):
                             Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
                             for im12, (Yl1m1, Yl2m2) in enumerate(itertools.product(Ylms[ell1], Ylms[ell2])):
-                                xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * rnorm * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])).c2r()
+                                xi = mattrs.create(kind='complex', fill=((knorm >= kin[0]) & (knorm <= kin[-1])) * Yl1m1(*kvec) * Yl2m2(*[-kk for kk in kvec])).c2r()
                                 # Typically takes ~ 2x the time to load all Qs than the above FFT
                                 # Not great, but... recomputing 15 FFTs would have taken more time
                                 for ell in Aell:
@@ -1336,7 +1346,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             power = []
                             for ill, ell in enumerate(ells):
                                 Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0))
+                                power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
                                 del Aell[ell]
                             if pbar:
                                 t.update(n=round((im12 + 1) / 36))
@@ -1360,17 +1370,20 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
     observable = []
     for ill, ell in enumerate(ells):
-        observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=jnp.zeros_like(bin.xavg), nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg) * norm, ell=ell))
+        observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=jnp.zeros_like(bin.xavg), num_shotnoise=jnp.zeros_like(bin.xavg), norm=jnp.ones_like(bin.xavg) * norm[ill], ell=ell))
     observable = Mesh2SpectrumPoles(observable)
 
     theory = []
     kin, kin_edges = jnp.mean(kin, axis=-1), kin
     for ill, ell in enumerate(ellsin):
-        theory.append(Mesh2SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin), nmodes=jnp.ones_like(kin), norm=jnp.ones_like(kin), ell=ell))
-    theory = Mesh2SpectrumPoles(theory)
-
+        #theory.append(ObservableLeaf(k=kin, k_edges=kin_edges, value=jnp.zeros_like(kin), coords=['k']))
+        theory.append(Mesh2SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin)))
+    #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
+    kw = dict(ells=list(ellsin))
+    if isinstance(ellsin[0], tuple):  # ell, wide-angle order
+        kw = dict(ells=[ell[0] for ell in ellsin], wa_orders=[ell[1] for ell in ellsin])
+    theory = ObservableTree(theory, **kw)
     return WindowMatrix(observable=observable, theory=theory, value=wmat)
-
 
 
 def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | MeshAttrs, theory: Callable | dict[Callable],
@@ -1434,10 +1447,10 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         else: poles = poles[:-1]
     if isinstance(poles, tuple):
         kin, poles = poles
-    if isinstance(poles, Mesh2SpectrumPoles):
+    if isinstance(poles, ObservableTree):
         edges = next(iter(poles)).edges('k')
         kin = jnp.append(edges[..., 0], edges[-1, 1])
-        poles = {ell: poles.get(ell) for ell in poles.ells}
+        poles = {ell: poles.get(ell).value() for ell in poles.ells}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip((0, 2, 4), poles)}
     kvec = mattrs.kcoords(sparse=True)
@@ -1562,6 +1575,6 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         # Format the power results into :class:`Mesh2SpectrumPoles` instance
         spectrum = []
         for ill, ell in enumerate(ells):
-            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg) * norm,
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=jnp.ones_like(bin.xavg) * norm,
                                               volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
         return Mesh2SpectrumPoles(spectrum)

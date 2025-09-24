@@ -464,7 +464,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
 
     Returns
     -------
-    result : Spectrum2Poles or Correlation2Poles
+    result : Mesh2CorrelationPoles or Mesh2SpectrumPoles
         Resulting spectrum or correlation function object.
     """
     ells = bin.ells
@@ -482,10 +482,10 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
     if isinstance(bin, BinParticle2CorrelationPoles):
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, ell=ell, num=num[ill], edges=bin.edges, norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill]))
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill], ell=ell))
         return Mesh2CorrelationPoles(correlation)
     else:  # 'complex'
         spectrum = []
         for ill, ell in enumerate(ells):
-            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, ell=ell, num=num[ill], edges=bin.edges, norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill]))
+            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, edges=bin.edges, num_raw=num[ill], edges=bin.edges, norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill], ell=ell))
         return Mesh2SpectrumPoles(spectrum)
