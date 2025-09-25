@@ -95,7 +95,7 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, cut=None, zrange=(0.4, 1.1), e
     t4 = time.time()
     del fkp
     spectrum = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
-    spectrum.attrs.update(mesh=dict(mesh.attrs), zrange=zrange)
+    spectrum.attrs.update(zrange=zrange)
     jax.block_until_ready(spectrum)
     t5 = time.time()
     if cut is not None:

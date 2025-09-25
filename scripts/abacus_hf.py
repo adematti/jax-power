@@ -161,18 +161,19 @@ def compute_spectrum(output_fn, get_data, get_randoms, ells=(0, 2, 4), los='firs
     from jaxpower import (ParticleField, FKPField, compute_fkp2_normalization, compute_fkp2_shotnoise, BinMesh2SpectrumPoles, get_mesh_attrs, compute_mesh2_spectrum)
     t0 = time.time()
     data, randoms = get_data(), get_randoms()
-    attrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
-    data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
-    randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
+    mattrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
+    data = ParticleField(*data, attrs=mattrs, exchange=True, backend='jax')
+    randoms = ParticleField(*randoms, attrs=mattrs, exchange=True, backend='jax')
     fkp = FKPField(data, randoms)
-    bin = BinMesh2SpectrumPoles(mesh.attrs, edges={'step': 0.001}, ells=ells)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.001}, ells=ells)
     norm, num_shotnoise = compute_fkp2_normalization(fkp, bin=bin), compute_fkp2_shotnoise(fkp, bin=bin)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     wsum_data1 = data.sum()
     del fkp, data, randoms
     jitted_compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'], donate_argnums=[0])
     spectrum = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
-    spectrum.attrs.update(mesh=dict(mesh.attrs), los=los, wsum_data1=wsum_data1)
+    mattrs = {name: mattrs[name] for name in ['boxsize', 'boxcenter', 'meshsize']}
+    spectrum = spectrum.clone(attrs=dict(los=los, wsum_data1=wsum_data1, **mattrs))
     jax.block_until_ready(spectrum)
     t1 = time.time()
     if jax.process_index() == 0:
@@ -184,7 +185,7 @@ def compute_spectrum_window(output_fn, get_randoms, spectrum_fn=None, kind='smoo
     from jax import numpy as jnp
     from jaxpower import (ParticleField, compute_mesh2_spectrum_window, BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, compute_mesh2_correlation, compute_fkp2_shotnoise, compute_smooth2_spectrum_window, MeshAttrs, read)
     spectrum = read(spectrum_fn)
-    mattrs = MeshAttrs(**spectrum.attrs['mesh'])
+    mattrs = MeshAttrs(**{name: spectrum.attrs[name] for name in ['boxsize', 'boxcenter', 'meshsize']})
     randoms = ParticleField(*get_randoms(), attrs=mattrs, exchange=True, backend='jax')
     randoms = spectrum.attrs['wsum_data1'] / randoms.sum() * randoms
     los = spectrum.attrs['los']
@@ -212,7 +213,7 @@ def compute_thetacut(output_fn, get_data, get_randoms, spectrum_fn=None, output_
     from jaxpower import MeshAttrs, ParticleField, FKPField, BinParticle2CorrelationPoles, compute_particle2, read
     spectrum = read(spectrum_fn)
     ells, los = spectrum.ells, spectrum.attrs['los']
-    mattrs = MeshAttrs(**spectrum.attrs['mesh'])
+    mattrs = MeshAttrs(**{name: spectrum.attrs[name] for name in ['boxsize', 'boxcenter', 'meshsize']})
 
     data, randoms = get_data(), get_randoms()
     data = ParticleField(*data, attrs=mattrs)
@@ -233,7 +234,7 @@ def compute_thetacut_window(output_fn, get_randoms, spectrum_fn=None, window_fn=
     from jaxpower import MeshAttrs, ParticleField, FKPField, BinParticle2CorrelationPoles, BinMesh2SpectrumPoles, Mesh2SpectrumPole, Mesh2SpectrumPoles, compute_particle2, WindowMatrix, compute_smooth2_spectrum_window, read
     spectrum = read(spectrum_fn)
     ells, norm = spectrum.ells, spectrum.get(0).values('norm')
-    attrs = MeshAttrs(**spectrum.attrs['mesh'])
+    attrs = MeshAttrs(**{name: spectrum.attrs[name] for name in ['boxsize', 'boxcenter', 'meshsize']})
     output_fn = str(output_fn)
 
     wmatrix = read(window_fn)
@@ -401,10 +402,10 @@ def compute_bispectrum(output_fn, get_data, get_randoms, basis='scoccimarro', lo
     t0 = time.time()
     data, randoms = get_data(), get_randoms()
     mattrs = get_mesh_attrs(data[0], randoms[0], check=True, **attrs)
-    data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
-    randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
+    data = ParticleField(*data, attrs=mattrs, exchange=True, backend='jax')
+    randoms = ParticleField(*randoms, attrs=mattrs, exchange=True, backend='jax')
     fkp = FKPField(data, randoms)
-    ells = [(0, 0, 0), (0, 0, 2)] if 'sugiyama' in basis else [0, 2]
+    ells = [(0, 0, 0), (2, 0, 2)] if 'sugiyama' in basis else [0, 2]
     bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.01}, basis=basis, ells=ells, buffer_size=4)
     #norm = compute_fkp3_normalization(fkp, bin=bin, cellsize=None)
     norm = compute_fkp3_normalization(fkp, split=42, bin=bin, cellsize=None)
@@ -476,7 +477,7 @@ if __name__ == '__main__':
 
     from jaxpower.mesh import create_sharding_mesh
 
-    for imock in range(12, nmocks):
+    for imock in range(nmocks):
         data_fn = get_data_fn(imock=imock, **catalog_args)
         all_randoms_fn = [get_randoms_fn(iran=iran, **catalog_args) for iran in range(4)][:1]
         get_data = lambda: get_clustering_positions_weights(data_fn, **catalog_args)

@@ -793,7 +793,7 @@ class MeshAttrs(object):
 
     # For mapping
     def __getitem__(self, key):
-            return getattr(self, key)
+        return getattr(self, key)
 
     def keys(self):
         return self.__annotations__.keys()
