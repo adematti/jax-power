@@ -8,7 +8,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_normalization, compute_fkp3_spectrum_normalization, compute_fkp3_spectrum_shotnoise, read, utils)
+from jaxpower import (compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils)
 
 
 dirname = Path('_tests')
@@ -28,10 +28,10 @@ def test_mesh3_spectrum(plot=False):
     list_los = ['x', 'local']
     mattrs = MeshAttrs(meshsize=128, boxsize=1000.)
 
-    for basis in ['sugiyama-diagonal', 'scoccimarro-equilateral']:
+    for basis in ['scoccimarro', 'scoccimarro-equilateral', 'sugiyama-diagonal'][:1]:
 
         ells = [0] if 'scoccimarro' in basis else [(0, 0, 0)]
-        bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.01}, basis=basis, ells=ells)
+        bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.1}, basis=basis, ells=ells)
 
         @partial(jax.jit, static_argnames=['los'])
         def mock(mattrs, bin, seed, los='x'):
@@ -146,7 +146,7 @@ def test_timing():
     assert np.allclose(bk1, bk2)
 
 
-def test_polybin3d():
+def test_polybin3d(plot=False):
 
     from PolyBin3D import PolyBin3D, BSpec
 
@@ -183,7 +183,7 @@ def test_polybin3d():
             t0 = time.time()
             spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
             spectrum = spectrum.clone(norm=[mean**3 * pole.norm for pole in spectrum])
-            num_shotnoise = compute_fkp3_spectrum_shotnoise(data, los=los, bin=bin, **kw)
+            num_shotnoise = compute_fkp3_shotnoise(data, los=los, bin=bin, **kw)
             spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
             jax.block_until_ready(spectrum)
@@ -194,7 +194,7 @@ def test_polybin3d():
             print(f'jax-power took {t1 - t0:.2f} s')
             print(f'polybin took {t2 - t1:.2f} s')
 
-            if imock == 0:
+            if plot and imock == 0:
                 k = spectrum.get(0).coords('k', center='mid')
                 weight = k.prod(axis=-1)
                 spectrum_raw = spectrum.clone(num_shotnoise=[0. * pole.num_shotnoise for pole in spectrum])
@@ -210,7 +210,7 @@ def test_polybin3d():
                 plt.show()
 
 
-def test_triumvirate_box():
+def test_triumvirate_box(plot=False):
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -237,7 +237,7 @@ def test_triumvirate_box():
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, convention='triumvirate', los=los, **kw)
+    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, convention='triumvirate', los=los, **kw)
     spectrum = spectrum.clone(norm=[pole.norm * mean**3 for pole in spectrum])
     spectrum_raw = spectrum
     spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
@@ -257,17 +257,18 @@ def test_triumvirate_box():
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
 
-    #print(results['bk_raw'] / spectrum_raw.view())
-    #print((results['bk_raw'] - results['bk_shot']) / spectrum.view())
-    ax = plt.gca()
-    #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
-    ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
-    ax.plot(spectrum.value(), label='jaxpower')
-    ax.legend()
-    plt.show()
+    if plot:
+        #print(results['bk_raw'] / spectrum_raw.view())
+        #print((results['bk_raw'] - results['bk_shot']) / spectrum.view())
+        ax = plt.gca()
+        #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
+        ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
+        ax.plot(spectrum.value(), label='jaxpower')
+        ax.legend()
+        plt.show()
 
 
-def test_triumvirate_survey():
+def test_triumvirate_survey(plot=False):
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -295,9 +296,9 @@ def test_triumvirate_survey():
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    num_shotnoise = compute_fkp3_spectrum_shotnoise(data, bin=bin, los=los, **kw)
+    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
     mean = size / mattrs.meshsize.prod(dtype=float)
-    spectrum = spectrum.clone(norm=spectrum.norm * mean**3)
+    spectrum = spectrum.clone(norm=[pole.norm * mean**3 for pole in spectrum])
     #spectrum = spectrum.clone(num_shotnoise=jnp.array(num_shotnoise))
 
     from triumvirate.catalogue import ParticleCatalogue
@@ -319,12 +320,13 @@ def test_triumvirate_survey():
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec(data, randoms, paramset=paramset, logger=logger)
 
-    ax = plt.gca()
-    #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
-    ax.plot(results['bk_raw'], label='triumvirate')
-    ax.plot(spectrum.value(), label='jaxpower')
-    ax.legend()
-    plt.show()
+    if plot:
+        ax = plt.gca()
+        #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
+        ax.plot(results['bk_raw'], label='triumvirate')
+        ax.plot(spectrum.value(), label='jaxpower')
+        ax.legend()
+        plt.show()
 
 
 def test_normalization():
@@ -343,9 +345,9 @@ def test_normalization():
     data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
     randoms = generate_uniform_particles(mattrs, size * 10, seed=42)
     fkp = FKPField(data, randoms)
-    norm = compute_fkp3_spectrum_normalization(fkp, cellsize=20., split=None)
+    norm = compute_fkp3_normalization(fkp, cellsize=20., split=None)
     print('norm no split', norm)
-    norm_split = compute_fkp3_spectrum_normalization(fkp, cellsize=20., split=42)
+    norm_split = compute_fkp3_normalization(fkp, cellsize=20., split=42)
     print('norm split', norm_split)
 
 
@@ -384,19 +386,8 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    #test_mesh3_spectrum(plot=True)
-    #test_polybin3d()
-    #test_triumvirate_box()
-    #test_triumvirate_survey()
+    test_mesh3_spectrum(plot=True)
+    test_polybin3d()
+    test_triumvirate_box()
+    test_triumvirate_survey()
     test_normalization()
-    exit()
-
-    #test_timing()
-    #test_mesh3_spectrum(plot=False)
-    #test_timing()
-    #test_polybin3d()
-    #test_normalization()
-    #test_triumvirate_box()
-    #test_triumvirate_survey()
-    #test_fisher()
-    #test_normalization()

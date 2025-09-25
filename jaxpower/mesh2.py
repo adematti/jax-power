@@ -41,6 +41,7 @@ class BinMesh2SpectrumPoles(object):
     ibin: jax.Array = None
     wmodes: jax.Array = None
     ells: tuple = None
+    mattrs: MeshAttrs = None
 
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
         if not isinstance(mattrs, MeshAttrs):
@@ -75,7 +76,7 @@ class BinMesh2SpectrumPoles(object):
             xsum += bin[2]
         edges = np.column_stack([edges[:-1], edges[1:]])
         ells = _format_ells(ells)
-        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells)
+        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells, mattrs=mattrs)
 
     def __call__(self, mesh, antisymmetric=False, remove_zero=False):
         """
@@ -127,6 +128,7 @@ class BinMesh2CorrelationPoles(object):
     xavg: jax.Array = None
     ibin: jax.Array = None
     ells: tuple = None
+    mattrs: MeshAttrs = None
 
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
         if not isinstance(mattrs, MeshAttrs):
@@ -157,7 +159,7 @@ class BinMesh2CorrelationPoles(object):
             xsum += bin[2]
         edges = np.column_stack([edges[:-1], edges[1:]])
         ells = _format_ells(ells)
-        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, ells=ells)
+        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, ells=ells, mattrs=mattrs)
 
     def __call__(self, mesh, remove_zero=False):
         """
@@ -635,7 +637,7 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2S
     return norm
 
 
-def compute_fkp2_spectrum_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10.):
+def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10.):
     """
     Compute the FKP normalization for the power spectrum.
 
@@ -643,12 +645,14 @@ def compute_fkp2_spectrum_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPo
     ----------
     fkps : FKPField or ParticleField
         FKP fields.
+    bin : BinMesh2SpectrumPoles or BinMesh2CorrelationPoles, optional
+        Binning operator. Only used to return a list of normalization factors for each multipole.
     cellsize : float, optional
         Cell size.
 
     Returns
     -------
-    norm : jax.Array
+    norm : float, list
     """
     # This is the pypower normalization - move to new one?
     fkps, autocorr = _format_meshs(*fkps)
@@ -676,7 +680,7 @@ def compute_fkp2_spectrum_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPo
     return norm
 
 
-def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None):
+def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None):
     """
     Compute the FKP shot noise for the power spectrum.
 
@@ -684,10 +688,12 @@ def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField, bin: BinMes
     ----------
     fkps : FKPField or ParticleField
         FKP or particle fields.
+    bin : BinMesh2SpectrumPoles or BinMesh2CorrelationPoles, optional
+        Binning operator. Only used to return a list of shotnoise estimates for each multipole.
 
     Returns
     -------
-    shotnoise : jax.Array
+    shotnoise : float, list
     """
     # This is the pypower normalization - move to new one?
     fkps, autocorr = _format_meshs(*fkps)
@@ -699,7 +705,12 @@ def compute_fkp2_spectrum_shotnoise(*fkps: FKPField | ParticleField, bin: BinMes
     else:
         shotnoise = 0.
     if bin is not None:
-        return [shotnoise * (ell == 0) * jnp.ones_like(bin.xavg) for ell in bin.ells]
+        if isinstance(bin, BinMesh2CorrelationPoles):
+            mask_shotnoise = (bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.)
+            mask_shotnoise = mask_shotnoise / bin.mattrs.cellsize.prod()
+        else:
+            mask_shotnoise = jnp.ones_like(bin.xavg)
+        return [shotnoise * (ell == 0) * mask_shotnoise for ell in bin.ells]
     return shotnoise
 
 

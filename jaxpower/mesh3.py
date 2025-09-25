@@ -321,7 +321,9 @@ def _iter_triposh(*ells, los='local'):
             continue
         toret.append([im1 + ell1, im2 + ell2, im3 + ell3, gaunt, sym])  # m indexing starting from 0
         acc.append(toret[-1][:3])
-    return [jnp.array(xx) for xx in zip(*toret)]
+    if toret:
+        return [jnp.array(xx) for xx in zip(*toret)]
+    return [jnp.zeros((0,), dtype=int) for _ in range(5)]
 
 
 def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh3SpectrumPoles=None, los: str | np.ndarray='x'):
@@ -336,7 +338,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
-        If ``los`` is 'local', use local (varying) first point (resp. end point) line-of-sight.
+        If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
 
@@ -406,19 +408,22 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = (4. * np.pi)**2 * coeff * bin(*tmp, remove_zero=True)
-            carry += tmp + sym * tmp.conj()
+            tmp = (4. * np.pi)**2 * coeff.astype(mattrs.rdtype) * bin(*tmp, remove_zero=True)
+            carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
             return carry, im
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
             Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
             xs = _iter_triposh(ell1, ell2, ell3, los=los)
-            num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
-            #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
+            if xs[0].size:
+                num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
+                #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
+            else:
+                num.append(jnp.zeros(len(bin.edges), dtype=mattrs.dtype))
 
     spectrum = []
     for ill, ell in enumerate(ells):
-        spectrum.append(Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], norm=norm, attrs=attrs, basis=bin.basis, ell=ell))
+        spectrum.append(Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes[ill], num_raw=num[ill], norm=norm, attrs=attrs, basis=bin.basis, ell=ell))
     return Mesh3SpectrumPoles(spectrum)
 
 
@@ -468,24 +473,29 @@ def _split_particles(*particles, seed=0):
     return toret
 
 
-def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
+def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=10., split=None):
     """
     Compute the FKP normalization for the bispectrum.
 
     Parameters
     ----------
-    fkps : FKPField
-        FKP fields.
+    fkps : FKPField or PaticleField
+        FKP or particle fields.
+    bin : BinMesh3SpectrumPoles, optional
+        Binning operator. Only used to return a list of normalization factors for each multipole.
     cellsize : float, optional
         Cell size.
     split : int or None, optional
         Random seed for splitting.
         This is useful to get unbiased estimate of the normalization.
+        The input particle fields are split such that the total number of splits is 3.
+        For instance, if 3 different fields are provided, no splitting is performed; if 2 fields are provided, one of them is split in 2.
+        The each split is painted on a mesh, and the normalization is computed from the product of the 3 meshes.
         If ``None``, no splitting is performed.
 
     Returns
     -------
-    norm : float
+    norm : float, list
     """
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
@@ -499,10 +509,12 @@ def compute_fkp3_spectrum_normalization(*fkps, cellsize=10., split=None):
         if kw[name] is None: kw.pop(name)
     alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum(), fkps))
     norm = alpha * compute_normalization(*[fkp.randoms for fkp in fkps], **kw)
+    if bin is not None:
+        return [norm] * len(bin.ells)
     return norm
 
 
-def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', convention=None, resampler='cic', interlacing=False, **kwargs):
+def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', convention=None, resampler='cic', interlacing=False, **kwargs):
     """
     Compute the FKP shot noise for the bispectrum.
 
@@ -514,7 +526,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
-        If ``los`` is 'local', use local (varying) first point (resp. end point) line-of-sight.
+        If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
     convention : str, optional
@@ -533,7 +545,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
     Returns
     -------
-    shotnoise : tuple
+    shotnoise : list
         Shot noise for each multipole.
     """
     fkps, same = _format_meshs(*fkps)
@@ -694,10 +706,13 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             for ell1, ell2, ell3 in ells:
                 Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
                 xs = _iter_triposh(ell1, ell2, ell3, los=los)
-                xs = xs + [jnp.array([s111[ellms.index((ell3, im3))] for im3 in xs[2]])]
-                sign = (-1)**((ell1 + ell2) // 2)
-                s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0]), xs=xs)[0])
-
+                if xs[0].size:
+                     # Add s111 for s, im in xs are offset by ell
+                    xs = xs + [jnp.array([s111[ellms.index((ell3, int(im3) - ell3))] for im3 in xs[2]])]
+                    sign = (-1)**((ell1 + ell2) // 2)
+                    s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0]), xs=xs)[0])
+                else:
+                    s113.append(jnp.zeros_like(bin.xavg[..., 0]))
             return s113
 
         uells = sorted(sum(ells, start=tuple()))
@@ -738,8 +753,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
 
-    return tuple(shotnoise)
-
+    return list(shotnoise)
 
 
 

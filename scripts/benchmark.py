@@ -58,13 +58,14 @@ def get_clustering_positions_weights2(*fns, zrange=None):
     return get(fns)
 
 
-def get_mock_fn(kind='power'):
+def get_mock_fn(kind='spectrum'):
     base_dir = Path('_tests')
-    return base_dir / '{}.npy'.format(kind)
+    ext = 'npy' if 'pypower' in kind else 'h5'
+    return base_dir / f'{kind}.{ext}'
 
 
 def compute_jaxpower(fn, data_fn, all_randoms_fn, cut=None, zrange=(0.4, 1.1), ells=(0, 2, 4), los='firstpoint', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2Spectrum, BinParticle2Correlation, BinParticle2Spectrum, compute_particle2, get_mesh_attrs)
+    from jaxpower import (ParticleField, FKPField, compute_fkp2_normalization, compute_fkp2_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2SpectrumPoles, BinParticle2CorrelationPoles, BinParticle2SpectrumPoles, compute_particle2, get_mesh_attrs)
     t0 = time.time()
     data = get_clustering_positions_weights(data_fn, zrange=zrange)
     randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
@@ -72,37 +73,37 @@ def compute_jaxpower(fn, data_fn, all_randoms_fn, cut=None, zrange=(0.4, 1.1), e
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    attrs = get_mesh_attrs(data[0], randoms[0], **attrs)
+    mattrs = get_mesh_attrs(data[0], randoms[0], **attrs)
     #attrs = get_mesh_attrs(data[0], **attrs)
     kw = dict(exchange=True, backend='mpi')
-    data = ParticleField(*data, attrs=attrs, **kw)
-    randoms = ParticleField(*randoms, attrs=attrs, **kw)
+    data = ParticleField(*data, attrs=mattrs, **kw)
+    randoms = ParticleField(*randoms, attrs=mattrs, **kw)
     fkp = FKPField(data, randoms)
     #del data, randoms
     t2 = time.time()
     if cut is not None:
-        bin = BinParticle2Correlation(attrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
-        #bin = BinParticle2Spectrum(attrs, edges=np.linspace(0.01, 0.1, 10), selection={'theta': (0., 0.05)}, ells=ells)
+        bin = BinParticle2CorrelationPoles(mattrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
+        #bin = BinParticle2SpectrumPoles(attrs, edges=np.linspace(0.01, 0.1, 10), selection={'theta': (0., 0.05)}, ells=ells)
         cut = compute_particle2(fkp.particles, bin=bin, los=los)
         #print(cut.clone(num_shotnoise=None).view().sum(), cut.view().sum(), attrs.meshsize)
     t3 = time.time()
-    norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
+    bin = BinMesh2SpectrumPoles(mesh.attrs, edges={'step': 0.001}, ells=ells)
+    norm, num_shotnoise = compute_fkp2_normalization(fkp, bin=bin), compute_fkp2_shotnoise(fkp, bin=bin)
     #f = (data - data.sum() / randoms.sum() * randoms).clone(attrs=data.attrs)
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     jax.block_until_ready(mesh)
     t4 = time.time()
     del fkp
-    bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=ells)
-    power = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
-    power.attrs.update(mesh=dict(mesh.attrs), zrange=zrange)
-    jax.block_until_ready(power)
+    spectrum = jitted_compute_mesh2_spectrum(mesh, bin=bin, los=los).clone(norm=norm, num_shotnoise=num_shotnoise)
+    spectrum.attrs.update(mesh=dict(mesh.attrs), zrange=zrange)
+    jax.block_until_ready(spectrum)
     t5 = time.time()
     if cut is not None:
-        cut = cut.to_spectrum(power)
-        power = power.clone(num=[power.num[iproj] - cut.num[iproj] for iproj in range(len(power.projs))])
+        cut = cut.to_spectrum(spectrum)
+        spectrum = spectrum.clone(value=spectrum.value() - cut.value())
     if jax.process_index() == 0:
-        print(f'reading {t1 - t0:.2f} exchange {t2 - t1:.2f} theta-cut {t3 - t2:.2f} painting {t4 - t3:.2f} power {t5 - t4:.2f}')
-    power.save(fn)
+        print(f'reading {t1 - t0:.2f} exchange {t2 - t1:.2f} theta-cut {t3 - t2:.2f} painting {t4 - t3:.2f} spectrum {t5 - t4:.2f}')
+    spectrum.write(fn)
 
 
 def compute_thetacut(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4), los='firstpoint', **attrs):
@@ -113,16 +114,15 @@ def compute_thetacut(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2,
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    from jaxpower import get_mesh_attrs, ParticleField, FKPField, BinParticle2Correlation, compute_particle2
+    from jaxpower import get_mesh_attrs, ParticleField, FKPField, BinParticle2CorrelationPoles, compute_particle2
     attrs = get_mesh_attrs(data[0], randoms[0], **attrs)
     data = ParticleField(*data, attrs=attrs, exchange=True, backend='jax')
     randoms = ParticleField(*randoms, attrs=attrs, exchange=True, backend='jax')
     fkp = FKPField(data, randoms)
     ells = (0,)
-    bin = BinParticle2Correlation(attrs, edges={'step': 0.1, 'max': 100.}, selection={'theta': (0., 0.05)}, ells=ells)
+    bin = BinParticle2CorrelationPoles(attrs, edges={'step': 0.1, 'max': 100.}, selection={'theta': (0., 0.05)}, ells=ells)
     cut = compute_particle2(fkp.particles, bin=bin, los=los)
-    print(cut.num)
-    cut.save(fn)
+    cut.write(fn)
 
 
 def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
@@ -138,16 +138,16 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     direct_edges = {'min': 0., 'step': 0.1}
     direct_attrs = {'nthreads': mpicomm.size}
     #direct_selection_attrs = direct_edges = direct_attrs = None
-    power = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, direct_selection_attrs=direct_selection_attrs, direct_edges=direct_edges, direct_attrs=direct_attrs)
+    spectrum = CatalogFFTPower(data_positions1=data_positions, data_weights1=data_weights, randoms_positions1=randoms_positions, randoms_weights1=randoms_weights, position_type='pos', resampler='tsc', interlacing=3, edges={'step': 0.001}, **attrs, direct_selection_attrs=direct_selection_attrs, direct_edges=direct_edges, direct_attrs=direct_attrs)
     t2 = time.time()
     if mpicomm.rank == 0:
-        print(f'reading {t1 - t0:.2f} power {t2 - t1:.2f}')
-    power.save(fn)
+        print(f'reading {t1 - t0:.2f} spectrum {t2 - t1:.2f}')
+    spectrum.write(fn)
 
 
 
 def compute_test(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4), los='firstpoint', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2Spectrum, BinParticle2Correlation, BinParticle2Spectrum, compute_particle2, get_mesh_attrs)
+    from jaxpower import (ParticleField, FKPField, compute_fkp2_normalization, compute_fkp2_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2Spectrum, BinParticle2CorrelationPoles, BinParticle2SpectrumPoles, compute_particle2, get_mesh_attrs)
     t0 = time.time()
     data = get_clustering_positions_weights(data_fn, zrange=zrange)
     randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
@@ -155,22 +155,22 @@ def compute_test(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4),
     mpicomm = MPI.COMM_WORLD
     mpicomm.barrier()
     t1 = time.time()
-    attrs = get_mesh_attrs(data[0], randoms[0], **attrs)
+    mattrs = get_mesh_attrs(data[0], randoms[0], **attrs)
     #attrs = get_mesh_attrs(data[0], **attrs)
     kw = dict(exchange=True, backend='jax')
-    data = ParticleField(*data, attrs=attrs, **kw)
-    randoms = ParticleField(*randoms, attrs=attrs, **kw)
+    data = ParticleField(*data, attrs=mattrs, **kw)
+    randoms = ParticleField(*randoms, attrs=mattrs, **kw)
     fkp = FKPField(data, randoms)
     p = fkp.particles
     #del data, randoms
     t2 = time.time()
 
-    bin = BinParticle2Correlation(attrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
-    #bin = BinParticle2Spectrum(attrs, edges=np.linspace(0.01, 0.1, 10), selection={'theta': (0., 0.05)}, ells=ells)
+    bin = BinParticle2CorrelationPoles(mattrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
+    #bin = BinParticle2SpectrumPoles(mattrs, edges=np.linspace(0.01, 0.1, 10), selection={'theta': (0., 0.05)}, ells=ells)
     #print(p.size, jnp.std(p.weights))
     cut = compute_particle2(p, bin=bin, los=los)
     print(cut.clone(num_shotnoise=None).view().sum(), cut.view()[:3])
-    
+
 
 if __name__ == '__main__':
 
@@ -213,13 +213,13 @@ if __name__ == '__main__':
             cut = True
             if jax.process_count() > 1:
                 with create_sharding_mesh() as sharding_mesh:
-                    power = compute_jaxpower(fn, data_fn, all_randoms_fn, cut=cut, **cutsky_args)
-                    #power = compute_test(fn, data_fn, all_randoms_fn, **cutsky_args)
-                    jax.block_until_ready(power)
+                    spectrum = compute_jaxpower(fn, data_fn, all_randoms_fn, cut=cut, **cutsky_args)
+                    #spectrum = compute_test(fn, data_fn, all_randoms_fn, **cutsky_args)
+                    jax.block_until_ready(spectrum)
             else:
-                power = compute_jaxpower(fn, data_fn, all_randoms_fn, cut=cut, **cutsky_args)
-                #power = compute_test(fn, data_fn, all_randoms_fn, **cutsky_args)
-                jax.block_until_ready(power)
+                spectrum = compute_jaxpower(fn, data_fn, all_randoms_fn, cut=cut, **cutsky_args)
+                #spectrum = compute_test(fn, data_fn, all_randoms_fn, **cutsky_args)
+                jax.block_until_ready(spectrum)
 
         if todo == 'thetacut':
             fn = get_mock_fn(f'thetacut_{imock:d}')

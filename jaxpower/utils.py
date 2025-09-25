@@ -494,6 +494,7 @@ class Interpolator1D(object):
             raise NotImplementedError
 
     def __call__(self, fun: jax.Array):
+        fun = jnp.asarray(fun)
         if self.order == 0:
             toret = fun[self.idx]
         if self.order == 1:

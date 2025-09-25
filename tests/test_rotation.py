@@ -16,7 +16,7 @@ def test_rotation_spectrum2(plot=False):
 
     observable = Mesh2SpectrumPoles([Mesh2SpectrumPole(k=ko, k_edges=ko_edges, num_raw=np.zeros_like(ko), ell=ell) for ell in ells])
     value = np.eye(3 * ko.size)
-    covmatrix = CovarianceMatrix(value=value, observable=observable)
+    covariance = CovarianceMatrix(value=value, observable=observable)
 
     kt_edges = np.linspace(0., 0.2, 41)
     kt_edges = np.column_stack([kt_edges[:-1], kt_edges[1:]])
@@ -30,15 +30,14 @@ def test_rotation_spectrum2(plot=False):
 
     value = np.block([[(1. if ello == ellt else 1. / 10) * f(*np.meshgrid(observable.get(ello).coords('k'), theory.get(ellt).coords('k'), indexing='ij')) for ellt in ells] for ello in ells])
     value = value / np.sum(value, axis=-1)[..., None]
-    wmatrix = WindowMatrix(observable=observable, theory=theory, value=value)
+    window = WindowMatrix(observable=observable, theory=theory, value=value)
     if plot:
-        wmatrix.plot(show=True)
-        #fig = wmatrix.plot_slice(indices=10)
-        #wmatrix.plot_slice(indices=10, fig=fig, show=True)
+        window.plot(show=True)
+        #fig = window.plot_slice(indices=10)
+        #window.plot_slice(indices=10, fig=fig, show=True)
 
-    rotation = WindowRotationSpectrum2(wmatrix=wmatrix, covmatrix=covmatrix)
+    rotation = WindowRotationSpectrum2(window=window, covariance=covariance)
     rotation.setup()
-    print(rotation.loss(rotation.init))
     rotation.fit()
 
     fn = dirname / 'tmp.npy'
@@ -47,10 +46,13 @@ def test_rotation_spectrum2(plot=False):
     rotation = WindowRotationSpectrum2.load(fn)
     if plot:
         rotation.plot_compactness(show=True)
-        rotation.plot_wmatrix_slice(indices=10, show=True)
+        rotation.plot_window_slice(indices=10, show=True)
 
 
 if __name__ == '__main__':
 
+    from jax import config
+    config.update('jax_enable_x64', True)
+
     setup_logging()
-    test_rotation_spectrum2(plot=True)
+    test_rotation_spectrum2(plot=False)

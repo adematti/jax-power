@@ -1757,7 +1757,7 @@ class ParticleField(object):
         def split_particles(isplit):
             isplit = np.array(isplit)
             mask = jnp.all((self.positions >= isplit * extent_boxsize + extent_offset) & (self.positions <= (isplit + 1) * extent_boxsize + extent_offset), axis=-1)
-            attrs = self.attrs.clone(boxsize=split_boxsize, boxcenter=(isplit + 0.5) * extent_boxsize + extent_offset, meshsize=attrs.meshsize)
+            attrs = self.attrs.clone(boxsize=split_boxsize, boxcenter=(isplit + 0.5) * extent_boxsize + extent_offset, meshsize=self.attrs.meshsize)
             return self.clone(positions=self.positions[mask], weights=self.weights[mask], attrs=attrs)
 
         for isplit in itertools.product(*(range(nsplit) for nsplit in nsplits)):

@@ -1,20 +1,29 @@
 import jax
-import numpy as np
+from jax import numpy as jnp
 
 from lsstypes import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, Mesh3SpectrumPole, Mesh3SpectrumPoles, ObservableLeaf, ObservableTree, WindowMatrix, CovarianceMatrix, read, write
+from lsstypes.base import from_state, _edges_names
 
 
 def make_leaf_pytree(cls):
 
     def tree_flatten(self):
-        children = tuple(self._data[name] for name in self._coords_names + self._values_names)
+        children = list(self._data[name] for name in self._coords_names + self._values_names)
+        edges_names = []
+        for name in _edges_names(self._coords_names):
+            if name in self._data:
+                children.append(self._data[name])
+                edges_names.append(name)
         aux_data = {name: getattr(self, name) for name in ['_attrs', '_meta', '_coords_names', '_values_names']}
-        return children, aux_data
+        aux_data['_edges_names'] = edges_names
+        return tuple(children), aux_data
 
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
+        aux_data = dict(aux_data)
+        edges_names = aux_data.pop('_edges_names')
         new.__dict__.update(aux_data)
-        new._data = {name: child for name, child in zip(new._coords_names + new._values_names, children)}
+        new._data = {name: child for name, child in zip(new._coords_names + new._values_names + edges_names, children)}
         return new
 
     cls.tree_flatten = tree_flatten
@@ -88,3 +97,88 @@ Mesh3SpectrumPoles = make_tree_pytree(Mesh3SpectrumPoles)
 
 WindowMatrix = make_window_pytree(WindowMatrix)
 CovarianceMatrix = make_covariance_pytree(CovarianceMatrix)
+
+
+
+def _correlation_to_spectrum(correlation, k):
+    """
+    Convert the correlation function multipoles to power spectrum multipoles.
+
+    Parameters
+    ----------
+    k : array-like or Particle2SpectrumPoles
+        Wavenumber bin centers or :class:`Particle2SpectrumPoles` instance.
+
+    Returns
+    -------
+    Particle2SpectrumPoles
+    """
+    from .utils import BesselIntegral
+
+    def pole_to_spectrum(pole, ell=None):
+        if ell is None:
+            ell = pole.ell
+        leaf = None
+        if isinstance(k, ObservableLeaf):
+            leaf = k
+        elif isinstance(k, ObservableTree):
+            leaf = k.get(ell)
+        if leaf is not None:
+            kk = leaf.coords('k')
+        else:
+            kk = k
+        integ = BesselIntegral(pole.coords('s'), kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
+        #num.append(integ(self._value[ill]))
+        # self.weights = volume factor
+        xi = pole.value()
+        if 'volume' in pole.values():
+            volume = pole.values('volume')
+            xi = jnp.where(volume == 0., 0., xi)
+        else:
+            volume = 1.
+        value = integ(volume * xi)
+        if leaf is not None:
+            return leaf.clone(value=value)
+        return ObservableLeaf(k=k, value=value, coords=['k'])
+
+    if isinstance(correlation, ObservableTree):  # multipoles
+        return ObservableTree([pole_to_spectrum(correlation.get(ells=ell), ell) for ell in correlation.ells], ells=correlation.ells)
+    return pole_to_spectrum(correlation)
+
+
+class Particle2SpectrumPole(Mesh2SpectrumPole): pass
+class Particle2SpectrumPoles(Mesh2SpectrumPoles): pass
+
+class Particle2CorrelationPole(Mesh2CorrelationPole):
+
+    def to_spectrum(self, k):
+        """
+        Convert the correlation function multipole to power spectrum multipole.
+
+        Parameters
+        ----------
+        k : array-like or Particle2SpectrumPoles
+            Wavenumber bin centers or :class:`Particle2SpectrumPoles` instance.
+
+        Returns
+        -------
+        Particle2SpectrumPole
+        """
+        return _correlation_to_spectrum(self, k)
+
+class Particle2CorrelationPoles(Mesh2CorrelationPoles):
+
+    def to_spectrum(self, k):
+        """
+        Convert the correlation function multipoles to power spectrum multipoles.
+
+        Parameters
+        ----------
+        k : array-like or Particle2SpectrumPoles
+            Wavenumber bin centers or :class:`Particle2SpectrumPoles` instance.
+
+        Returns
+        -------
+        Particle2SpectrumPoles
+        """
+        return _correlation_to_spectrum(self, k)

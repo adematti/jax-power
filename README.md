@@ -48,45 +48,45 @@ from jaxpower import (
     ParticleField,
     FKPField,
     create_sharding_mesh,
-    BinMesh2Spectrum,
-    compute_fkp2_spectrum_normalization,
-    compute_fkp2_spectrum_shotnoise
+    BinMesh2SpectrumPoles,
+    compute_fkp2_normalization,
+    compute_fkp2_shotnoise
 )
 
 with create_sharding_mesh() as sharding_mesh:  # distribute mesh and particles
 
     # Create MeshAttrs from positions (assumed already sharded across processes)
-    attrs = get_mesh_attrs(data_positions, randoms_positions, boxpad=2., meshsize=128)
+    mattrs = get_mesh_attrs(data_positions, randoms_positions, boxpad=2., meshsize=128)
 
     # Define FKP field = data - randoms
-    data = ParticleField(data_positions, data_weights, attrs=attrs, exchange=True)
-    randoms = ParticleField(randoms_positions, randoms_weights, attrs=attrs, exchange=True)
+    data = ParticleField(data_positions, data_weights, attrs=mattrs, exchange=True)
+    randoms = ParticleField(randoms_positions, randoms_weights, attrs=mattrs, exchange=True)
     fkp = FKPField(data, randoms)
     # Warning!
     # If you access data.positions, data.weights (same for randoms) in a distributed context,
     # You'll see they are reordered w.r.t. data_positions, data_weights
     # This is such that the local portion of the 3D mesh receives the relevant particles
 
+    # Define k-bin edges and multipoles
+    bin = BinMesh2SpectrumPoles(mesh.attrs, edges={'step': 0.001}, ells=(0, 2, 4))
+
     # Compute normalization and shot noise terms
-    norm = compute_fkp2_spectrum_normalization(fkp)
-    num_shotnoise = compute_fkp2_spectrum_shotnoise(fkp)
+    norm = compute_fkp2_normalization(fkp, bin=bin)
+    num_shotnoise = compute_fkp2_shotnoise(fkp, bin=bin)
 
     # Paint FKP field to mesh
     mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
     del fkp  # cleanup
 
-    # Define k-bin edges and multipoles
-    bin = BinMesh2Spectrum(mesh.attrs, edges={'step': 0.001}, ells=(0, 2, 4))
-
     # JIT the power spectrum function
     compute_mesh2_spectrum = jax.jit(compute_mesh2_spectrum, static_argnames=['los'])
 
     # Compute P(k)
-    power = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
-    power = power.clone(norm=norm, num_shotnoise=num_shotnoise)
+    spectrum = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
+    spectrum = spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
 
     # Save result
-    power.save('power.npy')
+    spectrum.write('spectrum.h5')
 
 # Shut down distributed environment
 jax.distributed.shutdown()

@@ -236,20 +236,22 @@ def test_particle2(plot=False):
     pcount = jax.block_until_ready(pcount)
     print(time.time() - t0)
     assert isinstance(pcount, Mesh2CorrelationPoles)
-    pcount.to_spectrum(jnp.linspace(0.01, 0.1, 20))
+    from jaxpower.particle2 import correlation_to_spectrum
+    pcount.to_spectrum(k=jnp.linspace(0.01, 0.1, 20))
     bin = BinParticle2SpectrumPoles(mattrs, edges={'step': 0.01, 'max': 0.2}, **kw)
-    power = compute_particle2(data, bin=bin)
-    assert isinstance(power, Mesh2SpectrumPoles)
-    power2 = pcount.to_spectrum(power)
+    spectrum = compute_particle2(data, bin=bin)
+    assert isinstance(spectrum, Mesh2SpectrumPoles)
+    spectrum2 = pcount.to_spectrum(k=spectrum)
 
     if plot:
         from matplotlib import pyplot as plt
         ax = plt.gca()
-        for ill, ell in enumerate(power.ells):
+        for ill, ell in enumerate(spectrum.ells):
             color = f'C{ill}'
-            k = power.x(ell)
-            ax.plot(k, k * power.view(projs=ell).real, color=color, linestyle='--')
-            ax.plot(k, k * power2.view(projs=ell).real, color=color, linestyle='-', label=rf'$\ell = {ell:d}$')
+            pole = spectrum.get(ell)
+            pole2 = spectrum2.get(ell)
+            ax.plot(pole.k, pole.k * pole.value(), color=color, linestyle='--')
+            ax.plot(pole.k, pole.k * pole2.value(), color=color, linestyle='-', label=rf'$\ell = {ell:d}$')
         ax.plot([], [], color='k', linestyle='--', label='real')
         ax.plot([], [], color='k', linestyle='-', label='complex')
         plt.show()
@@ -278,6 +280,7 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+
     test_particle2(plot=True)
     #jax.distributed.initialize()
     #jax.distributed.shutdown()

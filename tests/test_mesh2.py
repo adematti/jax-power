@@ -11,7 +11,7 @@ from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       BinMesh2CorrelationPoles, compute_mesh2_correlation,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
                       MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
-                      compute_fkp2_spectrum_normalization, compute_fkp2_spectrum_shotnoise, compute_normalization,
+                      compute_fkp2_normalization, compute_fkp2_shotnoise, compute_normalization,
                       Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils)
 
 
@@ -158,8 +158,8 @@ def test_fkp2_spectrum(plot=False):
             fkp = FKPField(data, randoms)
             mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='complex')
             spectrum = compute_mesh2_spectrum(mesh, bin=bin, los=los)
-            norm = compute_fkp2_spectrum_normalization(fkp, bin=bin, cellsize=None)
-            num_shotnoise = compute_fkp2_spectrum_shotnoise(fkp, bin=bin)
+            norm = compute_fkp2_normalization(fkp, bin=bin, cellsize=None)
+            num_shotnoise = compute_fkp2_shotnoise(fkp, bin=bin)
             return spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
 
         nmock = 5
@@ -545,7 +545,7 @@ def test_window_timing():
         return toret
 
     selection = gaussian_survey(mattrs, paint=True)
-    norm = compute_fkp2_spectrum_normalization(selection, selection)
+    norm = compute_fkp2_normalization(selection, selection)
 
     for flag in ['smooth', 'infinite'][-1:]:
         for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')][-1:]:
@@ -687,7 +687,7 @@ def test_split():
 
     from cosmoprimo.fiducial import DESI
     from jaxpower import (compute_mesh2_spectrum, Mesh2SpectrumPoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                          WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_spectrum_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
+                          WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
 
     mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1000., boxcenter=1200.)
     size = int(1e-4 * mattrs.boxsize.prod())
@@ -764,7 +764,7 @@ def test_sharding():
     attrs = MeshAttrs(boxsize=1000., meshsize=meshsize)
     poles = get_theory(4 * attrs.knyq.max())
 
-    from jaxpower import create_sharding_mesh, exchange_particles, ParticleField, compute_fkp2_spectrum_shotnoise, compute_mesh2, get_mesh_attrs
+    from jaxpower import create_sharding_mesh, exchange_particles, ParticleField, compute_fkp2_shotnoise, compute_mesh2, get_mesh_attrs
 
     with create_sharding_mesh() as sharding_mesh:  # specify how to spatially distribute particles / mesh
         print('Sharding mesh {}.'.format(sharding_mesh))
@@ -786,7 +786,7 @@ def test_sharding():
         randoms = ParticleField(randoms.positions, attrs=attrs, exchange=True)
         # Now data and randoms are exchanged given MeshAttrs attrs, we can proceed as normal
         fkp = FKPField(data, randoms, attrs=attrs)
-        norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp), compute_fkp2_spectrum_shotnoise(fkp)
+        norm, num_shotnoise = compute_fkp2_normalization(fkp), compute_fkp2_shotnoise(fkp)
         mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
         del fkp
         bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
@@ -863,7 +863,7 @@ def test_pypower():
         # Now data and randoms are exchanged given MeshAttrs attrs, we can proceed as normal
         fkp = FKPField(data, randoms, attrs=mattrs)
         bin = BinMesh2SpectrumPoles(mattrs, edges=edges, ells=ells)
-        norm, num_shotnoise = compute_fkp2_spectrum_normalization(fkp, bin=bin), compute_fkp2_spectrum_shotnoise(fkp, bin=bin)
+        norm, num_shotnoise = compute_fkp2_normalization(fkp, bin=bin), compute_fkp2_shotnoise(fkp, bin=bin)
         mesh = fkp.paint(**kw_paint, compensate=compensate, out='real')
         del fkp
         pk_jax = compute_mesh2_spectrum(mesh, bin=bin, los=los)

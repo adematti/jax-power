@@ -11,7 +11,7 @@ from jax.sharding import PartitionSpec as P
 from .mesh import MeshAttrs, staticarray, ParticleField, _identity_fn
 from .mesh2 import _format_ells
 from .utils import get_legendre, get_spherical_jn, set_env
-from .types import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles
+from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Mesh2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
 
 
 def _compute_dist_mu_weight(positions1, weights1, positions2, weights2, selection=None, boxsize=None, los='x'):
@@ -464,7 +464,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
 
     Returns
     -------
-    result : Mesh2CorrelationPoles or Mesh2SpectrumPoles
+    result : Particle2CorrelationPoles or Particle2SpectrumPoles
         Resulting spectrum or correlation function object.
     """
     ells = bin.ells
@@ -480,12 +480,14 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
     num_shotnoise = [(2 * ell + 1) * get_legendre(ell)(0.) * num_shotnoise for ell in ells]
 
     if isinstance(bin, BinParticle2CorrelationPoles):
+        mask_shotnoise = (bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.)
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill], ell=ell))
-        return Mesh2CorrelationPoles(correlation)
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), num_shotnoise=num_shotnoise[ill] * mask_shotnoise, ell=ell))
+        return Particle2CorrelationPoles(correlation)
     else:  # 'complex'
+        mask_shotnoise = jnp.ones_like(bin.xavg)
         spectrum = []
         for ill, ell in enumerate(ells):
-            spectrum.append(Mesh2SpectrumPole(k=bin.xavg, edges=bin.edges, num_raw=num[ill], edges=bin.edges, norm=jnp.ones_like(num), num_shotnoise=num_shotnoise[ill], ell=ell))
-        return Mesh2SpectrumPoles(spectrum)
+            spectrum.append(Particle2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), num_shotnoise=num_shotnoise[ill] * mask_shotnoise, ell=ell))
+        return Particle2SpectrumPoles(spectrum)

@@ -388,8 +388,9 @@ class BaseWindowRotation(object):
         return state
 
     def __setstate__(self, state):
+        from .types import from_state
         for name in ['theory', 'observable']:
-            state[name] = ObservableTree.from_state(state[name])
+            state[name] = from_state(state[name])
         self.__dict__.update(state)
 
     @classmethod
@@ -506,7 +507,6 @@ class WindowRotationSpectrum2(BaseWindowRotation):
             #loss_C = jnp.sum(softabs(Rp * weights_covariance)) / jnp.sum(softabs(Rp) * weights_covariance_denom)
             loss_M = 10 * jnp.sum((jnp.sum(mmatrix, axis=1) - 1.)**2)
             #print(loss_W, loss_C, weights_window.sum(), weights_covariance.sum(), weights_window.shape, weights_covariance.shape)
-            #print(loss_W, loss_C, loss_M)
             return loss_W + loss_C + loss_M
 
         self.init = Minit
