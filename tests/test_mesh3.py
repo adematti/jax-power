@@ -231,14 +231,16 @@ def test_triumvirate_box(plot=False):
     #mean = 1.
     mesh = mesh - mean
     edges = np.arange(0.01, mattrs.knyq[0], 0.01)
-    #ell = (0, 0, 0)
-    ell = (2, 0, 2)
+    ell = (0, 0, 0)
+    #ell = (2, 0, 2)
     los = 'z'
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, convention='triumvirate', los=los, **kw)
-    spectrum = spectrum.clone(norm=[pole.norm * mean**3 for pole in spectrum])
+    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
+    nz = size / mattrs.boxsize.prod()
+    norm = jnp.sum(data.weights * nz**2)
+    spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
     spectrum_raw = spectrum
     spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
@@ -246,24 +248,29 @@ def test_triumvirate_box(plot=False):
     from triumvirate.threept import compute_bispec_in_gpp_box
     from triumvirate.parameters import ParameterSet
 
-    catalogue = ParticleCatalogue(*np.array(data.positions.T), nz=np.ones_like(data.weights) * jnp.sum(data.weights) / mattrs.boxsize.prod())
+    catalogue = ParticleCatalogue(*np.array(data.positions.T), nz=np.ones_like(data.weights) * nz)
 
     #trv_logger = setup_logger(log_level=20)
     #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
     paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None),
-                    range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', interlace='off',
+                    range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', interlace=False,
                     boxsize=dict(zip('xyz', np.array(mattrs.boxsize))), ngrid=dict(zip('xyz', np.array(mattrs.meshsize))), verbose=20)
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
 
+    #print(spectrum.get(ell).values('num_shotnoise'))
+
     if plot:
-        #print(results['bk_raw'] / spectrum_raw.view())
-        #print((results['bk_raw'] - results['bk_shot']) / spectrum.view())
         ax = plt.gca()
-        #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
-        ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
-        ax.plot(spectrum.value(), label='jaxpower')
+        ax.plot(results['bk_shot'], label='triumvirate shotnoise')
+        ax.plot(spectrum.get(ell).values('shotnoise'), label='jaxpower shotnoise')
+        ax.legend()
+        plt.show()
+
+        ax = plt.gca()
+        ax.plot(results['bk_raw'], label='triumvirate')
+        ax.plot(spectrum.get(ell).values('value') + spectrum.get(ell).values('shotnoise'), label='jaxpower')
         ax.legend()
         plt.show()
 
@@ -287,19 +294,19 @@ def test_triumvirate_survey(plot=False):
 
     kw = dict(resampler='cic', interlacing=False, compensate=True)
     mesh = fkp.paint(**kw)
-    #mean = 1.
-    #mesh = mesh - mean
     edges = np.arange(0.01, mattrs.knyq[0], 0.01)
-    #ell = (0, 0, 0)
-    ell = (2, 0, 2)
+    ell = (0, 0, 0)
+    #ell = (2, 0, 2)
     los = 'local'
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+
     num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
-    mean = size / mattrs.meshsize.prod(dtype=float)
-    spectrum = spectrum.clone(norm=[pole.norm * mean**3 for pole in spectrum])
-    #spectrum = spectrum.clone(num_shotnoise=jnp.array(num_shotnoise))
+    nz = size / mattrs.boxsize.prod()
+    norm = jnp.sum(data.weights * nz**2)
+    spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
+    spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
     from triumvirate.catalogue import ParticleCatalogue
     from triumvirate.threept import compute_bispec
@@ -307,24 +314,30 @@ def test_triumvirate_survey(plot=False):
     from triumvirate.logger import setup_logger
 
     logger = setup_logger(20)
-    data = ParticleCatalogue(*np.array(data.positions.T), ws=data.weights, nz=size / mattrs.boxsize.prod())
-    randoms = ParticleCatalogue(*np.array(randoms.positions.T), ws=randoms.weights, nz=size / mattrs.boxsize.prod())
+    data = ParticleCatalogue(*np.array(data.positions.T), ws=data.weights, nz=nz)
+    randoms = ParticleCatalogue(*np.array(randoms.positions.T), ws=randoms.weights, nz=nz)
 
     #trv_logger = setup_logger(log_level=20)
     #binning = Binning(space='fourier', scheme='lin', bin_min=edges[0], bin_max=edges[-1], num_bins=len(edges) - 1)
     paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None),
                     range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', interlace='off', alignment='centre', padfactor=0.,
-                    boxsize=dict(zip('xyz', np.array(mattrs.boxsize))),
-                    ngrid=dict(zip('xyz', np.array(mattrs.meshsize))), verbose=20)
+                    boxsize=dict(zip('xyz', np.array(mattrs.boxsize))), ngrid=dict(zip('xyz', np.array(mattrs.meshsize))), verbose=20)
 
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec(data, randoms, paramset=paramset, logger=logger)
 
+    #print(spectrum.get(ell).values('num_shotnoise'))
+
     if plot:
         ax = plt.gca()
-        #ax.plot(results['bk_raw'] - results['bk_shot'], label='triumvirate')
+        ax.plot(results['bk_shot'], label='triumvirate shotnoise')
+        ax.plot(spectrum.get(ell).values('shotnoise'), label='jaxpower shotnoise')
+        ax.legend()
+        plt.show()
+
+        ax = plt.gca()
         ax.plot(results['bk_raw'], label='triumvirate')
-        ax.plot(spectrum.value(), label='jaxpower')
+        ax.plot(spectrum.get(ell).values('value') + spectrum.get(ell).values('shotnoise'), label='jaxpower')
         ax.legend()
         plt.show()
 
@@ -386,7 +399,7 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_mesh3_spectrum(plot=True)
+    test_mesh3_spectrum()
     test_polybin3d()
     test_triumvirate_box()
     test_triumvirate_survey()

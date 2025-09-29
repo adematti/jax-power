@@ -597,7 +597,7 @@ def test_smooth_window(plot=False):
     from jaxpower.utils import plotter
 
     @plotter
-    def plot(self, fig=None):
+    def plot_xi(self, fig=None):
         from matplotlib import pyplot as plt
         if fig is None:
             fig, ax = plt.subplots()
@@ -617,7 +617,7 @@ def test_smooth_window(plot=False):
         wmatrix = compute_mesh2_spectrum_window(selection, edgesin=edgesin, ellsin=ellsin if thlos is None else (ellsin, thlos),
                                                 bin=bin, los=los, norm=norm, flags=['smooth'])
         xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
-        #plot(xi, show=True)
+        #plot_xi(xi, show=True)
 
         wmatrix2 = compute_smooth2_spectrum_window(xi, edgesin=edgesin, ellsin=ellsin, bin=bin)
         #wmatrix2.plot(show=True)
