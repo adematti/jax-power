@@ -442,7 +442,34 @@ def compute_box_bispectrum(output_fn, get_data, basis='scoccimarro', los='z', **
     spectrum.write(output_fn)
 
 
+def convert_old_jaxpower(fn):
+    # Convert old files
+    import numpy as np
+    from lsstypes import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh3SpectrumPole, Mesh3SpectrumPoles
+    spectrum = np.load(fn, allow_pickle=True)[()]
+    name = spectrum['__class__name__']
+    if name == 'Spectrum2Poles':
+        poles = []
+        for ill, ell in enumerate(spectrum['_projs']):
+            poles.append(Mesh2SpectrumPole(k=spectrum['_x'][ill], k_edges=spectrum['_edges'][ill],
+                                           nmodes=spectrum['_weights'][ill], num_raw=spectrum['_value'][ill],
+                                           num_shotnoise=spectrum['_num_shotnoise'][ill], norm=spectrum['_norm'], ell=ell))
+        return Mesh2SpectrumPoles(poles)
+    if name == 'Spectrum3Poles':
+        poles = []
+        for ill, ell in enumerate(spectrum['_projs']):
+            poles.append(Mesh3SpectrumPole(k=spectrum['_x'][ill], k_edges=spectrum['_edges'][ill],
+                                           nmodes=spectrum['_weights'][ill], num_raw=spectrum['_value'][ill],
+                                           num_shotnoise=spectrum['_num_shotnoise'][ill], norm=spectrum['_norm'], basis=spectrum['basis'], ell=ell))
+        return Mesh3SpectrumPoles(poles)
+    raise NotImplementedError(f'Cannot convert {name}.')
+
+
 if __name__ == '__main__':
+
+    #fn = '/dvs_ro/cfs/cdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph000/CutSky/LRG/mesh2spectrum_abacusHF_DR2_LRG_z0p500_z0.4-0.6_NGC.npy'
+    #fn = '/dvs_ro/cfs/cdirs/desi/mocks/cai/abacus_HF/DR2_v1.0/desipipe_test/AbacusSummit_base_c000_ph000/CutSky/LRG/mesh3spectrum_scoccimarro_abacusHF_DR2_LRG_z0p500_z0.4-0.6_NGC.npy'
+    #convert_old_jaxpower(fn).select(k=slice(0, None, 2))
 
     #catalog_args = dict(tracer='ELG_LOP', region='SGC', zsnap=0.950, zrange=(0.8, 1.1))
     catalog_args = dict(tracer='LRG', region='NGC', zsnap=0.950, zrange=(0.8, 1.1))

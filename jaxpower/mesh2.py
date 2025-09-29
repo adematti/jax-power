@@ -621,16 +621,21 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2S
             attrs = {name: getattr(inp, name) for name in ['boxsize', 'boxcenter', 'meshsize']}
         else:
             particles.append(inp)
+    halo_add = 0
     if particles:
         cattrs = dict(particles[0].attrs)
-        if 'cellsize' in attrs: cattrs.pop('meshsize')
+        update_cellsize = 'cellsize' in attrs
+        if update_cellsize:
+            cattrs.pop('meshsize')
         attrs = particles[0].attrs.clone(**get_mesh_attrs(**(cattrs | attrs)))
+        if update_cellsize:
+            add_halo = jnp.ceil(jnp.max((attrs.boxsize - cattrs['boxsize']) / 2. / attrs.cellsize))
         particles = [particle.clone(attrs=attrs) for particle in particles]
     normalization = 1
     for mesh in meshes:
         normalization *= mesh
     for particle in particles:
-        normalization *= particle.paint(resampler=resampler, interlacing=0, compensate=False)
+        normalization *= particle.paint(resampler=resampler, interlacing=0, compensate=False, halo_add=halo_add)
     norm = normalization.sum() * normalization.cellsize.prod()**(1 - len(inputs))
     if bin is not None:
         return [norm] * len(bin.ells)

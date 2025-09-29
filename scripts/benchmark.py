@@ -145,33 +145,6 @@ def compute_pypower(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), **attrs):
     spectrum.write(fn)
 
 
-
-def compute_test(fn, data_fn, all_randoms_fn, zrange=(0.4, 1.1), ells=(0, 2, 4), los='firstpoint', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp2_normalization, compute_fkp2_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2Spectrum, BinParticle2CorrelationPoles, BinParticle2SpectrumPoles, compute_particle2, get_mesh_attrs)
-    t0 = time.time()
-    data = get_clustering_positions_weights(data_fn, zrange=zrange)
-    randoms = get_clustering_positions_weights(*all_randoms_fn, zrange=zrange)
-    from mpi4py import MPI
-    mpicomm = MPI.COMM_WORLD
-    mpicomm.barrier()
-    t1 = time.time()
-    mattrs = get_mesh_attrs(data[0], randoms[0], **attrs)
-    #attrs = get_mesh_attrs(data[0], **attrs)
-    kw = dict(exchange=True, backend='jax')
-    data = ParticleField(*data, attrs=mattrs, **kw)
-    randoms = ParticleField(*randoms, attrs=mattrs, **kw)
-    fkp = FKPField(data, randoms)
-    p = fkp.particles
-    #del data, randoms
-    t2 = time.time()
-
-    bin = BinParticle2CorrelationPoles(mattrs, edges={'step': 0.1}, selection={'theta': (0., 0.05)}, ells=ells)
-    #bin = BinParticle2SpectrumPoles(mattrs, edges=np.linspace(0.01, 0.1, 10), selection={'theta': (0., 0.05)}, ells=ells)
-    #print(p.size, jnp.std(p.weights))
-    cut = compute_particle2(p, bin=bin, los=los)
-    print(cut.clone(num_shotnoise=None).view().sum(), cut.view()[:3])
-
-
 if __name__ == '__main__':
 
     tracer = 'QSO'
