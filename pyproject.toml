@@ -10,7 +10,7 @@ requires = [
 name = "jax-power"
 authors = [{name = "Arnaud de Mattia"}]
 description = "JAX-powered power spectrum"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = ["jax"]
 readme = "README.md"
 requires-python = ">=3.10"
