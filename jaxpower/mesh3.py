@@ -133,7 +133,9 @@ class BinMesh3SpectrumPoles(object):
 
         nmodes = [nmodes] * len(ells)
 
-        if buffer_size >= 1:
+        if 'diagonal' in basis: buffer_size = 0
+
+        if buffer_size > 1:
             split_edges, split_iedges = [], []
             for axis in range(ndim):
                 axis_iedges = jnp.arange(len(uedges[axis]))
@@ -161,9 +163,11 @@ class BinMesh3SpectrumPoles(object):
             #print('Number of FFTs padded', sum(sum(len(bb) for bb in b) for b in _buffer_iuedges))
             _buffer_global_iedges = jnp.concatenate(_buffer_global_iedges, axis=0)
             _buffer_sort = jnp.array([jnp.flatnonzero(jnp.all(iedge == _buffer_global_iedges, axis=1))[0] for iedge in iedges])
+            # _buffer_iedges = (N-dim bins, corresponding unique bins along each dim, how to sort the N-dim bins to obtain the requested bins)
             _buffer_iedges = (jnp.stack(_buffer_iedges), jnp.stack(_buffer_iuedges), _buffer_sort)
         else:
             _buffer_iedges = None
+
 
         ells = _format_ells(ells, basis=basis)
         self.__dict__.update(edges=edges, xavg=xavg, nmodes=nmodes, ibin=ibin, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size, _iedges=iedges, _buffer_iedges=_buffer_iedges, _nmodes1d=nmodes1d, ells=ells)

@@ -173,8 +173,8 @@ def test_polybin3d(plot=False):
 
     for los in ['z', 'local'][:1]:
 
-        kw = dict(gridsize=mattrs.meshsize, boxsize=mattrs.boxsize, boxcenter=mattrs.boxcenter * (0. if los == 'z' else 1.))
-        base = PolyBin3D(sightline='global' if los == 'z' else los, **kw, backend='jax', real_fft=False)
+        kw_pb = dict(gridsize=mattrs.meshsize, boxsize=mattrs.boxsize, boxcenter=mattrs.boxcenter * (0. if los == 'z' else 1.))
+        base = PolyBin3D(sightline='global' if los == 'z' else los, **kw_pb, backend='jax', real_fft=False)
         bspec = BSpec(base, k_bins=edges[0],
                       lmax=2, k_bins_squeeze=edges[1],
                       include_partial_triangles=False)
@@ -283,7 +283,7 @@ def test_triumvirate_survey(plot=False):
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
     mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
-    pattrs = MeshAttrs(boxsize=500., boxcenter=500., meshsize=64)
+    pattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
 
     mesh = generate_gaussian_mesh(mattrs, pkvec, seed=42, unitary_amplitude=True)
     size = int(1e4)
