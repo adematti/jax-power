@@ -283,13 +283,14 @@ def test_triumvirate_survey(plot=False):
     pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
 
     mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
+    pattrs = MeshAttrs(boxsize=500., boxcenter=500., meshsize=64)
 
     mesh = generate_gaussian_mesh(mattrs, pkvec, seed=42, unitary_amplitude=True)
     size = int(1e4)
-    data = generate_uniform_particles(mattrs, size, seed=32)
+    data = generate_uniform_particles(pattrs, size, seed=32)
     # Triumvirate doesn't take weights for box statistics...
     #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
-    randoms = generate_uniform_particles(mattrs, 2 * size, seed=42)
+    randoms = generate_uniform_particles(pattrs, 2 * size, seed=42)
     fkp = FKPField(data, randoms)
 
     kw = dict(resampler='cic', interlacing=False, compensate=True)
@@ -302,7 +303,7 @@ def test_triumvirate_survey(plot=False):
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
 
-    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
+    num_shotnoise = compute_fkp3_shotnoise(fkp, bin=bin, los=los, **kw)
     nz = size / mattrs.boxsize.prod()
     norm = jnp.sum(data.weights * nz**2)
     spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
@@ -336,8 +337,10 @@ def test_triumvirate_survey(plot=False):
         plt.show()
 
         ax = plt.gca()
-        ax.plot(results['bk_raw'], label='triumvirate')
-        ax.plot(spectrum.get(ell).values('value') + spectrum.get(ell).values('shotnoise'), label='jaxpower')
+        k = results['k1_eff']
+        ax.plot(k, k**2 * results['bk_raw'], label='triumvirate')
+        k = spectrum.get(ell).coords('k')[..., 0]
+        ax.plot(k, k**2 * (spectrum.get(ell).values('value') + spectrum.get(ell).values('shotnoise')), label='jaxpower')
         ax.legend()
         plt.show()
 

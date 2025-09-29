@@ -2032,6 +2032,9 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
             value = _count(value, *ibin)
             return jax.lax.psum(value, sharding_mesh.axis_names)
 
-        count = shard_map(count, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),) + (P(sharding_mesh.axis_names),) * len(ibin), out_specs=P(None))
+        in_specs = (P(*sharding_mesh.axis_names),)
+        for ib in ibin:
+            in_specs += (P(sharding_mesh.axis_names) if ib.ndim <= 1 else P(*sharding_mesh.axis_names),)
+        count = shard_map(count, mesh=sharding_mesh, in_specs=in_specs, out_specs=P(None))
 
     return count(value, *ibin)
