@@ -1306,13 +1306,16 @@ class RealMeshField(BaseMeshField):
         if with_sharding and exchange:
             positions, exchange, inverse = exchange_particles(self.attrs, positions, return_inverse=True, return_type='jax')
         toret = _read(self, positions, resampler=resampler, compensate=compensate, **kwargs)
+        #jread = jax.jit(_read, static_argnames=['resampler', 'compensate', 'halo_add'])
+        #toret = jread(self, positions, resampler=resampler, compensate=compensate, **kwargs)
         if inverse is not None:
             toret = inverse(toret)
         return toret
 
 
-@partial(jax.jit, static_argnames=['resampler', 'compensate', 'halo_size'])
-def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False, **kwargs):
+# Avoid this as this accumulates in the GPU memory (jax.clear_caches() to clear the cache)
+@partial(jax.jit, static_argnames=['resampler', 'compensate', 'halo_add'])
+def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensate: bool=False, halo_add: int=0):
     """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
 
     resampler = resamplers.get_resampler(resampler)
@@ -1354,7 +1357,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
         #print('2', positions[12])
 
-        kw_sharding = dict(halo_size=resampler.order, sharding_mesh=sharding_mesh) | kwargs
+        kw_sharding = dict(halo_size=halo_add + resampler.order, sharding_mesh=sharding_mesh)
         value, offset = pad_halo(value, **kw_sharding, factor=1)
         positions = positions + offset
         #idx = jnp.round(positions[12]).astype(int)
@@ -1800,12 +1803,14 @@ class ParticleField(object):
         #positions = jnp.pad(positions, pad_width=((0, size - positions.shape[0]), (0, 0)))
         #weights = jnp.pad(weights,  pad_width=((0, size - weights.shape[0]),))
         return _paint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out, **kwargs)
+        #jpaint = jax.jit(_paint, static_argnames=['resampler',  'interlacing', 'compensate', 'out', 'halo_add'])
+        #return jpaint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out, **kwargs)
         #jax.block_until_ready(toret)
         #print(f'exchange {t1 - t0:.2f} painting {time.time() - t1:.2f}', positions.shape[0] / size, _paint._cache_size())
 
 
-@partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out', 'halo_size'])
-def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, out: str='real', **kwargs):
+@partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out', 'halo_add'])
+def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, out: str='real', halo_add: int=0):
     """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
 
     resampler = resamplers.get_resampler(resampler)
@@ -1848,7 +1853,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         if weights is not None:
             w = weights.astype(value.dtype)
         if with_sharding:
-            kw_sharding = kwargs | dict(halo_size=resampler.order + interlacing, sharding_mesh=sharding_mesh)
+            kw_sharding = dict(halo_size=halo_add + resampler.order + interlacing, sharding_mesh=sharding_mesh)
             #print(value.shape)
             value, offset = pad_halo(value, **kw_sharding)
             #print('padded', value.shape, offset)
