@@ -101,7 +101,6 @@ def test_resamplers():
             weights = getattr(resamplers, resampler).read(mesh, positions)
 
 
-
 def get_random_catalog(mattrs, size=10000, seed=42):
     from jaxpower import create_sharded_random, generate_uniform_particles
     seed = jax.random.key(seed)
@@ -110,7 +109,6 @@ def get_random_catalog(mattrs, size=10000, seed=42):
         return jax.random.uniform(key, shape, dtype=mattrs.dtype)
     weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=0)
     return particles.clone(weights=weights)
-
 
 
 def _identity_fn(x):

@@ -377,7 +377,6 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         return Mesh2SpectrumPoles(spectrum)
 
 
-
 def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2CorrelationPoles=None, los: str | np.ndarray='z') -> Mesh2CorrelationPoles:
     """
     Compute the correlation function multipoles from mesh.
@@ -788,12 +787,25 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
 
     kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
+    ellsin = [ellin if isinstance(ellin, tuple) else (ellin, 0) for ellin in ellsin]
+
     wmat_tmp = {}
 
-    for ell1 in ellsin:
+    for ell1, wa1 in ellsin:
         wmat_tmp[ell1] = 0
         for ill, ell in enumerate(ells):
-            Qs = sum(legendre_product(ell, ell1, q) * window.get(q).value().real if q in window.ells else jnp.zeros(()) for q in list(range(abs(ell - ell1), ell + ell1 + 1)))
+
+            def get_w(q):
+                kw = dict(ells=q)
+                if 'wa_orders' in window.labels(return_type='keys'):
+                    kw.update(wa_orders=wa1)
+                elif wa1 != 0:
+                    raise ValueError('wa_orders must be provided in input window')
+                if kw in window.labels(return_type='flatten'):
+                    return window.get(**kw).value().real
+                return jnp.zeros(())
+
+            Qs = sum(legendre_product(ell, ell1, q) * get_w(q) for q in list(range(abs(ell - ell1), ell + ell1 + 1)))
             tmpw = next(iter(window))
             if 'volume' in tmpw.values():
                 snmodes = tmpw.values('volume')
@@ -804,7 +816,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
             #integ = BesselIntegral(window.get(0).edges('s'), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
 
             def f(kin):
-                tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
+                tophat_Qs = BesselIntegral(kin, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs * savg**wa1
                 def f2(kout):
                     integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
                     return integ(snmodes * tophat_Qs)
@@ -833,7 +845,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
     kw = dict(ells=list(ellsin))
     if isinstance(ellsin[0], tuple):  # ell, wide-angle order
-        kw = dict(ells=[ell[0] for ell in ellsin], wa=[ell[1] for ell in ellsin])
+        kw = dict(ells=[ell[0] for ell in ellsin], wa_orders=[ell[1] for ell in ellsin])
     theory = ObservableTree(theory, **kw)
 
     return WindowMatrix(observable=observable, theory=theory, value=wmat)

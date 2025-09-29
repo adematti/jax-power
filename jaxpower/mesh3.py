@@ -655,8 +655,11 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', conventio
             return s111
 
         def compensate_shotnoise(s111):
-            if False: #convention == 'triumvirate' and not interlacing:
-                return s111 * resampler.aliasing_shotnoise(1., kcirc) * resampler.compensate(1., kcirc)
+            # NOTE: when there is no interlacing, triumvirate compensates pk with aliasing_shotnoise in the shotnoise estimation (but in bk estimation?)
+            # In jaxpower, we always compensate by the standard compensate
+            #if convention == 'triumvirate' and not interlacing:
+            if not interlacing:
+                return s111 * resampler.aliasing_shotnoise(1., kcirc) * resampler.compensate(1., kcirc)**2
             return s111
 
         def compute_S122(particles, ells, axis):  # 1 == 2
@@ -721,10 +724,12 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', conventio
         if same[0] == same[1] == same[2]:
             s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
-            if ell0 in ells: shotnoise[ells.index(ell0)] += jnp.sqrt(4. * jnp.pi) * s111[ellms.index((0, 0))]
+            if ell0 in ells:
+                shotnoise[ells.index(ell0)] += jnp.sqrt(4. * jnp.pi) * s111[ellms.index((0, 0))]
 
         if same[1] == same[2]:
-            def select(ell): return ell[2] == ell[0] and ell[1] == 0
+            def select(ell):
+                return ell[2] == ell[0] and ell[1] == 0
 
             ells1 = [ell[0] for ell in ells if select(ell)]
             if ells1:
@@ -737,7 +742,8 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', conventio
                         shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
 
         if same[0] == same[2]:
-            def select(ell): return ell[2] == ell[1] and ell[0] == 0
+            def select(ell):
+                return ell[2] == ell[1] and ell[0] == 0
 
             ells2 = [ell[1] for ell in ells if select(ell)]
             if ells2:
