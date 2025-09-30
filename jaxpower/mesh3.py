@@ -9,7 +9,7 @@ from jax import numpy as jnp
 from jax import random
 from dataclasses import dataclass
 
-from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
+from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
 from .mesh2 import _get_los_vector, _get_zero, FKPField
 from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, WindowMatrix
 from .utils import real_gaunt, get_legendre, get_spherical_jn, get_real_Ylm, register_pytree_dataclass
@@ -262,7 +262,7 @@ class BinMesh3SpectrumPoles(object):
         return self.bin_reduce_meshs(bin, reduce) * norm
 
 
-def _format_meshs(*meshes):
+def _format_meshes(*meshes):
     """Format input meshes for autocorrelation/cross-correlation: return list of 3 meshes,
     and a list of indices corresponding to the mesh they are equal to."""
     meshes = list(meshes)
@@ -350,7 +350,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     -------
     result : Mesh3SpectrumPoles
     """
-    meshes, same = _format_meshs(*meshes)
+    meshes, same = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)**2
@@ -431,7 +431,13 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     return Mesh3SpectrumPoles(spectrum)
 
 
-from .mesh2 import compute_normalization
+from .mesh2 import compute_normalization, compute_box_normalization
+
+
+def compute_box3_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh3SpectrumPoles=None) -> jax.Array:
+    """Compute normalization, assuming constant density, for the bispectrum."""
+    return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
+
 
 
 def _split_particles(*particles, seed=0):
@@ -504,10 +510,10 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
         randoms = _split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
-        fkps, same = _format_meshs(*fkps)
+        fkps, same = _format_meshes(*fkps)
         fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
     else:
-        fkps, same = _format_meshs(*fkps)
+        fkps, same = _format_meshes(*fkps)
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
@@ -552,7 +558,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', conventio
     shotnoise : list
         Shot noise for each multipole.
     """
-    fkps, same = _format_meshs(*fkps)
+    fkps, same = _format_meshes(*fkps)
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]

@@ -198,7 +198,7 @@ def _get_zero(mesh):
     return mesh[(0,) * mesh.ndim]
 
 
-def _format_meshs(*meshes):
+def _format_meshes(*meshes):
     """Format input meshes for autocorrelation/cross-correlation: return list of two meshes, and boolean if they are equal."""
     meshes = list(meshes)
     assert 1 <= len(meshes) <= 2
@@ -276,7 +276,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     result : Mesh2SpectrumPoles
     """
 
-    meshes, autocorr = _format_meshs(*meshes)
+    meshes, autocorr = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
@@ -397,7 +397,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     -------
     result : Mesh2CorrelationPoles
     """
-    meshes, autocorr = _format_meshs(*meshes)
+    meshes, autocorr = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
@@ -641,6 +641,24 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2S
     return norm
 
 
+def compute_box_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None) -> jax.Array:
+    """Compute normalization, assuming constant density."""
+    normalization = 1.
+    mattrs = inputs[0].attrs
+    size = mattrs.meshsize.prod(dtype=mattrs.rdtype)
+    for mesh in inputs:
+        normalization *= mesh.sum() / size
+    norm = normalization * size * mattrs.cellsize.prod()**(1 - len(inputs))
+    if bin is not None:
+        return [norm] * len(bin.ells)
+    return norm
+
+
+def compute_box2_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None) -> jax.Array:
+    """Compute normalization, assuming constant density, for the power spectrum."""
+    return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
+
+
 def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10.):
     """
     Compute the FKP normalization for the power spectrum.
@@ -659,7 +677,7 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
     norm : float, list
     """
     # This is the pypower normalization - move to new one?
-    fkps, autocorr = _format_meshs(*fkps)
+    fkps, autocorr = _format_meshes(*fkps)
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
@@ -700,7 +718,7 @@ def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2Spectru
     shotnoise : float, list
     """
     # This is the pypower normalization - move to new one?
-    fkps, autocorr = _format_meshs(*fkps)
+    fkps, autocorr = _format_meshes(*fkps)
     if autocorr:
         particles = fkp = fkps[0]
         if isinstance(fkp, FKPField):
@@ -896,7 +914,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
     from .utils import BesselIntegral
 
-    meshes, autocorr = _format_meshs(*meshes)
+    meshes, autocorr = _format_meshes(*meshes)
     periodic = isinstance(meshes[0], MeshAttrs)
     if periodic:
         assert autocorr
@@ -1440,7 +1458,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
     -------
     power : Mesh2SpectrumPoles
     """
-    meshes, autocorr = _format_meshs(*meshes)
+    meshes, autocorr = _format_meshes(*meshes)
     periodic = isinstance(meshes[0], MeshAttrs)
     if periodic:
         assert autocorr
