@@ -11,7 +11,7 @@ name = "jax-power"
 authors = [{name = "Arnaud de Mattia"}]
 description = "JAX-powered power spectrum"
 version = "0.2.0"
-dependencies = ["jax"]
+dependencies = ["jax", "jaxdecomp", "lsstypes @ git+https://github.com/adematti/lsstypes"]
 readme = "README.md"
 requires-python = ">=3.10"
 urls = {Repository = "https://github.com/adematti/jax-power"}
