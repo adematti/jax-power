@@ -1972,7 +1972,7 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
 
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=('sharding_mesh', 'ravel'))  # if we want to save some memory, consider linear binning
-def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
+def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
 
     def _get_attrs(coords, edges, weights):
         r"""Return bin index, binned number of modes and coordinates."""
@@ -2003,6 +2003,14 @@ def _get_bin_attrs(coords, edges: staticarray, weights: None | jax.Array=None, s
                     out_specs=(P(sharding_mesh.axis_names) if ravel else P(*sharding_mesh.axis_names), P(None), P(None)))
 
     return get_attrs(coords, edges, weights)
+
+
+@default_sharding_mesh
+def _get_bin_attrs_edges2d(coords, edges: jax.Array, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
+    edges_1d = jnp.unique(edges.ravel())
+    battrs = _get_bin_attrs(coords, edges_1d, weights=weights, sharding_mesh=sharding_mesh, ravel=ravel)
+    M = ((edges_1d[:-1] >= edges[:, [0]]) & (edges_1d[1:]  <= edges[:, [1]])).astype(int)  # rebinning matrix
+    return battrs, edges_1d, M
 
 
 @default_sharding_mesh

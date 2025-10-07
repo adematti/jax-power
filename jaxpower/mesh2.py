@@ -14,6 +14,43 @@ from .utils import get_legendre, get_spherical_jn, get_real_Ylm, real_gaunt, reg
 from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
 
 
+def _make_edges2(mattrs, edges, ells, kind='complex', mode_oversampling=0):
+    wmodes = None
+    if kind == 'complex':
+        vec = mattrs.kcoords(kind='separation', sparse=True)
+        vec0 = mattrs.kfun.min()
+        if mattrs.hermitian:
+            wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
+    else:
+        vec = mattrs.xcoords(kind='separation', sparse=True)
+        vec0 = mattrs.cellsize.min()
+
+    if edges is None:
+        edges = {}
+    if isinstance(edges, dict):
+        step = edges.get('step', None)
+        if step is None:
+            edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
+        else:
+            edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
+    if edges.ndim == 2:  # coming from BinnedStatistic
+        assert np.allclose(edges[1:, 0], edges[:-1, 1])
+        edges = np.append(edges[:, 0], edges[-1, 1])
+    shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
+    shifts = list(itertools.product(*shifts))
+    ibin, nmodes, xsum = [], 0, 0
+    for shift in shifts:
+        coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
+        bin = _get_bin_attrs(coords, edges, weights=wmodes)
+        del coords
+        ibin.append(bin[0])
+        nmodes += bin[1]
+        xsum += bin[2]
+    edges = np.column_stack([edges[:-1], edges[1:]])
+    ells = _format_ells(ells)
+    return dict(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells, mattrs=mattrs)
+
+
 @partial(register_pytree_dataclass, meta_fields=['ells'])
 @dataclass(init=False, frozen=True)
 class BinMesh2SpectrumPoles(object):
@@ -46,37 +83,8 @@ class BinMesh2SpectrumPoles(object):
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        hermitian = mattrs.hermitian
-        vec = mattrs.kcoords(kind='separation', sparse=True)
-        vec0 = mattrs.kfun.min()
-
-        wmodes = None
-        if hermitian:
-            wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
-        if edges is None:
-            edges = {}
-        if isinstance(edges, dict):
-            step = edges.get('step', None)
-            if step is None:
-                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
-            else:
-                edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
-        if edges.ndim == 2:  # coming from BinnedStatistic
-            assert np.allclose(edges[1:, 0], edges[:-1, 1])
-            edges = np.append(edges[:, 0], edges[-1, 1])
-        shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
-        shifts = list(itertools.product(*shifts))
-        ibin, nmodes, xsum = [], 0, 0
-        for shift in shifts:
-            coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
-            bin = _get_bin_attrs(coords, edges, weights=wmodes)
-            del coords
-            ibin.append(bin[0])
-            nmodes += bin[1]
-            xsum += bin[2]
-        edges = np.column_stack([edges[:-1], edges[1:]])
-        ells = _format_ells(ells)
-        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells, mattrs=mattrs)
+        kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='complex', mode_oversampling=mode_oversampling)
+        self.__dict__.update(kw)
 
     def __call__(self, mesh, antisymmetric=False, remove_zero=False):
         """
@@ -133,33 +141,9 @@ class BinMesh2CorrelationPoles(object):
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        vec = mattrs.xcoords(kind='separation', sparse=True)
-        vec0 = mattrs.cellsize.min()
-
-        if edges is None:
-            edges = {}
-        if isinstance(edges, dict):
-            step = edges.get('step', None)
-            if step is None:
-                edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
-            else:
-                edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
-        if edges.ndim == 2:  # coming from BinnedStatistic
-            assert np.allclose(edges[1:, 0], edges[:-1, 1])
-            edges = np.append(edges[:-1, 0], edges[-1, 1])
-        shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
-        shifts = list(itertools.product(*shifts))
-        ibin, nmodes, xsum = [], 0, 0
-        for shift in shifts:
-            coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
-            bin = _get_bin_attrs(coords, edges, weights=None)
-            del coords
-            ibin.append(bin[0])
-            nmodes += bin[1]
-            xsum += bin[2]
-        edges = np.column_stack([edges[:-1], edges[1:]])
-        ells = _format_ells(ells)
-        self.__dict__.update(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, ells=ells, mattrs=mattrs)
+        kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='real', mode_oversampling=mode_oversampling)
+        kw.pop('wmodes')
+        self.__dict__.update(kw)
 
     def __call__(self, mesh, remove_zero=False):
         """
@@ -191,11 +175,6 @@ def _get_los_vector(los: str | np.ndarray, ndim=3):
     else:
         vlos = los
     return staticarray(vlos)
-
-
-def _get_zero(mesh):
-    """Return the zero mode of the mesh."""
-    return mesh[(0,) * mesh.ndim]
 
 
 def _format_meshes(*meshes):
@@ -628,7 +607,7 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2S
             cattrs.pop('meshsize')
         attrs = particles[0].attrs.clone(**get_mesh_attrs(**(cattrs | attrs)))
         if update_cellsize:
-            add_halo = jnp.ceil(jnp.max((attrs.boxsize - cattrs['boxsize']) / 2. / attrs.cellsize))
+            halo_add = jnp.ceil(jnp.max((attrs.boxsize - cattrs['boxsize']) / 2. / attrs.cellsize))
         particles = [particle.clone(attrs=attrs) for particle in particles]
     normalization = 1
     for mesh in meshes:

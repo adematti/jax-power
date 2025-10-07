@@ -1,7 +1,7 @@
 import jax
 from jax import numpy as jnp
 
-from lsstypes import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, Mesh3SpectrumPole, Mesh3SpectrumPoles, ObservableLeaf, ObservableTree, WindowMatrix, CovarianceMatrix, read, write
+from lsstypes import Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableLeaf, ObservableTree, WindowMatrix, CovarianceMatrix, read, write
 from lsstypes.base import from_state, _edges_names
 
 
@@ -94,6 +94,9 @@ Mesh2CorrelationPole = make_leaf_pytree(Mesh2CorrelationPole)
 Mesh2CorrelationPoles = make_tree_pytree(Mesh2CorrelationPoles)
 Mesh3SpectrumPole = make_leaf_pytree(Mesh3SpectrumPole)
 Mesh3SpectrumPoles = make_tree_pytree(Mesh3SpectrumPoles)
+Mesh3CorrelationPole = make_leaf_pytree(Mesh3CorrelationPole)
+Mesh3CorrelationPoles = make_tree_pytree(Mesh3CorrelationPoles)
+
 
 WindowMatrix = make_window_pytree(WindowMatrix)
 CovarianceMatrix = make_covariance_pytree(CovarianceMatrix)
