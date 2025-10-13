@@ -29,12 +29,12 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
 
     if mask_edges is None:
         if 'scoccimarro' in basis:
-            mask_edges == '1<=2,2<=3'
+            mask_edges = '1<=2,2<=3'
         else:
-            mask_edges == '1<=2'
+            mask_edges = '1<=2'
     if isinstance(mask_edges, str):
         mask_edges = mask_edges.strip()
-        mask_edges_list = ','.split(mask_edges)
+        mask_edges_list = mask_edges.split(',')
 
         def mask_edges(*edges):
             mask = True
@@ -44,15 +44,15 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
                 xmid = xmids[int(c[0]) - 1], xmids[int(c[-1]) - 1]
                 symbol = c[1:-1]
                 if symbol == '==':
-                    mask = xmid[0] == xmid[1]
+                    mask &= xmid[0] == xmid[1]
                 elif symbol == '<=':
-                    mask = xmid[0] <= xmid[1]
+                    mask &= xmid[0] <= xmid[1]
                 elif symbol == '>=':
-                    mask = xmid[0] >= xmid[1]
+                    mask &= xmid[0] >= xmid[1]
                 elif symbol == '<':
-                    mask = xmid[0] < xmid[1]
+                    mask &= xmid[0] < xmid[1]
                 elif symbol == '>':
-                    mask = xmid[0] > xmid[1]
+                    mask &= xmid[0] > xmid[1]
                 else:
                     raise ValueError(f'constraint {symbol} not understood')
             return mask
@@ -111,7 +111,7 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
 
     # of shape (nbins, ndim, 2)
     edges = jnp.concatenate([_product([edge[..., 0] for edge in uedges])[..., None], _product([edge[..., 1] for edge in uedges])[..., None]], axis=-1)
-    mask = mask_edges(*edges)
+    mask = mask_edges(*[edges[:, i, :] for i in range(ndim)])
     edges = edges[mask]
     xavg = _product(xavg)[mask]
     nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
