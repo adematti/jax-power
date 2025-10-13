@@ -7,7 +7,7 @@ from jax import numpy as jnp
 
 from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
 from .mesh2 import _get_los_vector
-from .utils import get_legendre, get_real_Ylm
+from .utils import get_legendre, get_Ylm
 from .types import ObservableTree
 
 
@@ -148,7 +148,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
         mesh, mesh2 = get_meshs(random.split(seed))
         xvec = mesh.coords(sparse=True)
         ell = 2
-        Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+        Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
 
         @jax.checkpoint
         def f(carry, im):
@@ -201,7 +201,7 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42, excha
         seed = random.key(seed)
 
     def sample(key, shape):
-        return mattrs.boxsize * random.uniform(key, shape + (len(mattrs.boxsize),), dtype=mattrs.dtype) - mattrs.boxsize / 2. + mattrs.boxcenter
+        return mattrs.boxsize * random.uniform(key, shape + (len(mattrs.boxsize),), dtype=mattrs.rdtype) - mattrs.boxsize / 2. + mattrs.boxcenter
 
     positions = create_sharded_random(sample, seed, shape=size, out_specs=0)
     #positions = exchange_particles(mattrs, positions=positions, return_inverse=False)[0]

@@ -358,7 +358,7 @@ def test_gaunt():
     import itertools
     import sympy as sp
     from sympy.physics.wigner import real_gaunt
-    from jaxpower.utils import compute_real_gaunt, get_real_Ylm
+    from jaxpower.utils import compute_sympy_real_gaunt, get_Ylm
 
     if False:
         for ell1, ell2, ell3 in itertools.product((0, 2, 4), (0, 2), (0, 2)):
@@ -366,7 +366,7 @@ def test_gaunt():
                                         list(range(-ell2, ell2 + 1)),
                                         list(range(-ell3, ell3 + 1))))
             for m1, m2, m3 in ms:
-                g = compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))
+                g = compute_sympy_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))
                 print(g)
 
     if False:
@@ -384,8 +384,8 @@ def test_gaunt():
         xyz /= np.sqrt(np.sum(xyz**2, axis=-1))[..., None]
         for ell in (0, 2, 4):
             for m in range(-ell, ell + 1):
-                tmp = get_real_Ylm(ell, m, modules=('scipy',), batch=False)(*xyz.T)
-                tmp2 = get_real_Ylm(ell, m, batch=False)(*xyz.T)
+                tmp = get_Ylm(ell, m, modules=('scipy',), real=True)(*xyz.T)
+                tmp2 = get_Ylm(ell, m, real=True)(*xyz.T)
                 assert np.allclose(tmp2, tmp, rtol=1e-6, atol=1e-6)
 
     if False:
@@ -393,7 +393,7 @@ def test_gaunt():
             ms = list(itertools.product(list(range(-ell1, ell1 + 1)),
                                         list(range(-ell2, ell2 + 1)),
                                         list(range(-ell3, ell3 + 1))))
-            if any(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3)) for m1, m2, m3 in ms):
+            if any(compute_sympy_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3)) for m1, m2, m3 in ms):
 
                 for m1, m2, m3 in ms:
                     mattrs = MeshAttrs(boxsize=500, meshsize=64)
@@ -403,16 +403,26 @@ def test_gaunt():
                     kedges = jnp.array([0.8 * mesh.knyq.min(), 0.9 * mesh.knyq.min()])
                     kmask = (knorm >= kedges[0]) & (knorm <= kedges[-1])
                     bin = BinMesh2SpectrumPoles(mesh, edges=kedges)
-                    mesh = mesh.clone(value=kmask * get_real_Ylm(ell1, m1)(*kvec) * get_real_Ylm(ell2, m2)(*kvec) * get_real_Ylm(ell3, m3)(*kvec))
+                    mesh = mesh.clone(value=kmask * get_Ylm(ell1, m1, real=True)(*kvec) * get_Ylm(ell2, m2, real=True)(*kvec) * get_Ylm(ell3, m3, real=True)(*kvec))
                     value = bin(mesh)[0]
-                    g = float(compute_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))) / (4 * np.pi)
+                    g = float(compute_sympy_real_gaunt((ell1, m1), (ell2, m2), (ell3, m3))) / (4 * np.pi)
                     if not np.allclose(value, g, rtol=1e-2, atol=1e-3):
                         print(ell1, ell2, ell3, m1, m2, m3, value, g)
 
-    if True:
+    if False:
         ell = 2
         for m in range(-ell, ell + 1):
-            print(ell, m, get_real_Ylm(ell, m)(0, 0, 1))
+            print(ell, m, get_Ylm(ell, m, real=True)(0, 0, 1))
+
+    if True:
+        rng = np.random.RandomState(seed=42)
+        xyz = rng.uniform(-1., 1., (100, 3))
+        xyz /= np.sqrt(np.sum(xyz**2, axis=-1))[..., None]
+        for ell in (0, 2, 4):
+            for m in range(-ell, ell + 1):
+                tmp = get_Ylm(ell, m, modules=('scipy',), real=False)(*xyz.T)
+                tmp2 = get_Ylm(ell, m, real=False)(*xyz.T)
+                assert np.allclose(tmp2, tmp, rtol=1e-6, atol=1e-6)
 
 
 def test_window_box(plot=False):

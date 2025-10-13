@@ -268,9 +268,14 @@ class HankelTransform(FFTlog):
         FFTlog.__init__(self, x, kernel, **kwargs)
         self.padded_prefactor *= self.padded_x**2
 
+    @property
+    def fftlog(self):
+        return self
+
+
 
 @jax.tree_util.register_pytree_node_class
-class SpectrumToCorrelation(FFTlog):
+class SpectrumToCorrelation(object):
     r"""
     Power spectrum to correlation function transform, defined as:
 
@@ -300,27 +305,85 @@ class SpectrumToCorrelation(FFTlog):
         kwargs : dict
             Arguments for :class:`FFTlog`.
         """
-        if np.ndim(ell) == 0:
-            kernel = SphericalBesselJKernel(ell)
+        def get_fftlog(k, ell):
+            if np.ndim(ell) == 0:
+                kernel = SphericalBesselJKernel(ell)
+            else:
+                kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
+            fftlog = FFTlog(k, kernel, q=1.5 + q, **kwargs)
+            fftlog.padded_prefactor *= fftlog.padded_x**3 / (2 * np.pi)**1.5
+            # Convention is (-i)^ell/(2 pi^2)
+            ell = np.atleast_1d(ell)
+            if complex:
+                phase = (-1j)**ell
+            else:
+                # Prefactor is (-i)^ell, but we take in the imaginary part of odd power spectra, hence:
+                # (-i)^ell = (-1)^(ell/2) if ell is even
+                # (-i)^ell i = (-1)^(ell//2) if ell is odd
+                phase = (-1)**(ell // 2)
+            # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
+            fftlog.padded_postfactor *= phase[:, None]
+            return fftlog
+
+        if isinstance(k, (tuple, list)):  # multi-dimensional
+            ells = ell
+            if np.ndim(ell[0]) != 0:  # multiple ells [(0, 0), (2, 2), ...]
+                ells = list(zip(*ell))
+            fftlog = tuple(get_fftlog(k_, ell_) for k_, ell_ in zip(k, ells))
         else:
-            kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
-        FFTlog.__init__(self, k, kernel, q=1.5 + q, **kwargs)
-        self.padded_prefactor *= self.padded_x**3 / (2 * np.pi)**1.5
-        # Convention is (-i)^ell/(2 pi^2)
-        ell = np.atleast_1d(ell)
-        if complex:
-            phase = (-1j) ** ell
+            fftlog = get_fftlog(k, ell)
+
+        self._fftlog = fftlog
+
+    def __call__(self, fun, **kwargs):
+        if isinstance(self._fftlog, tuple):
+            y = []
+            fun_ = fun
+            for idim, fftlog in enumerate(self._fftlog):
+                axes = list(range(fun.ndim))
+
+                def swap(axis1, axis2):
+                    bak = axes[axis2]
+                    axes[axis2] = axes[axis1]
+                    axes[axis2] = bak
+
+                if fftlog.inparallel:
+                    swap(0, -2)  # nparallel is second-to-last axis
+                swap(idim, -1)  # axis is last
+                axes = tuple(axes)
+                fun_ = jnp.transpose(fun_, axes)
+                y_, fun_ = fftlog(fun_, **kwargs)
+                fun_ = jnp.transpose(fun_, np.argsort(axes))
+                y.append(y_)
+            toret = tuple(y), fun_
         else:
-            # Prefactor is (-i)^ell, but we take in the imaginary part of odd power spectra, hence:
-            # (-i)^ell = (-1)^(ell/2) if ell is even
-            # (-i)^ell i = (-1)^(ell//2) if ell is odd
-            phase = (-1)**(ell // 2)
-        # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
-        self.padded_postfactor = self.padded_postfactor * phase[:, None]
+            toret = self._fftlog(fun, **kwargs)
+        return toret
+
+    def __getattr__(self, name):
+        if isinstance(self._fftlog, tuple):
+            raise AttributeError(f'Attribute {name} not found')
+        return getattr(self._fftlog, name)
+
+    @property
+    def fftlog(self):
+        return self._fftlog
+
+    def tree_flatten(self):
+        children = self._fftlog
+        aux_data = {}
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        new = cls.__new__(cls)
+        new.__dict__.update(aux_data)
+        new._fftlog = children
+        return new
 
 
 @jax.tree_util.register_pytree_node_class
-class CorrelationToSpectrum(FFTlog):
+class CorrelationToSpectrum(object):
     r"""
     Correlation function to power spectrum transform, defined as:
 
@@ -350,20 +413,44 @@ class CorrelationToSpectrum(FFTlog):
         kwargs : dict
             Arguments for :class:`FFTlog`.
         """
-        if np.ndim(ell) == 0:
-            kernel = SphericalBesselJKernel(ell)
+        def get_fftlog(k, ell):
+            if np.ndim(ell) == 0:
+                kernel = SphericalBesselJKernel(ell)
+            else:
+                kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
+            fftlog = FFTlog(k, kernel, q=1.5 + q, **kwargs)
+            fftlog.padded_prefactor *= fftlog.padded_x**3 * (2 * np.pi)**1.5
+            # Convention is (-i)^ell/(2 pi^2)
+            ell = np.atleast_1d(ell)
+            if complex:
+                phase = (-1j)**ell
+            else:
+                # Prefactor is (-i)^ell, but we take in the imaginary part of odd power spectra, hence:
+                # (-i)^ell = (-1)^(ell/2) if ell is even
+                # (-i)^ell i = (-1)^(ell//2) if ell is odd
+                phase = (-1)**(ell // 2)
+            # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
+            fftlog.padded_postfactor *= phase[:, None]
+            return fftlog
+
+        if isinstance(s, (tuple, list)):  # multi-dimensional
+            ells = ell
+            if np.ndim(ell[0]) != 0:  # multiple ells [(0, 0), (2, 2), ...]
+                ells = list(zip(*ell))
+            fftlog = tuple(get_fftlog(s_, ell_) for s_, ell_ in zip(s, ells))
         else:
-            kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
-        FFTlog.__init__(self, s, kernel, q=1.5 + q, **kwargs)
-        self.padded_prefactor *= self.padded_x**3 * (2 * np.pi)**1.5
-        # Convention is 4 \pi i^ell, and we return imaginary part of odd poles
-        ell = np.atleast_1d(ell)
-        if complex:
-            phase = (-1j) ** ell
-        else:
-            # We return imaginary part of odd poles
-            phase = (-1)**(ell // 2)
-        self.padded_postfactor = self.padded_postfactor * phase[:, None]
+            fftlog = get_fftlog(s, ell)
+
+        self._fftlog = fftlog
+
+    @property
+    def fftlog(self):
+        return self._fftlog
+
+    __getattr__ = SpectrumToCorrelation.__getattr__
+    __call__ = SpectrumToCorrelation.__call__
+    tree_flatten = SpectrumToCorrelation.tree_flatten
+    tree_unflatten = SpectrumToCorrelation.tree_unflatten
 
 
 @jax.tree_util.register_pytree_node_class
@@ -393,6 +480,10 @@ class TophatVariance(FFTlog):
         FFTlog.__init__(self, k, kernel, q=1.5 + q, **kwargs)
         self.padded_prefactor *= self.padded_x**3 / (2 * np.pi**2)
 
+    @property
+    def fftlog(self):
+        return self
+
 
 @jax.tree_util.register_pytree_node_class
 class GaussianVariance(FFTlog):
@@ -420,6 +511,10 @@ class GaussianVariance(FFTlog):
         kernel = GaussianSqKernel()
         FFTlog.__init__(self, k, kernel, q=1.5 + q, **kwargs)
         self.padded_prefactor *= self.padded_x**3 / (2 * np.pi**2)
+
+    @property
+    def fftlog(self):
+        return self
 
 
 def pad(array, pad_width, axis=-1, extrap=0):

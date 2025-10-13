@@ -188,7 +188,7 @@ class MemoryMonitor(object):
 
 
 @lru_cache(maxsize=32, typed=False)
-def get_real_Ylm(ell, m, modules=None):
+def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
     """
     Return a function that computes the real spherical harmonic of order (ell, m).
     Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/convpower/fkp.py.
@@ -226,10 +226,16 @@ def get_real_Ylm(ell, m, modules=None):
 
     # Normalization of Ylms
     amp = np.sqrt((2 * ell + 1) / (4 * np.pi))
+    if reduced:
+        amp = 1.
     if m != 0:
         fac = 1
         for n in range(ell - abs(m) + 1, ell + abs(m) + 1): fac *= n  # (ell + |m|)!/(ell - |m|)!
-        amp *= np.sqrt(2. / fac)
+        amp *= np.sqrt(1. / fac)
+    if real and m != 0:
+        amp *= np.sqrt(2.) * (-1)**m
+    if not real and m < 0:
+        amp *= (-1)**m
 
     sp = None
 
@@ -252,7 +258,9 @@ def get_real_Ylm(ell, m, modules=None):
         def Ylm(*xvec):
             xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
             xhat = tuple(_safe_divide(xx, xnorm) for xx in xvec)
-            return func(*xhat)
+            toret = jnp.asarray(func(*xhat))
+            if not real: toret += 0 * 1j  # for JAX jit
+            return toret
 
         for name, value in attrs.items():
             setattr(Ylm, name, value)
@@ -263,18 +271,26 @@ def get_real_Ylm(ell, m, modules=None):
 
         def _Ylm(xhat, yhat, zhat):
             # The cos(theta) dependence encoded by the associated Legendre polynomial
-            toret = amp * (-1)**m * special.lpmv(abs(m), ell, zhat)
+            toret = amp * special.lpmv(abs(m), ell, zhat)
             # The phi dependence
             phi = np.arctan2(yhat, xhat)
-            if m < 0:
-                toret *= np.sin(abs(m) * phi)
+            if real:
+                if m < 0:
+                    eimphi = np.sin(abs(m) * phi)
+                elif m > 0:
+                    eimphi = np.cos(m * phi)
+                else:
+                    eimphi = 1
             else:
-                toret *= np.cos(m * phi)
-            return toret
+                eimphi = np.exp(1j * m * phi)
+                if conj: eimphi = eimphi.conj()
+            return toret * eimphi
 
         def func(xhat, yhat, zhat):
             shape = jnp.broadcast_shapes(jnp.shape(xhat), jnp.shape(yhat), jnp.shape(zhat))
             dtype = jnp.result_type(xhat, yhat, zhat)
+            if not real:
+                dtype = (1j * jnp.zeros((), dtype=dtype)).dtype
             out_type = jax.ShapeDtypeStruct(shape, dtype)
             return jax.pure_callback(_Ylm, out_type, xhat, yhat, zhat)
 
@@ -291,25 +307,35 @@ def get_real_Ylm(ell, m, modules=None):
                 (sp.cos(theta), z / sp.sqrt(x**2 + y**2 + z**2))]
 
         # The cos(theta) dependence encoded by the associated Legendre polynomial
-        expr = (-1)**m * sp.assoc_legendre(ell, abs(m), sp.cos(theta))
+        expr = sp.assoc_legendre(ell, abs(m), sp.cos(theta))
 
         # The phi dependence
-        if m < 0:
-            expr *= sp.expand_trig(sp.sin(abs(m) * phi))
-        elif m > 0:
-            expr *= sp.expand_trig(sp.cos(m * phi))
+        if real:
+            if m < 0:
+                eimphi = sp.sin(abs(m) * phi)
+            elif m > 0:
+                eimphi = sp.cos(m * phi)
+            else:
+                eimphi = 1
+        else:
+            # lambdify doesn't seem to tacke sp.exp properly with JAX
+            eimphi = sp.cos(m * phi) + sp.sin(m * phi) * 1j
+            if conj: eimphi = sp.conjugate(eimphi)
+
+        expr *= sp.expand_trig(eimphi)
 
         # Simplify
         expr = sp.together(expr.subs(defs)).subs(x**2 + y**2 + z**2, r**2)
         expr = amp * expr.expand().subs([(x / r, xhat), (y / r, yhat), (z / r, zhat)])
-        func = sp.lambdify((xhat, yhat, zhat), expr, modules='jax')
+        func = sp.lambdify((xhat, yhat, zhat), expr, modules=['jax'])
 
         Ylm = get_Ylm_func(func, ell=ell, m=m, expr=expr)
 
     return Ylm
 
 
-[[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
+[[get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
+
 
 
 _registered_legendre = [None] * 11
@@ -596,6 +622,18 @@ _legendre_product3 = {(0, 0, 0): 1, (0, 1, 1): 1/3, (0, 2, 2): 1/5, (0, 3, 3): 1
                       (3, 5, 8): 56/2431, (3, 6, 7): 168/12155, (3, 7, 8): 252/20995, (4, 4, 4): 18/1001, (4, 4, 6): 20/1287, (4, 4, 8): 490/21879, (4, 5, 5): 2/143, (4, 5, 7): 280/21879, (4, 6, 6): 28/2431, (4, 6, 8): 504/46189,
                       (4, 7, 7): 2268/230945, (4, 8, 8): 36/4199, (5, 5, 6): 80/7293, (5, 5, 8): 490/46189, (5, 6, 7): 420/46189, (5, 7, 8): 360/46189, (6, 6, 6): 400/46189, (6, 6, 8): 350/46189, (6, 7, 7): 1000/138567,
                       (6, 8, 8): 600/96577, (7, 7, 8): 1750/289731, (8, 8, 8): 490/96577}
+
+
+def wigner_3j(*ells):
+    from sympy.physics.wigner import wigner_3j
+    ells = map(int, ells)
+    return float(wigner_3j(*ells))
+
+
+def wigner_9j(*ells):
+    from sympy.physics.wigner import wigner_9j
+    ells = map(int, ells)
+    return float(wigner_9j(*ells))
 
 
 def legendre_product(*ells):
