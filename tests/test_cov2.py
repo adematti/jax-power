@@ -373,9 +373,9 @@ def test_fftlog2():
     cosmo = DESI(engine='eisenstein_hu')
     pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)(k)
 
-    from jaxpower.fftlog import PowerToCorrelation, CorrelationToPower
+    from jaxpower.fftlog import SpectrumToCorrelation, CorrelationToSpectrum
 
-    fftlog = PowerToCorrelation(k, ell=0, lowring=lowring, minfolds=False)
+    fftlog = SpectrumToCorrelation(k, ell=0, lowring=lowring, minfolds=False).fftlog
     tmp2 = fftlog(pk)[1]
     tmp3 = P2xi(k, l=0, N=len(k), lowring=lowring)(pk)[1]
 
@@ -385,10 +385,10 @@ def test_fftlog2():
     class Correlation2Power(object):
 
         def __init__(self, k, ells):
-            from jaxpower.fftlog import PowerToCorrelation
-            fftlog = PowerToCorrelation(k, ell=ells[0], lowring=False, minfolds=False)
+            from jaxpower.fftlog import SpectrumToCorrelation
+            fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False).fflog
             self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-            self._fftlog = PowerToCorrelation(k, ell=ells[1], lowring=False, minfolds=False)
+            self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False).fftlog
             dlnk = jnp.diff(jnp.log(k)).mean()
             self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
             self.k = k
@@ -473,10 +473,10 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
     #test_fftlog2()
     #export_sympy()
-    #save_box_mocks()
+    save_box_mocks()
     #test_box2_covariance(plot=True)
-    #save_cutsky_mocks()
+    save_cutsky_mocks()
     #test_cutsky2_covariance(plot=True)
-    #save_fkp_mocks()
+    save_fkp_mocks()
     #test_fkp2_window(plot=True)
     test_fkp2_covariance(plot=True)

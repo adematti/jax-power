@@ -28,9 +28,9 @@ class Correlation2Spectrum(object):
     """
     def __init__(self, k, ells):
         from .fftlog import SpectrumToCorrelation
-        fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False)
+        fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False).fftlog
         self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-        self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False)
+        self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False).fftlog
         dlnk = jnp.diff(jnp.log(k)).mean()
         self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
         self.k = k

@@ -26,7 +26,7 @@ def test_mesh3_spectrum(plot=False):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'local']
-    mattrs = MeshAttrs(meshsize=128, boxsize=1000.)
+    mattrs = MeshAttrs(meshsize=128, boxsize=1000., dtype=complex)
 
     for basis in ['scoccimarro', 'scoccimarro-equilateral', 'sugiyama-diagonal'][:1]:
 
@@ -250,16 +250,25 @@ def test_triumvirate_box(plot=False):
     #mean = 1.
     mesh = mesh - mean
     edges = np.arange(0.01, mattrs.knyq[0], 0.01)
-    #ell = (0, 0, 0)
-    ell = (2, 0, 2)
+    ell = (0, 0, 0)
+    ell = (1, 0, 1)
+    #ell = (2, 0, 2)
+    #ell = (3, 1, 2)
+    #ell = (1, 3, 2)
     los = 'z'
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
+
+    def take(array):
+        if sum(ell[:2]) % 2 == 0:
+            return array.real
+        return array.imag
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
     num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
     nz = size / mattrs.boxsize.prod()
     norm = jnp.sum(data.weights * nz**2)
     spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
+    #print(spectrum.value())
     spectrum_raw = spectrum
     spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
@@ -277,18 +286,18 @@ def test_triumvirate_box(plot=False):
     print(paramset)
     paramset = ParameterSet(param_dict=paramset)
     results = compute_bispec_in_gpp_box(catalogue, paramset=paramset)
-
-    #print(spectrum.get(ell).values('num_shotnoise'))
+    #print(results['bk_raw'])
+    print(spectrum.get(ell).values('num_shotnoise'))
 
     if plot:
         ax = plt.gca()
-        ax.plot(results['bk_shot'], label='triumvirate shotnoise')
+        ax.plot(take(results['bk_shot']), label='triumvirate shotnoise')
         ax.plot(spectrum.get(ell).values('shotnoise'), label='jaxpower shotnoise')
         ax.legend()
         plt.show()
 
         ax = plt.gca()
-        ax.plot(results['bk_raw'], label='triumvirate')
+        ax.plot(take(results['bk_raw']), label='triumvirate')
         ax.plot(spectrum.get(ell).values('value') + spectrum.get(ell).values('shotnoise'), label='jaxpower')
         ax.legend()
         plt.show()
@@ -315,16 +324,23 @@ def test_triumvirate_box_correlation(plot=False):
     #mean = 1.
     mesh = mesh - mean
     edges = np.arange(0.1, mattrs.boxsize.min() / 3., 40.01)
-    ell = (0, 0, 0)
+    #ell = (0, 0, 0)
+    ell = (1, 0, 1)
     #ell = (2, 0, 2)
+    #ell = (3, 1, 2)
+    #ell = (1, 3, 2)
     los = 'z'
     bin = BinMesh3CorrelationPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
+
+    def take(array):
+        return array.real
 
     correlation = compute_mesh3_correlation(mesh, los=los, bin=bin)
     num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
     nz = size / mattrs.boxsize.prod()
     norm = jnp.sum(data.weights * nz**2)
     correlation = correlation.map(lambda pole: pole.clone(norm=norm))
+    #print(correlation.value())
     correlation_raw = correlation
     correlation = correlation.clone(num_shotnoise=num_shotnoise)
 
@@ -339,21 +355,22 @@ def test_triumvirate_box_correlation(plot=False):
     paramset = dict(norm_convention='particle', form='diag', degrees=dict(zip(['ell1', 'ell2', 'ELL'], ell)), wa_orders=dict(i=None, j=None),
                     range=[edges[0], edges[-1]], num_bins=len(edges) - 1, binning='lin', assignment='cic', interlace=False,
                     boxsize=dict(zip('xyz', np.array(mattrs.boxsize))), ngrid=dict(zip('xyz', np.array(mattrs.meshsize))), verbose=20)
-    print(paramset)
+
     paramset = ParameterSet(param_dict=paramset)
     results = compute_3pcf_in_gpp_box(catalogue, paramset=paramset)
-    #print(spectrum.get(ell).values('num_shotnoise'))
+    print(results['zeta_raw'])
+    print(correlation.get(ell).values('value'))
 
     if plot:
         ax = plt.gca()
-        ax.plot(results['zeta_shot'], label='triumvirate shotnoise')
-        ax.plot(correlation.get(ell).values('shotnoise'), label='jaxpower shotnoise')
+        ax.plot(take(results['zeta_shot']), label='triumvirate shotnoise')
+        ax.plot(take(correlation.get(ell).values('shotnoise')), label='jaxpower shotnoise')
         ax.legend()
         plt.show()
 
         ax = plt.gca()
-        ax.plot(results['zeta_raw'], label='triumvirate')
-        ax.plot(correlation.get(ell).values('value') + correlation.get(ell).values('shotnoise'), label='jaxpower')
+        ax.plot(take(results['zeta_raw']), label='triumvirate')
+        ax.plot(take(correlation.get(ell).values('value') + correlation.get(ell).values('shotnoise')), label='jaxpower')
         ax.legend()
         plt.show()
 
@@ -380,9 +397,17 @@ def test_triumvirate_survey(plot=False):
     mesh = fkp.paint(**kw)
     edges = np.arange(0.01, mattrs.knyq[0], 0.01)
     ell = (0, 0, 0)
+    #ell = (1, 0, 1)
     #ell = (2, 0, 2)
+    #ell = (3, 1, 2)
+    #ell = (1, 3, 2)
     los = 'local'
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
+
+    def take(array):
+        if sum(ell[:2]) % 2 == 0:
+            return array.real
+        return array.imag
 
     spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
 
@@ -414,14 +439,14 @@ def test_triumvirate_survey(plot=False):
 
     if plot:
         ax = plt.gca()
-        ax.plot(results['bk_shot'], label='triumvirate shotnoise')
+        ax.plot(take(results['bk_shot']), label='triumvirate shotnoise')
         ax.plot(spectrum.get(ell).values('shotnoise'), label='jaxpower shotnoise')
         ax.legend()
         plt.show()
 
         ax = plt.gca()
         k = results['k1_eff']
-        ax.plot(k, k**2 * results['bk_raw'], label='triumvirate')
+        ax.plot(k, k**2 * take(results['bk_raw']), label='triumvirate')
         k = spectrum.get(ell).coords('k')[..., 0]
         ax.plot(k, k**2 * (spectrum.get(ell).values('value') + spectrum.get(ell).values('shotnoise')), label='jaxpower')
         ax.legend()
@@ -449,10 +474,16 @@ def test_triumvirate_survey_correlation(plot=False):
     kw = dict(resampler='cic', interlacing=False, compensate=True)
     mesh = fkp.paint(**kw)
     edges = np.arange(0.1, mattrs.boxsize.min() / 3., 40.01)
-    #ell = (0, 0, 0)
-    ell = (2, 0, 2)
+    ell = (0, 0, 0)
+    ell = (1, 0, 1)
+    #ell = (2, 0, 2)
+    #ell = (3, 1, 2)
+    #ell = (1, 3, 2)
     los = 'local'
     bin = BinMesh3CorrelationPoles(mattrs, edges=edges, basis='sugiyama-diagonal', ells=[ell])
+
+    def take(array):
+        return array.real
 
     correlation = compute_mesh3_correlation(mesh, los=los, bin=bin)
     num_shotnoise = compute_fkp3_shotnoise(fkp, bin=bin, los=los, **kw)
@@ -480,18 +511,18 @@ def test_triumvirate_survey_correlation(plot=False):
     paramset = ParameterSet(param_dict=paramset)
     results = compute_3pcf(data, randoms, paramset=paramset, logger=logger)
 
-    #print(spectrum.get(ell).values('num_shotnoise'))
+    print(correlation.get(ell).values('num_shotnoise'))
 
     if plot:
         ax = plt.gca()
-        ax.plot(results['zeta_shot'], label='triumvirate shotnoise')
-        ax.plot(correlation.get(ell).values('shotnoise'), label='jaxpower shotnoise')
+        ax.plot(take(results['zeta_shot']), label='triumvirate shotnoise')
+        ax.plot(take(correlation.get(ell).values('shotnoise')), label='jaxpower shotnoise')
         ax.legend()
         plt.show()
 
         ax = plt.gca()
-        ax.plot(results['zeta_raw'], label='triumvirate')
-        ax.plot(correlation.get(ell).values('value') + correlation.get(ell).values('shotnoise'), label='jaxpower')
+        ax.plot(take(results['zeta_raw']), label='triumvirate')
+        ax.plot(take(correlation.get(ell).values('value') + correlation.get(ell).values('shotnoise')), label='jaxpower')
         ax.legend()
         plt.show()
 
@@ -570,6 +601,49 @@ def test_bincount():
     print(digitize_overlapping_matrix(x, edges))
 
 
+def test_fftlog2(plot=False):
+    from jaxpower.fftlog import SpectrumToCorrelation, CorrelationToSpectrum
+
+    from cosmoprimo.fiducial import DESI
+
+    lgkmin, lgkmax = -6, 2
+    Nk = 3645
+    k = np.logspace(lgkmin, lgkmax, num=Nk, endpoint=False)
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pkt = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)(k)
+
+    ells = [0]
+    pk = pkt[None, :]
+    s, xi = SpectrumToCorrelation(k, ell=ells)(pk)
+    k2, pk2 = CorrelationToSpectrum(s, ell=ells)(xi)
+
+    if plot:
+        ax = plt.gca()
+        for ill, ell in enumerate(ells):
+            color = f'C{ill:d}'
+            ax.loglog(k, pk[ill], linestyle='--', color=color)
+            ax.loglog(k2[ill], pk2[ill], linestyle='-', color=color)
+        plt.show()
+
+    bkt = pkt[:, None] * pkt
+    k = (k, k)
+    ells = [(0, 0)]
+    bk = bkt[None, :]
+    s, zeta = SpectrumToCorrelation(k, ell=ells)(bk)
+    k2, bk2 = CorrelationToSpectrum(s, ell=ells)(zeta)
+
+    if plot:
+        ax = plt.gca()
+        idx = 100
+        for ill, ell in enumerate(ells):
+            color = f'C{ill:d}'
+            ax.loglog(k[0], bk[ill, :, idx], linestyle='--', color=color)
+            ax.loglog(k2[0][ill], bk2[ill, :, idx], linestyle='-', color=color)
+        plt.show()
+
+
+
 if __name__ == '__main__':
 
     #import os
@@ -579,6 +653,7 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    #test_fftlog2()
     test_buffer()
     test_mesh3_spectrum()
     test_polybin3d()

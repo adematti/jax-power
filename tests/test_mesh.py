@@ -8,7 +8,7 @@ from jax import numpy as jnp
 from jax import random
 from jax.sharding import PartitionSpec as P
 
-from jaxpower import resamplers
+from jaxpower import resamplers, kernels
 from jaxpower.mesh import staticarray, MeshAttrs, BaseMeshField, RealMeshField, ParticleField, get_sharding_mesh, create_sharding_mesh, get_mesh_attrs
 
 
@@ -63,12 +63,12 @@ def test_base_mesh():
     mesh2.attrs.boxsize
     assert np.allclose(mesh2.value, mesh.value)
 
+    mesh2.r2c().apply(kernels.gaussian(radius=10.))
+
 
 def test_real_mesh():
     for engine in ['jax', 'jaxdecomp']:
         mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)), boxsize=(1000., 102., 2320.), fft_engine=engine)
-        mesh2 = mesh.rebin(factor=(2, 1, 1))
-        assert mesh2.shape == (5, 21, 13)
         mesh2 = mesh.r2c()
         assert mesh2.shape != mesh.shape
         assert np.allclose(mesh2.c2r(), mesh)

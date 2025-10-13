@@ -67,14 +67,14 @@ def invlaplace(order: str | None=None):
     return fn
 
 
-def longrange(r_split: float = 0.):
-    """
-    Return long range kernel.
+def gaussian(radius: float=0.):
+    r"""
+    Return Gaussian smoothing kernel, :math:`e^{-(k * r)^2 / 2}`.
 
     Parameters
     ----------
-    r_split : float
-        Splitting radius.
+    radius : float=0.
+        Smoothing radius.
 
     Returns
     --------
@@ -84,11 +84,9 @@ def longrange(r_split: float = 0.):
         Kernel callable to be applied to mesh: ``mesh.apply(fn)``.
     """
     def fn(value, kvec):
-        if r_split != 0:
-            kk = sum(ki**2 for ki in kvec)
-            kernel = jnp.exp(-kk * r_split**2)
-        else:
-            kernel = 1.
+        radii = jnp.ones(len(kvec), dtype=kvec[0].dtype) * radius
+        k2 = sum((kk * rr)**2 for kk, rr in zip(kvec, radii))
+        kernel = jnp.exp(- 0.5 * k2)
         return value * kernel
-    fn.kind = 'circular'
+    fn.kind = 'wavenumber'
     return fn

@@ -11,20 +11,57 @@ from dataclasses import dataclass
 
 from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
 from .mesh2 import _get_los_vector, FKPField
-from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, WindowMatrix
-from .utils import real_gaunt, get_legendre, get_spherical_jn, get_real_Ylm, register_pytree_dataclass
+from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableTree, WindowMatrix
+from .utils import real_gaunt, get_legendre, get_spherical_jn, get_Ylm, wigner_3j, wigner_9j, register_pytree_dataclass
 
 
 prod = functools.partial(functools.reduce, operator.mul)
 
 
 
-def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch_size=None, buffer_size=0):
+def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch_size=None, buffer_size=0, mask_edges=None):
+    assert basis in ['sugiyama', 'sugiyama-diagonal', 'scoccimarro', 'scoccimarro-diagonal']
+    if 'scoccimarro' in basis:
+        ndim = 3
+    else:
+        ndim = 2
+        mattrs = mattrs.clone(dtype=mattrs.cdtype)
+
+    if mask_edges is None:
+        if 'scoccimarro' in basis:
+            mask_edges == '1<=2,2<=3'
+        else:
+            mask_edges == '1<=2'
+    if isinstance(mask_edges, str):
+        mask_edges = mask_edges.strip()
+        mask_edges_list = ','.split(mask_edges)
+
+        def mask_edges(*edges):
+            mask = True
+            xmids = [np.mean(edge, axis=-1) for edge in edges]
+            for c in mask_edges_list:
+                c = c.strip()
+                xmid = xmids[int(c[0]) - 1], xmids[int(c[-1]) - 1]
+                symbol = c[1:-1]
+                if symbol == '==':
+                    mask = xmid[0] == xmid[1]
+                elif symbol == '<=':
+                    mask = xmid[0] <= xmid[1]
+                elif symbol == '>=':
+                    mask = xmid[0] >= xmid[1]
+                elif symbol == '<':
+                    mask = xmid[0] < xmid[1]
+                elif symbol == '>':
+                    mask = xmid[0] > xmid[1]
+                else:
+                    raise ValueError(f'constraint {symbol} not understood')
+            return mask
+
     wmodes = None
     if kind == 'complex':
         vec = mattrs.kcoords(kind='separation', sparse=True)
         vec0 = mattrs.kfun.min()
-        if mattrs.hermitian:
+        if mattrs.is_hermitian:
             wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
     else:
         vec = mattrs.xcoords(kind='separation', sparse=True)
@@ -38,10 +75,6 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
             edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
         else:
             edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
-
-    assert basis in ['sugiyama', 'sugiyama-diagonal', 'scoccimarro', 'scoccimarro-diagonal']
-    if 'scoccimarro' in basis: ndim = 3
-    else: ndim = 2
 
     if not isinstance(edges, (tuple, list)):
         edges = [edges] * ndim
@@ -76,16 +109,10 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
         else:
             return _cproduct(array)
 
-    def get_order_mask(edges):
-        xmid = _product([jnp.mean(edge, axis=-1) for edge in edges])
-        mask = True
-        for i in range(xmid.shape[1] - 1):
-            mask &= xmid[:, i] <= xmid[:, i + 1]  # select k1 <= k2 <= k3...
-        return mask
-
-    mask = get_order_mask(uedges)
     # of shape (nbins, ndim, 2)
-    edges = jnp.concatenate([_product([edge[..., 0] for edge in uedges])[..., None], _product([edge[..., 1] for edge in uedges])[..., None]], axis=-1)[mask]
+    edges = jnp.concatenate([_product([edge[..., 0] for edge in uedges])[..., None], _product([edge[..., 1] for edge in uedges])[..., None]], axis=-1)
+    mask = mask_edges(*edges)
+    edges = edges[mask]
     xavg = _product(xavg)[mask]
     nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
     iedges = _product([jnp.arange(len(xx)) for xx in nmodes1d])[mask]
@@ -181,10 +208,10 @@ class BinMesh3SpectrumPoles(object):
     buffer_size: int = 0
     ells: tuple = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='complex', batch_size=batch_size, buffer_size=buffer_size)
+        kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='complex', batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
         self.__dict__.update(kw)
         xmid = jnp.mean(self.edges, axis=-1).T
 
@@ -315,10 +342,10 @@ class BinMesh3CorrelationPoles(object):
     buffer_size: int = 0
     ells: tuple = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='real', batch_size=batch_size, buffer_size=buffer_size)
+        kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='real', batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
         self.__dict__.update(kw)
 
     bin_reduce_meshs = BinMesh3SpectrumPoles.bin_reduce_meshs
@@ -341,7 +368,7 @@ class BinMesh3CorrelationPoles(object):
         values = []
         ndim = 2
         ell = ell[:2]
-        norm = (-1)**(sum(ell) // 2) / self.mattrs.cellsize.prod()**2
+        norm = (1j)**sum(ell) / self.mattrs.cellsize.prod()**2
         knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
         jns = [get_spherical_jn(ell) for ell in ell]
 
@@ -418,16 +445,24 @@ def _iter_triposh(*ells, los='local'):
     if los == 'z':
         ms[-1] = [0]
     toret, acc = [], []
-    for im1, im2, im3 in itertools.product(*ms):
-        gaunt = real_gaunt((ell1, im1), (ell2, im2), (ell3, im3))
-        if gaunt == 0.: continue
+    for m1, m2, m3 in itertools.product(*ms):
+        # In https://arxiv.org/pdf/1803.02132, the total coefficient is
+        # H(ell1 ell2, L) wigner_3j(ell1, ell2, L, m1, m2, M) (2ell1 + 1) (2ell2 + 1) (2L + 1)
+        # i.e. (2ell1 + 1) (2ell2 + 1) (2L + 1) wigner_3j(ell1, ell2, L, 0, 0, 0) wigner_3j(ell1 ell2 L, m1, m2, M)
+        # Gaunt below is:
+        # sqrt((2ell1 + 1) (2ell2 + 1) (2L + 1) / 4pi) wigner_3j(ell1, ell2, L, 0, 0, 0) wigner_3j(ell1 ell2 L, m1, m2, M)
+        # The ratio between the 2 is compensated by our definition of Spherical Harmonics, which includes coefficents sqrt((2ell + 1) / 4 pi)
+        #gaunt = real_gaunt((ell1, im1), (ell2, im2), (ell3, im3))
+        gaunt = (2 * ell1 + 1) * (2 * ell2 + 1) * (2 * ell3 + 1) * wigner_3j(ell1, ell2, ell3, 0, 0, 0) * wigner_3j(ell1, ell2, ell3, m1, m2, m3)
+        if abs(gaunt) < 1e-7:
+            continue
         sym = 0.
-        neg = (-im1, -im2, -im3)
+        neg = (-m1, -m2, -m3)
         if neg in acc:
             idx = acc.index(neg)
             toret[idx][-1] = (-1)**ell3
             continue
-        toret.append([im1 + ell1, im2 + ell2, im3 + ell3, gaunt, sym])  # m indexing starting from 0
+        toret.append([m1 + ell1, m2 + ell2, m3 + ell3, gaunt, sym])  # m indexing starting from 0
         acc.append(toret[-1][:3])
     if toret:
         return [jnp.array(xx) for xx in zip(*toret)]
@@ -487,6 +522,9 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     meshes, same = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
+    if 'sugiyama' in bin.basis:
+        mattrs = mattrs.clone(dtype=mattrs.cdtype)
+    meshes = [mesh.clone(attrs=mattrs) for mesh in meshes]
     norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)**2
 
     los, vlos = _format_los(los, ndim=mattrs.ndim)
@@ -520,7 +558,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 return carry, im
 
             for ill3, ell3 in enumerate(ells):
-                Ylms = [get_real_Ylm(ell3, m) for m in range(-ell3, ell3 + 1)]
+                Ylms = [get_Ylm(ell3, m, reduced=False, real=True) for m in range(-ell3, ell3 + 1)]
                 xs = np.arange(len(Ylms))
                 tmp = tuple(meshes[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshes[0].clone(value=jnp.zeros_like(meshes[0].value)), xs=xs)[0],)
                 tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
@@ -546,18 +584,19 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = (4. * np.pi)**2 * coeff.astype(mattrs.rdtype) * bin(*tmp, remove_zero=True)
+            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, remove_zero=True)
             carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
             return carry, im
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
-            Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
+            Ylms = [[get_Ylm(ell, m, reduced=True, real=False, conj=True) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
             xs = _iter_triposh(ell1, ell2, ell3, los=los)
             if xs[0].size:
-                num.append(jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0] / bin.nmodes[ill])
+                num_ = jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0] / bin.nmodes[ill]
                 #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
             else:
-                num.append(jnp.zeros(len(bin.edges), dtype=mattrs.dtype))
+                num_ = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
+            num.append(num_.real if (ell1 + ell2) % 2 == 0 else num_.imag)
 
     spectrum = []
     for ill, ell in enumerate(ells):
@@ -589,6 +628,10 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     meshes, same = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
+    if 'sugiyama' in bin.basis:
+        mattrs = mattrs.clone(dtype=mattrs.cdtype)
+    meshes = [mesh.clone(attrs=mattrs) for mesh in meshes]
+
     norm = mattrs.meshsize.prod(dtype=rdtype) / jnp.prod(mattrs.cellsize, dtype=rdtype)**2
 
     los, vlos = _format_los(los, ndim=mattrs.ndim)
@@ -625,18 +668,19 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
             tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = (4. * np.pi)**2 * coeff.astype(mattrs.rdtype) * bin(*tmp, ell=ell, remove_zero=True)
+            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, ell=ell, remove_zero=True)
             carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
             return carry, im
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
-            Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
+            Ylms = [[get_Ylm(ell, m, reduced=True, real=False, conj=True) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
             xs = _iter_triposh(ell1, ell2, ell3, los=los)
             if xs[0].size:
-                num.append(jax.lax.scan(partial(f, Ylms, (ell1, ell2, ell3)), init=jnp.zeros(len(bin.edges), dtype=mattrs.dtype), xs=xs)[0])
+                num_ = jax.lax.scan(partial(f, Ylms, (ell1, ell2, ell3)), init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0]
                 #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
             else:
-                num.append(jnp.zeros(len(bin.edges), dtype=mattrs.dtype))
+                num_ = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
+            num.append(num_.real)
 
     correlation = []
     for ill, ell in enumerate(ells):
@@ -776,6 +820,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
     raise ValueError(f'bin must be either BinMesh3SpectrumPoles or BinMesh3CorrelationPoles, not {type(bin)}')
 
 
+
 def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, **kwargs):
     """
     Compute the FKP shot noise for the bispectrum.
@@ -809,6 +854,11 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         Shot noise for each multipole.
     """
     fkps, same = _format_meshes(*fkps)
+    mattrs = fkps[0].attrs
+    if 'sugiyama' in bin.basis:
+        mattrs = mattrs.clone(dtype=mattrs.cdtype)
+    fkps = [fkp.clone(attrs=mattrs) for fkp in fkps]
+
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
@@ -834,7 +884,6 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 fkp = fkp.particles
             particles.append(fkp)
 
-    mattrs = particles[0].attrs
     los, vlos = _format_los(los, ndim=mattrs.ndim)
     # The real-space grid
     xvec = mattrs.rcoords(sparse=True)
@@ -862,7 +911,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
         def apply_fourier_harmonics(ell, rmesh):
             rmesh = getattr(rmesh, 'value', rmesh)
-            Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+            Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
 
             @partial(jax.checkpoint, static_argnums=(0, 1))
             def f(Ylm, carry, im):
@@ -899,7 +948,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                     carry += (4 * jnp.pi) * sum(tmp[axis][bin._iedges[..., axis]] * tmp[ndim - 1][bin._iedges[..., ndim - 1]] for axis in range(ndim - 1))
                     return carry, im
 
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 xs = np.arange(len(Ylms))
                 shotnoise[ill] = (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=sn_ell, xs=xs)[0]
 
@@ -909,11 +958,11 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         def compute_S111(particles, ellms):
             ellms = list(ellms)
             if ellms == [(0, 0)]:
-                s0 = jnp.sum(particles[0].weights**3) / jnp.sqrt(4. * jnp.pi)
+                s0 = jnp.sum(particles[0].weights**3)
                 s111 = [s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms]
             else:
                 rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-                s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ellms]
+                s111 = [jnp.sum(rmesh.value * get_Ylm(ell, m, reduced=True, real=False, conj=True)(*xvec)) for ell, m in ellms]
             return s111
 
         def compensate_shotnoise(s111):
@@ -936,14 +985,14 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 # Second and third lines
                 s111 = compensate_shotnoise(s111)
                 los = xvec if vlos is None else vlos
-                carry += jax.lax.switch(im, Ylm, *kvec) * ((rmesh * jax.lax.switch(im, Ylm, *los)).r2c() * cmesh.conj() - s111)
+                carry += jax.lax.switch(im, Ylm, *kvec) * (cmesh * (rmesh * jax.lax.switch(im, Ylm, *los)).r2c().conj() - s111)
                 return carry, im
 
             s122 = []
             for ell in ells:
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)]
                 xs = (jnp.arange(len(Ylms)), jnp.array([s111[ellms.index((ell, m))] for m in range(-ell, ell + 1)]))
-                s122.append(4. * jnp.pi * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0], axis))
+                s122.append((2 * ell + 1) * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0], axis))
             return s122
 
         def compute_S113(particles, ells):
@@ -959,26 +1008,26 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 s111, coeff, sym, im = im[-1], im[3], im[4], im[:3]
                 s111 = compensate_shotnoise(s111)
                 # Fourth line
-                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh.conj() - s111)
+                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los).conj()).r2c() * cmesh.conj() - s111)
                 snorm = jnp.sqrt(sum(xx**2 for xx in svec))
-                tmp = tmp.c2r() * jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)
+                tmp = tmp.c2r() * (jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)).conj()
 
                 def fk(k):
                     return jnp.sum(tmp.value * jl[0](snorm * k[0]) * jl[1](snorm * k[1]))
 
-                tmp = (4. * np.pi)**2 * jax.lax.map(fk, bin.xavg)
+                tmp = jax.lax.map(fk, bin.xavg)
                 carry += tmp + sym * tmp.conj()
                 return carry, im
 
             s113 = []
             for ell1, ell2, ell3 in ells:
-                Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
+                Ylms = [[get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
                 xs = _iter_triposh(ell1, ell2, ell3, los=los)
                 if xs[0].size:
-                     # Add s111 for s, im in xs are offset by ell
+                    # Add s111 for s, im in xs are offset by ell
                     xs = xs + [jnp.array([s111[ellms.index((ell3, int(im3) - ell3))] for im3 in xs[2]])]
-                    sign = (-1)**((ell1 + ell2) // 2)
-                    s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0]), xs=xs)[0])
+                    sign = (1j)**(ell1 + ell2)
+                    s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0], dtype=mattrs.cdtype), xs=xs)[0])
                 else:
                     s113.append(jnp.zeros_like(bin.xavg[..., 0]))
             return s113
@@ -990,7 +1039,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
             if ell0 in ells:
-                shotnoise[ells.index(ell0)] += jnp.sqrt(4. * jnp.pi) * s111[ellms.index((0, 0))]
+                shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))]
 
         if same[1] == same[2]:
             def select(ell):
@@ -1024,8 +1073,9 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
 
-    return list(shotnoise)
+        shotnoise = [sn.real if sum(ell[:2]) % 2 == 0 else sn.imag for ell, sn in zip(ells, shotnoise)]
 
+    return list(shotnoise)
 
 
 def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, **kwargs):
@@ -1061,6 +1111,10 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
         Shot noise for each multipole.
     """
     fkps, same = _format_meshes(*fkps)
+    mattrs = fkps[0].attrs
+    if 'sugiyama' in bin.basis:
+        mattrs = mattrs.clone(dtype=mattrs.cdtype)
+    fkps = [fkp.clone(attrs=mattrs) for fkp in fkps]
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
@@ -1099,17 +1153,17 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
 
         raise NotImplementedError
 
-    else:
+    else: # sugiyama
         # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132
 
         def compute_S111(particles, ellms):
             ellms = list(ellms)
             if ellms == [(0, 0)]:
-                s0 = jnp.sum(particles[0].weights**3) / jnp.sqrt(4. * jnp.pi)
+                s0 = jnp.sum(particles[0].weights**3)
                 s111 = [s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms]
             else:
                 rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-                s111 = [jnp.sum(rmesh.value * get_real_Ylm(ell, m)(*xvec)) for ell, m in ellms]
+                s111 = [jnp.sum(rmesh.value * get_Ylm(ell, m, reduced=True, real=False, conj=True)(*xvec)) for ell, m in ellms]
             return s111
 
         def compensate_shotnoise(s111):
@@ -1132,14 +1186,14 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                 # Second and third lines
                 s111 = compensate_shotnoise(s111)
                 los = xvec if vlos is None else vlos
-                carry += jax.lax.switch(im, Ylm, *svec) * ((rmesh * jax.lax.switch(im, Ylm, *los)).r2c() * cmesh.conj() - s111).c2r()
+                carry += jax.lax.switch(im, Ylm, *svec) * (cmesh * (rmesh * jax.lax.switch(im, Ylm, *los)).r2c().conj() - s111).c2r()
                 return carry, im
 
             s122 = []
             for ell in ells:
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)]
                 xs = (jnp.arange(len(Ylms)), jnp.array([s111[ellms.index((ell, m))] for m in range(-ell, ell + 1)]))
-                s122.append(4. * jnp.pi * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=rmesh.clone(value=jnp.zeros_like(rmesh.value)), xs=xs)[0], axis))
+                s122.append((2 * ell + 1) * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=rmesh.clone(value=jnp.zeros_like(rmesh.value, dtype=mattrs.cdtype)), xs=xs)[0], axis))
             return s122
 
         def compute_S113(particles, ells):
@@ -1167,21 +1221,21 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                 s111, coeff, sym, im = im[-1], im[3], im[4], im[:3]
                 s111 = compensate_shotnoise(s111)
                 # Fourth line
-                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los)).r2c() * cmesh.conj() - s111)
-                tmp = tmp.c2r() * jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)
-                tmp = (4. * np.pi)**2 * bin_mesh2_inter(tmp)
+                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los).conj()).r2c() * cmesh.conj() - s111)
+                tmp = tmp.c2r() * (jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)).conj()
+                tmp = bin_mesh2_inter(tmp)
                 carry += tmp + sym * tmp.conj()
                 return carry, im
 
             s113 = []
             for ell1, ell2, ell3 in ells:
-                Ylms = [[get_real_Ylm(ell, m) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
+                Ylms = [[get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
                 xs = _iter_triposh(ell1, ell2, ell3, los=los)
                 if xs[0].size:
-                     # Add s111 for s, im in xs are offset by ell
+                    # Add s111 for s, im in xs are offset by ell
                     xs = xs + [jnp.array([s111[ellms.index((ell3, int(im3) - ell3))] for im3 in xs[2]])]
                     sign = (-1)**(ell1 + ell2)
-                    s113.append(sign * jax.lax.scan(partial(f, Ylms), init=jnp.zeros_like(bin.xavg[..., 0]), xs=xs)[0])
+                    s113.append(sign * jax.lax.scan(partial(f, Ylms), init=jnp.zeros_like(bin.xavg[..., 0], dtype=mattrs.cdtype), xs=xs)[0])
                 else:
                     s113.append(jnp.zeros_like(bin.xavg[..., 0]))
             return s113
@@ -1194,7 +1248,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
             ell0 = (0, 0, 0)
             mask_shotnoise = jnp.all((bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.), axis=1)
             if ell0 in ells:
-                shotnoise[ells.index(ell0)] += jnp.sqrt(4. * jnp.pi) * s111[ellms.index((0, 0))] * mask_shotnoise
+                shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))] * mask_shotnoise
 
         if same[1] == same[2]:
             def select(ell):
@@ -1218,7 +1272,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                 return ell[2] == ell[1] and ell[0] == 0
 
             ells2 = [ell[1] for ell in ells if select(ell)]
-             # r1 == 0
+            # r1 == 0
             mask_shotnoise = (bin.edges[..., 0, 0] <= 0.) & (bin.edges[..., 0, 1] >= 0.)
 
             if ells2:
@@ -1234,12 +1288,157 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
 
+        shotnoise = [sn.real for sn in shotnoise]
+
     return [sn / mattrs.cellsize.prod()**2 for sn in shotnoise]
 
+
+def get_sugiyama_window_convolution_coeffs(ell, ellt):  # observed ell, theory ell
+    coeffs = []
+    for ellw in itertools.product(*[range(ell_ + ellt_ + 1) for ell_, ellt_ in zip(ell, ellt)]):
+        if sum(ellw) % 2: continue
+        if ellw[2] % 2: continue
+        coeff = wigner_9j(*ellw, *ellt, *ell)
+        coeff *= wigner_3j(*ell, 0, 0, 0)
+        for i in range(3): coeff *= wigner_3j(ell[i], ellt[i], ellw[i])
+        if abs(coeff) < 1e-7: continue
+        coeff /= wigner_3j(*ellt, 0, 0, 0) * wigner_3j(*ellw, 0, 0, 0)
+        coeffs.append((ellw, coeff))
+    return coeffs
+
+
+def square_mesh3_sugiyama(observable):
+    from lsstypes import ObservableLeaf
+
+    new = observable.clear()
+    all_labels = observable.labels()
+
+    def square_leaf(leaf):
+        coords, edges, shape, inverses = {}, {}, [], []
+        axis_name = next(iter(leaf.coords()))
+        for idim, coord in enumerate(leaf.coords(axis_name, center='mid_if_edges').T):
+            _, index, inverse = np.unique(coord, return_index=True, return_inverse=True)
+            coords[f'{axis_name}{idim + 1:d}'] = leaf.coords(axis_name)[index]
+            edges[f'{axis_name}{idim + 1:d}_edges'] = leaf.edges(axis_name)[index]
+            shape.append(len(index))
+            inverses.append(inverse)
+        shape = tuple(shape)
+        values = {}
+        for name, value in leaf.values().items():
+            tmp = jnp.ones_like(value, shape=shape) * jnp.nan
+            tmp = tmp.at[tuple(inverses)].set(value)
+            values[name] = tmp
+        return ObservableLeaf(**coords, **edges, **values, coords=list(coords), meta=dict(leaf.meta), attrs=dict(leaf.attrs))
+
+    for label in all_labels:
+        sym_label = {key: value[1::-1] + value[2:] for key, value in label.items()}
+        leaf = observable.get(**label)
+        if sym_label not in all_labels:
+            raise ValueError(f'label {sym_label} not in input observable')
+        leaf = square_leaf(leaf)
+        sym_leaf = square_leaf(observable.get(**sym_label))
+        for name, value in leaf.values().items():
+            pass
+        new = new.insert(leaf, **label)
+
+    return new
+
+
+
+def compute_smooth3_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None) -> WindowMatrix:
+    """
+    Compute the "smooth" (no binning effect) bispectrum window matrix.
+
+    Parameters
+    ----------
+    window : ObservableTree
+        Configuration-space window function, in the sugiyama basis.
+    edgesin : np.ndarray
+        Input bin edges.
+    ellsin : tuple, optional
+        Input multipole orders. Optional when ``edgesin`` is provided.
+    bin : BinMesh2SpectrumPoles
+        Output binning.
+
+    Returns
+    -------
+    wmat : WindowMatrix
+    """
+    ells = bin.ells
+    for pole in window:
+        break
+    if len(pole.shape) == 1:
+        window = square_mesh3_sugiyama(window)
+
+    if isinstance(edgesin, ObservableTree):
+        kin = next(iter(edgesin)).edges('k')
+        ellsin = edgesin.ells
+        if 'wa_orders' in edgesin.labels(return_type='keys'):
+            ellsin = [(ell, wa) for ell, wa in zip(edgesin.ells, edgesin.wa_orders)]
+
+    if edgesin.ndim == 3:
+        kin = edgesin
+        edgesin = None
+    else:
+        kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+
+    kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
+    ellsin = [ellin if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
+
+    if 'scoccimarro' in bin.basis:
+
+        raise NotImplementedError
+
+    else:
+
+        wmat_tmp = {}
+
+        for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
+            wmat_tmp[ell1, wa1] = 0
+            for ill, ell in enumerate(ells):
+
+                def get_w_rect(q):
+                    kw = dict(ells=q)
+                    if 'wa_orders' in window.labels(return_type='keys'):
+                        kw.update(wa_orders=wa1)
+                    elif wa1 != 0:
+                        raise ValueError('wa_orders must be provided in input window')
+                    if kw in window.labels(return_type='flatten'):
+                        return window.get(**kw).value().real
+                    return jnp.zeros(())
+
+                Qs = sum(coeff * get_w_rect(q) for coeff, q in get_sugiyama_window_convolution_coeffs(ell, ell1))
+                tmpw = next(iter(window))
+                if 'volume' in tmpw.values():
+                    snmodes = tmpw.values('volume')
+                else:
+                    snmodes = jnp.ones_like(tmpw.value())
+                savg = jnp.where(snmodes == 0, 0., tmpw.coords('s'))
+                Qs = jnp.where(snmodes == 0, 0., Qs)
+                raise NotImplementedError
+
+    wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
+
+    observable = []
+    for ill, ell in enumerate(ells):
+        observable.append(Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=jnp.zeros_like(bin.xavg), num_shotnoise=jnp.zeros_like(bin.xavg), norm=jnp.ones_like(bin.xavg), basis=bin.basis, ell=ell))
+    observable = Mesh3SpectrumPoles(observable)
+
+    theory = []
+    kin, kin_edges = jnp.mean(kin, axis=-1), kin
+    for ill, ell in enumerate(ellsin):
+        #theory.append(ObservableLeaf(k=kin, k_edges=kin_edges, value=jnp.zeros_like(kin), coords=['k']))
+        theory.append(Mesh3SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin)))
+    #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
+    kw = dict(ells=[ell[0] for ell in ellsin], wa_orders=[ell[1] for ell in ellsin])
+    theory = ObservableTree(theory, **kw)
+
+    return WindowMatrix(observable=observable, theory=theory, value=wmat)
 
 
 def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_selection=None, power=None, seed=42, norm=None):
 
+    raise NotImplementedError('not working (yet)')
     assert 'scoccimarro' in bin.basis, 'fisher is only available for scoccimarro basis'
 
     if apply_selection is None and isinstance(mattrs, RealMeshField):
@@ -1322,7 +1521,7 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                 return get_legendre(ell)(mu) * cmesh
 
             def apply_fourier_harmonics(ell, rmesh):
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 xvec = mattrs.rcoords(sparse=True)
                 kvec = mattrs.kcoords(sparse=True)
 
@@ -1335,7 +1534,7 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                 return (4. * jnp.pi) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
 
             def apply_real_harmonics(ell, cmesh):
-                Ylms = [get_real_Ylm(ell, m) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 xvec = mattrs.rcoords(sparse=True)
                 kvec = mattrs.kcoords(sparse=True)
 

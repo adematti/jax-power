@@ -745,6 +745,7 @@ def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inv
     return _exchange_particles_mpi(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
 
 
+
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class MeshAttrs(object):
@@ -773,12 +774,20 @@ class MeshAttrs(object):
         return jnp.zeros((), dtype=self.dtype).real.dtype
 
     @property
+    def cdtype(self):
+        return (1j * jnp.zeros((), dtype=self.dtype)).dtype
+
+    @property
     def sharding_mesh(self):
         return get_sharding_mesh()
 
     @property
-    def hermitian(self):
-        return self.fft_engine != 'jaxdecomp' and jnp.issubdtype(self.dtype, jnp.floating)
+    def is_real(self):
+        return jnp.issubdtype(self.dtype, jnp.floating)
+
+    @property
+    def is_hermitian(self):
+        return self.fft_engine != 'jaxdecomp' and self.is_real
 
     def tree_flatten(self):
         state = asdict(self)
@@ -883,7 +892,7 @@ class MeshAttrs(object):
         axis_order = None
         if self.fft_engine == 'jaxdecomp':
             axis_order = tuple(np.roll(np.arange(self.ndim), shift=2))
-        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh, dtype=self.rdtype)
+        return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.is_hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh, dtype=self.rdtype)
 
     xcoords = rcoords
     kcoords = ccoords
@@ -909,7 +918,7 @@ class MeshAttrs(object):
         name = kind.__name__.lower()
         shape = tuple(self.meshsize)
         if 'complex' in name:
-            if self.hermitian:
+            if self.is_hermitian:
                 shape = shape[:-1] + (shape[-1] // 2 + 1,)
             if self.fft_engine == 'jaxdecomp':
                 shape = tuple(np.roll(shape, shift=len(self.sharding_mesh.axis_names)))
@@ -932,7 +941,7 @@ class MeshAttrs(object):
             if self.sharding_mesh.axis_names: value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
             value = jaxdecomp.fft.pfft3d(value)
         else:
-            if self.hermitian:
+            if self.is_hermitian:
                 value = jnp.fft.rfftn(value)
             else:
                 value = jnp.fft.fftn(value)
@@ -949,10 +958,10 @@ class MeshAttrs(object):
         if self.fft_engine == 'jaxdecomp':
             if self.sharding_mesh.axis_names: value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
             value = jaxdecomp.fft.pifft3d(value)
-            if jnp.issubdtype(self.dtype, jnp.floating):
+            if self.is_real:
                 value = value.real.astype(self.dtype)
         else:
-            if self.hermitian:
+            if self.is_hermitian:
                 value = jnp.fft.irfftn(value, s=tuple(self.meshsize))
             else:
                 value = jnp.fft.ifftn(value)
@@ -988,7 +997,7 @@ class BaseMeshField(object):
             if meshsize is None: meshsize = shape
             meshsize = staticarray.fill(meshsize, len(shape), dtype='i4')
             mattrs = MeshAttrs(meshsize=meshsize, **kwargs)
-            mattrs = mattrs.clone(dtype=value.real.dtype if 'complex' in self.__class__.__name__.lower() and mattrs.hermitian else value.dtype)
+            mattrs = mattrs.clone(dtype=value.real.dtype if 'complex' in self.__class__.__name__.lower() and mattrs.is_hermitian else value.dtype)
         self.__dict__.update(value=value, attrs=mattrs)
 
     def tree_flatten(self):
@@ -1208,11 +1217,6 @@ for name in ['set',
 class RealMeshField(BaseMeshField):
 
     """A :class:`BaseMeshField` containing the values of a real (or complex) field."""
-
-    def rebin(self, factor: int | tuple, axis: int | tuple=None, reduce: Callable=jnp.sum):
-        """Rebin mesh by factors ``factor`` along axes ``axis``, with reduction operation ``reduce``."""
-        value = utils.rebin(self.value, factor, axis=axis, reduce=reduce)
-        return self.clone(value=value)
 
     @property
     def spacing(self):
@@ -1591,6 +1595,12 @@ class ParticleField(object):
 
     This class is used to represent a set of particles (e.g., galaxies, simulation particles, or random points)
     with positions and weights, and provides utilities for distributed computation and painting to mesh grids.
+
+    Warning
+    -------
+    When particles are exchanged (`exchange=True`), positions (and weights) array may be reordered and resized such that their shards are of the same size
+    (per JAX design). To resize positions and weights, positions are filled with the mean position, and weights by 0.
+    Therefore, whenever particles are exchanged, please use the column :attr:`weights` (even if no input weights were given / all input weights were 1).
 
     Parameters
     ----------
