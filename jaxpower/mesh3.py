@@ -1,3 +1,4 @@
+import numbers
 import itertools
 import operator
 import functools
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 
 from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
 from .mesh2 import _get_los_vector, FKPField
-from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableTree, WindowMatrix
+from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableLeaf, ObservableTree, WindowMatrix
 from .utils import real_gaunt, get_legendre, get_spherical_jn, get_Ylm, wigner_3j, wigner_9j, register_pytree_dataclass
 
 
@@ -37,10 +38,11 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
         mask_edges_list = mask_edges.split(',')
 
         def mask_edges(*edges):
-            mask = True
             xmids = [np.mean(edge, axis=-1) for edge in edges]
+            mask = np.ones_like(xmids[0], dtype=bool)
             for c in mask_edges_list:
                 c = c.strip()
+                if not c: continue
                 xmid = xmids[int(c[0]) - 1], xmids[int(c[-1]) - 1]
                 symbol = c[1:-1]
                 if symbol == '==':
@@ -82,19 +84,19 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
     ells = _format_ells(ells, basis=basis)
 
     coords = jnp.sqrt(sum(xx**2 for xx in vec))
-    ibin, nmodes1d, xavg, uedges = [], [], [], []
+    ibin1d, nmodes1d, xavg1d, edges1d = [], [], [], []
     for edge in edges:
         ib, nm, x = _get_bin_attrs(coords, edge, wmodes, ravel=False)
         ib = ib - 1
         x /= nm
-        ibin.append(ib)
+        ibin1d.append(ib)
         nmodes1d.append(nm)
-        xavg.append(x)
-        uedges.append(jnp.column_stack([edge[:-1], edge[1:]]))
-    uedges = uedges + [uedges[-1]] * (ndim - len(uedges))
-    ibin = ibin + [ibin[-1]] * (ndim - len(ibin))
+        xavg1d.append(x)
+        edges1d.append(jnp.column_stack([edge[:-1], edge[1:]]))
+    edges1d = edges1d + [edges1d[-1]] * (ndim - len(edges1d))
+    ibin1d = ibin1d + [ibin1d[-1]] * (ndim - len(ibin1d))
     nmodes1d = nmodes1d + [nmodes1d[-1]] * (ndim - len(nmodes1d))
-    xavg = xavg + [xavg[-1]] * (ndim - len(xavg))
+    xavg1d = xavg1d + [xavg1d[-1]] * (ndim - len(xavg1d))
 
     def _cproduct(array):
         grid = jnp.meshgrid(*array, sparse=False, indexing='ij')
@@ -110,10 +112,10 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
             return _cproduct(array)
 
     # of shape (nbins, ndim, 2)
-    edges = jnp.concatenate([_product([edge[..., 0] for edge in uedges])[..., None], _product([edge[..., 1] for edge in uedges])[..., None]], axis=-1)
+    edges = jnp.concatenate([_product([edge[..., 0] for edge in edges1d])[..., None], _product([edge[..., 1] for edge in edges1d])[..., None]], axis=-1)
     mask = mask_edges(*[edges[:, i, :] for i in range(ndim)])
     edges = edges[mask]
-    xavg = _product(xavg)[mask]
+    xavg = _product(xavg1d)[mask]
     nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
     iedges = _product([jnp.arange(len(xx)) for xx in nmodes1d])[mask]
 
@@ -137,39 +139,39 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
         split_iedges = []
 
         for axis in range(ndim):
-            axis_iedges = jnp.arange(len(uedges[axis]))
+            axis_iedges = jnp.arange(len(edges1d[axis]))
             # Number of batches
             nsplits = (len(axis_iedges) + buffer_size - 1) // buffer_size
             split_iedges.append(jnp.array_split(axis_iedges, nsplits, axis=0))
-        _buffer_global_iedges, _buffer_iedges, _buffer_iuedges = [], [], []
+        _buffer_global_iedges, _buffer_iedges, _buffer_iedges1d = [], [], []
         size_max, usize_max = 0, 0
 
-        for biuedges in itertools.product(*split_iedges):
-            biedges = _cproduct(biuedges)
+        for biedges1d in itertools.product(*split_iedges):
+            biedges = _cproduct(biedges1d)
             mask = jax.vmap(lambda biedge: jnp.all(iedges == biedge, axis=-1).any())(biedges)
             if mask.sum():
                 _buffer_global_iedges.append(biedges[mask])
-                _buffer_iedges.append(_cproduct([jnp.arange(len(iedge)) for iedge in biuedges])[mask])
-                _buffer_iuedges.append(biuedges)
+                _buffer_iedges.append(_cproduct([jnp.arange(len(iedge)) for iedge in biedges1d])[mask])
+                _buffer_iedges1d.append(biedges1d)
                 size_max = max(size_max, len(_buffer_iedges[-1]))
-                usize_max = max(usize_max, *[len(b) for b in _buffer_iuedges[-1]])
+                usize_max = max(usize_max, *[len(b) for b in _buffer_iedges1d[-1]])
 
-        #print('Number of FFTs', sum(sum(len(bb) for bb in b) for b in _buffer_iuedges))
+        #print('Number of FFTs', sum(sum(len(bb) for bb in b) for b in _buffer_iedges1d))
         # Pad to be able to use jax.lax.map, otherwise compilation time is prohibitive
         for i in range(len(_buffer_global_iedges)):
             _buffer_global_iedges[i] = jnp.pad(_buffer_global_iedges[i], [(0, size_max - len(_buffer_global_iedges[i])), (0, 0)], mode='edge')
             _buffer_iedges[i] = jnp.pad(_buffer_iedges[i], [(0, size_max - len(_buffer_iedges[i])), (0, 0)], mode='edge')
-            _buffer_iuedges[i] = jnp.stack([jnp.pad(b, (0, usize_max - len(b)), mode='edge') for b in _buffer_iuedges[i]])
+            _buffer_iedges1d[i] = jnp.stack([jnp.pad(b, (0, usize_max - len(b)), mode='edge') for b in _buffer_iedges1d[i]])
 
-        #print('Number of FFTs padded', sum(sum(len(bb) for bb in b) for b in _buffer_iuedges))
+        #print('Number of FFTs padded', sum(sum(len(bb) for bb in b) for b in _buffer_iedges1d))
         _buffer_global_iedges = jnp.stack(_buffer_global_iedges).reshape(-1, ndim)
         _buffer_sort = jnp.array([jnp.flatnonzero(jnp.all(iedge == _buffer_global_iedges, axis=1))[0] for iedge in iedges])
         # _buffer_iedges = (N-dim bins, corresponding unique bins along each dim, how to sort the N-dim bins to obtain the requested bins)
-        _buffer_iedges = (jnp.stack(_buffer_iedges), jnp.stack(_buffer_iuedges), _buffer_sort)
+        _buffer_iedges = (jnp.stack(_buffer_iedges), jnp.stack(_buffer_iedges1d), _buffer_sort)
     else:
         _buffer_iedges = None
 
-    return dict(edges=edges, xavg=xavg, nmodes=nmodes, ibin=ibin, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size, _iedges=iedges, _buffer_iedges=_buffer_iedges, _nmodes1d=nmodes1d, ells=ells)
+    return dict(edges=edges, ibin1d=tuple(ibin1d), nmodes1d=tuple(nmodes1d), xavg1d=tuple(xavg1d), nmodes=nmodes, xavg=xavg, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size, _iedges=iedges, _buffer_iedges=_buffer_iedges, ells=ells)
 
 
 @partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
@@ -195,13 +197,14 @@ class BinMesh3SpectrumPoles(object):
     """
 
     edges: jax.Array = None
+    nmodes1d: jax.Array = None
+    xavg1d: tuple
+    ibin1d: tuple
     nmodes: jax.Array = None
     xavg: jax.Array = None
-    ibin: jax.Array = None
     wmodes: jax.Array = None
     _iedges: jax.Array = None
     _buffer_iedges: tuple = None
-    _nmodes1d: jax.Array = None
     mattrs: MeshAttrs = None
     basis: str = 'sugiyama'
     batch_size: int = 1
@@ -221,7 +224,7 @@ class BinMesh3SpectrumPoles(object):
             symfactor = jnp.where((xmid[1] == xmid[0]) & (xmid[2] == xmid[0]), 6, symfactor)
 
             def bin(axis, ibin):
-                return mattrs.c2r(self.ibin[axis] == ibin)
+                return mattrs.c2r(self.ibin1d[axis] == ibin)
 
             def reduce(meshes):
                 return prod(meshes).sum()
@@ -297,7 +300,7 @@ class BinMesh3SpectrumPoles(object):
             values.append(value)
 
         def bin(axis, ibin):
-            return self.mattrs.c2r(values[axis] * (self.ibin[axis] == ibin))
+            return self.mattrs.c2r(values[axis] * (self.ibin1d[axis] == ibin))
 
         def reduce(meshes):
             return prod(meshes, 1. if 'scoccimarro' in self.basis else values[2]).sum()
@@ -329,13 +332,15 @@ class BinMesh3CorrelationPoles(object):
     """
 
     edges: jax.Array = None
+    nmodes1d: jax.Array = None
+    xavg1d: tuple
+    ibin1d: tuple
     nmodes: jax.Array = None
     xavg: jax.Array = None
-    ibin: jax.Array = None
     wmodes: jax.Array = None
     _iedges: jax.Array = None
     _buffer_iedges: tuple = None
-    _nmodes1d: jax.Array = None
+    nmodes1d: jax.Array = None
     mattrs: MeshAttrs = None
     basis: str = 'sugiyama'
     batch_size: int = 1
@@ -382,8 +387,9 @@ class BinMesh3CorrelationPoles(object):
             values.append(value)
 
         def bin(axis, ibin):
-            x = knorm * self.xavg[ibin, axis]
+            x = knorm * self.xavg1d[axis][ibin]
             jn = jns[axis](x)
+            #jn = x
             return self.mattrs.c2r(values[axis] * jn)
 
         def reduce(meshes):
@@ -571,7 +577,8 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
             for ill3, ell3 in enumerate(ells):
                 tmp = meshes[:2] + [meshes[2] * get_legendre(ell3)(mu)]
-                tmp = (2 * ell3 + 1) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
+                #tmp = (2 * ell3 + 1) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
+                tmp = (2 * ell3 + 1) * bin(*tmp) / bin.nmodes[ill3]
                 num.append(tmp)
 
     else:
@@ -584,7 +591,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, remove_zero=True)
+            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp) # remove_zero=True)
             carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
             return carry, im
 
@@ -668,7 +675,7 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
             tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, ell=ell, remove_zero=True)
+            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, ell=ell) # remove_zero=True)
             carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
             return carry, im
 
@@ -869,8 +876,8 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     interlacing = max(interlacing, 1) >= 2
 
     def bin_mesh2(mesh, axis):
-        nmodes1d = bin._nmodes1d[axis]
-        return _bincount(bin.ibin[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
+        nmodes1d = bin.nmodes1d[axis]
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
     if same[2] == same[1] + 1 == same[0] + 2:
         return tuple(shotnoise)
@@ -1125,8 +1132,8 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
     interlacing = max(interlacing, 1) >= 2
 
     def bin_mesh2(mesh, axis):
-        nmodes1d = bin._nmodes1d[axis]
-        return _bincount(bin.ibin[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
+        nmodes1d = bin.nmodes1d[axis]
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
     if same[2] == same[1] + 1 == same[0] + 2:
         return tuple(shotnoise)
@@ -1213,7 +1220,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
 
             def bin_mesh2_inter(mesh):
                 tmp = M @ _bincount(inter_ibin, getattr(mesh, 'value', mesh), length=len(uinter_edges) - 1)
-                return tmp / (bin._nmodes1d[0][bin._iedges[..., 0]] * bin._nmodes1d[1][bin._iedges[..., 1]])
+                return tmp / (bin.nmodes1d[0][bin._iedges[..., 0]] * bin.nmodes1d[1][bin._iedges[..., 1]])
 
             @partial(jax.checkpoint, static_argnums=(0, 1))
             def f(Ylms, carry, im):
@@ -1294,58 +1301,78 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
 
 
 def get_sugiyama_window_convolution_coeffs(ell, ellt):  # observed ell, theory ell
+    # Prefactor, eq. 63 of https://arxiv.org/pdf/1803.02132
+    # ell = (ell_1, ell_2, L)
+    # ellt = (ell_1', ell_2', L')
     coeffs = []
     for ellw in itertools.product(*[range(ell_ + ellt_ + 1) for ell_, ellt_ in zip(ell, ellt)]):
         if sum(ellw) % 2: continue
         if ellw[2] % 2: continue
-        coeff = wigner_9j(*ellw, *ellt, *ell)
+        coeff = prod((2 * ell_ + 1) for ell_ in ell)
+        coeff *= wigner_9j(*ellw, *ellt, *ell)
         coeff *= wigner_3j(*ell, 0, 0, 0)
-        for i in range(3): coeff *= wigner_3j(ell[i], ellt[i], ellw[i])
+        for i in range(3): coeff *= wigner_3j(ell[i], ellt[i], ellw[i], 0, 0, 0)
         if abs(coeff) < 1e-7: continue
         coeff /= wigner_3j(*ellt, 0, 0, 0) * wigner_3j(*ellw, 0, 0, 0)
         coeffs.append((ellw, coeff))
     return coeffs
 
 
-def square_mesh3_sugiyama(observable):
-    from lsstypes import ObservableLeaf
 
-    new = observable.clear()
-    all_labels = observable.labels()
+def get_smooth3_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
+    """
+    Get the window bin attributes for sugiyama basis.
 
-    def square_leaf(leaf):
-        coords, edges, shape, inverses = {}, {}, [], []
-        axis_name = next(iter(leaf.coords()))
-        for idim, coord in enumerate(leaf.coords(axis_name, center='mid_if_edges').T):
-            _, index, inverse = np.unique(coord, return_index=True, return_inverse=True)
-            coords[f'{axis_name}{idim + 1:d}'] = leaf.coords(axis_name)[index]
-            edges[f'{axis_name}{idim + 1:d}_edges'] = leaf.edges(axis_name)[index]
-            shape.append(len(index))
-            inverses.append(inverse)
-        shape = tuple(shape)
-        values = {}
-        for name, value in leaf.values().items():
-            tmp = jnp.ones_like(value, shape=shape) * jnp.nan
-            tmp = tmp.at[tuple(inverses)].set(value)
-            values[name] = tmp
-        return ObservableLeaf(**coords, **edges, **values, coords=list(coords), meta=dict(leaf.meta), attrs=dict(leaf.attrs))
+    Parameters
+    ----------
+    ells : list
+        Observed multipole orders.
+    ellsin : tuple
+        Theory multipole orders.
 
-    for label in all_labels:
-        sym_label = {key: value[1::-1] + value[2:] for key, value in label.items()}
-        leaf = observable.get(**label)
-        if sym_label not in all_labels:
-            raise ValueError(f'label {sym_label} not in input observable')
-        leaf = square_leaf(leaf)
-        sym_leaf = square_leaf(observable.get(**sym_label))
-        for name, value in leaf.values().items():
-            pass
-        new = new.insert(leaf, **label)
+    Returns
+    -------
+    dict
+    """
+    if isinstance(ellsin, numbers.Number):
+        nellsin = ellsin
+        ellsin = []
+        for ellin in itertools.product(*[range(nellsin + 1) for _ in range(3)]):
+            if sum(ellin) % 2: continue
+            if ellin[2] % 2: continue
+            ellin = tuple(sorted(ellin[:2])) + ellin[2:]
+            if ellin not in ellsin:
+                ellsin.append(ellin)
+    with_wide_angle = any(isinstance(ellin[0], tuple) for ellin in ellsin)
+    ellsin = [ellin if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
+    non_zero_ellsin = []
+    ellw = {}
+    for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
+        if wa1 not in ellw: ellw[wa1] = []
+        for ill, ell in enumerate(ells):
+            coeffs = get_sugiyama_window_convolution_coeffs(ell, ell1)
+            if coeffs and (ell1, wa1) not in non_zero_ellsin:
+                non_zero_ellsin.append((ell1, wa1))
+            for ell, _ in coeffs:
+                ell = tuple(sorted(ell[:2])) + ell[2:]
+                if ell not in ellw[wa1]: ellw[wa1].append(ell)
+    for wa in ellw:
+        ellw[wa] = sorted(set(ellw[wa]))
 
-    return new
+    def _make_dict(ellw):
+        return dict(ells=ellw, basis='sugiyama', mask_edges='')
+
+    if with_wide_angle:
+        ellw = [(_make_dict(ellw[wa]), wa) for wa in ellw]
+    else:
+        ellw = _make_dict(ellw[(0, 0)])
+        non_zero_ellsin = [ellin[0] for ellin in non_zero_ellsin]
+    if return_ellsin:
+        return ellw, non_zero_ellsin
+    return ellw
 
 
-
-def compute_smooth3_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None) -> WindowMatrix:
+def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 
@@ -1353,7 +1380,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     ----------
     window : ObservableTree
         Configuration-space window function, in the sugiyama basis.
-    edgesin : np.ndarray
+    edgesin : np.ndarray | tuple
         Input bin edges.
     ellsin : tuple, optional
         Input multipole orders. Optional when ``edgesin`` is provided.
@@ -1365,25 +1392,44 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     wmat : WindowMatrix
     """
     ells = bin.ells
-    for pole in window:
-        break
-    if len(pole.shape) == 1:
-        window = square_mesh3_sugiyama(window)
 
     if isinstance(edgesin, ObservableTree):
-        kin = next(iter(edgesin)).edges('k')
         ellsin = edgesin.ells
         if 'wa_orders' in edgesin.labels(return_type='keys'):
             ellsin = [(ell, wa) for ell, wa in zip(edgesin.ells, edgesin.wa_orders)]
+        pole = next(iter(edgesin))
+        edgesin = pole.edges('k')
 
-    if edgesin.ndim == 3:
-        kin = edgesin
-        edgesin = None
     else:
-        kin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+        if not isinstance(edgesin, (list, tuple)):
+            edgesin = (edgesin,)
+        edgesin = tuple(edgesin)
+        edgesin += (edgesin[-1],) * (bin.xavg.shape[-1] - len(edgesin))
+        grid_edgesin = []
+        for edge in edgesin:
+            if edge.ndim == 1: edge = jnp.column_stack([edge[:-1], edge[1:]])
+            grid_edgesin.append(edge)
+        grid_edgesin = tuple(grid_edgesin)
+        grid_kin = tuple(jnp.mean(edge, axis=-1) for edge in grid_edgesin)
 
-    kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
-    ellsin = [ellin if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
+        def _cproduct(array):
+            grid = jnp.meshgrid(*array, sparse=False, indexing='ij')
+            return jnp.column_stack([tmp.ravel() for tmp in grid])
+
+        # of shape (nbins, ndim, 2)
+        edgesin = jnp.concatenate([_cproduct([edge[..., 0] for edge in grid_edgesin])[..., None], _cproduct([edge[..., 1] for edge in grid_edgesin])[..., None]], axis=-1)
+        kin = _cproduct(grid_kin)
+
+    ellsin = [(ellin[0], tuple(ellin[1])) if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
+
+    kout = bin.xavg
+
+    grid_kout, grid_kout_idx = [], []
+    for idim, iedge in enumerate(bin._iedges.T):
+        grid_kout_idx.append(iedge)
+        _, index = np.unique(iedge, return_index=True)
+        grid_kout.append(kout[index, idim])
+    grid_kout, grid_kout_idx = tuple(grid_kout), tuple(grid_kout_idx)
 
     if 'scoccimarro' in bin.basis:
 
@@ -1394,41 +1440,66 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         wmat_tmp = {}
 
         for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
-            wmat_tmp[ell1, wa1] = 0
+            wmat_tmp[ell1, wa1] = []
             for ill, ell in enumerate(ells):
 
                 def get_w_rect(q):
+                    transpose = False
+                    if q not in window.ells:
+                        q = q[1::-1] + q[2:]
+                        transpose = True
                     kw = dict(ells=q)
                     if 'wa_orders' in window.labels(return_type='keys'):
                         kw.update(wa_orders=wa1)
-                    elif wa1 != 0:
+                    elif wa1 != (0, 0):
                         raise ValueError('wa_orders must be provided in input window')
                     if kw in window.labels(return_type='flatten'):
-                        return window.get(**kw).value().real
+                        value = window.get(**kw).value().real
+                        if transpose:
+                            value = jnp.swapaxes(value, 0, 1)
+                        return value
                     return jnp.zeros(())
 
-                Qs = sum(coeff * get_w_rect(q) for coeff, q in get_sugiyama_window_convolution_coeffs(ell, ell1))
-                tmpw = next(iter(window))
-                if 'volume' in tmpw.values():
-                    snmodes = tmpw.values('volume')
-                else:
-                    snmodes = jnp.ones_like(tmpw.value())
-                savg = jnp.where(snmodes == 0, 0., tmpw.coords('s'))
-                Qs = jnp.where(snmodes == 0, 0., Qs)
-                raise NotImplementedError
+                Qs = sum(coeff * get_w_rect(q) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, ell1))
 
-    wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
+                # fftlog
+                from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
+                to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1)
+                to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ell1)
+
+                def interp2d(x, y, xp, yp, fp, left=0., right=0.):
+                    # fp shape: (len(xp), len(yp))
+                    interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
+                    return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
+
+                def convolve(theory):
+                    shape = tuple(len(kk) for kk in grid_kin)
+                    spectrum = interp2d(*to_spectrum.k, *grid_kin, theory.reshape(shape), left=0., right=0.)
+                    correlation = to_correlation(spectrum)[1]
+                    correlation = correlation * Qs * to_correlation.s[0]**wa1[0] * to_correlation.s[1]**wa1[1]
+                    return interp2d(*grid_kout, *to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)[grid_kout_idx]
+
+                #tmp = jax.jacfwd(convolve)(jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype))
+                def f(idxin):
+                    theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
+                    return convolve(theory)
+
+                tmp = jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+                wmat_tmp[ell1, wa1].append(tmp)
+
+            wmat_tmp[ell1, wa1] = jnp.concatenate(wmat_tmp[ell1, wa1], axis=0)
+
+    wmat = jnp.concatenate(list(wmat_tmp.values()), axis=1)
 
     observable = []
     for ill, ell in enumerate(ells):
-        observable.append(Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=jnp.zeros_like(bin.xavg), num_shotnoise=jnp.zeros_like(bin.xavg), norm=jnp.ones_like(bin.xavg), basis=bin.basis, ell=ell))
+        observable.append(Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes[ill], num_raw=jnp.zeros_like(bin.xavg[..., 0]), basis=bin.basis, ell=ell))
     observable = Mesh3SpectrumPoles(observable)
 
     theory = []
-    kin, kin_edges = jnp.mean(kin, axis=-1), kin
+    kin, edgesin = jnp.mean(edgesin, axis=-1), edgesin
     for ill, ell in enumerate(ellsin):
-        #theory.append(ObservableLeaf(k=kin, k_edges=kin_edges, value=jnp.zeros_like(kin), coords=['k']))
-        theory.append(Mesh3SpectrumPole(k=kin, k_edges=kin_edges, num_raw=jnp.zeros_like(kin)))
+        theory.append(ObservableLeaf(k=kin, k_edges=edgesin, value=jnp.zeros_like(kin[..., 0]), coords=['k']))
     #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
     kw = dict(ells=[ell[0] for ell in ellsin], wa_orders=[ell[1] for ell in ellsin])
     theory = ObservableTree(theory, **kw)
@@ -1475,7 +1546,7 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                 def f(weights, ibin):
                     mesh_prod = 1.
                     for ivalue in range(3):
-                        mask = (bin.ibin[ivalue] == ibin[ivalue]) * weights[ivalue]
+                        mask = (bin.ibin1d[ivalue] == ibin[ivalue]) * weights[ivalue]
                         mesh_prod = mesh_prod * mattrs.c2r(mask.astype(mattrs.dtype))
                     return jnp.sum(mesh_prod)
 
@@ -1549,7 +1620,7 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
             # Compute g_{b,0} maps
             g_b0_maps, leg_maps = [], []
             for axis in range(2):
-                g_b0_maps.append([mattrs.c2r(cwmaps[axis] * (bin.ibin[axis + 1] == b)) for b in bin._uiedges[axis + 1]])
+                g_b0_maps.append([mattrs.c2r(cwmaps[axis] * (bin.ibin1d[axis + 1] == b)) for b in bin._uiedges[axis + 1]])
                 if vlos is None:
                     leg_maps.append([apply_fourier_harmonics(ell, rwmaps[axis]) for ell in bin.ells])
 
@@ -1558,8 +1629,8 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                 for axis in range(2):
                     tmp = []
                     for ell in bin.ells:
-                        if vlos is not None: tmp.append(mattrs.c2r(apply_fourier_legendre(ell, cwmaps[axis] * (bin.ibin[2] == ibin3))))
-                        else: tmp.append(mattrs.c2r(leg_maps[axis] * (bin.ibin[2] == ibin3)))
+                        if vlos is not None: tmp.append(mattrs.c2r(apply_fourier_legendre(ell, cwmaps[axis] * (bin.ibin1d[2] == ibin3))))
+                        else: tmp.append(mattrs.c2r(leg_maps[axis] * (bin.ibin1d[2] == ibin3)))
                     g_bBl_maps.append(tmp)
 
                 for ibin1 in bin.uiedges[0]:
@@ -1570,7 +1641,7 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                             # Compute FT[g_{0, bA}, g_{ell, bB}]
                             ft_ABl = mattrs.r2c(g_b0_maps[0][ibin1] * g_bBl_maps[0][ill][ibin3] - g_b0_maps[1][ibin1] * g_bBl_maps[1][ill][ibin3])
                             for ibin2 in ibins2:
-                                fisher = fisher.at[ibin2 + ill * len(bin._iedges)].set(jnp.sum(ft_ABl * Q_Ainv.conj() * (bin.ibin[1] == ibin2)))
+                                fisher = fisher.at[ibin2 + ill * len(bin._iedges)].set(jnp.sum(ft_ABl * Q_Ainv.conj() * (bin.ibin1d[1] == ibin2)))
 
                     if weighting == 'Ainv':
                         # Find which elements of the Q3 matrix this pair is used for (with ordering)
@@ -1589,12 +1660,12 @@ def compute_fisher_scoccimarro(mattrs, bin, los: str | np.ndarray='z', apply_sel
                                 ibin = bin._iedges[ibin, axis]
                                 for ill, ell in enumerate(bin.ells):
                                     if (ell == 0) or (axis == 2):
-                                        tmp = ft_ABl[ill] * (bin.ibin[axis] == ibin)
+                                        tmp = ft_ABl[ill] * (bin.ibin1d[axis] == ibin)
                                     else:
                                         if vlos is not None:
-                                            tmp = apply_fourier_legendre(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[axis] == ibin))
+                                            tmp = apply_fourier_legendre(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin1d[axis] == ibin))
                                         else:
-                                            tmp = apply_real_harmonics(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin[axis] == ibin)).r2c()
+                                            tmp = apply_real_harmonics(ell, ft_ABl[bin.ells.index(0)] * (bin.ibin1d[axis] == ibin)).r2c()
                                     Q_Ainv[ibin2 + ill * len(bin._iedges)] += tmp
 
                         Q_Ainv = add_Q_element(Q_Ainv, 2, ibins1)

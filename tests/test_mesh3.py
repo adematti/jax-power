@@ -8,7 +8,8 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, compute_mesh3_correlation, BinMesh3CorrelationPoles, Mesh3CorrelationPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles, FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils)
+from jaxpower import (compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, compute_mesh3_correlation, BinMesh3CorrelationPoles, Mesh3CorrelationPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles,
+                      FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils, ParticleField, compute_smooth3_spectrum_window)
 
 
 dirname = Path('_tests')
@@ -28,7 +29,7 @@ def test_mesh3_spectrum(plot=False):
     list_los = ['x', 'local']
     mattrs = MeshAttrs(meshsize=128, boxsize=1000., fft_engine='jax')
 
-    for basis in ['scoccimarro', 'scoccimarro-equilateral', 'sugiyama-diagonal'][:1]:
+    for basis in ['scoccimarro', 'sugiyama-diagonal']:
 
         ells = [0] if 'scoccimarro' in basis else [(0, 0, 0)]
         bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.1}, basis=basis, ells=ells)
@@ -50,6 +51,7 @@ def test_mesh3_spectrum(plot=False):
                 spectrum = mock(mattrs, bin, random.key(i + 42), los=los)
                 jax.block_until_ready(spectrum)
             print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
+            #for pole in spectrum: pole.basis
             spectrum.write(get_fn(los))
 
         if plot:
@@ -643,6 +645,182 @@ def test_fftlog2(plot=False):
         plt.show()
 
 
+def test_interp2d():
+
+    def interp2d(x, y, xp, yp, fp):
+        # fp shape: (len(xp), len(yp))
+        interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f), in_axes=1, out_axes=1)(fp)
+        return jax.vmap(lambda f: jnp.interp(y, yp, f), in_axes=0, out_axes=0)(interp_x)
+
+    x = jnp.logspace(-3, 3, 100)
+    y = jnp.logspace(-2, 2, 80)
+    xx, yy = jnp.meshgrid(x, y, indexing='ij')
+    zz = jnp.sin(xx) * jnp.cos(yy) / (1. + 0.1 * xx * yy)
+
+    xnew = jnp.logspace(-3, 3, 150)
+    ynew = jnp.logspace(-2, 2, 120)
+    zznew = interp2d(xnew, ynew, x, y, zz)
+
+    from matplotlib import pyplot as plt
+
+    fig, lax = plt.subplots(2, 1, figsize=(6, 10))
+    ax = lax[0]
+    im = ax.pcolormesh(x, y, zz.T, shading='auto')
+    ax.set_title('Original')
+    plt.colorbar(im, ax=ax)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+
+    ax = lax[1]
+    im = ax.pcolormesh(xnew, ynew, zznew.T, shading='auto')
+    ax.set_title('Interpolated')
+    plt.colorbar(im, ax=ax)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    plt.show()
+
+
+def test_smooth_window(plot=False):
+    from matplotlib import pyplot as plt
+    from cosmoprimo.fiducial import DESI
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+
+    mattrs = MeshAttrs(boxsize=2000., meshsize=64, boxcenter=800.)
+    ells = [(0, 0, 0), (2, 0, 2)]
+    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.03}, basis='sugiyama-diagonal', ells=ells, mask_edges='')
+    #edgesin = np.arange(0., 1.1 * mattrs.knyq.max(), 0.002)
+    edgesin = np.arange(0., 1.2 * mattrs.knyq.max(), 0.02)
+    kin = (edgesin[:-1] + edgesin[1:]) / 2.
+    bk = pk(kin)[:, None] * pk(kin)[None, :]
+    edgesin = (edgesin, edgesin)
+    kin = (kin, kin)
+
+    def gaussian_survey(pattrs, mattrs=None, size=int(1e6), seed=random.key(42), scale=0.3, paint=False):
+        # Generate Gaussian-distributed positions
+        positions = scale * random.normal(seed, shape=(size, 3))
+        bscale = scale  # cut at 1 sigma
+        mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+        if mattrs is None: mattrs = pattrs
+        positions = positions * pattrs.boxsize + pattrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
+        if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
+        return toret
+
+    selection = gaussian_survey(mattrs, paint=True)
+    norm = compute_normalization(selection, selection, selection)
+
+    from jaxpower import get_smooth3_window_bin_attrs, interpolate_window_function
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=0, return_ellsin=True)
+    poles = [1. / (1 + sum(ell)) * bk for ell in ellsin]
+
+    from jaxpower.utils import plotter
+
+    @plotter
+    def plot_zeta(self, s=30., fig=None):
+        from matplotlib import pyplot as plt
+        if fig is None:
+            fig, ax = plt.subplots()
+        else:
+            ax = fig.axes[0]
+        for ill, ell in enumerate(self.ells):
+            pole = self.get(ells=ell)
+            idx = np.abs(pole.coords('s2') - s).argmin()
+            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=f'$\ell={ell}$')
+        ax.legend()
+        ax.grid(True)
+        ax.set_xscale('log')
+        return fig
+
+    los = 'local'
+
+    sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * selection.attrs.cellsize[0]}, **kw, batch_size=12)
+    zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
+    zeta = zeta.unravel()
+    if plot:
+        plot_zeta(zeta, show=True)
+
+    zetas = []
+    for scale in [1, 4]:
+        selection = gaussian_survey(mattrs, mattrs=mattrs.clone(boxsize=scale * mattrs.boxsize), paint=True)
+        sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * selection.attrs.cellsize[0]}, **kw, batch_size=12)
+        zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
+        zetas.append(zeta.unravel())
+
+    coords = jnp.logspace(-3, 4, 1024)
+    xis = [interpolate_window_function(zeta, coords=coords, order=3) for zeta in zetas]
+    limit = 0.4 * mattrs.boxsize[0]
+    coords = list(next(iter(xis[0])).coords().values())
+    mask = (coords[0] < limit)[:, None] * (coords[1] < limit)[None, :]
+    weights = [jnp.maximum(mask, 1e-6), jnp.maximum(~mask, 1e-6)]
+    zeta2 = zetas[0].sum(xis, weights=weights)
+    if plot:
+        plot_zeta(zeta2, show=True)
+
+    if False:
+        sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * mattrs.cellsize[0]}, **kw)
+        zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
+        #for label in zeta.labels(): print(label, zeta.get(**label).value())
+        if plot:
+            zeta.plot(show=True)
+        zeta = zeta.unravel()
+        if plot:
+            plot_zeta(zeta, show=True)
+            zeta.plot(show=True)
+
+    wmatrix = compute_smooth3_spectrum_window(zeta2, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    wpoles = wmatrix.dot(np.concatenate([p.ravel() for p in poles]), return_type=None)
+    if plot:
+        ax = plt.gca()
+        for ill, ell in enumerate(wpoles.ells[:1]):
+            pole = wpoles.get(ells=ell)
+            factor = pole.coords('k').prod(axis=-1)
+            ax.plot(factor * pole.value(), color='C1')
+            if ell in ellsin:
+                i = ellsin.index(ell)
+                from scipy import interpolate
+                spline = interpolate.RectBivariateSpline(*kin, poles[i], kx=1, ky=1, s=0)
+                pole = spline(*pole.coords('k').T, grid=False)
+                ax.plot(factor * pole, color='k')
+        plt.show()
+
+
+def test_basis():
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=64)
+
+    mesh = generate_gaussian_mesh(mattrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e4)
+    data = generate_uniform_particles(mattrs, size, seed=32)
+
+    kw = dict(resampler='cic', interlacing=False, compensate=True)
+    mesh = data.paint(**kw)
+    mean = mesh.mean()
+    #mean = 1.
+    mesh = mesh - mean
+
+    if True:
+        edges = np.arange(0.01, mattrs.knyq[0], 0.04)
+        bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0)], mask_edges='')
+        spectrum = compute_mesh3_spectrum(mesh, los='local', bin=bin)
+        for pole in spectrum:
+            value = pole.value().reshape((len(edges) - 1,) * 2)
+            print(value, np.unique(value).size, value.size)
+
+    if True:
+        edges = np.arange(0.0, 200, 4 * mattrs.cellsize[0])
+        bin = BinMesh3CorrelationPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0)], mask_edges='')
+        correlation = compute_mesh3_correlation(mesh, los='local', bin=bin)
+        for pole in correlation:
+            value = pole.value().reshape((len(edges) - 1,) * 2)
+            print(value, np.unique(value).size, value.size)
+
 
 if __name__ == '__main__':
 
@@ -653,6 +831,8 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    test_smooth_window(plot=True)
+    exit()
     #test_fftlog2()
     test_buffer()
     test_mesh3_spectrum()

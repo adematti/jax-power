@@ -1,4 +1,5 @@
 import os
+import numbers
 from functools import partial
 from dataclasses import dataclass, field, asdict
 from collections.abc import Callable
@@ -10,7 +11,7 @@ import jax
 from jax import numpy as jnp
 
 from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, ObservableLeaf, ObservableTree
-from .utils import get_legendre, get_spherical_jn, get_Ylm, real_gaunt, register_pytree_dataclass
+from .utils import get_legendre, get_spherical_jn, get_Ylm, real_gaunt, legendre_product, register_pytree_dataclass
 from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
 
 
@@ -110,7 +111,7 @@ class BinMesh2SpectrumPoles(object):
         return _bincount(self.ibin, value, weights=weights, length=len(self.xavg), antisymmetric=antisymmetric) / self.nmodes
 
 
-@partial(register_pytree_dataclass, meta_fields=['ells'])
+@partial(register_pytree_dataclass, meta_fields=['ells', 'basis', 'batch_size'])
 @dataclass(init=False, frozen=True)
 class BinMesh2CorrelationPoles(object):
     """
@@ -136,16 +137,19 @@ class BinMesh2CorrelationPoles(object):
     xavg: jax.Array = None
     ibin: jax.Array = None
     ells: tuple = None
+    basis: str = None
+    batch_size: int = None
     mattrs: MeshAttrs = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, batch_size: int=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
         kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='real', mode_oversampling=mode_oversampling)
         kw.pop('wmodes')
+        kw.update(basis=basis, batch_size=batch_size)
         self.__dict__.update(kw)
 
-    def __call__(self, mesh, remove_zero=False):
+    def __call__(self, mesh, ell=0, remove_zero=False):
         """
         Bin the mesh to compute the correlation function.
 
@@ -161,9 +165,21 @@ class BinMesh2CorrelationPoles(object):
         binned : array-like
         """
         value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
-        if remove_zero:
-            value = value.at[(0,) * value.ndim].set(0.)
-        return _bincount(self.ibin, value, weights=None, length=len(self.xavg)) / self.nmodes
+        if self.basis == 'bessel':
+            if remove_zero:
+                value = value.at[(0,) * value.ndim].set(0.)
+            jn = get_spherical_jn(ell)
+            knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
+
+            def bin(ibin):
+                x = knorm * self.xavg[ibin]
+                return (-1)**(ell // 2) * jnp.sum(value * jn(x)) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
+
+            return jax.lax.map(bin, jnp.arange(len(self.xavg)), batch_size=self.batch_size)
+        else:
+            if remove_zero:
+                value = value.at[(0,) * value.ndim].set(0.)
+            return _bincount(self.ibin, value, weights=None, length=len(self.xavg)) / self.nmodes
 
 
 def _get_los_vector(los: str | np.ndarray, ndim=3):
@@ -296,9 +312,9 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         if nonzeroells:
             rmesh1 = _2r(rmesh1)
             # The real-space grid
-            xvec = rmesh1.coords(sparse=True)
+            xvec = mattrs.rcoords(sparse=True)
             # The Fourier-space grid
-            kvec = A0.coords(sparse=True)
+            kvec = mattrs.kcoords(sparse=True)
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
@@ -344,7 +360,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             num.append(bin(Aell, antisymmetric=False))
 
         if nonzeroells:
-            kvec = Aell.coords(sparse=True)
+            kvec = mattrs.kcoords(sparse=True)
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
                 num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), antisymmetric=bool(ell % 2), remove_zero=True))
@@ -417,9 +433,9 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         if nonzeroells:
             rmesh1 = _2r(rmesh1)
             # The real-space grid
-            xvec = rmesh1.coords(sparse=True)
+            xvec = mattrs.rcoords(sparse=True)
             # The separation grid
-            svec = rmesh1.coords(kind='separation', sparse=True)
+            svec = mattrs.rcoords(kind='separation', sparse=True)
 
             @partial(jax.checkpoint, static_argnums=0)
             def f(Ylm, carry, im):
@@ -460,10 +476,139 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
             num.append(bin(Aell))
 
         if nonzeroells:
-            svec = Aell.coords(kind='separation', sparse=True)
+            svec = mattrs.rcoords(kind='separation', sparse=True)
             mu = sum(ss * ll for ss, ll in zip(svec, vlos)) / jnp.sqrt(sum(ss**2 for ss in svec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
                 num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), remove_zero=True))
+
+        correlation = []
+        for ill, ell in enumerate(ells):
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
+                                                    volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2CorrelationPoles(correlation)
+
+
+
+def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2CorrelationPoles=None, los: str | np.ndarray='z') -> Mesh2CorrelationPoles:
+    """
+    Compute the correlation function multipoles from mesh.
+
+    Parameters
+    ----------
+    meshs : RealMeshField or ComplexMeshField
+        Input meshes.
+    bin : BinMesh2CorrelationPoles
+        Binning operator.
+    los : str or array-like, optional
+        Line-of-sight specification.
+        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
+        Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
+        Else, a 3-vector.
+
+    Returns
+    -------
+    result : Mesh2CorrelationPoles
+    """
+    meshes, autocorr = _format_meshes(*meshes)
+    rdtype = meshes[0].real.dtype
+    mattrs = meshes[0].attrs
+    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
+
+    los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
+    attrs = dict(los=vlos if vlos is not None else los)
+    ells = bin.ells
+
+    def _2r(mesh):
+        if not isinstance(mesh, RealMeshField):
+            mesh = mesh.c2r()
+        return mesh
+
+    def _2c(mesh):
+        if not isinstance(mesh, ComplexMeshField):
+            mesh = mesh.r2c()
+        return mesh
+
+    if vlos is None:  # local, varying line-of-sight
+        nonzeroells = ells
+        if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
+        if swap: meshes = meshes[::-1]
+
+        rmesh1 = meshes[0]
+        A0 = _2c(rmesh1 if autocorr else meshes[1])
+        del meshes
+
+        num = []
+        if 0 in ells:
+            if autocorr:
+                Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
+            else:
+                Aell = _2c(rmesh1) * A0.conj()
+            if bin.basis != 'bessel': Aell = Aell.c2r()  # convert to real space
+            num.append(bin(Aell, ell=0))
+            del Aell
+
+        if nonzeroells:
+            rmesh1 = _2r(rmesh1)
+            # The real-space grid
+            xvec = mattrs.rcoords(sparse=True)
+            # The separation grid
+            svec = mattrs.rcoords(kind='separation', sparse=True)
+            kvec = mattrs.kcoords(sparse=True)
+
+            @partial(jax.checkpoint, static_argnums=0)
+            def f(Ylm, carry, im):
+                if bin.basis != 'bessel':
+                    carry += _2r(_2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)).conj() * A0) * jax.lax.switch(im, Ylm, *svec)
+                else:
+                    carry += _2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)).conj() * A0 * jax.lax.switch(im, Ylm, *kvec)
+                return carry, im
+
+            for ell in nonzeroells:
+                Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
+                xs = np.arange(len(Ylms))
+                if bin.basis != 'bessel':
+                    init = rmesh1.clone(value=jnp.zeros_like(rmesh1.value))
+                else:
+                    init = A0.clone(value=jnp.zeros_like(A0.value))
+                Aell = jax.lax.scan(partial(f, Ylms), init=init, xs=xs)[0]
+                num.append(4. * jnp.pi * bin(Aell, ell=ell, remove_zero=True))
+                del Aell
+
+        if swap: num = list(map(jnp.conj, num))
+        # Format the num results into :class:`Mesh2CorrelationPoles` instance
+        correlation = []
+        for ill, ell in enumerate(ells):
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
+                                                    volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
+        return Mesh2CorrelationPoles(correlation)
+
+    else:  # fixed line-of-sight
+
+        for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+            meshes[imesh] = _2c(mesh)
+        if autocorr:
+            Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
+        else:
+            Aell = meshes[0] * meshes[1].conj()
+        if bin.basis != 'bessel': Aell = Aell.c2r()  # convert to real space
+        del meshes
+
+        nonzeroells = ells
+        if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
+
+        num = []
+        if 0 in ells:
+            num.append(bin(Aell, ell=0))
+
+        if nonzeroells:
+            svec = mattrs.rcoords(kind='separation', sparse=True)
+            kvec = mattrs.kcoords(sparse=True)
+            if bin.basis != 'bessel':
+                mu = sum(ss * ll for ss, ll in zip(svec, vlos)) / jnp.sqrt(sum(ss**2 for ss in svec)).at[(0,) * mattrs.ndim].set(1.)
+            else:
+                mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
+            for ell in nonzeroells:  # TODO: jax.lax.scan
+                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), ell=ell, remove_zero=True))
 
         correlation = []
         for ill, ell in enumerate(ells):
@@ -750,7 +895,155 @@ def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
     return toret
 
 
-def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None) -> WindowMatrix:
+def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarray | int=4096, order=3):
+    """
+    Extrapolate / resample the configuration-space window function.
+
+    Parameters
+    ----------
+    window : ObservableTree
+        Window function to resample.
+    coords : tuple | numpy.ndarray | int, optional
+        Target coordinates for interpolation.
+        - If an integer N, generate `N` log-spaced points spanning an extended
+          decade range derived from the original coordinates.
+        - If an array-like, it is used as the new coordinate for the first axis.
+        - If a tuple of arrays, each element is used for the corresponding axis.
+        When a leaf has more axes than supplied coordinates, the last supplied
+        coordinate is repeated for the remaining axes.
+    order : int, optional
+        Spline order (degree). Default is 3 (cubic). For 2D interpolation this
+        is used for both dimensions (kx = ky = order).
+
+    Returns
+    -------
+    window : ObservableTree
+        New (extrapolated) window function.
+    """
+    def get_new_coords(old_coords, arg_coords):
+        if isinstance(old_coords, list):
+            return [get_new_coords(old_coord, arg_coord) for old_coord, arg_coord in zip(old_coords, arg_coords)]
+        start, stop = old_coords.min(), old_coords.max()
+        start = 0 if start <= 0 else np.floor(np.log10(start)).astype(int)
+        stop = np.ceil(np.log10(stop)).astype(int)
+        delta = (stop - start) / 2.
+        start, stop = start - delta, stop + delta
+
+        if isinstance(arg_coords, numbers.Number):
+            num = int(arg_coords)
+            return jnp.logspace(start, stop, num)
+        else:
+            return arg_coords
+
+    def pad_coords(coords):
+        if isinstance(coords, list):
+            return [pad_coords(coord) for coord in coords]
+        # Add 0 in front, last value at the end
+        return jnp.pad(coords, (1, 1), mode='constant', constant_values=(0. - (coords[1] - coords[0]), coords[-1] + (coords[-1] - coords[-2])))
+
+    def pad_value(value):
+        value = jnp.pad(value, ((0, 1),) * value.ndim, mode='constant', constant_values=0.)
+        value = jnp.pad(value, ((1, 0),) * value.ndim, mode='edge')
+        return value
+
+    def remove_nan(coords, value):
+        masks = []
+        coords = list(coords)
+        for axis in range(value.ndim):
+            masks.append(np.isfinite(value).all(axis=tuple(i for i in range(value.ndim) if i != axis)))
+            coords[axis] = coords[axis][masks[-1]]
+        value = value[np.ix_(*masks)]
+        return coords, value
+
+    def extrapolate_leaf(leaf, coords):
+        from scipy import interpolate
+        old_coords = leaf.coords(center='mid_if_edges_and_nan')
+        if not isinstance(coords, tuple):
+            coords = (coords,)
+        coords += (coords[-1],) * (len(old_coords) - len(coords))
+        if len(old_coords) == 1:
+            old_x = list(old_coords.values())[0]
+            new_x = get_new_coords(old_x, coords[0])
+            old_x = pad_coords(old_x)
+            old_value = pad_value(leaf.value())
+            old_x, old_value = remove_nan([old_x], old_value)
+            spline = interpolate.UnivariateSpline(old_x[0], old_value, k=order, s=0, ext=3, check_finite=False)
+            new_value = spline(new_x)
+            new_coords = [new_x]
+        elif len(old_coords) == 2:
+            old_x = list(old_coords.values())
+            new_x = get_new_coords(old_x, coords)
+            old_x = pad_coords(old_x)
+            old_value = pad_value(leaf.value())
+            old_x, old_value = remove_nan(old_x, old_value)
+            spline = interpolate.RectBivariateSpline(*old_x, old_value, kx=order, ky=order, s=0)
+            new_value = spline(*new_x, grid=True)
+            new_coords = new_x
+        new_coords = {name: coord for name, coord in zip(old_coords, new_coords)}
+        return ObservableLeaf(value=new_value, **new_coords, coords=list(new_coords), attrs=dict(leaf.attrs), meta=dict(leaf.meta))
+
+    if isinstance(window, ObservableLeaf):
+        return extrapolate_leaf(window, coords=coords)
+    return window.map(lambda leaf: extrapolate_leaf(leaf, coords=coords))
+
+
+def get_window_coeffs(ell, ell1):
+    coeffs = []
+    for q in range(abs(ell - ell1), ell + ell1 + 1):
+        coeff = (2 * ell + 1) * legendre_product(ell, ell1, q)
+        if abs(coeff) < 1e-7: continue
+        coeffs.append((q, coeff))
+    return coeffs
+
+
+def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
+    """
+    Get the window bin attributes for sugiyama basis.
+
+    Parameters
+    ----------
+    ells : list
+        Observed multipole orders.
+    ellsin : tuple, int
+        Theory multipole orders, or number of even multipoles up to which to compute the window.
+
+    Returns
+    -------
+    dict
+    """
+    if isinstance(ellsin, numbers.Number):
+        ellsin = list(range(0, 2 * ellsin - 1, 2))
+    with_wide_angle = any(isinstance(ellin, tuple) for ellin in ellsin)
+    ellsin = [ellin if isinstance(ellin, tuple) else (ellin, 0) for ellin in ellsin]
+    non_zero_ellsin = []
+    ellw = {}
+    for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
+        if wa1 not in ellw: ellw[wa1] = []
+        for ill, ell in enumerate(ells):
+            coeffs = get_window_coeffs(ell, ell1)
+            if coeffs and (ell1, wa1) not in non_zero_ellsin:
+                non_zero_ellsin.append((ell1, wa1))
+            for ell, _ in coeffs:
+                if ell not in ellw[wa1]: ellw[wa1].append(ell)
+
+    for wa in ellw:
+        ellw[wa] = sorted(set(ellw[wa]))
+
+    def _make_dict(ellw):
+        return dict(ells=ellw)
+
+    if with_wide_angle:
+        ellw = [(_make_dict(ellw[wa]), wa) for wa in ellw]
+    else:
+        ellw = _make_dict(ellw[0])
+        non_zero_ellsin = [ellin[0] for ellin in non_zero_ellsin]
+    if return_ellsin:
+        return ellw, non_zero_ellsin
+    return ellw
+
+
+
+def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('rect',)) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) power spectrum window matrix.
 
@@ -769,8 +1062,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     -------
     wmat : WindowMatrix
     """
-    from .utils import legendre_product, BesselIntegral
-    tophat_method = 'rect'
+    from .utils import BesselIntegral
     ells = bin.ells
 
     if isinstance(edgesin, ObservableTree):
@@ -782,13 +1074,14 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     elif edgesin.ndim != 2:
         edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
 
-    kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
     ellsin = [ellin if isinstance(ellin, tuple) else (ellin, 0) for ellin in ellsin]
+    #kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
+    kout = bin.xavg
 
     wmat_tmp = {}
 
     for ell1, wa1 in ellsin:
-        wmat_tmp[ell1, wa1] = 0
+        wmat_tmp[ell1, wa1] = []
         for ill, ell in enumerate(ells):
 
             def get_w(q):
@@ -801,36 +1094,53 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                     return window.get(**kw).value().real
                 return jnp.zeros(())
 
-            def get_coeffs(ell, ell1):
-                for q in range(abs(ell - ell1), ell + ell1 + 1):
-                    yield legendre_product(ell, ell1, q), q
+            Qs = sum(coeff * get_w(q) for q, coeff in get_window_coeffs(ell, ell1))
 
-            Qs = sum(coeff * get_w(q) for coeff, q in get_coeffs(ell, ell1))
-            tmpw = next(iter(window))
-            if 'volume' in tmpw.values():
-                snmodes = tmpw.values('volume')
-            else:
-                snmodes = jnp.ones_like(tmpw.value())
-            savg = jnp.where(snmodes == 0, 0., tmpw.coords('s'))
-            Qs = jnp.where(snmodes == 0, 0., Qs)
             #integ = BesselIntegral(window.get(0).edges('s'), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
+            if 'rect' in flags:
+                tmpw = next(iter(window))
+                if 'volume' in tmpw.values():
+                    snmodes = tmpw.values('volume')
+                else:
+                    snmodes = jnp.ones_like(tmpw.value())
+                savg = jnp.where(snmodes == 0, 0., tmpw.coords('s'))
+                Qs = jnp.where(snmodes == 0, 0., Qs)
 
-            def f(edgein):
-                tophat_Qs = BesselIntegral(edgein, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs * savg**wa1
-                def f2(kout):
-                    integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
-                    return integ(snmodes * tophat_Qs)
-                #    return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
-                batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
-                power = (2 * ell + 1) * jax.lax.map(f2, kout, batch_size=batch_size)
-                #power = (2 * ell + 1) * integ(snmodes * tophat_Qs)
-                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                return power.ravel()
+                def f(edgein):
+                    tophat_Qs = BesselIntegral(edgein, savg, ell=ell1, edges=True, method='rect', mode='backward').w[..., 0] * Qs * savg**wa1
+                    def f2(kout):
+                        integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
+                        return integ(snmodes * tophat_Qs)
+                    #    return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
+                    batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
+                    spectrum = jax.lax.map(f2, kout, batch_size=batch_size)
+                    #spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                    return spectrum#.ravel()
 
-            batch_size = int(min(max(1e7 / (kout.size * savg.size), 1), edgesin.shape[0]))
-            wmat_tmp[ell1, wa1] += jax.lax.map(f, xs=edgesin, batch_size=batch_size)
+                batch_size = int(min(max(1e7 / (kout.size * savg.size), 1), edgesin.shape[0]))
+                tmp = jax.lax.map(f, xs=edgesin, batch_size=batch_size).T
+            else:
+                # fftlog
+                from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
+                to_spectrum = CorrelationToSpectrum(s=next(iter(window)).coords('s'), ell=ell, check_level=1, lowring=False)
+                to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ell1, lowring=False)
+                kin = jnp.mean(edgesin, axis=-1)
 
-    wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
+                def convolve(theory):
+                    #return (ell == ell1) * jnp.interp(kout, kin, theory, left=0., right=0.)
+                    theory = jnp.interp(to_spectrum.k, kin, theory, left=0., right=0.)
+                    correlation = to_correlation(theory)[1]
+                    #correlation = (ell == ell1) * correlation
+                    correlation = correlation * Qs * to_correlation.s**wa1
+                    return jnp.interp(kout, to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)
+
+                tmp = jax.jacfwd(convolve)(jnp.zeros_like(edgesin[..., 0]))
+                #tmp = jnp.zeros_like(tmp, shape=(len(ells) * tmp.shape[0], tmp.shape[1])).at[ill * tmp.shape[0]:(ill + 1) * tmp.shape[0]].set(tmp).T
+
+            wmat_tmp[ell1, wa1].append(tmp)
+        wmat_tmp[ell1, wa1] = jnp.concatenate(wmat_tmp[ell1, wa1], axis=0)
+
+    wmat = jnp.concatenate(list(wmat_tmp.values()), axis=1)
 
     observable = []
     for ill, ell in enumerate(ells):

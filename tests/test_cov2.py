@@ -8,7 +8,7 @@ from matplotlib import pyplot as plt
 
 from jaxpower import (MeshAttrs, compute_mesh2_covariance_window, compute_fkp2_covariance_window, compute_spectrum2_covariance,
                       generate_anisotropic_gaussian_mesh, generate_uniform_particles, BinMesh2SpectrumPoles, Mesh2SpectrumPole, Mesh2SpectrumPoles,
-                      read, compute_mesh2_spectrum)
+                      read, compute_mesh2_spectrum, interpolate_window_function)
 from jaxpower.types import ObservableTree
 
 
@@ -168,19 +168,6 @@ def test_cutsky2_covariance(plot=False):
     #edges = {'step': attrs.cellsize.min()}
     edges = None
     los = 'local'
-    windows = compute_mesh2_covariance_window(selection, los=los, edges=edges)
-
-    def smooth_window(windows, xmin):
-        num = []
-        for window in windows:
-            for ell in window.ells:
-                _num = window.get(ells=ell).value()
-                if ell != 0:
-                    _num = jnp.where(window.get(ells=ell).coords('s') >= xmin, _num, 0.)
-                num.append(_num)
-        return windows.clone(value=np.concatenate(num))
-
-    windows = smooth_window(windows, 4 * mattrs.cellsize.min())
 
     from jaxpower.utils import plotter
 
@@ -198,6 +185,19 @@ def test_cutsky2_covariance(plot=False):
         ax.grid(True)
         #ax.set_xscale('log')
         return fig
+    windows = compute_mesh2_covariance_window(selection, los=los, edges=edges)
+
+    def smooth_window(windows, xmin):
+        num = []
+        for window in windows:
+            for ell in window.ells:
+                _num = window.get(ells=ell).value()
+                if ell != 0:
+                    _num = jnp.where(window.get(ells=ell).coords('s') >= xmin, _num, 0.)
+                num.append(_num)
+        return windows.clone(value=np.concatenate(num))
+
+    windows = smooth_window(windows, 4 * mattrs.cellsize.min())
 
     if plot:
         plot(windows.get(tracers=(0, 0, 0, 0)), show=True)
@@ -382,7 +382,7 @@ def test_fftlog2():
     H0 = jax.jacfwd(lambda fun: fftlog(fun, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
 
 
-    class Correlation2Power(object):
+    class Correlation2Spectrum(object):
 
         def __init__(self, k, ells):
             from jaxpower.fftlog import SpectrumToCorrelation
@@ -452,7 +452,7 @@ def test_fftlog2():
         for j, lp in enumerate(ell_prime):
             for i, l in enumerate(ell):
                 #Q[i, j] = Q[i, j] @ H[j]
-                fftlog = Correlation2Power(k, (l, lp))
+                fftlog = Correlation2Spectrum(k, (l, lp))
                 assert np.allclose(fftlog.s, s)
                 _, Q[i, j] = fftlog(Qll[i, j])
 
@@ -473,10 +473,10 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
     #test_fftlog2()
     #export_sympy()
-    save_box_mocks()
+    #save_box_mocks()
     #test_box2_covariance(plot=True)
-    save_cutsky_mocks()
-    #test_cutsky2_covariance(plot=True)
-    save_fkp_mocks()
+    #save_cutsky_mocks()
+    test_cutsky2_covariance(plot=True)
+    #save_fkp_mocks()
     #test_fkp2_window(plot=True)
-    test_fkp2_covariance(plot=True)
+    #test_fkp2_covariance(plot=True)

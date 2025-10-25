@@ -33,8 +33,14 @@ class Correlation2Spectrum(object):
         self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False).fftlog
         dlnk = jnp.diff(jnp.log(k)).mean()
         self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
-        self.k = k
-        self.s = fftlog.y
+
+    @property
+    def k(self):
+        return self._fftlog.x
+
+    @property
+    def s(self):
+        return self._fftlog.y
 
     def __call__(self, fun):
         """
@@ -91,9 +97,10 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, trac
     WW, WS, SS = {}, {}, {}
     if bin is None:
         mattrs = fkps[0].attrs
-        kw = {'edges': None, 'ells': tuple(range(0, 9, 2))}
+        kw = {'edges': None, 'ells': tuple(range(0, 9, 2)), 'basis': None, 'batch_size': None}
         for name in kw: kw[name] = kwargs.pop(name, kw[name])
-        edges = kw.pop('edges', None) or {}
+        edges = kw.pop('edges', None)
+        if edges is None: edges = {}
         if isinstance(edges, dict):
             edges.setdefault('max', np.sqrt(np.sum((mattrs.boxsize / 2)**2)))
         bin = BinMesh2CorrelationPoles(mattrs, edges=edges, **kw)
@@ -177,9 +184,10 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', tracers=None,
     WW = {}
     if bin is None:
         mattrs = meshes[0].attrs
-        kw = {'edges': None, 'ells': tuple(range(0, 9, 2))}
+        kw = {'edges': None, 'ells': tuple(range(0, 9, 2)), 'basis': None, 'batch_size': None}
         for name in kw: kw[name] = kwargs.pop(name, kw[name])
-        edges = kw.pop('edges', None) or {}
+        edges = kw.pop('edges', None)
+        if edges is None: edges = {}
         if isinstance(edges, dict):
             edges.setdefault('max', np.sqrt(np.sum((mattrs.boxsize / 2)**2)))
         bin = BinMesh2CorrelationPoles(mattrs, edges=edges, **kw)
@@ -199,7 +207,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', tracers=None,
             norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
             norm = norm / mattrs.cellsize.prod()**2
-            update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells), attrs={'mattrs': dict(mattrs)})
+            update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells))
             WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(**update)
     if tracers is None: tracers = list(range(len(meshes)))
     tuple_tracers = [tuple(tracers[ii] for ii in iW) for iW in WW]
@@ -325,11 +333,10 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             s = tmpw.coords('s')
 
             if 'fftlog' in flags:
-                fftlog = Correlation2Spectrum(np.logspace(-6, 2, num=3645, endpoint=False), (q1, q2))
-                from scipy.interpolate import UnivariateSpline, RectBivariateSpline
-                if s[0] > 0: s, w = np.insert(s, 0, 0.), np.insert(w, 0, w[0])
-                w = UnivariateSpline(s, w, k=1, s=0, ext='zeros')(fftlog.s)
-                _, tmp = fftlog(w)
+                s = tmpw.coords('s')
+                fftlog = Correlation2Spectrum(s, (q1, q2))
+                from scipy.interpolate import RectBivariateSpline
+                tmp = fftlog(w)[1]
                 toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
                 return toret
 

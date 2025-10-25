@@ -85,16 +85,16 @@ class FFTlog(object):
         if np.ndim(q) == 0:
             q = [q] * len(kernel)
         q = list(q)
-        self.x = jnp.asarray(x)
+        self._x = jnp.asarray(x)
         if not self.inparallel:
-            self.x = self.x[None, :]
-        elif self.x.ndim == 1:
-            self.x = jnp.tile(self.x[None, :], (len(kernel), 1))
+            self._x = self._x[None, :]
+        elif self._x.ndim == 1:
+            self._x = jnp.tile(self._x[None, :], (len(kernel), 1))
         if np.ndim(xy) == 0:
             xy = [xy] * len(kernel)
         xy = list(xy)
         if check_level:
-            if len(self.x) != len(kernel):
+            if len(self._x) != len(kernel):
                 raise ValueError('x and kernel must of same length')
             if len(q) != len(kernel):
                 raise ValueError('q and kernel must be lists of same length')
@@ -119,18 +119,28 @@ class FFTlog(object):
         self._engine = get_fft_engine(engine, size=self.padded_size, nparallel=self.nparallel, **engine_kwargs)
 
     @property
+    def x(self):
+        """Input x-coordinates."""
+        return self._x if self.inparallel else self._x[0]
+
+    @property
+    def y(self):
+        """Output y-coordinates."""
+        return self._y if self.inparallel else self._y[0]
+
+    @property
     def nparallel(self):
         """Number of transforms performed in parallel."""
-        return self.x.shape[0]
+        return self._x.shape[0]
 
     @property
     def size(self):
         """Size of x-coordinates."""
-        return self.x.shape[-1]
+        return self._x.shape[-1]
 
     def _setup(self, kernels, qs, minfolds=2, lowring=True, xy=1., check_level=0):
         """Set up u funtions."""
-        self.delta = jnp.log(self.x[:, -1] / self.x[:, 0]) / (self.size - 1)
+        self.delta = jnp.log(self._x[:, -1] / self._x[:, 0]) / (self.size - 1)
 
         self.padded_size = self.size
         if minfolds:
@@ -142,7 +152,7 @@ class FFTlog(object):
         self.padded_size_out_left, self.padded_size_out_right = npad - npad // 2, npad // 2
 
         if check_level:
-            if not jnp.allclose(jnp.log(self.x[:, 1:] / self.x[:, :-1]), self.delta, rtol=1e-3):
+            if not jnp.allclose(jnp.log(self._x[:, 1:] / self._x[:, :-1]), self.delta, rtol=1e-3):
                 raise ValueError('Input x must be log-spaced')
             if self.padded_size < self.size:
                 raise ValueError('Convolution size must be larger than input x size')
@@ -152,28 +162,28 @@ class FFTlog(object):
         else:
             self.lnxy = jnp.log(jnp.array(xy))# + self.delta
 
-        self.y = jnp.exp(self.lnxy - self.delta)[:, None] / self.x[:, ::-1]
+        self._y = jnp.exp(self.lnxy - self.delta)[:, None] / self._x[:, ::-1]
 
         m = np.arange(0, self.padded_size // 2 + 1)
-        self.padded_u, self.padded_prefactor, self.padded_postfactor = [], [], []
-        self.padded_x = pad(self.x, (self.padded_size_in_left, self.padded_size_in_right), axis=-1, extrap='log')
-        self.padded_y = pad(self.y, (self.padded_size_out_left, self.padded_size_out_right), axis=-1, extrap='log')
+        self._padded_u, self._padded_prefactor, self._padded_postfactor = [], [], []
+        self._padded_x = pad(self._x, (self.padded_size_in_left, self.padded_size_in_right), axis=-1, extrap='log')
+        self._padded_y = pad(self._y, (self.padded_size_out_left, self.padded_size_out_right), axis=-1, extrap='log')
         prev_kernel, prev_q, prev_delta, prev_u = None, None, None, None
-        for kernel, padded_x, padded_y, lnxy, delta, q in zip(kernels, self.padded_x, self.padded_y, self.lnxy, self.delta, qs):
-            self.padded_prefactor.append(padded_x**(-q))
-            self.padded_postfactor.append(padded_y**(-q))
+        for kernel, padded_x, padded_y, lnxy, delta, q in zip(kernels, self._padded_x, self._padded_y, self.lnxy, self.delta, qs):
+            self._padded_prefactor.append(padded_x**(-q))
+            self._padded_postfactor.append(padded_y**(-q))
             if kernel is prev_kernel and q == prev_q and delta == prev_delta:
                 u = prev_u
             else:
                 u = prev_u = kernel(q + 2j * np.pi / self.padded_size / delta * m)
-            self.padded_u.append(u * jnp.exp(-2j * jnp.pi * lnxy / self.padded_size / delta * m))
+            self._padded_u.append(u * jnp.exp(-2j * jnp.pi * lnxy / self.padded_size / delta * m))
             prev_kernel, prev_q, prev_delta = kernel, q, delta
-        self.padded_u = jnp.array(self.padded_u)
-        self.padded_prefactor = jnp.array(self.padded_prefactor)
-        self.padded_postfactor = jnp.array(self.padded_postfactor)
+        self._padded_u = jnp.array(self._padded_u)
+        self._padded_prefactor = jnp.array(self._padded_prefactor)
+        self._padded_postfactor = jnp.array(self._padded_postfactor)
 
     def tree_flatten(self):
-        children = (self.x, self.y, self.padded_x, self.padded_y, self.padded_u, self.padded_prefactor, self.padded_postfactor)
+        children = (self._x, self._y, self._padded_x, self._padded_y, self._padded_u, self._padded_prefactor, self._padded_postfactor)
         aux_data = {name: getattr(self, name) for name in ['inparallel', 'padded_size', 'padded_size_in_left', 'padded_size_in_right', 'padded_size_out_left', 'padded_size_out_right', '_engine']}
         return children, aux_data
 
@@ -181,7 +191,7 @@ class FFTlog(object):
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
         new.__dict__.update(aux_data)
-        new.x, new.y, new.padded_x, new.padded_y, new.padded_u, new.padded_prefactor, new.padded_postfactor = children
+        new._x, new._y, new._padded_x, new._padded_y, new._padded_u, new._padded_prefactor, new._padded_postfactor = children
         return new
 
     def __call__(self, fun, extrap=0, keep_padding=False, ignore_prepostfactor=False):
@@ -214,16 +224,16 @@ class FFTlog(object):
         """
         fun = jnp.asarray(fun)
         padded_fun = pad(fun, (self.padded_size_in_left, self.padded_size_in_right), axis=-1, extrap=extrap)
-        padded_prefactor, padded_postfactor = self.padded_prefactor,  self.padded_postfactor
+        padded_prefactor, padded_postfactor = self._padded_prefactor,  self._padded_postfactor
         if ignore_prepostfactor:
             padded_prefactor = padded_postfactor = 1.
-        fftloged = self._engine.backward(self._engine.forward(padded_fun * padded_prefactor) * self.padded_u) * padded_postfactor
+        fftloged = self._engine.backward(self._engine.forward(padded_fun * padded_prefactor) * self._padded_u) * padded_postfactor
 
         if not keep_padding:
-            y = self.y
+            y = self._y
             fftloged = fftloged[..., self.padded_size_out_left:self.padded_size_out_left + self.size]
         else:
-            y = self.padded_y
+            y = self._padded_y
         if not self.inparallel:
             y = y[0]
             fftloged = jnp.reshape(fftloged, fun.shape if not keep_padding else fun.shape[:-1] + (self.padded_size,))
@@ -231,10 +241,10 @@ class FFTlog(object):
 
     def inv(self):
         """Inverse the transform."""
-        self.x, self.y = self.y, self.x
-        self.padded_x, self.padded_y = self.y, self.x
-        self.padded_prefactor, self.padded_postfactor = 1 / self.padded_postfactor, 1 / self.padded_prefactor
-        self.padded_u = 1 / self.padded_u.conj()
+        self._x, self._y = self._y, self._x
+        self._padded_x, self._padded_y = self._y, self._x
+        self._padded_prefactor, self._padded_postfactor = 1 / self._padded_postfactor, 1 / self._padded_prefactor
+        self._padded_u = 1 / self._padded_u.conj()
 
 
 @jax.tree_util.register_pytree_node_class
@@ -266,7 +276,7 @@ class HankelTransform(FFTlog):
         else:
             kernel = [BesselJKernel(nu_) for nu_ in nu]
         FFTlog.__init__(self, x, kernel, **kwargs)
-        self.padded_prefactor *= self.padded_x**2
+        self._padded_prefactor *= self._padded_x**2
 
     @property
     def fftlog(self):
@@ -311,7 +321,7 @@ class SpectrumToCorrelation(object):
             else:
                 kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
             fftlog = FFTlog(k, kernel, q=1.5 + q, **kwargs)
-            fftlog.padded_prefactor *= fftlog.padded_x**3 / (2 * np.pi)**1.5
+            fftlog._padded_prefactor *= fftlog._padded_x**3 / (2 * np.pi)**1.5
             # Convention is (-i)^ell/(2 pi^2)
             ell = np.atleast_1d(ell)
             if complex:
@@ -322,7 +332,7 @@ class SpectrumToCorrelation(object):
                 # (-i)^ell i = (-1)^(ell//2) if ell is odd
                 phase = (-1)**(ell // 2)
             # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
-            fftlog.padded_postfactor *= phase[:, None]
+            fftlog._padded_postfactor *= phase[:, None]
             return fftlog
 
         if isinstance(k, (tuple, list)):  # multi-dimensional
@@ -359,6 +369,18 @@ class SpectrumToCorrelation(object):
         else:
             toret = self._fftlog(fun, **kwargs)
         return toret
+
+    @property
+    def k(self):
+        if isinstance(self._fftlog, tuple):
+            return tuple(fftlog.x for fftlog in self._fftlog)
+        return self._fftlog.x
+
+    @property
+    def s(self):
+        if isinstance(self._fftlog, tuple):
+            return tuple(fftlog.y for fftlog in self._fftlog)
+        return self._fftlog.y
 
     def __getattr__(self, name):
         if isinstance(self._fftlog, tuple):
@@ -419,7 +441,7 @@ class CorrelationToSpectrum(object):
             else:
                 kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
             fftlog = FFTlog(k, kernel, q=1.5 + q, **kwargs)
-            fftlog.padded_prefactor *= fftlog.padded_x**3 * (2 * np.pi)**1.5
+            fftlog._padded_prefactor *= fftlog._padded_x**3 * (2 * np.pi)**1.5
             # Convention is (-i)^ell/(2 pi^2)
             ell = np.atleast_1d(ell)
             if complex:
@@ -430,7 +452,7 @@ class CorrelationToSpectrum(object):
                 # (-i)^ell i = (-1)^(ell//2) if ell is odd
                 phase = (-1)**(ell // 2)
             # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
-            fftlog.padded_postfactor *= phase[:, None]
+            fftlog._padded_postfactor *= phase[:, None]
             return fftlog
 
         if isinstance(s, (tuple, list)):  # multi-dimensional
@@ -442,6 +464,18 @@ class CorrelationToSpectrum(object):
             fftlog = get_fftlog(s, ell)
 
         self._fftlog = fftlog
+
+    @property
+    def k(self):
+        if isinstance(self._fftlog, tuple):
+            return tuple(fftlog.y for fftlog in self._fftlog)
+        return self._fftlog.y
+
+    @property
+    def s(self):
+        if isinstance(self._fftlog, tuple):
+            return tuple(fftlog.x for fftlog in self._fftlog)
+        return self._fftlog.x
 
     @property
     def fftlog(self):
@@ -478,7 +512,7 @@ class TophatVariance(FFTlog):
         """
         kernel = TophatSqKernel(ndim=3)
         FFTlog.__init__(self, k, kernel, q=1.5 + q, **kwargs)
-        self.padded_prefactor *= self.padded_x**3 / (2 * np.pi**2)
+        self._padded_prefactor *= self._padded_x**3 / (2 * np.pi**2)
 
     @property
     def fftlog(self):
@@ -510,7 +544,7 @@ class GaussianVariance(FFTlog):
         """
         kernel = GaussianSqKernel()
         FFTlog.__init__(self, k, kernel, q=1.5 + q, **kwargs)
-        self.padded_prefactor *= self.padded_x**3 / (2 * np.pi**2)
+        self._padded_prefactor *= self._padded_x**3 / (2 * np.pi**2)
 
     @property
     def fftlog(self):

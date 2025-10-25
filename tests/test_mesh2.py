@@ -103,7 +103,10 @@ def test_mesh2_correlation(plot=False):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'local'][:1]
-    bin = BinMesh2CorrelationPoles(mattrs, edges={'step': 4, 'max': 200}, ells=(0, 2, 4))
+    edges = {'step': 4, 'max': 200}
+    ells = (0, 2, 4)
+    bin = BinMesh2CorrelationPoles(mattrs, edges=edges, ells=ells)
+    bin2 = BinMesh2CorrelationPoles(mattrs, edges=edges, ells=ells, basis='bessel', batch_size=4)
 
     #@partial(jax.jit, static_argnames=['los'])
     def mock(mattrs, bin, seed, los='x'):
@@ -127,6 +130,22 @@ def test_mesh2_correlation(plot=False):
             xi = get_xi(s, pk)
             for ill, ell in enumerate(corr.ells):
                 ax.plot(s, s**2 * xi[ill], color='C{:d}'.format(ill), linestyle='--')
+            ax.set_title(los)
+            plt.show()
+
+    for los in list_los:
+        seed = random.key(43)
+        corr = mock(mattrs, bin, seed, los=los)
+        corr2 = mock(mattrs, bin2, seed, los=los)
+        if plot:
+            from matplotlib import pyplot as plt
+            ax = plt.gca()
+            for ill, ell in enumerate(corr.ells):
+                color = 'C{:d}'.format(ill)
+                pole = corr.get(ell)
+                ax.plot(pole.coords('s'), pole.coords('s')**2 * pole.value(), color=color, linestyle='-')
+                pole = corr2.get(ell)
+                ax.plot(pole.coords('s'), pole.coords('s')**2 * pole.value(), color=color, linestyle='--')
             ax.set_title(los)
             plt.show()
 
@@ -643,6 +662,113 @@ def test_smooth_window(plot=False):
                 ax.plot(k, k * wpoles2.get(ells=ell).value(), color='C2')
             plt.show()
 
+
+def test_smooth_window(plot=False):
+    from matplotlib import pyplot as plt
+    from cosmoprimo.fiducial import DESI
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+
+    mattrs = MeshAttrs(boxsize=2000., meshsize=100, boxcenter=800.)
+    ells = (0, 2, 4)
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=ells)
+    #edgesin = np.arange(0., 1.1 * mattrs.knyq.max(), 0.002)
+    edgesin = np.arange(0., 1.2 * mattrs.knyq.max(), 0.005)
+    kin = (edgesin[:-1] + edgesin[1:]) / 2.
+    ellsin = (0, 2, 4)
+    f, b = 0.8, 1.5
+    beta = f / b
+    poles = jnp.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk(kin),
+                        0.9 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk(kin),
+                        8. / 35 * beta ** 2 * pk(kin)])[:len(ellsin)]
+    #poles = poles.at[2:].set(0.)
+    #klim = (0.1, 0.106)
+    #poles = poles.at[..., (kin < klim[0]) | (kin > klim[1])].set(0.)
+
+    def gaussian_survey(pattrs, mattrs=None, size=int(1e6), seed=random.key(42), scale=0.3, paint=False):
+        # Generate Gaussian-distributed positions
+        positions = scale * random.normal(seed, shape=(size, 3))
+        bscale = scale  # cut at 1 sigma
+        mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
+        if mattrs is None: mattrs = pattrs
+        positions = positions * pattrs.boxsize + pattrs.boxcenter
+        toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
+        if paint: toret = toret.paint(resampler='cic', interlacing=1, compensate=False)
+        return toret
+
+    selection = gaussian_survey(mattrs, paint=True)
+    norm = compute_normalization(selection, selection)
+    #selection = selection.clone(value=selection.value.at[...].set(1.))
+    #sbin = BinMesh2CorrelationPoles(selection, edges={'step': selection.attrs.cellsize.min()}, ells=(0,))
+    from jaxpower import get_smooth2_window_bin_attrs, interpolate_window_function
+    kw = get_smooth2_window_bin_attrs(ells, ellsin)
+    los = 'local'
+
+    from jaxpower.utils import plotter
+
+    @plotter
+    def plot_xi(self, fig=None):
+        from matplotlib import pyplot as plt
+        if fig is None:
+            fig, ax = plt.subplots()
+        else:
+            ax = fig.axes[0]
+        for ill, ell in enumerate(self.ells):
+            pole = self.get(ells=ell)
+            color = f'C{ill:d}'
+            ax.plot(pole.coords('s'), pole.value().real, color=color, label=f'$\ell={ell}$')
+        ax.legend()
+        ax.grid(True)
+        ax.set_xscale('log')
+        return fig
+
+    #kw['ells'] = [0, 2, 4]
+    sbin = BinMesh2CorrelationPoles(selection, edges=None, **kw)
+    xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
+
+    xis = []
+    for scale in [1, 4]:
+        selection = gaussian_survey(mattrs, mattrs=mattrs.clone(boxsize=scale * mattrs.boxsize), paint=True)
+        sbin = BinMesh2CorrelationPoles(selection, edges={'step': 2 * selection.attrs.cellsize[0]}, **kw, basis='bessel', batch_size=12)
+        xi = compute_mesh2_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
+        xis.append(xi)
+    large = xis[1]
+    coords = jnp.logspace(-3, 4, 4 * 1024)
+    xis = [interpolate_window_function(xi, coords=coords, order=3) for xi in xis]
+    limits = [0, 0.4 * mattrs.boxsize[0], 2. * mattrs.boxsize[0]]
+    weights = [jnp.maximum((coords >= limits[i]) & (coords < limits[i + 1]), 1e-10) for i in range(len(limits) - 1)]
+    xi2 = xis[0].sum(xis, weights=weights)
+    if plot:
+        from matplotlib import pyplot as plt
+        ax = plot_xi(xi2).axes[0]
+        for ill, ell in enumerate(large.ells):
+            pole = large.get(ells=ell)
+            color = f'C{ill:d}'
+            ax.plot(pole.coords('s'), pole.value().real, color=color, linestyle='--')
+        plt.show()
+
+    if False:
+        kbin = BinMesh2SpectrumPoles(selection, edges=None, **kw)
+        pk = compute_mesh2_spectrum(selection, bin=kbin, los=los).clone(norm=[norm] * len(kbin.ells))
+        xi = pk.to_correlation(s=jnp.arange(0.001, mattrs.boxsize[0], mattrs.cellsize[0]))
+        if plot:
+            plot_xi(xi, show=True)
+
+    wmatrix = compute_smooth2_spectrum_window(xi, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    wmatrix2 = compute_smooth2_spectrum_window(xi2, edgesin=edgesin, ellsin=ellsin, bin=bin, flags=('fftlog',))
+    #wmatrix2.plot(show=True)
+    wpoles = wmatrix.dot(poles.ravel(), return_type=None)
+    wpoles2 = wmatrix2.dot(poles.ravel(), return_type=None)
+    if plot:
+        ax = plt.gca()
+        for ill, ell in enumerate(wpoles.ells):
+            ax.plot(kin, kin * poles[ill], color='k')
+            pole = wpoles.get(ells=ell)
+            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color='C1')
+            pole = wpoles2.get(ells=ell)
+            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color='C2')
+        plt.show()
 
 
 def test_sympy():

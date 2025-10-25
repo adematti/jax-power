@@ -1524,7 +1524,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         - boxcenter : array, box center
         - meshsize : array, shape of mesh.
     """
-    if boxsize is None or boxcenter is None or check:
+    if boxsize is None or boxcenter is None or (positions and check):
         if not positions:
             raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
         # Find bounding coordinates
@@ -1563,9 +1563,14 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                 meshsize = (meshsize + shape_devices - 1) // shape_devices * shape_devices  # to make it a multiple of devices
             toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
+            if not positions:
+                if not np.allclose(toret['boxsize'], boxsize):
+                    raise ValueError(f"cannot enforce cellsize = {cellsize} with meshsize = {meshsize}, as it would lead to boxsize = {toret['boxsize']} != input boxsize = {boxsize}")
         else:
             raise ValueError('meshsize (or cellsize) must be specified')
     else:
+        if cellsize is not None:
+            raise ValueError('cannot specify both meshsize and cellsize')
         meshsize = _np_array_fill(meshsize, ndim, dtype='i4')
         toret['meshsize'] = meshsize
     boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=rdtype)
