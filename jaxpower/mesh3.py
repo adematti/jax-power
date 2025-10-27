@@ -28,35 +28,31 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
         ndim = 2
         mattrs = mattrs.clone(dtype=mattrs.cdtype)
 
+    # Argument after e.q. 53 of https://arxiv.org/pdf/1512.07295
     if mask_edges is None:
         if 'scoccimarro' in basis:
-            mask_edges = '1<=2,2<=3'
-        else:
-            mask_edges = '1<=2'
+            mask_edges = ['mid1 <= mid2', 'mid2 <= mid3']
+            mask_edges += ['(mid3 >= jnp.abs(mid1 - mid2)) & (mid3 <= jnp.abs(mid1 + mid2))']
+            mask_edges += ['(edge1 + edge2 + edge3)[:, 1] <= 2 * nyq']
+        else:  # sugiyama
+            mask_edges = ['mid1 <= mid2']
+            mask_edges += ['(edge1 + edge2)[:, 1] <= nyq']
     if isinstance(mask_edges, str):
         mask_edges = mask_edges.strip()
-        mask_edges_list = mask_edges.split(',')
+        mask_edges = tuple(mask_edges.split(';'))
+    if isinstance(mask_edges, (list, tuple)):
+        mask_edges_list = mask_edges
 
         def mask_edges(*edges):
-            xmids = [np.mean(edge, axis=-1) for edge in edges]
-            mask = np.ones_like(xmids[0], dtype=bool)
+            mask = np.ones_like(edges[0], shape=edges[0].shape[0], dtype=bool)
+            d = {'nyq': vecmax}
+            for i, edge in enumerate(edges):
+                d[f'mid{i + 1:d}'] = np.mean(edge, axis=-1)
+                d[f'edge{i + 1:d}'] = edge
             for c in mask_edges_list:
                 c = c.strip()
                 if not c: continue
-                xmid = xmids[int(c[0]) - 1], xmids[int(c[-1]) - 1]
-                symbol = c[1:-1]
-                if symbol == '==':
-                    mask &= xmid[0] == xmid[1]
-                elif symbol == '<=':
-                    mask &= xmid[0] <= xmid[1]
-                elif symbol == '>=':
-                    mask &= xmid[0] >= xmid[1]
-                elif symbol == '<':
-                    mask &= xmid[0] < xmid[1]
-                elif symbol == '>':
-                    mask &= xmid[0] > xmid[1]
-                else:
-                    raise ValueError(f'constraint {symbol} not understood')
+                mask &= eval(c, {'np': np, 'jnp': jnp}, d)
             return mask
 
     wmodes = None
@@ -71,21 +67,26 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
 
     if edges is None:
         edges = {}
-    if isinstance(edges, dict):
-        step = edges.get('step', None)
-        if step is None:
-            edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
-        else:
-            edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
-
     if not isinstance(edges, (tuple, list)):
         edges = [edges] * ndim
+    edges = list(edges)
+    for iedge, edge in enumerate(edges):
+        if isinstance(edge, dict):
+            step = edge.get('step', None)
+            vecmax = vec0 * np.min(mattrs.meshsize) / 2.
+            if step is None:
+                edge = _find_unique_edges(vec, vec0, xmin=edge.get('min', 0.), xmax=edge.get('max', np.inf))
+            else:
+                edge = np.arange(edge.get('min', 0.), edge.get('max', vecmax), step)
+        else:
+            edge = np.asarray(edge)
+        edges[iedge] = edge
 
     ells = _format_ells(ells, basis=basis)
 
     coords = jnp.sqrt(sum(xx**2 for xx in vec))
     ibin1d, nmodes1d, xavg1d, edges1d = [], [], [], []
-    for edge in edges:
+    for edge in edges[:ndim]:
         ib, nm, x = _get_bin_attrs(coords, edge, wmodes, ravel=False)
         ib = ib - 1
         x /= nm
@@ -113,17 +114,12 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
 
     # of shape (nbins, ndim, 2)
     edges = jnp.concatenate([_product([edge[..., 0] for edge in edges1d])[..., None], _product([edge[..., 1] for edge in edges1d])[..., None]], axis=-1)
-    mask = mask_edges(*[edges[:, i, :] for i in range(ndim)])
+    list_edges = [edges[:, i, :] for i in range(ndim)]
+    mask = mask_edges(*list_edges)
     edges = edges[mask]
     xavg = _product(xavg1d)[mask]
     nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
     iedges = _product([jnp.arange(len(xx)) for xx in nmodes1d])[mask]
-
-    if 'scoccimarro' in basis:
-        xmid = jnp.mean(edges, axis=-1).T
-        mask = (xmid[2] >= jnp.abs(xmid[0] - xmid[1])) & (xmid[2] <= jnp.abs(xmid[0] + xmid[1]))
-        xmid, edges, xavg, nmodes, iedges = xmid[..., mask], edges[mask], xavg[mask], nmodes[mask], iedges[mask]
-
     nmodes = [nmodes] * len(ells)
 
     if 'diagonal' in basis:
@@ -389,7 +385,6 @@ class BinMesh3CorrelationPoles(object):
         def bin(axis, ibin):
             x = knorm * self.xavg1d[axis][ibin]
             jn = jns[axis](x)
-            #jn = x
             return self.mattrs.c2r(values[axis] * jn)
 
         def reduce(meshes):
@@ -567,7 +562,8 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 Ylms = [get_Ylm(ell3, m, reduced=False, real=True) for m in range(-ell3, ell3 + 1)]
                 xs = np.arange(len(Ylms))
                 tmp = tuple(meshes[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshes[0].clone(value=jnp.zeros_like(meshes[0].value)), xs=xs)[0],)
-                tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
+                #tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
+                tmp = (2 * ell3 + 1) * bin(*tmp) / bin.nmodes[ill3]
                 num.append(tmp)
 
         else:
@@ -591,7 +587,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
             los = xvec if vlos is None else vlos
             tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp) # remove_zero=True)
+            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp) #, remove_zero=True)
             carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
             return carry, im
 
@@ -701,7 +697,6 @@ from .mesh2 import compute_normalization, compute_box_normalization
 def compute_box3_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh3SpectrumPoles=None) -> jax.Array:
     """Compute normalization, assuming constant density, for the bispectrum."""
     return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
-
 
 
 def _split_particles(*particles, seed=0):
@@ -828,7 +823,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
 
 
 
-def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, **kwargs):
+def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
     """
     Compute the FKP shot noise for the bispectrum.
 
@@ -869,7 +864,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
-    kwargs.update(resampler=resampler, interlacing=interlacing)
+    kwargs.update(resampler=resampler, interlacing=interlacing, compensate=compensate)
 
     from . import resamplers
     resampler = resamplers.get_resampler(resampler)
@@ -977,7 +972,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
             # In jaxpower, we always compensate by the standard compensate
             #if convention == 'triumvirate' and not interlacing:
             if not interlacing:
-                return s111 * resampler.aliasing_shotnoise(1., kcirc) * resampler.compensate(1., kcirc)**2
+                return s111 * resampler.aliasing_shotnoise(1., kcirc) * (resampler.compensate(1., kcirc)**2 if compensate else 1.)
             return s111
 
         def compute_S122(particles, ells, axis):  # 1 == 2
@@ -1085,7 +1080,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     return list(shotnoise)
 
 
-def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, **kwargs):
+def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
     """
     Compute the FKP shot noise for the 3pcf.
 
@@ -1125,7 +1120,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
     # ells
     ells = bin.ells
     shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
-    kwargs.update(resampler=resampler, interlacing=interlacing)
+    kwargs.update(resampler=resampler, interlacing=interlacing, compensate=compensate)
 
     from . import resamplers
     resampler = resamplers.get_resampler(resampler)
@@ -1178,7 +1173,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
             # In jaxpower, we always compensate by the standard compensate
             #if convention == 'triumvirate' and not interlacing:
             if not interlacing:
-                return s111 * resampler.aliasing_shotnoise(1., kcirc) * resampler.compensate(1., kcirc)**2
+                return s111 * resampler.aliasing_shotnoise(1., kcirc) * (resampler.compensate(1., kcirc)**2 if compensate else 1.)
             return s111
 
         def compute_S122(particles, ells, axis):  # 1 == 2

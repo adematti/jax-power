@@ -30,10 +30,11 @@ def _make_edges2(mattrs, edges, ells, kind='complex', mode_oversampling=0):
         edges = {}
     if isinstance(edges, dict):
         step = edges.get('step', None)
+        vecmax = vec0 * np.min(mattrs.meshsize) / 2.
         if step is None:
             edges = _find_unique_edges(vec, vec0, xmin=edges.get('min', 0.), xmax=edges.get('max', np.inf))
         else:
-            edges = np.arange(edges.get('min', 0.), edges.get('max', vec0 * np.min(mattrs.meshsize) / 2.), step)
+            edges = np.arange(edges.get('min', 0.), edges.get('max', vecmax), step)
     if edges.ndim == 2:  # coming from ObservableTree
         assert np.allclose(edges[1:, 0], edges[:-1, 1])
         edges = np.append(edges[:, 0], edges[-1, 1])
@@ -172,8 +173,8 @@ class BinMesh2CorrelationPoles(object):
             knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
 
             def bin(ibin):
-                x = knorm * self.xavg[ibin]
-                return (-1)**(ell // 2) * jnp.sum(value * jn(x)) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
+                j = jn(knorm * self.xavg[ibin]) #* (knorm < self.mattrs.knyq.min())
+                return (-1)**(ell // 2) * jnp.sum(value * j) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
 
             return jax.lax.map(bin, jnp.arange(len(self.xavg)), batch_size=self.batch_size)
         else:
