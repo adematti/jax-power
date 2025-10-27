@@ -438,7 +438,7 @@ _registered_bessel[10] = (lambda x: (-55/x**2 + 25740/x**4 - 2837835/x**6 + 9189
 def get_spherical_jn(ell):
 
     def jn(x):
-        mask = x > 0.01
+        mask = x > 0.1
         bessel = _registered_bessel[ell]
         return jnp.where(mask, bessel[0](x), bessel[1](x))
 
@@ -468,23 +468,18 @@ class BesselIntegral(object):
             norm = (-1)**(ell // 2)
         else:
             norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
-        xmin = 0.01
         if method == 'rect':
             w = norm
             x = xeval * xp
-            mask = x > xmin
-            bessel = _registered_bessel[ell]
-            self.w = norm * jnp.where(mask, bessel[0](x), bessel[1](x))
-            #self.w = norm * get_spherical_jn(ell)(x)
+            self.w = norm * get_spherical_jn(ell)(x)
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         elif method == 'trapz':
             x = xeval[..., None] * edges
-            mask = x > xmin
-            bessel = _registered_bessel[ell]
-            self.w = norm * jnp.sum(jnp.where(mask, bessel[0](x), bessel[1](x)), axis=-1) / 2.
+            self.w = norm * jnp.sum(get_spherical_jn(ell)(x), axis=-1) / 2.
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         else:  # exact
             x = xeval[..., None] * edges
+            xmin = 0.1
             mask = x > xmin
             tophat = _registered_bessel_tophat_integral[ell]
             w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3

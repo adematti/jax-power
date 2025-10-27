@@ -103,7 +103,7 @@ CovarianceMatrix = make_covariance_pytree(CovarianceMatrix)
 
 
 
-def _correlation_to_spectrum(correlation, k):
+def observable_correlation_to_spectrum(correlation, k):
     """
     Convert the correlation function multipoles to power spectrum multipoles.
 
@@ -151,7 +151,7 @@ def _correlation_to_spectrum(correlation, k):
     return pole_to_spectrum(correlation)
 
 
-def _spectrum_to_correlation(spectrum, s):
+def observable_spectrum_to_correlation(spectrum, s):
     """
     Convert the power spectrum multipoles to correlation function multipoles.
 
@@ -200,8 +200,8 @@ def _spectrum_to_correlation(spectrum, s):
     return pole_to_correlation(spectrum)
 
 
-Mesh2SpectrumPole.to_correlation = _spectrum_to_correlation
-Mesh2SpectrumPoles.to_correlation = _spectrum_to_correlation
+Mesh2SpectrumPole.to_correlation = observable_spectrum_to_correlation
+Mesh2SpectrumPoles.to_correlation = observable_spectrum_to_correlation
 
 
 class Particle2SpectrumPole(Mesh2SpectrumPole): pass
@@ -222,7 +222,7 @@ class Particle2CorrelationPole(Mesh2CorrelationPole):
         -------
         Particle2SpectrumPole
         """
-        return _correlation_to_spectrum(self, k)
+        return observable_correlation_to_spectrum(self, k)
 
 class Particle2CorrelationPoles(Mesh2CorrelationPoles):
 
@@ -239,4 +239,4 @@ class Particle2CorrelationPoles(Mesh2CorrelationPoles):
         -------
         Particle2SpectrumPoles
         """
-        return _correlation_to_spectrum(self, k)
+        return observable_correlation_to_spectrum(self, k)

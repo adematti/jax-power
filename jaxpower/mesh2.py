@@ -140,14 +140,15 @@ class BinMesh2CorrelationPoles(object):
     ells: tuple = None
     basis: str = None
     batch_size: int = None
+    kcut: tuple = None
     mattrs: MeshAttrs = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, batch_size: int=None):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, kcut=None, batch_size: int=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
         kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='real', mode_oversampling=mode_oversampling)
         kw.pop('wmodes')
-        kw.update(basis=basis, batch_size=batch_size)
+        kw.update(basis=basis, batch_size=batch_size, kcut=kcut)
         self.__dict__.update(kw)
 
     def __call__(self, mesh, ell=0, remove_zero=False):
@@ -173,7 +174,8 @@ class BinMesh2CorrelationPoles(object):
             knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
 
             def bin(ibin):
-                j = jn(knorm * self.xavg[ibin]) #* (knorm < self.mattrs.knyq.min())
+                j = jn(knorm * self.xavg[ibin])
+                if self.kcut is not None: j *= (knorm >= self.kcut[0]) * (knorm < self.kcut[1])
                 return (-1)**(ell // 2) * jnp.sum(value * j) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
 
             return jax.lax.map(bin, jnp.arange(len(self.xavg)), batch_size=self.batch_size)
@@ -849,6 +851,12 @@ def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2Spectru
         if isinstance(fkp, FKPField):
             particles = fkp.particles
         shotnoise = jnp.sum(particles.weights**2)
+        kcut = getattr(bin, 'kcut', None)
+        if kcut is not None:  # count number of modes
+            kvec = bin.mattrs.kcoords(sparse=True)
+            knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
+            shotnoise *= jnp.sum((knorm >= kcut[0]) & (knorm <= kcut[-1])) / knorm.size
+            del knorm
     else:
         shotnoise = 0.
     if bin is not None:
