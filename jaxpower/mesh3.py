@@ -40,6 +40,7 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
     if isinstance(mask_edges, str):
         mask_edges = mask_edges.strip()
         mask_edges = tuple(mask_edges.split(';'))
+
     if isinstance(mask_edges, (list, tuple)):
         mask_edges_list = mask_edges
 
@@ -64,6 +65,7 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
     else:
         vec = mattrs.xcoords(kind='separation', sparse=True)
         vec0 = mattrs.cellsize.min()
+    vecmax = vec0 * np.min(mattrs.meshsize) / 2.
 
     if edges is None:
         edges = {}
@@ -73,7 +75,6 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
     for iedge, edge in enumerate(edges):
         if isinstance(edge, dict):
             step = edge.get('step', None)
-            vecmax = vec0 * np.min(mattrs.meshsize) / 2.
             if step is None:
                 edge = _find_unique_edges(vec, vec0, xmin=edge.get('min', 0.), xmax=edge.get('max', np.inf))
             else:
@@ -167,7 +168,7 @@ def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch
     else:
         _buffer_iedges = None
 
-    return dict(edges=edges, ibin1d=tuple(ibin1d), nmodes1d=tuple(nmodes1d), xavg1d=tuple(xavg1d), nmodes=nmodes, xavg=xavg, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size, _iedges=iedges, _buffer_iedges=_buffer_iedges, ells=ells)
+    return dict(edges=edges, ibin1d=tuple(ibin1d), edges1d=tuple(edges1d), nmodes1d=tuple(nmodes1d), xavg1d=tuple(xavg1d), nmodes=nmodes, xavg=xavg, wmodes=wmodes, mattrs=mattrs, basis=basis, batch_size=batch_size, buffer_size=buffer_size, _iedges=iedges, _buffer_iedges=_buffer_iedges, ells=ells)
 
 
 @partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
@@ -206,6 +207,7 @@ class BinMesh3SpectrumPoles(object):
     batch_size: int = 1
     buffer_size: int = 0
     ells: tuple = None
+    edges1d: tuple = None
 
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
         if not isinstance(mattrs, MeshAttrs):
@@ -342,6 +344,7 @@ class BinMesh3CorrelationPoles(object):
     batch_size: int = 1
     buffer_size: int = 0
     ells: tuple = None
+    edges1d: tuple = None
 
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
         if not isinstance(mattrs, MeshAttrs):
@@ -1367,7 +1370,7 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
     return ellw
 
 
-def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None) -> WindowMatrix:
+def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None, flags: tuple=None) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 

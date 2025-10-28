@@ -2041,9 +2041,15 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
             if antisymmetric: value = value.imag
             else: value = value.real
             value *= weights
-        count = lambda ib: jnp.bincount(ib, weights=value, length=length + 2)
+
+        def count(ib):
+            return jnp.bincount(ib, weights=value, length=length + 2)
+
         if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
-            count = lambda ib: jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
+
+            def count(ib):
+                return jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
+
         value = sum(count(ib.ravel() if ib.ndim > 1 else ib) for ib in ibin)
         return value[1:-1] / len(ibin)
 
