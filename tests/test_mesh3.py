@@ -712,7 +712,7 @@ def test_smooth_window(plot=False):
     norm = compute_normalization(selection, selection, selection)
 
     from jaxpower import get_smooth3_window_bin_attrs, interpolate_window_function
-    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=0, return_ellsin=True)
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=2, return_ellsin=True)
     poles = [1. / (1 + sum(ell)) * bk for ell in ellsin]
 
     from jaxpower.utils import plotter
@@ -734,55 +734,51 @@ def test_smooth_window(plot=False):
         return fig
 
     los = 'local'
-
-    sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * selection.attrs.cellsize[0]}, **kw, batch_size=12)
-    zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
-    zeta = zeta.unravel()
-    if plot:
-        plot_zeta(zeta, show=True)
-
-    zetas = []
-    for scale in [1, 4]:
-        selection = gaussian_survey(mattrs, mattrs=mattrs.clone(boxsize=scale * mattrs.boxsize), paint=True)
+    if False:
         sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * selection.attrs.cellsize[0]}, **kw, batch_size=12)
         zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
-        zetas.append(zeta.unravel())
-
-    coords = jnp.logspace(-3, 4, 1024)
-    xis = [interpolate_window_function(zeta, coords=coords, order=3) for zeta in zetas]
-    limit = 0.4 * mattrs.boxsize[0]
-    coords = list(next(iter(xis[0])).coords().values())
-    mask = (coords[0] < limit)[:, None] * (coords[1] < limit)[None, :]
-    weights = [jnp.maximum(mask, 1e-6), jnp.maximum(~mask, 1e-6)]
-    zeta2 = zetas[0].sum(xis, weights=weights)
-    if plot:
-        plot_zeta(zeta2, show=True)
-
-    if False:
-        sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * mattrs.cellsize[0]}, **kw)
-        zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
-        #for label in zeta.labels(): print(label, zeta.get(**label).value())
-        if plot:
-            zeta.plot(show=True)
         zeta = zeta.unravel()
         if plot:
             plot_zeta(zeta, show=True)
-            zeta.plot(show=True)
 
+    fn = '_tests/zeta.h5'
+    if False:
+        zetas = []
+        for scale in [1, 4]:
+            selection = gaussian_survey(mattrs, mattrs=mattrs.clone(boxsize=scale * mattrs.boxsize), paint=True)
+            sbin = BinMesh3CorrelationPoles(selection, edges={'step': 2 * selection.attrs.cellsize[0]}, **kw, batch_size=12)
+            zeta = compute_mesh3_correlation(selection, bin=sbin, los=los).clone(norm=[norm] * len(sbin.ells))
+            zetas.append(zeta.unravel())
+
+        coords = jnp.logspace(-3, 4, 1024)
+        xis = [interpolate_window_function(zeta, coords=coords, order=3) for zeta in zetas]
+        limit = 0.4 * mattrs.boxsize[0]
+        coords = list(next(iter(xis[0])).coords().values())
+        mask = (coords[0] < limit)[:, None] * (coords[1] < limit)[None, :]
+        weights = [jnp.maximum(mask, 1e-6), jnp.maximum(~mask, 1e-6)]
+        zeta2 = zetas[0].sum(xis, weights=weights)
+        if plot:
+            plot_zeta(zeta2, show=True)
+        zeta2.write(fn)
+
+    zeta2 = read(fn)
     wmatrix = compute_smooth3_spectrum_window(zeta2, edgesin=edgesin, ellsin=ellsin, bin=bin)
     wpoles = wmatrix.dot(np.concatenate([p.ravel() for p in poles]), return_type=None)
     if plot:
         ax = plt.gca()
-        for ill, ell in enumerate(wpoles.ells[:1]):
+        for ill, ell in enumerate(wpoles.ells):
+            color = f'C{ill:d}'
             pole = wpoles.get(ells=ell)
             factor = pole.coords('k').prod(axis=-1)
-            ax.plot(factor * pole.value(), color='C1')
+            ax.plot(factor * pole.value(), color=color, linestyle='-')
+            print(ell, ellsin)
+            ell = tuple(sorted(ell[:2])) + ell[2:]
             if ell in ellsin:
                 i = ellsin.index(ell)
                 from scipy import interpolate
                 spline = interpolate.RectBivariateSpline(*kin, poles[i], kx=1, ky=1, s=0)
                 pole = spline(*pole.coords('k').T, grid=False)
-                ax.plot(factor * pole, color='k')
+                ax.plot(factor * pole, color=color, linestyle=':')
         plt.show()
 
 

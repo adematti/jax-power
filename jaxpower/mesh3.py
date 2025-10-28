@@ -402,12 +402,12 @@ def _format_meshes(*meshes):
     and a list of indices corresponding to the mesh they are equal to."""
     meshes = list(meshes)
     meshes = meshes + [None] * (3 - len(meshes))
-    same = [0]
-    for mesh in meshes[1:]: same.append(same[-1] if mesh is None else same[-1] + 1)
+    ifields = [0]
+    for mesh in meshes[1:]: ifields.append(ifields[-1] if mesh is None else ifields[-1] + 1)
     for imesh, mesh in enumerate(meshes):
         if mesh is None:
             meshes[imesh] = meshes[imesh - 1]
-    return meshes, tuple(same)
+    return meshes, tuple(ifields)
 
 
 def _format_ells(ells, basis: str='sugiyama'):
@@ -523,7 +523,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     -------
     result : Mesh3SpectrumPoles
     """
-    meshes, same = _format_meshes(*meshes)
+    meshes, ifields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     if 'sugiyama' in bin.basis:
@@ -631,7 +631,7 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     -------
     result : Mesh3CorrelationPoles
     """
-    meshes, same = _format_meshes(*meshes)
+    meshes, ifields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     if 'sugiyama' in bin.basis:
@@ -772,10 +772,10 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
         randoms = _split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
-        fkps, same = _format_meshes(*fkps)
+        fkps, ifields = _format_meshes(*fkps)
         fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
     else:
-        fkps, same = _format_meshes(*fkps)
+        fkps, ifields = _format_meshes(*fkps)
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
@@ -858,7 +858,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     shotnoise : list
         Shot noise for each multipole.
     """
-    fkps, same = _format_meshes(*fkps)
+    fkps, ifields = _format_meshes(*fkps)
     mattrs = fkps[0].attrs
     if 'sugiyama' in bin.basis:
         mattrs = mattrs.clone(dtype=mattrs.cdtype)
@@ -877,11 +877,11 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         nmodes1d = bin.nmodes1d[axis]
         return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
-    if same[2] == same[1] + 1 == same[0] + 2:
+    if ifields[2] == ifields[1] + 1 == ifields[0] + 2:
         return tuple(shotnoise)
 
     particles = []
-    for fkp, s in zip(fkps, same):
+    for fkp, s in zip(fkps, ifields):
         if s < len(particles):
             particles.append(particles[s])
         else:
@@ -900,7 +900,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     if 'scoccimarro' in bin.basis:
 
         # Eq. 58 of https://arxiv.org/pdf/1506.02729, 1 => 3
-        if not (same[0] == same[1] == same[2]):
+        if not (ifields[0] == ifields[1] == ifields[2]):
             raise NotImplementedError
         cmeshw = particles[0].paint(**kwargs, out='complex')
         cmeshw = cmeshw.clone(value=cmeshw.value.at[(0,) * cmeshw.ndim].set(0.))  # remove zero-mode
@@ -1040,13 +1040,13 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         uells = sorted(sum(ells, start=tuple()))
         ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
         s111 = [0.] * len(ellms)
-        if same[0] == same[1] == same[2]:
+        if ifields[0] == ifields[1] == ifields[2]:
             s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
             if ell0 in ells:
                 shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))]
 
-        if same[1] == same[2]:
+        if ifields[1] == ifields[2]:
             def select(ell):
                 return ell[2] == ell[0] and ell[1] == 0
 
@@ -1060,7 +1060,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                         idx = ells1.index(ell[0])
                         shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
 
-        if same[0] == same[2]:
+        if ifields[0] == ifields[2]:
             def select(ell):
                 return ell[2] == ell[1] and ell[0] == 0
 
@@ -1073,7 +1073,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                         idx = ells2.index(ell[1])
                         shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
 
-        if same[0] == same[1]:
+        if ifields[0] == ifields[1]:
             s113 = compute_S113(particles, ells)
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
@@ -1115,7 +1115,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
     shotnoise : list
         Shot noise for each multipole.
     """
-    fkps, same = _format_meshes(*fkps)
+    fkps, ifields = _format_meshes(*fkps)
     mattrs = fkps[0].attrs
     if 'sugiyama' in bin.basis:
         mattrs = mattrs.clone(dtype=mattrs.cdtype)
@@ -1133,11 +1133,11 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
         nmodes1d = bin.nmodes1d[axis]
         return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
-    if same[2] == same[1] + 1 == same[0] + 2:
+    if ifields[2] == ifields[1] + 1 == ifields[0] + 2:
         return tuple(shotnoise)
 
     particles = []
-    for fkp, s in zip(fkps, same):
+    for fkp, s in zip(fkps, ifields):
         if s < len(particles):
             particles.append(particles[s])
         else:
@@ -1248,14 +1248,14 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
         uells = sorted(sum(ells, start=tuple()))
         ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
         s111 = [0.] * len(ellms)
-        if same[0] == same[1] == same[2]:
+        if ifields[0] == ifields[1] == ifields[2]:
             s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
             mask_shotnoise = jnp.all((bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.), axis=1)
             if ell0 in ells:
                 shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))] * mask_shotnoise
 
-        if same[1] == same[2]:
+        if ifields[1] == ifields[2]:
             def select(ell):
                 return ell[2] == ell[0] and ell[1] == 0
 
@@ -1272,7 +1272,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                         idx = ells1.index(ell[0])
                         shotnoise[ill] += s122[idx][bin._iedges[..., 0]] * mask_shotnoise
 
-        if same[0] == same[2]:
+        if ifields[0] == ifields[2]:
             def select(ell):
                 return ell[2] == ell[1] and ell[0] == 0
 
@@ -1288,7 +1288,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                         idx = ells2.index(ell[1])
                         shotnoise[ill] += s121[idx][bin._iedges[..., 1]] * mask_shotnoise
 
-        if same[0] == same[1]:
+        if ifields[0] == ifields[1]:
             s113 = compute_S113(particles, ells)
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
@@ -1303,6 +1303,7 @@ def get_sugiyama_window_convolution_coeffs(ell, ellt):  # observed ell, theory e
     # ell = (ell_1, ell_2, L)
     # ellt = (ell_1', ell_2', L')
     coeffs = []
+    #for ellw in itertools.product(*([range(max(ell) + max(ellt) + 1)] * 3)):
     for ellw in itertools.product(*[range(ell_ + ellt_ + 1) for ell_, ellt_ in zip(ell, ellt)]):
         if sum(ellw) % 2: continue
         if ellw[2] % 2: continue
@@ -1317,7 +1318,7 @@ def get_sugiyama_window_convolution_coeffs(ell, ellt):  # observed ell, theory e
 
 
 
-def get_smooth3_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
+def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bool=False):
     """
     Get the window bin attributes for sugiyama basis.
 
@@ -1327,18 +1328,23 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
         Observed multipole orders.
     ellsin : tuple
         Theory multipole orders.
+    ifields : tuple, list, optional
+        3-tuple or 3-list of field identifiers, e.g. [1, 1, 1] if all 3 fields are the ifields,
+        [1, 2, 3] if all different. To take advantage of symmetries.
 
     Returns
     -------
     dict
     """
+    if ifields is None:
+        ifields = [1, 1, 1]
     if isinstance(ellsin, numbers.Number):
         nellsin = ellsin
         ellsin = []
         for ellin in itertools.product(*[range(nellsin + 1) for _ in range(3)]):
             if sum(ellin) % 2: continue
             if ellin[2] % 2: continue
-            ellin = tuple(sorted(ellin[:2])) + ellin[2:]
+            if ifields[1] == ifields[0]: ellin = tuple(sorted(ellin[:2])) + ellin[2:]
             if ellin not in ellsin:
                 ellsin.append(ellin)
     with_wide_angle = any(isinstance(ellin[0], tuple) for ellin in ellsin)
@@ -1352,7 +1358,7 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
             if coeffs and (ell1, wa1) not in non_zero_ellsin:
                 non_zero_ellsin.append((ell1, wa1))
             for ell, _ in coeffs:
-                ell = tuple(sorted(ell[:2])) + ell[2:]
+                if ifields[1] == ifields[0]: ell = tuple(sorted(ell[:2])) + ell[2:]
                 if ell not in ellw[wa1]: ellw[wa1].append(ell)
     for wa in ellw:
         ellw[wa] = sorted(set(ellw[wa]))
@@ -1459,6 +1465,10 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     return jnp.zeros(())
 
                 Qs = sum(coeff * get_w_rect(q) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, ell1))
+                sym_ell1 = tuple(ell1[1::-1]) + ell1[2:]
+                # Takes care of symmetry
+                if ell1[1] != ell1[0] and (sym_ell1, wa1) not in ellsin:
+                    Qs += sum(coeff * get_w_rect(q) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, sym_ell1))
 
                 # fftlog
                 from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum

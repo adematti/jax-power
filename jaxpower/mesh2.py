@@ -201,12 +201,12 @@ def _format_meshes(*meshes):
     meshes = list(meshes)
     assert 1 <= len(meshes) <= 2
     meshes = meshes + [None] * (2 - len(meshes))
-    same = [0]
-    for mesh in meshes[1:]: same.append(same[-1] if mesh is None else same[-1] + 1)
+    ifields = [0]
+    for mesh in meshes[1:]: ifields.append(ifields[-1] if mesh is None else ifields[-1] + 1)
     for imesh, mesh in enumerate(meshes):
         if mesh is None:
             meshes[imesh] = meshes[imesh - 1]
-    return meshes, same[1] == same[0]
+    return meshes, ifields[1] == ifields[0]
 
 
 def _format_ells(ells):
@@ -1143,8 +1143,12 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                     correlation = correlation * Qs * to_correlation.s**wa1
                     return jnp.interp(kout, to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)
 
-                tmp = jax.jacfwd(convolve)(jnp.zeros_like(edgesin[..., 0]))
-                #tmp = jnp.zeros_like(tmp, shape=(len(ells) * tmp.shape[0], tmp.shape[1])).at[ill * tmp.shape[0]:(ill + 1) * tmp.shape[0]].set(tmp).T
+                #tmp = jax.jacfwd(convolve)(jnp.zeros_like(edgesin[..., 0]))
+                def f(idxin):
+                    theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
+                    return convolve(theory)
+
+                tmp = jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
 
             wmat_tmp[ell1, wa1].append(tmp)
         wmat_tmp[ell1, wa1] = jnp.concatenate(wmat_tmp[ell1, wa1], axis=0)
