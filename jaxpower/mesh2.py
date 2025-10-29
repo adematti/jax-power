@@ -170,13 +170,12 @@ class BinMesh2CorrelationPoles(object):
         if self.basis == 'bessel':
             if remove_zero:
                 value = value.at[(0,) * value.ndim].set(0.)
-            jn = get_spherical_jn(ell)
             knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
 
             def bin(ibin):
-                j = jn(knorm * self.xavg[ibin])
-                if self.kcut is not None: j *= (knorm >= self.kcut[0]) * (knorm < self.kcut[1])
-                return (-1)**(ell // 2) * jnp.sum(value * j) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
+                jn = get_spherical_jn(ell)(knorm * self.xavg[ibin])
+                if self.kcut is not None: jn *= (knorm >= self.kcut[0]) * (knorm < self.kcut[1])
+                return (-1)**(ell // 2) * jnp.sum(value * jn) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
 
             return jax.lax.map(bin, jnp.arange(len(self.xavg)), batch_size=self.batch_size)
         else:
@@ -851,12 +850,14 @@ def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2Spectru
         if isinstance(fkp, FKPField):
             particles = fkp.particles
         shotnoise = jnp.sum(particles.weights**2)
+        scale = 1.
         kcut = getattr(bin, 'kcut', None)
         if kcut is not None:  # count number of modes
             kvec = bin.mattrs.kcoords(sparse=True)
             knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-            shotnoise *= jnp.sum((knorm >= kcut[0]) & (knorm <= kcut[-1])) / knorm.size
+            scale = jnp.sum((knorm >= kcut[0]) & (knorm <= kcut[-1])) / knorm.size
             del knorm
+        shotnoise = scale * shotnoise
     else:
         shotnoise = 0.
     if bin is not None:
@@ -1292,13 +1293,13 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
 
         def _bin(Aell):
-            power = []
+            spectrum = []
             for ill, ell in enumerate(ells):
                 leg = get_legendre(ell)(mu)
                 odd = ell % 2
                 if odd: leg += get_legendre(ell)(-mu)
-                power.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=True) * rnorm[ill])
-            return jnp.concatenate(power)
+                spectrum.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg, remove_zero=True) * rnorm[ill])
+            return jnp.concatenate(spectrum)
 
         def my_map(f, xs):
             if pbar:
@@ -1336,11 +1337,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
 
                         batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
-                        power = jax.lax.map(f2, kout, batch_size=batch_size)
+                        spectrum = jax.lax.map(f2, kout, batch_size=batch_size)
 
                         if pbar:
                             t.update(n=round(1 / len(ells) / len(ellsin)))
-                        return (2 * ell + 1) * power* rnorm[ill]
+                        return (2 * ell + 1) * spectrum* rnorm[ill]
 
                     wmat_tmp.append(my_map(f, edgesin))
                 wmat.append(jnp.concatenate(wmat_tmp, axis=-1))
@@ -1356,10 +1357,10 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                     Aell = BesselIntegral(edgein, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * legin * mattrs.boxsize.prod(dtype=rdtype)
                     Aell = mattrs.create(kind='real', fill=Aell)
                     if Q is not None: Aell *= Q
-                    power = _bin(_2c(Aell))
+                    spectrum = _bin(_2c(Aell))
                     if pbar:
                         t.update(n=round(1 / len(ellsin)))
-                    return power
+                    return spectrum
 
                 wmat.append(my_map(f, edgesin))
 
@@ -1370,19 +1371,19 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
                 if common:
                     Aell = mattrs.create(kind='complex', fill=legin * mattrs.meshsize.prod(dtype=rdtype))
-                    power = _bin(Aell)
-                    wmat_ellin = jnp.zeros_like(power, shape=(edgesin.shape[0], power.size))
-                    wmat_ellin = wmat_ellin.at[jnp.tile(jnp.flatnonzero(mask_in), len(bin.ells)), jnp.tile(mask_edges, len(bin.ells))].set(power)
+                    spectrum = _bin(Aell)
+                    wmat_ellin = jnp.zeros_like(spectrum, shape=(edgesin.shape[0], spectrum.size))
+                    wmat_ellin = wmat_ellin.at[jnp.tile(jnp.flatnonzero(mask_in), len(bin.ells)), jnp.tile(mask_edges, len(bin.ells))].set(spectrum)
 
                 else:
 
                     def f(edgein):
                         Aell = mattrs.create(kind='complex', fill=((knorm >= edgein[0]) & (knorm < edgein[-1])) * legin * mattrs.meshsize.prod(dtype=rdtype))
                         if Q is not None: Aell = _2c(Q * _2r(Aell))
-                        power = _bin(Aell)
+                        spectrum = _bin(Aell)
                         if pbar:
                             t.update(n=round(1 / len(ellsin)))
-                        return power
+                        return spectrum
                     wmat_ellin = my_map(f, edgesin)
 
                 wmat.append(wmat_ellin)
@@ -1485,12 +1486,12 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                 return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
 
                             batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
-                            power = jax.lax.map(f2, kout, batch_size=batch_size) * rnorm[ill]
+                            spectrum = jax.lax.map(f2, kout, batch_size=batch_size) * rnorm[ill]
 
                             if pbar:
                                 t.update(n=round(1 / len(ells) / len(ellsin)))
-                            power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                            return power.ravel()
+                            spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                            return spectrum.ravel()
 
                         wmat_tmp[ell1, wa1] += my_map(f, edgesin)
 
@@ -1509,11 +1510,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
                             def f(edgein):
                                 tophat_Qs = BesselIntegral(edgein, snorm, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
-                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
-                                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                                return power.ravel()
+                                spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                                return spectrum.ravel()
                             wmat_tmp[ell1, wa1] += my_map(f, edgesin)
             else:
 
@@ -1539,12 +1540,12 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                    power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                    spectrum = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                     del Aell[ell]
                                     if pbar:
                                         t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell in ells)) / sum(len(Ylms[ell]) for ell, _ in ellsin))
-                                    power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                                    return power.ravel()
+                                    spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                                    return spectrum.ravel()
 
                                 wmat_tmp[ell1, wa1] += my_map(f, edgesin)
 
@@ -1558,14 +1559,14 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
-                            power = []
+                            spectrum = []
                             for ill, ell in enumerate(ells):
                                 Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
+                                spectrum.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
                                 del Aell[ell]
                             if pbar:
                                 t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell, _ in ellsin)))
-                            return jnp.concatenate(power)
+                            return jnp.concatenate(spectrum)
 
                         wmat_tmp[ell1, wa1] = my_map(f, edgesin)
 
@@ -1613,11 +1614,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Q)
 
                                 batch_size = int(min(max(mattrs.meshsize.prod(dtype=float) / savg.size, 1), kout.size))
-                                power = jax.lax.map(f2, kout, batch_size=batch_size) * rnorm[ill]
+                                spectrum = jax.lax.map(f2, kout, batch_size=batch_size) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1 / len(ells) / 6))
-                                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                                return power.ravel()
+                                spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                                return spectrum.ravel()
 
                             wmat_tmp[ell1, ell2] += my_map(f, edgesin)
 
@@ -1645,11 +1646,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     tophat = BesselIntegral(edgein, snorm, ell=p, edges=True, method=tophat_method, mode='backward').w[..., 0]
                                     Q = load_from_buffer(Qs[p])
                                     xi += tophat * Q
-                                power = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1 / sum(len(Ylms[ell]) for ell in ells) / 4))
-                                power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                                return power.ravel()
+                                spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                                return spectrum.ravel()
                             wmat_tmp[ell1, ell2] += my_map(f, edgesin)
 
             else:
@@ -1672,11 +1673,11 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                    power = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                    spectrum = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                     if pbar:
                                         t.update(n=round((im + 1) / sum(len(Ylms[ell]) for ell in ells) / 36))
-                                    power = jnp.zeros_like(power, shape=(len(ells), power.size)).at[ill].set(power)
-                                    return power.ravel()
+                                    spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
+                                    return spectrum.ravel()
                                 wmat_tmp[ell1, ell2] += my_map(f, edgesin)
 
                     if 'recompute' not in flags:
@@ -1691,14 +1692,14 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                 for ell in Aell:
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
-                            power = []
+                            spectrum = []
                             for ill, ell in enumerate(ells):
                                 Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                power.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
+                                spectrum.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
                                 del Aell[ell]
                             if pbar:
                                 t.update(n=round((im12 + 1) / 36))
-                            return jnp.concatenate(power)
+                            return jnp.concatenate(spectrum)
 
                         wmat_tmp[ell1, ell2] = my_map(f, edgesin)
 
@@ -1758,7 +1759,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
     Returns
     -------
-    power : Mesh2SpectrumPoles
+    spectrum : Mesh2SpectrumPoles
     """
     meshes, autocorr = _format_meshes(*meshes)
     periodic = isinstance(meshes[0], MeshAttrs)
@@ -1920,7 +1921,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
         if swap: num = list(map(jnp.conj, num))
-        # Format the power results into :class:`Mesh2SpectrumPoles` instance
+        # Format the spectrum results into :class:`Mesh2SpectrumPoles` instance
         spectrum = []
         for ill, ell in enumerate(ells):
             spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=jnp.ones_like(bin.xavg) * norm,

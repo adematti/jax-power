@@ -195,8 +195,9 @@ class BinMesh3SpectrumPoles(object):
 
     edges: jax.Array = None
     nmodes1d: jax.Array = None
-    xavg1d: tuple
-    ibin1d: tuple
+    edges1d: tuple = None
+    xavg1d: tuple = None
+    ibin1d: tuple = None
     nmodes: jax.Array = None
     xavg: jax.Array = None
     wmodes: jax.Array = None
@@ -207,7 +208,6 @@ class BinMesh3SpectrumPoles(object):
     batch_size: int = 1
     buffer_size: int = 0
     ells: tuple = None
-    edges1d: tuple = None
 
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
         if not isinstance(mattrs, MeshAttrs):
@@ -307,7 +307,7 @@ class BinMesh3SpectrumPoles(object):
 
 
 
-@partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells'])
+@partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells', 'kcut'])
 @dataclass(init=False, frozen=True)
 class BinMesh3CorrelationPoles(object):
     """
@@ -331,8 +331,9 @@ class BinMesh3CorrelationPoles(object):
 
     edges: jax.Array = None
     nmodes1d: jax.Array = None
-    xavg1d: tuple
-    ibin1d: tuple
+    edges1d: tuple = None
+    xavg1d: tuple = None
+    ibin1d: tuple = None
     nmodes: jax.Array = None
     xavg: jax.Array = None
     wmodes: jax.Array = None
@@ -344,13 +345,14 @@ class BinMesh3CorrelationPoles(object):
     batch_size: int = 1
     buffer_size: int = 0
     ells: tuple = None
-    edges1d: tuple = None
+    kcut: tuple = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None, kcut=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
         kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='real', batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
         self.__dict__.update(kw)
+        self.__dict__.update(kcut=kcut)
 
     bin_reduce_meshs = BinMesh3SpectrumPoles.bin_reduce_meshs
 
@@ -388,6 +390,7 @@ class BinMesh3CorrelationPoles(object):
         def bin(axis, ibin):
             x = knorm * self.xavg1d[axis][ibin]
             jn = jns[axis](x)
+            if self.kcut is not None: jn *= (knorm >= self.kcut[0]) * (knorm < self.kcut[1])
             return self.mattrs.c2r(values[axis] * jn)
 
         def reduce(meshes):
@@ -702,7 +705,7 @@ def compute_box3_normalization(*inputs: RealMeshField | ParticleField, bin: BinM
     return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
 
 
-def _split_particles(*particles, seed=0):
+def split_particles(*particles, seed=0):
     """
     Split input particles for estimation of the bispectrum normalization.
 
@@ -771,7 +774,7 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     """
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
-        randoms = _split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
+        randoms = split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
         fkps, ifields = _format_meshes(*fkps)
         fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
     else:
