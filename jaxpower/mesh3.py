@@ -568,8 +568,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 Ylms = [get_Ylm(ell3, m, reduced=False, real=True) for m in range(-ell3, ell3 + 1)]
                 xs = np.arange(len(Ylms))
                 tmp = tuple(meshes[i] for i in range(2)) + (jax.lax.scan(partial(f, Ylms), init=meshes[0].clone(value=jnp.zeros_like(meshes[0].value)), xs=xs)[0],)
-                #tmp = (4. * np.pi) * bin(*tmp, remove_zero=True) / bin.nmodes[ill3]
-                tmp = (2 * ell3 + 1) * bin(*tmp) / bin.nmodes[ill3]
+                tmp = (4. * np.pi) * bin(*tmp) / bin.nmodes[ill3]
                 num.append(tmp)
 
         else:
