@@ -355,20 +355,33 @@ class SpectrumToCorrelation(object):
                 def swap(axis1, axis2):
                     bak = axes[axis2]
                     axes[axis2] = axes[axis1]
-                    axes[axis2] = bak
+                    axes[axis1] = bak
 
+                # Input is (..., nparallel, axis1, axis2) if fftlog.inparallel
+                # or (..., axis1, axis2)
+                iaxis = fun_.ndim - self.ndim + idim
+                swap(iaxis, -1)  # axis is last
                 if fftlog.inparallel:
-                    swap(0, -2)  # nparallel is second-to-last axis
-                swap(idim, -1)  # axis is last
+                    swap(-self.ndim - 1, -2)  # nparallel is second-to-last axis
                 axes = tuple(axes)
+                #print('before T', fun_.shape, axes)
                 fun_ = jnp.transpose(fun_, axes)
+                #print('after T', fun_.shape, fftlog.size)
                 y_, fun_ = fftlog(fun_, **kwargs)
+                #print('after fftlog', fun_.shape)
                 fun_ = jnp.transpose(fun_, np.argsort(axes))
+                #print('after fftlog and T', fun_.shape)
                 y.append(y_)
             toret = tuple(y), fun_
         else:
             toret = self._fftlog(fun, **kwargs)
         return toret
+
+    @property
+    def ndim(self):
+        if isinstance(self._fftlog, tuple):
+            return len(self._fftlog)
+        return 1
 
     @property
     def k(self):
@@ -464,6 +477,12 @@ class CorrelationToSpectrum(object):
             fftlog = get_fftlog(s, ell)
 
         self._fftlog = fftlog
+
+    @property
+    def ndim(self):
+        if isinstance(self._fftlog, tuple):
+            return len(self._fftlog)
+        return 1
 
     @property
     def k(self):

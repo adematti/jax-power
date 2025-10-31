@@ -1487,7 +1487,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     shape = tuple(len(kk) for kk in grid_kin)
                     spectrum = interp2d(*to_spectrum.k, *grid_kin, theory.reshape(shape), left=0., right=0.)
                     correlation = to_correlation(spectrum)[1]
-                    correlation = correlation * Qs * to_correlation.s[0]**wa1[0] * to_correlation.s[1]**wa1[1]
+                    correlation = correlation * Qs * to_correlation.s[0][:, None]**wa1[0] * to_correlation.s[1][None, :]**wa1[1]
                     return interp2d(*grid_kout, *to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)[grid_kout_idx]
 
                 #tmp = jax.jacfwd(convolve)(jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype))

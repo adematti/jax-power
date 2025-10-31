@@ -608,41 +608,58 @@ def test_fftlog2(plot=False):
 
     from cosmoprimo.fiducial import DESI
 
-    lgkmin, lgkmax = -6, 2
-    Nk = 3645
-    k = np.logspace(lgkmin, lgkmax, num=Nk, endpoint=False)
+    k = (np.logspace(-6, 2, 1024, endpoint=False), np.logspace(-6, 2, 2048, endpoint=False))
+    #k = (np.logspace(-6, 2, 1024, endpoint=False), np.logspace(-6, 2, 1024, endpoint=False))
+    #k = (np.logspace(-6, 2, 128, endpoint=False), np.logspace(-6, 2, 256, endpoint=False))
 
     cosmo = DESI(engine='eisenstein_hu')
-    pkt = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)(k)
+    pk_callable = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
 
-    ells = [0]
-    pk = pkt[None, :]
-    s, xi = SpectrumToCorrelation(k, ell=ells)(pk)
-    k2, pk2 = CorrelationToSpectrum(s, ell=ells)(xi)
+    if True:
+        ells = [0]
+        pk = pkt = pk_callable(k[0])[None, :]
+        s, xi = SpectrumToCorrelation(k[0], ell=ells)(pk)
+        k2, pk2 = CorrelationToSpectrum(s, ell=ells)(xi)
 
-    if plot:
-        ax = plt.gca()
-        for ill, ell in enumerate(ells):
-            color = f'C{ill:d}'
-            ax.loglog(k, pk[ill], linestyle='--', color=color)
-            ax.loglog(k2[ill], pk2[ill], linestyle='-', color=color)
-        plt.show()
+        if plot:
+            ax = plt.gca()
+            idx = 10
+            for ill, ell in enumerate(ells):
+                color = f'C{ill:d}'
+                ax.plot(s[ill], xi[ill], linestyle='-', color=color)
+            ax.set_xscale('log')
+            plt.show()
 
-    bkt = pkt[:, None] * pkt
-    k = (k, k)
-    ells = [(0, 0)]
-    bk = bkt[None, :]
-    s, zeta = SpectrumToCorrelation(k, ell=ells)(bk)
-    k2, bk2 = CorrelationToSpectrum(s, ell=ells)(zeta)
+            ax = plt.gca()
+            for ill, ell in enumerate(ells):
+                color = f'C{ill:d}'
+                ax.loglog(k[0], pk[ill], linestyle='--', color=color)
+                ax.loglog(k2[ill], pk2[ill], linestyle='-', color=color)
+            plt.show()
 
-    if plot:
-        ax = plt.gca()
-        idx = 100
-        for ill, ell in enumerate(ells):
-            color = f'C{ill:d}'
-            ax.loglog(k[0], bk[ill, :, idx], linestyle='--', color=color)
-            ax.loglog(k2[0][ill], bk2[ill, :, idx], linestyle='-', color=color)
-        plt.show()
+    if True:
+        bkt = pk_callable(k[0])[:, None] * pk_callable(k[1])
+        ells = [(0, 0)]
+        bk = bkt[None, :]
+        s, zeta = SpectrumToCorrelation(k, ell=ells)(bk)
+        k2, bk2 = CorrelationToSpectrum(s, ell=ells)(zeta)
+
+        if plot:
+            ax = plt.gca()
+            idx = 10
+            for ill, ell in enumerate(ells):
+                color = f'C{ill:d}'
+                ax.plot(s[0][ill], zeta[ill, :, idx], linestyle='-', color=color)
+            ax.set_xscale('log')
+            plt.show()
+
+            ax = plt.gca()
+            idx = 100
+            for ill, ell in enumerate(ells):
+                color = f'C{ill:d}'
+                ax.loglog(k[0], bk[ill, :, idx], linestyle='--', color=color)
+                ax.loglog(k2[0][ill], bk2[ill, :, idx], linestyle='-', color=color)
+            plt.show()
 
 
 def test_interp2d():
@@ -782,6 +799,86 @@ def test_smooth_window(plot=False):
         plt.show()
 
 
+def test_smooth_window_synthetic(plot=False):
+    from matplotlib import pyplot as plt
+    from cosmoprimo.fiducial import DESI
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+
+    mattrs = MeshAttrs(boxsize=2000., meshsize=64, boxcenter=800.)
+    ells = [(0, 0, 0), (2, 0, 2)]
+    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.03}, basis='sugiyama-diagonal', ells=ells, mask_edges='')
+    #edgesin = np.arange(0., 1.1 * mattrs.knyq.max(), 0.002)
+    edgesin = np.arange(0., 1.2 * mattrs.knyq.max(), 0.02)
+    kin = (edgesin[:-1] + edgesin[1:]) / 2.
+    bk = pk(kin)[:, None] * pk(kin)[None, :]
+    edgesin = (edgesin, edgesin)
+    kin = (kin, kin)
+
+    from jaxpower import get_smooth3_window_bin_attrs
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=0, return_ellsin=True)
+    poles = [1. / (1 + sum(ell)) * bk for ell in ellsin]
+
+    from jaxpower.utils import plotter
+
+    @plotter
+    def plot_zeta(self, s=30., fig=None):
+        from matplotlib import pyplot as plt
+        if fig is None:
+            fig, ax = plt.subplots()
+        else:
+            ax = fig.axes[0]
+        for ill, ell in enumerate(self.ells):
+            pole = self.get(ells=ell)
+            idx = np.abs(pole.coords('s2') - s).argmin()
+            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=f'$\ell={ell}$')
+        ax.legend()
+        ax.grid(True)
+        ax.set_xscale('log')
+        return fig
+
+    coords = [jnp.logspace(-3, 4, 1024)] * 2 #, jnp.logspace(-3, 4, 512)]
+    def get_gaussian_damping(*s):
+        s = np.meshgrid(*s, indexing='ij')
+        return np.exp(-sum(ss**2 for ss in s) / 100.**2)
+        #return np.exp(-sum(ss**2 for ss in s) / 40.**2)
+        #return np.exp(-sum(ss**2 for ss in s) / 10.**2)
+
+    from lsstypes import ObservableLeaf, ObservableTree
+
+    zpoles = []
+    for ell in kw['ells']:
+        value = get_gaussian_damping(*coords)
+        if ell != (0, 0, 0): value[...] = 0.
+        #else: value[...] = 1.
+        pole = ObservableLeaf(s1=coords[0], s2=coords[1], value=value, coords=['s1', 's2'], meta={'ell': ell})
+        zpoles.append(pole)
+    zeta = ObservableTree(zpoles, ells=kw['ells'])
+    if plot:
+        plot_zeta(zeta, s=1., show=True)
+
+    wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    wpoles = wmatrix.dot(np.concatenate([p.ravel() for p in poles]), return_type=None)
+    if plot:
+        ax = plt.gca()
+        for ill, ell in enumerate(wpoles.ells):
+            color = f'C{ill:d}'
+            pole = wpoles.get(ells=ell)
+            factor = pole.coords('k').prod(axis=-1)
+            k = pole.coords('k')[..., 0]
+            ax.plot(k, factor * pole.value(), color=color, linestyle='-')
+            print(ell, ellsin)
+            ell = tuple(sorted(ell[:2])) + ell[2:]
+            if ell in ellsin:
+                i = ellsin.index(ell)
+                from scipy import interpolate
+                spline = interpolate.RectBivariateSpline(*kin, poles[i], kx=1, ky=1, s=0)
+                pole = spline(*pole.coords('k').T, grid=False)
+                ax.plot(k, factor * pole, color=color, linestyle=':')
+        plt.show()
+
+
 def test_basis():
     def pk(k):
         kp = 0.03
@@ -827,12 +924,12 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_smooth_window(plot=True)
-    exit()
-    #test_fftlog2()
     test_buffer()
     test_mesh3_spectrum()
     test_polybin3d()
     test_triumvirate_box()
     test_triumvirate_survey()
     test_normalization()
+    test_fftlog2(plot=True)
+    test_smooth_window_synthetic(plot=True)
+    test_smooth_window(plot=True)
