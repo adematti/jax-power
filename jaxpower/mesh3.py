@@ -1443,44 +1443,36 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
 
     else:
 
+        from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
+
+        def get_w_rect(q, wa1):
+            transpose = False
+            if q not in window.ells:
+                q = q[1::-1] + q[2:]
+                transpose = True
+            kw = dict(ells=q)
+            if 'wa_orders' in window.labels(return_type='keys'):
+                kw.update(wa_orders=wa1)
+            elif wa1 != (0, 0):
+                raise ValueError('wa_orders must be provided in input window')
+            if kw in window.labels(return_type='flatten'):
+                value = window.get(**kw).value().real
+                if transpose:
+                    value = jnp.swapaxes(value, 0, 1)
+                return value
+            return jnp.zeros(())
+
+
+        def interp2d(x, y, xp, yp, fp, left=0., right=0.):
+            # fp shape: (len(xp), len(yp))
+            interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
+            return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
+
         wmat_tmp = {}
 
         for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
             wmat_tmp[ell1, wa1] = []
             for ill, ell in enumerate(ells):
-
-                def get_w_rect(q):
-                    transpose = False
-                    if q not in window.ells:
-                        q = q[1::-1] + q[2:]
-                        transpose = True
-                    kw = dict(ells=q)
-                    if 'wa_orders' in window.labels(return_type='keys'):
-                        kw.update(wa_orders=wa1)
-                    elif wa1 != (0, 0):
-                        raise ValueError('wa_orders must be provided in input window')
-                    if kw in window.labels(return_type='flatten'):
-                        value = window.get(**kw).value().real
-                        if transpose:
-                            value = jnp.swapaxes(value, 0, 1)
-                        return value
-                    return jnp.zeros(())
-
-                Qs = sum(coeff * get_w_rect(q) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, ell1))
-                sym_ell1 = tuple(ell1[1::-1]) + ell1[2:]
-                # Takes care of symmetry
-                if ell1[1] != ell1[0] and (sym_ell1, wa1) not in ellsin:
-                    Qs += sum(coeff * get_w_rect(q) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, sym_ell1))
-
-                # fftlog
-                from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
-                to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1)
-                to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ell1)
-
-                def interp2d(x, y, xp, yp, fp, left=0., right=0.):
-                    # fp shape: (len(xp), len(yp))
-                    interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
-                    return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
 
                 def convolve(theory):
                     shape = tuple(len(kk) for kk in grid_kin)
@@ -1494,7 +1486,25 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
                     return convolve(theory)
 
-                tmp = jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+                tmp = jnp.zeros(shape=(len(grid_kout_idx[0]), len(edgesin)))
+                # fftlog
+                to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1, minfolds=0)
+
+                qcoeffs = get_sugiyama_window_convolution_coeffs(ell, ell1)
+                Qs = sum(coeff * get_w_rect(q, wa1) for q, coeff in qcoeffs)
+                if qcoeffs:
+                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ell1, minfolds=0)
+                    tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+
+                sym_ell1 = tuple(ell1[1::-1]) + ell1[2:]
+                # Takes care of symmetry
+                if ell1[1] != ell1[0] and (sym_ell1, wa1) not in ellsin:
+                    qcoeffs = get_sugiyama_window_convolution_coeffs(ell, sym_ell1)
+                    if qcoeffs:
+                        Qs = sum(coeff * get_w_rect(q, wa1) for q, coeff in qcoeffs)
+                        to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sym_ell1, minfolds=0)
+                        tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+
                 wmat_tmp[ell1, wa1].append(tmp)
 
             wmat_tmp[ell1, wa1] = jnp.concatenate(wmat_tmp[ell1, wa1], axis=0)

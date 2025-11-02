@@ -608,7 +608,8 @@ def test_fftlog2(plot=False):
 
     from cosmoprimo.fiducial import DESI
 
-    k = (np.logspace(-6, 2, 1024, endpoint=False), np.logspace(-6, 2, 2048, endpoint=False))
+    #k = (np.logspace(-6, 2, 1024, endpoint=False), np.logspace(-6, 2, 2048, endpoint=False))
+    k = (np.logspace(-4, 2, 2048, endpoint=False), np.logspace(-4, 2, 2048, endpoint=False))
     #k = (np.logspace(-6, 2, 1024, endpoint=False), np.logspace(-6, 2, 1024, endpoint=False))
     #k = (np.logspace(-6, 2, 128, endpoint=False), np.logspace(-6, 2, 256, endpoint=False))
 
@@ -616,10 +617,11 @@ def test_fftlog2(plot=False):
     pk_callable = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
 
     if True:
-        ells = [0]
-        pk = pkt = pk_callable(k[0])[None, :]
-        s, xi = SpectrumToCorrelation(k[0], ell=ells)(pk)
-        k2, pk2 = CorrelationToSpectrum(s, ell=ells)(xi)
+        ells = [2]
+        pkt = pk_callable(k[0])
+        pk = np.array([1 / (2 * ell + 1) * pkt for ell in ells])
+        s, xi = SpectrumToCorrelation(k[0], ell=ells, minfolds=0)(pk)
+        k2, pk2 = CorrelationToSpectrum(s, ell=ells, minfolds=0)(xi)
 
         if plot:
             ax = plt.gca()
@@ -639,10 +641,10 @@ def test_fftlog2(plot=False):
 
     if True:
         bkt = pk_callable(k[0])[:, None] * pk_callable(k[1])
-        ells = [(0, 0)]
-        bk = bkt[None, :]
-        s, zeta = SpectrumToCorrelation(k, ell=ells)(bk)
-        k2, bk2 = CorrelationToSpectrum(s, ell=ells)(zeta)
+        ells = [(0, 2)]
+        bk = np.array([1 / (2 * sum(ell) + 1) * bkt for ell in ells])
+        s, zeta = SpectrumToCorrelation(k, ell=ells, minfolds=0)(bk)
+        k2, bk2 = CorrelationToSpectrum(s, ell=ells, minfolds=0)(zeta)
 
         if plot:
             ax = plt.gca()
@@ -660,6 +662,7 @@ def test_fftlog2(plot=False):
                 ax.loglog(k[0], bk[ill, :, idx], linestyle='--', color=color)
                 ax.loglog(k2[0][ill], bk2[ill, :, idx], linestyle='-', color=color)
             plt.show()
+
 
 
 def test_interp2d():
@@ -817,7 +820,7 @@ def test_smooth_window_synthetic(plot=False):
     kin = (kin, kin)
 
     from jaxpower import get_smooth3_window_bin_attrs
-    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=0, return_ellsin=True)
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=2, return_ellsin=True)
     poles = [1. / (1 + sum(ell)) * bk for ell in ellsin]
 
     from jaxpower.utils import plotter
@@ -838,7 +841,7 @@ def test_smooth_window_synthetic(plot=False):
         ax.set_xscale('log')
         return fig
 
-    coords = [jnp.logspace(-3, 4, 1024)] * 2 #, jnp.logspace(-3, 4, 512)]
+    coords = [jnp.logspace(-2, 4, 2048)] * 2 #, jnp.logspace(-3, 4, 512)]
     def get_gaussian_damping(*s):
         s = np.meshgrid(*s, indexing='ij')
         return np.exp(-sum(ss**2 for ss in s) / 100.**2)
@@ -848,6 +851,7 @@ def test_smooth_window_synthetic(plot=False):
     from lsstypes import ObservableLeaf, ObservableTree
 
     zpoles = []
+    kw['ells'] = [(0, 0, 0)]
     for ell in kw['ells']:
         value = get_gaussian_damping(*coords)
         if ell != (0, 0, 0): value[...] = 0.
@@ -867,7 +871,7 @@ def test_smooth_window_synthetic(plot=False):
             pole = wpoles.get(ells=ell)
             factor = pole.coords('k').prod(axis=-1)
             k = pole.coords('k')[..., 0]
-            ax.plot(k, factor * pole.value(), color=color, linestyle='-')
+            ax.plot(k, factor * pole.value(), color=color, linestyle='-', label=str(ell))
             print(ell, ellsin)
             ell = tuple(sorted(ell[:2])) + ell[2:]
             if ell in ellsin:
@@ -875,7 +879,7 @@ def test_smooth_window_synthetic(plot=False):
                 from scipy import interpolate
                 spline = interpolate.RectBivariateSpline(*kin, poles[i], kx=1, ky=1, s=0)
                 pole = spline(*pole.coords('k').T, grid=False)
-                ax.plot(k, factor * pole, color=color, linestyle=':')
+                ax.plot(k, factor * pole, color=color, linestyle=':', label=str(ell))
         plt.show()
 
 
@@ -924,12 +928,13 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    #test_fftlog2(plot=True)
     test_buffer()
     test_mesh3_spectrum()
     test_polybin3d()
     test_triumvirate_box()
     test_triumvirate_survey()
     test_normalization()
-    test_fftlog2(plot=True)
-    test_smooth_window_synthetic(plot=True)
-    test_smooth_window(plot=True)
+    test_fftlog2()
+    test_smooth_window_synthetic()
+    test_smooth_window()
