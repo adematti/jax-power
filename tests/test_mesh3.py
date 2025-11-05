@@ -64,6 +64,19 @@ def test_mesh3_spectrum(plot=False):
                 plt.show()
 
 
+def test_mesh3_spectrum_soccimarro_shotnoise():
+
+    list_los = ['z', 'local']
+    mattrs = MeshAttrs(meshsize=128, boxsize=1000., boxcenter=[0., 0., 100000.])
+
+    particles = generate_uniform_particles(mattrs, size=int(1e-4 * mattrs.boxsize.prod()), seed=42)
+    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.05}, ells=[2], basis='scoccimarro', batch_size=2)
+
+    for los in list_los:
+        shotnoise = compute_fkp3_shotnoise(particles, bin=bin, los=los, resampler='cic', interlacing=False)
+        print(los, shotnoise)
+
+
 def test_timing():
 
     import time
@@ -938,3 +951,4 @@ if __name__ == '__main__':
     test_fftlog2()
     test_smooth_window_synthetic()
     test_smooth_window()
+    #test_mesh3_spectrum_soccimarro_shotnoise()

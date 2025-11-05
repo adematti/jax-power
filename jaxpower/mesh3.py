@@ -875,9 +875,9 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     resampler = resamplers.get_resampler(resampler)
     interlacing = max(interlacing, 1) >= 2
 
-    def bin_mesh2(mesh, axis):
+    def bin_mesh2(mesh, axis, antisymmetric=False):
         nmodes1d = bin.nmodes1d[axis]
-        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d), antisymmetric=antisymmetric) / nmodes1d
 
     if ifields[2] == ifields[1] + 1 == ifields[0] + 2:
         return tuple(shotnoise)
@@ -926,7 +926,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 return carry, im
 
             xs = np.arange(len(Ylms))
-            return (4. * jnp.pi) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
+            return (4. * jnp.pi) / (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
 
         for ill, ell in enumerate(ells):
             if ell == 0:
@@ -1300,27 +1300,46 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
     return [sn / mattrs.cellsize.prod()**2 for sn in shotnoise]
 
 
-def get_sugiyama_window_convolution_coeffs(ell, ellt):  # observed ell, theory ell
+def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory ell
     # Prefactor, eq. 63 of https://arxiv.org/pdf/1803.02132
     # ell = (ell_1, ell_2, L)
-    # ellt = (ell_1', ell_2', L')
+    # ellin = (ell_1', ell_2', L')
     coeffs = []
-    #for ellw in itertools.product(*([range(max(ell) + max(ellt) + 1)] * 3)):
-    for ellw in itertools.product(*[range(ell_ + ellt_ + 1) for ell_, ellt_ in zip(ell, ellt)]):
+    #for ellw in itertools.product(*([range(max(ell) + max(ellin) + 1)] * 3)):
+    for ellw in itertools.product(*[range(ell_ + ellt_ + 1) for ell_, ellt_ in zip(ell, ellin)]):
         if sum(ellw) % 2: continue
         if ellw[2] % 2: continue
         coeff = prod((2 * ell_ + 1) for ell_ in ell)
-        coeff *= wigner_9j(*ellw, *ellt, *ell)
+        coeff *= wigner_9j(*ellw, *ellin, *ell)
         coeff *= wigner_3j(*ell, 0, 0, 0)
-        for i in range(3): coeff *= wigner_3j(ell[i], ellt[i], ellw[i], 0, 0, 0)
+        for i in range(3): coeff *= wigner_3j(ell[i], ellin[i], ellw[i], 0, 0, 0)
         if abs(coeff) < 1e-7: continue
-        coeff /= wigner_3j(*ellt, 0, 0, 0) * wigner_3j(*ellw, 0, 0, 0)
+        coeff /= wigner_3j(*ellin, 0, 0, 0) * wigner_3j(*ellw, 0, 0, 0)
         coeffs.append((ellw, coeff))
     return coeffs
 
 
+def get_scoccimarro_window_convolution_coeffs(ell, ellin):
+    coeffs = []
+    sugiyama_ell_max = sugiyama_ellt_max = 4
+    min = None
+    if isinstance(ellin, tuple):
+        ellin, min = ellin
+    for sugiyama_ell in zip(range(sugiyama_ell_max + 1), range(sugiyama_ell_max + 1), [ell]):
+        if abs(wigner_3j(*sugiyama_ell, 0, 0, 0)) < 1e-7: continue
+        for sugiyama_ellt in zip(range(sugiyama_ellt_max + 1), range(sugiyama_ellt_max + 1), [ellin]):
+            if abs(wigner_3j(*sugiyama_ellt, 0, 0, 0)) < 1e-7: continue
+            sugiyama_coeffs = get_sugiyama_window_convolution_coeffs(sugiyama_ell, sugiyama_ellt)
+            if not sugiyama_coeffs: continue
+            if min is not None:
+                scoccimarro_to_sugiyama = prod((2 * ell_ + 1) for ell_ in sugiyama_ellt) * wigner_3j(*sugiyama_ellt, 0, 0, 0) * wigner_3j(*sugiyama_ellt, 0, -min, min)
+                scoccimarro_to_sugiyama /= jnp.sqrt(4. * jnp.pi * (2 * ellin + 1))
+                sugiyama_coeffs = [(ellw, scoccimarro_to_sugiyama * coeff) for ellw, coeff in sugiyama_coeffs]
+            coeffs += [(sugiyama_ell, sugiyama_ellt, sugiyama_coeffs)]
+    return coeffs
 
-def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bool=False):
+
+def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bool=False, basis: str='sugiyama'):
     """
     Get the window bin attributes for sugiyama basis.
 
@@ -1340,39 +1359,46 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bo
     """
     if ifields is None:
         ifields = [1, 1, 1]
-    if isinstance(ellsin, numbers.Number):
-        nellsin = ellsin
-        ellsin = []
-        for ellin in itertools.product(*[range(nellsin + 1) for _ in range(3)]):
-            if sum(ellin) % 2: continue
-            if ellin[2] % 2: continue
-            if ifields[1] == ifields[0]: ellin = tuple(sorted(ellin[:2])) + ellin[2:]
-            if ellin not in ellsin:
-                ellsin.append(ellin)
-    with_wide_angle = any(isinstance(ellin[0], tuple) for ellin in ellsin)
-    ellsin = [ellin if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
-    non_zero_ellsin = []
-    ellw = {}
-    for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
-        if wa1 not in ellw: ellw[wa1] = []
-        for ill, ell in enumerate(ells):
-            coeffs = get_sugiyama_window_convolution_coeffs(ell, ell1)
-            if coeffs and (ell1, wa1) not in non_zero_ellsin:
-                non_zero_ellsin.append((ell1, wa1))
-            for ell, _ in coeffs:
-                if ifields[1] == ifields[0]: ell = tuple(sorted(ell[:2])) + ell[2:]
-                if ell not in ellw[wa1]: ellw[wa1].append(ell)
-    for wa in ellw:
-        ellw[wa] = sorted(set(ellw[wa]))
-
-    def _make_dict(ellw):
-        return dict(ells=ellw, basis='sugiyama', mask_edges='')
-
-    if with_wide_angle:
-        ellw = [(_make_dict(ellw[wa]), wa) for wa in ellw]
+    if 'sugiyama' in basis:
+        if isinstance(ellsin, numbers.Number):
+            nellsin = ellsin
+            ellsin = []
+            for ellin in itertools.product(*[range(nellsin + 1) for _ in range(3)]):
+                if sum(ellin) % 2: continue
+                if ellin[2] % 2: continue
+                if ifields[1] == ifields[0]: ellin = tuple(sorted(ellin[:2])) + ellin[2:]
+                if ellin not in ellsin:
+                    ellsin.append(ellin)
+        ellsin = list(ellsin)
+        non_zero_ellsin, ellw = [], []
+        for ellin in ellsin:  # ell1 3-tuple, wain wide-angle order
+            for ill, ell in enumerate(ells):
+                coeffs = get_sugiyama_window_convolution_coeffs(ell, ellin)
+                if coeffs and ellin not in non_zero_ellsin:
+                    non_zero_ellsin.append(ellin)
+                for ellw_, _ in coeffs:
+                    if ifields[1] == ifields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
+                    if ellw_ not in ellw: ellw.append(ellw_)
+    elif 'scoccimarro' in basis:
+        if isinstance(ellsin, numbers.Number):
+            nellsin = ellsin
+            ellsin = list(range(0, 2 * nellsin + 1))
+        ellsin = list(ellsin)
+        non_zero_ellsin, ellw = [], []
+        for ellin in ellsin:  # ellin 1-integer
+            for ill, ell in enumerate(ells):
+                coeffs = get_scoccimarro_window_convolution_coeffs(ell, ellin)
+                if coeffs and ellin not in non_zero_ellsin:
+                    non_zero_ellsin.append(ellin)
+                for _, _, ellsw_ in coeffs:
+                    for ellw_ in ellsw_:
+                        if ifields[1] == ifields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
+                        if ellw_ not in ellw: ellw.append(ellw_)
     else:
-        ellw = _make_dict(ellw[(0, 0)])
-        non_zero_ellsin = [ellin[0] for ellin in non_zero_ellsin]
+        raise NotImplementedError(f'unknown basis {basis}')
+    ellw = sorted(set(ellw))
+
+    ellw = dict(ells=ellw, basis='sugiyama', mask_edges='')
     if return_ellsin:
         return ellw, non_zero_ellsin
     return ellw
@@ -1437,48 +1463,88 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         grid_kout.append(kout[index, idim])
     grid_kout, grid_kout_idx = tuple(grid_kout), tuple(grid_kout_idx)
 
+    from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
+
+    def get_w_rect(q, wain):
+        transpose = False
+        if q not in window.ells:
+            q = q[1::-1] + q[2:]
+            transpose = True
+        kw = dict(ells=q)
+        if 'wa_orders' in window.labels(return_type='keys'):
+            kw.update(wa_orders=wain)
+        elif wain != (0, 0):
+            raise ValueError('wa_orders must be provided in input window')
+        if kw in window.labels(return_type='flatten'):
+            value = window.get(**kw).value().real
+            if transpose:
+                value = jnp.swapaxes(value, 0, 1)
+            return value
+        return jnp.zeros(())
+
+    def interp2d(x, y, xp, yp, fp, left=0., right=0.):
+        # fp shape: (len(xp), len(yp))
+        interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
+        return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
+
     if 'scoccimarro' in bin.basis:
 
         raise NotImplementedError
 
+        def compute_I(ell, qs):
+            cos = (qs[2]**2 - qs[1]**2 - qs[0]**2) / (2 * qs[0] * qs[1])
+            tophat = (jnp.abs(cos) < 1.) + 1. / 2. * (jnp.abs(cos) == 1.)
+            m = None
+            if isinstance(ell, tuple): ell, m = ell
+            toret = (-1)**ell * np.pi**2 / prod(qs) * tophat
+            if m is None: toret *= get_legendre(ell)(cos)
+            else: toret *= get_Ylm(ell, m, reduced=True, complex=False)((jnp.sqrt(1. - cos**2), 0., cos))
+
+        wmat_tmp = {}
+        for ellin, wain in ellsin:  # ellin = L', M', wain wide-angle order
+            wmat_tmp[ellin, wain] = []
+            for ill, ell in enumerate(ells):  # ell = L
+
+                # Then sum over \ell_1, \ell_2, \ell_1', \ell_2', L', \ell_1'', \ell_2'', L''
+                tmp = jnp.zeros(shape=(len(grid_kout_idx[0]), len(edgesin)))
+
+                for sugiyama_ell, sugiyama_ellt, wcoeffs in get_scoccimarro_window_convolution_coeffs(ell, ellin):
+                    # fftlog
+                    to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=sugiyama_ell, check_level=1, minfolds=0)
+                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sugiyama_ellt, minfolds=0)
+                    Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
+
+                    def convolve(theory):
+                        tmp = jnp.diff(edgesin[..., 2, :]**3, axis=-1) / (6. * jnp.pi**2) * compute_I((ellin[0], -ellin[1]), kin) * theory
+                        spectrum = interp2d(*to_spectrum.k, *grid_kin, tmp, left=0., right=0.)
+                        correlation = to_correlation(spectrum)[1]
+                        correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
+                        spectrum = interp2d(*grid_kout, *to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)[grid_kout_idx]
+                        ell2 = sugiyama_ell[1]
+                        spectrum *= compute_I(ell2, kout) * (-1)**ell2 / compute_I(0, kout)
+                        return spectrum
+
+                    #tmp = jax.jacfwd(convolve)(jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype))
+                    def f(idxin):
+                        theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
+                        return convolve(theory)
+
+                    tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+
+                wmat_tmp[ellin, wain].append(tmp)
     else:
-
-        from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
-
-        def get_w_rect(q, wa1):
-            transpose = False
-            if q not in window.ells:
-                q = q[1::-1] + q[2:]
-                transpose = True
-            kw = dict(ells=q)
-            if 'wa_orders' in window.labels(return_type='keys'):
-                kw.update(wa_orders=wa1)
-            elif wa1 != (0, 0):
-                raise ValueError('wa_orders must be provided in input window')
-            if kw in window.labels(return_type='flatten'):
-                value = window.get(**kw).value().real
-                if transpose:
-                    value = jnp.swapaxes(value, 0, 1)
-                return value
-            return jnp.zeros(())
-
-
-        def interp2d(x, y, xp, yp, fp, left=0., right=0.):
-            # fp shape: (len(xp), len(yp))
-            interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
-            return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
 
         wmat_tmp = {}
 
-        for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
-            wmat_tmp[ell1, wa1] = []
+        for ellin, wain in ellsin:  # ellin 3-tuple, wain wide-angle order
+            wmat_tmp[ellin, wain] = []
             for ill, ell in enumerate(ells):
 
                 def convolve(theory):
                     shape = tuple(len(kk) for kk in grid_kin)
                     spectrum = interp2d(*to_spectrum.k, *grid_kin, theory.reshape(shape), left=0., right=0.)
                     correlation = to_correlation(spectrum)[1]
-                    correlation = correlation * Qs * to_correlation.s[0][:, None]**wa1[0] * to_correlation.s[1][None, :]**wa1[1]
+                    correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
                     return interp2d(*grid_kout, *to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)[grid_kout_idx]
 
                 #tmp = jax.jacfwd(convolve)(jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype))
@@ -1490,24 +1556,24 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 # fftlog
                 to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1, minfolds=0)
 
-                qcoeffs = get_sugiyama_window_convolution_coeffs(ell, ell1)
-                Qs = sum(coeff * get_w_rect(q, wa1) for q, coeff in qcoeffs)
-                if qcoeffs:
-                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ell1, minfolds=0)
+                wcoeffs = get_sugiyama_window_convolution_coeffs(ell, ellin)
+                Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
+                if wcoeffs:
+                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, minfolds=0)
                     tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
 
-                sym_ell1 = tuple(ell1[1::-1]) + ell1[2:]
+                sym_ell1 = tuple(ellin[1::-1]) + ellin[2:]
                 # Takes care of symmetry
-                if ell1[1] != ell1[0] and (sym_ell1, wa1) not in ellsin:
-                    qcoeffs = get_sugiyama_window_convolution_coeffs(ell, sym_ell1)
-                    if qcoeffs:
-                        Qs = sum(coeff * get_w_rect(q, wa1) for q, coeff in qcoeffs)
+                if ellin[1] != ellin[0] and (sym_ell1, wain) not in ellsin:
+                    wcoeffs = get_sugiyama_window_convolution_coeffs(ell, sym_ell1)
+                    if wcoeffs:
+                        Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                         to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sym_ell1, minfolds=0)
                         tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
 
-                wmat_tmp[ell1, wa1].append(tmp)
+                wmat_tmp[ellin, wain].append(tmp)
 
-            wmat_tmp[ell1, wa1] = jnp.concatenate(wmat_tmp[ell1, wa1], axis=0)
+            wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
 
     wmat = jnp.concatenate(list(wmat_tmp.values()), axis=1)
 

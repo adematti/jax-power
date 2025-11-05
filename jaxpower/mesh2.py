@@ -324,7 +324,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 return carry, im
 
             for ell in nonzeroells:
-                Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 #jax.debug.inspect_array_sharding(jnp.zeros_like(A0.value), callback=print)
                 xs = np.arange(len(Ylms))
                 #print('jax', ell, jax.lax.scan(partial(f, Ylms), init=A0.clone(value=jnp.zeros_like(A0.value)), xs=xs)[0].value.std())
@@ -445,7 +445,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
                 return carry, im
 
             for ell in nonzeroells:
-                Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 xs = np.arange(len(Ylms))
                 Aell = jax.lax.scan(partial(f, Ylms), init=rmesh1.clone(value=jnp.zeros_like(rmesh1.value)), xs=xs)[0]
                 num.append(4. * jnp.pi * bin(Aell, remove_zero=True))
@@ -566,7 +566,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
                 return carry, im
 
             for ell in nonzeroells:
-                Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
+                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 xs = np.arange(len(Ylms))
                 if bin.basis != 'bessel':
                     init = rmesh1.clone(value=jnp.zeros_like(rmesh1.value))
@@ -997,10 +997,10 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
     return window.map(lambda leaf: extrapolate_leaf(leaf, coords=coords))
 
 
-def get_window_coeffs(ell, ell1):
+def get_window_coeffs(ell, ellin):
     coeffs = []
-    for q in range(abs(ell - ell1), ell + ell1 + 1):
-        coeff = (2 * ell + 1) * legendre_product(ell, ell1, q)
+    for q in range(abs(ell - ellin), ell + ellin + 1):
+        coeff = (2 * ell + 1) * legendre_product(ell, ellin, q)
         if abs(coeff) < 1e-7: continue
         coeffs.append((q, coeff))
     return coeffs
@@ -1023,30 +1023,18 @@ def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
     """
     if isinstance(ellsin, numbers.Number):
         ellsin = list(range(0, 2 * ellsin - 1, 2))
-    with_wide_angle = any(isinstance(ellin, tuple) for ellin in ellsin)
-    ellsin = [ellin if isinstance(ellin, tuple) else (ellin, 0) for ellin in ellsin]
+    ellsin = list(ellsin)
     non_zero_ellsin = []
-    ellw = {}
-    for ell1, wa1 in ellsin:  # ell1 3-tuple, wa1 wide-angle order
-        if wa1 not in ellw: ellw[wa1] = []
+    ellw = []
+    for ellin in ellsin:  # ell 1-integer
         for ill, ell in enumerate(ells):
-            coeffs = get_window_coeffs(ell, ell1)
-            if coeffs and (ell1, wa1) not in non_zero_ellsin:
-                non_zero_ellsin.append((ell1, wa1))
+            coeffs = get_window_coeffs(ell, ellin)
+            if coeffs and ellin not in non_zero_ellsin:
+                non_zero_ellsin.append(ellin)
             for ell, _ in coeffs:
-                if ell not in ellw[wa1]: ellw[wa1].append(ell)
+                if ell not in ellw: ellw.append(ell)
 
-    for wa in ellw:
-        ellw[wa] = sorted(set(ellw[wa]))
-
-    def _make_dict(ellw):
-        return dict(ells=ellw)
-
-    if with_wide_angle:
-        ellw = [(_make_dict(ellw[wa]), wa) for wa in ellw]
-    else:
-        ellw = _make_dict(ellw[0])
-        non_zero_ellsin = [ellin[0] for ellin in non_zero_ellsin]
+    ellw = dict(ells=ellw)
     if return_ellsin:
         return ellw, non_zero_ellsin
     return ellw
@@ -1090,21 +1078,21 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
 
     wmat_tmp = {}
 
-    for ell1, wa1 in ellsin:
-        wmat_tmp[ell1, wa1] = []
+    for ellin, wain in ellsin:
+        wmat_tmp[ellin, wain] = []
         for ill, ell in enumerate(ells):
 
             def get_w(q):
                 kw = dict(ells=q)
                 if 'wa_orders' in window.labels(return_type='keys'):
-                    kw.update(wa_orders=wa1)
-                elif wa1 != 0:
+                    kw.update(wa_orders=wain)
+                elif wain != 0:
                     raise ValueError('wa_orders must be provided in input window')
                 if kw in window.labels(return_type='flatten'):
                     return window.get(**kw).value().real
                 return jnp.zeros(())
 
-            Qs = sum(coeff * get_w(q) for q, coeff in get_window_coeffs(ell, ell1))
+            Qs = sum(coeff * get_w(q) for q, coeff in get_window_coeffs(ell, ellin))
 
             #integ = BesselIntegral(window.get(0).edges('s'), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
             if 'rect' in flags:
@@ -1117,7 +1105,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 Qs = jnp.where(snmodes == 0, 0., Qs)
 
                 def f(edgein):
-                    tophat_Qs = BesselIntegral(edgein, savg, ell=ell1, edges=True, method='rect', mode='backward').w[..., 0] * Qs * savg**wa1
+                    tophat_Qs = BesselIntegral(edgein, savg, ell=ellin, edges=True, method='rect', mode='backward').w[..., 0] * Qs * savg**wain
                     def f2(kout):
                         integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
                         return integ(snmodes * tophat_Qs)
@@ -1133,15 +1121,15 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 # fftlog
                 from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
                 to_spectrum = CorrelationToSpectrum(s=next(iter(window)).coords('s'), ell=ell, check_level=1, lowring=False)
-                to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ell1, lowring=False)
+                to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, lowring=False)
                 kin = jnp.mean(edgesin, axis=-1)
 
                 def convolve(theory):
-                    #return (ell == ell1) * jnp.interp(kout, kin, theory, left=0., right=0.)
+                    #return (ell == ellin) * jnp.interp(kout, kin, theory, left=0., right=0.)
                     theory = jnp.interp(to_spectrum.k, kin, theory, left=0., right=0.)
                     correlation = to_correlation(theory)[1]
-                    #correlation = (ell == ell1) * correlation
-                    correlation = correlation * Qs * to_correlation.s**wa1
+                    #correlation = (ell == ellin) * correlation
+                    correlation = correlation * Qs * to_correlation.s**wain
                     return jnp.interp(kout, to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)
 
                 #tmp = jax.jacfwd(convolve)(jnp.zeros_like(edgesin[..., 0]))
@@ -1151,8 +1139,8 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
 
                 tmp = jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
 
-            wmat_tmp[ell1, wa1].append(tmp)
-        wmat_tmp[ell1, wa1] = jnp.concatenate(wmat_tmp[ell1, wa1], axis=0)
+            wmat_tmp[ellin, wain].append(tmp)
+        wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
 
     wmat = jnp.concatenate(list(wmat_tmp.values()), axis=1)
 
@@ -1414,7 +1402,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         # The Fourier-space grid
         kvec = A0.coords(sparse=True)
 
-        Ylms = {ell: [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
+        Ylms = {ell: [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
         spherical_jn = {ell: get_spherical_jn(ell) for ell in set(ells) | set(ellsin)}
         has_buffer = False
 
@@ -1461,15 +1449,15 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                 sbin = BinMesh2CorrelationPoles(rmesh1, edges=sedges)
                 kout = jnp.where(bin.nmodes == 0, 0., bin.xavg)
 
-                for ell1, wa1 in ellsin:
-                    wmat_tmp[ell1, wa1] = 0
+                for ellin, wain in ellsin:
+                    wmat_tmp[ellin, wain] = 0
                     for ill, ell in enumerate(ells):
                         Qs = 0.
                         xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
                         snorm = jnp.sqrt(sum(xx**2 for xx in svec))
-                        for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                        for im1, Yl1m1 in enumerate(Ylms[ellin]):
                             for im, Ylm in enumerate(Ylms[ell]):
-                                Q = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
+                                Q = (4. * np.pi) / (2 * ellin + 1) * _2r(_2c(rmesh1 * xnorm**(-wain) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wain
                                 Qs += 4. * np.pi * sbin(Q * Ylm(*svec) * Yl1m1(*svec)) * mattrs.cellsize.prod()
 
                         if ell != 0: Qs = Qs.at[0].set(0.)
@@ -1480,7 +1468,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                         del xnorm, snorm
 
                         def f(edgein):
-                            tophat_Qs = BesselIntegral(edgein, savg, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
+                            tophat_Qs = BesselIntegral(edgein, savg, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
 
                             def f2(kout):
                                 return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
@@ -1493,42 +1481,42 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
                             return spectrum.ravel()
 
-                        wmat_tmp[ell1, wa1] += my_map(f, edgesin)
+                        wmat_tmp[ellin, wain] += my_map(f, edgesin)
 
             elif 'infinite' in flags:
-                for ell1, wa1 in ellsin:
-                    wmat_tmp[ell1, wa1] = 0
+                for ellin, wain in ellsin:
+                    wmat_tmp[ellin, wain] = 0
                     for ill, ell in enumerate(ells):
                         for im, Ylm in enumerate(Ylms[ell]):
                             xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
                             snorm = jnp.sqrt(sum(xx**2 for xx in svec))
                             Qs = 0.
-                            for im1, Yl1m1 in enumerate(Ylms[ell1]):
-                                Q = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
+                            for im1, Yl1m1 in enumerate(Ylms[ellin]):
+                                Q = (4. * np.pi) / (2 * ellin + 1) * _2r(_2c(rmesh1 * xnorm**(-wain) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wain
                                 Qs += Yl1m1(*svec) * Q * mattrs.cellsize.prod()
                             del xnorm
 
                             def f(edgein):
-                                tophat_Qs = BesselIntegral(edgein, snorm, ell=ell1, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
+                                tophat_Qs = BesselIntegral(edgein, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
                                 spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
                                 spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
                                 return spectrum.ravel()
-                            wmat_tmp[ell1, wa1] += my_map(f, edgesin)
+                            wmat_tmp[ellin, wain] += my_map(f, edgesin)
             else:
 
-                for ell1, wa1 in ellsin:
-                    wmat_tmp[ell1, wa1] = 0
+                for ellin, wain in ellsin:
+                    wmat_tmp[ellin, wain] = 0
                     Qs = {}
-                    for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                    for im1, Yl1m1 in enumerate(Ylms[ellin]):
                         for ill, ell in enumerate(ells):
                             if 'recompute' in flags: Qs = {}
                             xnorm = jnp.sqrt(sum(xx**2 for xx in xvec))
                             snorm = jnp.sqrt(sum(xx**2 for xx in svec))
                             for im, Ylm in enumerate(Ylms[ell]):
                                 key = ell, im, im1
-                                tmp = (4. * np.pi) / (2 * ell1 + 1) * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wa1
+                                tmp = (4. * np.pi) / (2 * ellin + 1) * _2r(_2c(rmesh1 * xnorm**(-wain) * Ylm(*xvec) * Yl1m1(*xvec)).conj() * A0) * snorm**wain
                                 Qs[key] = dump_to_buffer(tmp, key)
                             del xnorm, snorm
                             if 'recompute' in flags:
@@ -1547,13 +1535,13 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
                                     return spectrum.ravel()
 
-                                wmat_tmp[ell1, wa1] += my_map(f, edgesin)
+                                wmat_tmp[ellin, wain] += my_map(f, edgesin)
 
                     if 'recompute' not in flags:
                         def f(edgein):
                             Aell = {ell: {im: 0. for im, Ylm in enumerate(Ylms[ell])} for ell in ells}
                             knorm = jnp.sqrt(sum(xx**2 for xx in kvec))
-                            for im1, Yl1m1 in enumerate(Ylms[ell1]):
+                            for im1, Yl1m1 in enumerate(Ylms[ellin]):
                                 xi = mattrs.create(kind='complex', fill=((knorm >= edgein[0]) & (knorm <= edgein[-1])) * Yl1m1(*kvec)).c2r()
                                 for ell in Aell:
                                     for im in Aell[ell]:
@@ -1568,7 +1556,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                 t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell, _ in ellsin)))
                             return jnp.concatenate(spectrum)
 
-                        wmat_tmp[ell1, wa1] = my_map(f, edgesin)
+                        wmat_tmp[ellin, wain] = my_map(f, edgesin)
 
             wmat = jnp.concatenate(list(wmat_tmp.values()), axis=0).T
 
@@ -1882,7 +1870,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         # The Fourier-space grid
         khat = A0.coords(sparse=True)
 
-        Ylms = {ell: [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
+        Ylms = {ell: [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
 
         num = []
         for ell in ells:
@@ -1890,11 +1878,11 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
             for Ylm in Ylms[ell]:
                 Q = 0.
                 if theory_los == 'firstpoint':
-                    for ell1, wa1 in poles:
-                        kernel_ell1 = get_theory((ell1, wa1)) * rnorm
+                    for ell1, wain in poles:
+                        kernel_ell1 = get_theory((ell1, wain)) * rnorm
                         for Yl1m1 in Ylms[ell1]:
-                            xi = mattrs.create(kind='complex', fill=kernel_ell1 * Yl1m1(*khat)).c2r() * snorm**wa1
-                            Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wa1) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
+                            xi = mattrs.create(kind='complex', fill=kernel_ell1 * Yl1m1(*khat)).c2r() * snorm**wain
+                            Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wain) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
 
                 elif theory_los == 'local':
                     coeff2 = {(0, 0): [(0, 1), (4, -7. / 18.)],
