@@ -82,6 +82,7 @@ def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
 
     dtype = 'int16' # int16 -> +/- 32_767, trkl
     shape = np.asarray(mesh.shape, dtype=dtype)
+
     def wrap(idx):
         return idx % shape
 
@@ -92,7 +93,7 @@ def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
     def step(carry, ishift):
         idx = id0 + ishift
         s = jnp.abs(idx - positions)
-        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(-1)
+        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(axis=-1)
 
         idx = jnp.unstack(idx, axis=-1)
         # idx = tuple(jnp.moveaxis(idx, -1, 0)) # TODO: JAX >= 0.4.28 for unstack

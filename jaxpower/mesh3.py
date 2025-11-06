@@ -307,7 +307,7 @@ class BinMesh3SpectrumPoles(object):
 
 
 
-@partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells', 'kcut'])
+@partial(register_pytree_dataclass, meta_fields=['basis', 'batch_size', 'buffer_size', 'ells', 'klimit'])
 @dataclass(init=False, frozen=True)
 class BinMesh3CorrelationPoles(object):
     """
@@ -345,14 +345,15 @@ class BinMesh3CorrelationPoles(object):
     batch_size: int = 1
     buffer_size: int = 0
     ells: tuple = None
-    kcut: tuple = None
+    klimit: tuple = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None, kcut=None):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None, klimit=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
         kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='real', batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
         self.__dict__.update(kw)
-        self.__dict__.update(kcut=kcut)
+        if isinstance(klimit, bool) and klimit: klimit = (0, mattrs.knyq.min())
+        self.__dict__.update(klimit=klimit)
 
     bin_reduce_meshs = BinMesh3SpectrumPoles.bin_reduce_meshs
 
@@ -390,7 +391,7 @@ class BinMesh3CorrelationPoles(object):
         def bin(axis, ibin):
             x = knorm * self.xavg1d[axis][ibin]
             jn = jns[axis](x)
-            if self.kcut is not None: jn *= (knorm >= self.kcut[0]) * (knorm < self.kcut[1])
+            if self.klimit is not None: jn *= (knorm >= self.klimit[0]) * (knorm < self.klimit[1])
             return self.mattrs.c2r(values[axis] * jn)
 
         def reduce(meshes):
@@ -405,12 +406,12 @@ def _format_meshes(*meshes):
     and a list of indices corresponding to the mesh they are equal to."""
     meshes = list(meshes)
     meshes = meshes + [None] * (3 - len(meshes))
-    ifields = [0]
-    for mesh in meshes[1:]: ifields.append(ifields[-1] if mesh is None else ifields[-1] + 1)
+    fields = [0]
+    for mesh in meshes[1:]: fields.append(fields[-1] if mesh is None else fields[-1] + 1)
     for imesh, mesh in enumerate(meshes):
         if mesh is None:
             meshes[imesh] = meshes[imesh - 1]
-    return meshes, tuple(ifields)
+    return meshes, tuple(fields)
 
 
 def _format_ells(ells, basis: str='sugiyama'):
@@ -526,7 +527,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     -------
     result : Mesh3SpectrumPoles
     """
-    meshes, ifields = _format_meshes(*meshes)
+    meshes, fields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     if 'sugiyama' in bin.basis:
@@ -633,7 +634,7 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     -------
     result : Mesh3CorrelationPoles
     """
-    meshes, ifields = _format_meshes(*meshes)
+    meshes, fields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     if 'sugiyama' in bin.basis:
@@ -774,10 +775,10 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
         randoms = split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
-        fkps, ifields = _format_meshes(*fkps)
+        fkps, fields = _format_meshes(*fkps)
         fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
     else:
-        fkps, ifields = _format_meshes(*fkps)
+        fkps, fields = _format_meshes(*fkps)
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
@@ -860,7 +861,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     shotnoise : list
         Shot noise for each multipole.
     """
-    fkps, ifields = _format_meshes(*fkps)
+    fkps, fields = _format_meshes(*fkps)
     mattrs = fkps[0].attrs
     if 'sugiyama' in bin.basis:
         mattrs = mattrs.clone(dtype=mattrs.cdtype)
@@ -879,11 +880,11 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         nmodes1d = bin.nmodes1d[axis]
         return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d), antisymmetric=antisymmetric) / nmodes1d
 
-    if ifields[2] == ifields[1] + 1 == ifields[0] + 2:
+    if fields[2] == fields[1] + 1 == fields[0] + 2:
         return tuple(shotnoise)
 
     particles = []
-    for fkp, s in zip(fkps, ifields):
+    for fkp, s in zip(fkps, fields):
         if s < len(particles):
             particles.append(particles[s])
         else:
@@ -902,7 +903,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     if 'scoccimarro' in bin.basis:
 
         # Eq. 58 of https://arxiv.org/pdf/1506.02729, 1 => 3
-        if not (ifields[0] == ifields[1] == ifields[2]):
+        if not (fields[0] == fields[1] == fields[2]):
             raise NotImplementedError
         cmeshw = particles[0].paint(**kwargs, out='complex')
         cmeshw = cmeshw.clone(value=cmeshw.value.at[(0,) * cmeshw.ndim].set(0.))  # remove zero-mode
@@ -1042,13 +1043,13 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
         uells = sorted(sum(ells, start=tuple()))
         ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
         s111 = [0.] * len(ellms)
-        if ifields[0] == ifields[1] == ifields[2]:
+        if fields[0] == fields[1] == fields[2]:
             s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
             if ell0 in ells:
                 shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))]
 
-        if ifields[1] == ifields[2]:
+        if fields[1] == fields[2]:
             def select(ell):
                 return ell[2] == ell[0] and ell[1] == 0
 
@@ -1062,7 +1063,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                         idx = ells1.index(ell[0])
                         shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
 
-        if ifields[0] == ifields[2]:
+        if fields[0] == fields[2]:
             def select(ell):
                 return ell[2] == ell[1] and ell[0] == 0
 
@@ -1075,7 +1076,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                         idx = ells2.index(ell[1])
                         shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
 
-        if ifields[0] == ifields[1]:
+        if fields[0] == fields[1]:
             s113 = compute_S113(particles, ells)
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
@@ -1117,7 +1118,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
     shotnoise : list
         Shot noise for each multipole.
     """
-    fkps, ifields = _format_meshes(*fkps)
+    fkps, fields = _format_meshes(*fkps)
     mattrs = fkps[0].attrs
     if 'sugiyama' in bin.basis:
         mattrs = mattrs.clone(dtype=mattrs.cdtype)
@@ -1135,11 +1136,11 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
         nmodes1d = bin.nmodes1d[axis]
         return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
-    if ifields[2] == ifields[1] + 1 == ifields[0] + 2:
+    if fields[2] == fields[1] + 1 == fields[0] + 2:
         return tuple(shotnoise)
 
     particles = []
-    for fkp, s in zip(fkps, ifields):
+    for fkp, s in zip(fkps, fields):
         if s < len(particles):
             particles.append(particles[s])
         else:
@@ -1250,14 +1251,14 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
         uells = sorted(sum(ells, start=tuple()))
         ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
         s111 = [0.] * len(ellms)
-        if ifields[0] == ifields[1] == ifields[2]:
+        if fields[0] == fields[1] == fields[2]:
             s111 = compute_S111(particles, ellms)
             ell0 = (0, 0, 0)
             mask_shotnoise = jnp.all((bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.), axis=1)
             if ell0 in ells:
                 shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))] * mask_shotnoise
 
-        if ifields[1] == ifields[2]:
+        if fields[1] == fields[2]:
             def select(ell):
                 return ell[2] == ell[0] and ell[1] == 0
 
@@ -1274,7 +1275,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                         idx = ells1.index(ell[0])
                         shotnoise[ill] += s122[idx][bin._iedges[..., 0]] * mask_shotnoise
 
-        if ifields[0] == ifields[2]:
+        if fields[0] == fields[2]:
             def select(ell):
                 return ell[2] == ell[1] and ell[0] == 0
 
@@ -1290,7 +1291,7 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
                         idx = ells2.index(ell[1])
                         shotnoise[ill] += s121[idx][bin._iedges[..., 1]] * mask_shotnoise
 
-        if ifields[0] == ifields[1]:
+        if fields[0] == fields[1]:
             s113 = compute_S113(particles, ells)
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
@@ -1339,7 +1340,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin):
     return coeffs
 
 
-def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bool=False, basis: str='sugiyama'):
+def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: bool=False, basis: str='sugiyama'):
     """
     Get the window bin attributes for sugiyama basis.
 
@@ -1349,16 +1350,16 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bo
         Observed multipole orders.
     ellsin : tuple
         Theory multipole orders.
-    ifields : tuple, list, optional
-        3-tuple or 3-list of field identifiers, e.g. [1, 1, 1] if all 3 fields are the ifields,
+    fields : tuple, list, optional
+        3-tuple or 3-list of field identifiers, e.g. [1, 1, 1] if all 3 fields are the fields,
         [1, 2, 3] if all different. To take advantage of symmetries.
 
     Returns
     -------
     dict
     """
-    if ifields is None:
-        ifields = [1, 1, 1]
+    if fields is None:
+        fields = [1, 1, 1]
     if 'sugiyama' in basis:
         if isinstance(ellsin, numbers.Number):
             nellsin = ellsin
@@ -1366,7 +1367,7 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bo
             for ellin in itertools.product(*[range(nellsin + 1) for _ in range(3)]):
                 if sum(ellin) % 2: continue
                 if ellin[2] % 2: continue
-                if ifields[1] == ifields[0]: ellin = tuple(sorted(ellin[:2])) + ellin[2:]
+                if fields[1] == fields[0]: ellin = tuple(sorted(ellin[:2])) + ellin[2:]
                 if ellin not in ellsin:
                     ellsin.append(ellin)
         ellsin = list(ellsin)
@@ -1377,7 +1378,7 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bo
                 if coeffs and ellin not in non_zero_ellsin:
                     non_zero_ellsin.append(ellin)
                 for ellw_, _ in coeffs:
-                    if ifields[1] == ifields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
+                    if fields[1] == fields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
                     if ellw_ not in ellw: ellw.append(ellw_)
     elif 'scoccimarro' in basis:
         if isinstance(ellsin, numbers.Number):
@@ -1391,8 +1392,8 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, ifields=None, return_ellsin: bo
                 if coeffs and ellin not in non_zero_ellsin:
                     non_zero_ellsin.append(ellin)
                 for _, _, ellsw_ in coeffs:
-                    for ellw_ in ellsw_:
-                        if ifields[1] == ifields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
+                    for ellw_, _ in ellsw_:
+                        if fields[1] == fields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
                         if ellw_ not in ellw: ellw.append(ellw_)
     else:
         raise NotImplementedError(f'unknown basis {basis}')
@@ -1441,7 +1442,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         for edge in edgesin:
             if edge.ndim == 1: edge = jnp.column_stack([edge[:-1], edge[1:]])
             grid_edgesin.append(edge)
-        grid_edgesin = tuple(grid_edgesin)
         grid_kin = tuple(jnp.mean(edge, axis=-1) for edge in grid_edgesin)
 
         def _cproduct(array):
@@ -1451,17 +1451,16 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # of shape (nbins, ndim, 2)
         edgesin = jnp.concatenate([_cproduct([edge[..., 0] for edge in grid_edgesin])[..., None], _cproduct([edge[..., 1] for edge in grid_edgesin])[..., None]], axis=-1)
         kin = _cproduct(grid_kin)
+        if 'soccimarro' in bin.basis:
+            mask = (kin[:, 2] >= jnp.abs(kin[:, 0] - kin[:, 1])) & (kin[:, 2] <= jnp.abs(kin[:, 0] + kin[:, 1]))
+            edgesin, kin = edgesin[mask], kin[mask]
 
-    ellsin = [(ellin[0], tuple(ellin[1])) if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
+    if 'sugiyama' in bin.basis:
+        ellsin = [(ellin[0], tuple(ellin[1])) if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
+    else:
+        ellsin = [(ellin[0], tuple(ellin[1])) if isinstance(ellin, tuple) else (ellin, (0, 0)) for ellin in ellsin]
 
     kout = bin.xavg
-
-    grid_kout, grid_kout_idx = [], []
-    for idim, iedge in enumerate(bin._iedges.T):
-        grid_kout_idx.append(iedge)
-        _, index = np.unique(iedge, return_index=True)
-        grid_kout.append(kout[index, idim])
-    grid_kout, grid_kout_idx = tuple(grid_kout), tuple(grid_kout_idx)
 
     from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
 
@@ -1482,14 +1481,39 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             return value
         return jnp.zeros(())
 
-    def interp2d(x, y, xp, yp, fp, left=0., right=0.):
-        # fp shape: (len(xp), len(yp))
-        interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
-        return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
+    def tophat(k, edgein, value):
+        # k tuple defining the k-grid, edgein tuple of (min, max), value flattened values
+        masks = []
+        for kk, edge in zip(k, edgein):
+            masks.append((kk >= edge[0]) & (kk < edge[1]))
+        return prod(jnp.meshgrid(*masks, indexing='ij', sparse=True)) * value
+
+    def read(kout, k, value):
+        # kout tuple of flattened output k's, k tuple defining the k-grid, value is grid
+        id0, s = [], []
+        mask = 1.
+        for kk, kkout in zip(k, kout):
+            id0_ = jnp.searchsorted(kk, kkout, side='right') - 1
+            mask = mask * ((id0_ >= 0) & (id0_ < len(kk) - 1.))
+            id0_ = jnp.clip(id0_, 0, len(kk) - 2)
+            id0.append(id0_)
+            s.append((kkout - kk[id0_]) / (kk[id0_ + 1] - kk[id0_]))
+        id0, s = jnp.column_stack(id0), jnp.column_stack(s)
+        ishifts = np.array(list(itertools.product(* len(k) * (np.arange(2),))), dtype=('i4'))
+
+        def step(carry, ishift):
+            idx = id0 + ishift
+            ker = jnp.prod((ishift == 0) * (1 - s) + (ishift == 1) * s, axis=-1)
+            idx = jnp.unstack(idx, axis=-1)
+            carry += value[idx] * ker * mask
+            return carry, None
+
+        toret = jnp.zeros_like(value, shape=kout[0].size)
+        return jax.lax.scan(step, toret, ishifts)[0]
+
+    wmat_tmp = {}
 
     if 'scoccimarro' in bin.basis:
-
-        raise NotImplementedError
 
         def compute_I(ell, qs):
             cos = (qs[2]**2 - qs[1]**2 - qs[0]**2) / (2 * qs[0] * qs[1])
@@ -1498,15 +1522,15 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             if isinstance(ell, tuple): ell, m = ell
             toret = (-1)**ell * np.pi**2 / prod(qs) * tophat
             if m is None: toret *= get_legendre(ell)(cos)
-            else: toret *= get_Ylm(ell, m, reduced=True, complex=False)((jnp.sqrt(1. - cos**2), 0., cos))
+            else: toret *= get_Ylm(ell, m, reduced=True, real=True)(jnp.sqrt(1. - cos**2), 0., cos)
+            return toret
 
-        wmat_tmp = {}
         for ellin, wain in ellsin:  # ellin = L', M', wain wide-angle order
             wmat_tmp[ellin, wain] = []
             for ill, ell in enumerate(ells):  # ell = L
 
                 # Then sum over \ell_1, \ell_2, \ell_1', \ell_2', L', \ell_1'', \ell_2'', L''
-                tmp = jnp.zeros(shape=(len(grid_kout_idx[0]), len(edgesin)))
+                tmp = jnp.zeros(shape=(len(kout), len(edgesin)))
 
                 for sugiyama_ell, sugiyama_ellt, wcoeffs in get_scoccimarro_window_convolution_coeffs(ell, ellin):
                     # fftlog
@@ -1514,45 +1538,34 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sugiyama_ellt, minfolds=0)
                     Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
 
-                    def convolve(theory):
-                        tmp = jnp.diff(edgesin[..., 2, :]**3, axis=-1) / (6. * jnp.pi**2) * compute_I((ellin[0], -ellin[1]), kin) * theory
-                        spectrum = interp2d(*to_spectrum.k, *grid_kin, tmp, left=0., right=0.)
+                    def convolve(idx):
+                        volume = (edgesin[idx, 2, 1]**3 - edgesin[idx, 2, 0]**3) / (6. * jnp.pi**2) * compute_I((sugiyama_ellt[0], -sugiyama_ellt[1]), kin[idx].T)
+                        spectrum = tophat(to_spectrum.k, edgesin[idx, :2], volume)
                         correlation = to_correlation(spectrum)[1]
                         correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
-                        spectrum = interp2d(*grid_kout, *to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)[grid_kout_idx]
+                        spectrum = read(kout.T, to_spectrum.k, to_spectrum(correlation)[1])
                         ell2 = sugiyama_ell[1]
-                        spectrum *= compute_I(ell2, kout) * (-1)**ell2 / compute_I(0, kout)
+                        spectrum *= compute_I(ell2, kout.T) * (-1)**ell2 / compute_I(0, kout.T)
                         return spectrum
 
-                    #tmp = jax.jacfwd(convolve)(jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype))
-                    def f(idxin):
-                        theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
-                        return convolve(theory)
-
-                    tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
 
                 wmat_tmp[ellin, wain].append(tmp)
-    else:
 
-        wmat_tmp = {}
+            wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
+    else:
 
         for ellin, wain in ellsin:  # ellin 3-tuple, wain wide-angle order
             wmat_tmp[ellin, wain] = []
             for ill, ell in enumerate(ells):
 
-                def convolve(theory):
-                    shape = tuple(len(kk) for kk in grid_kin)
-                    spectrum = interp2d(*to_spectrum.k, *grid_kin, theory.reshape(shape), left=0., right=0.)
+                def convolve(idx):
+                    spectrum = tophat(to_spectrum.k, edgesin[idx], 1.)
                     correlation = to_correlation(spectrum)[1]
                     correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
-                    return interp2d(*grid_kout, *to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)[grid_kout_idx]
+                    return read(kout.T, to_spectrum.k, to_spectrum(correlation)[1])
 
-                #tmp = jax.jacfwd(convolve)(jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype))
-                def f(idxin):
-                    theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
-                    return convolve(theory)
-
-                tmp = jnp.zeros(shape=(len(grid_kout_idx[0]), len(edgesin)))
+                tmp = jnp.zeros(shape=(len(kout), len(edgesin)))
                 # fftlog
                 to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1, minfolds=0)
 
@@ -1560,7 +1573,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                 if wcoeffs:
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, minfolds=0)
-                    tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
 
                 sym_ell1 = tuple(ellin[1::-1]) + ellin[2:]
                 # Takes care of symmetry
@@ -1569,7 +1582,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     if wcoeffs:
                         Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                         to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sym_ell1, minfolds=0)
-                        tmp += jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+                        tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
 
                 wmat_tmp[ellin, wain].append(tmp)
 

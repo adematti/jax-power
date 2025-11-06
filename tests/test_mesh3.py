@@ -70,7 +70,7 @@ def test_mesh3_spectrum_soccimarro_shotnoise():
     mattrs = MeshAttrs(meshsize=128, boxsize=1000., boxcenter=[0., 0., 100000.])
 
     particles = generate_uniform_particles(mattrs, size=int(1e-4 * mattrs.boxsize.prod()), seed=42)
-    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.05}, ells=[2], basis='scoccimarro', batch_size=2)
+    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.05}, ells=[0], basis='scoccimarro', batch_size=2)
 
     for los in list_los:
         shotnoise = compute_fkp3_shotnoise(particles, bin=bin, los=los, resampler='cic', interlacing=False)
@@ -680,6 +680,60 @@ def test_fftlog2(plot=False):
 
 def test_interp2d():
 
+    import itertools
+    from matplotlib import pyplot as plt
+
+    def paint(k, kin, value):
+        # k tuple defining the k-grid, kin tuple of flattened input k's, value flattened values
+        id0, s = [], []
+        for kk, kkin in zip(k, kin):
+            id0_ = jnp.searchsorted(kk, kkin, side='right') - 1
+            value = value * ((id0_ >= 0) & (id0_ < len(kk) - 1.))
+            id0_ = jnp.clip(id0_, 0, len(kk) - 2)
+            id0.append(id0_)
+            s.append((kkin - kk[id0_]) / (kk[id0_ + 1] - kk[id0_]))
+        id0, s = jnp.column_stack(id0), jnp.column_stack(s)
+        ishifts = np.array(list(itertools.product(* len(k) * (np.arange(2),))), dtype=('i4'))
+
+        def step(carry, ishift):
+            idx = id0 + ishift
+            ker = jnp.prod((ishift == 0) * (1 - s) + (ishift == 1) * s, axis=-1)
+            idx = jnp.unstack(idx, axis=-1)
+            carry = carry.at[idx].add(value * ker)
+            return carry, None
+
+        toret = jnp.zeros_like(value, shape=tuple(kk.size for kk in k))
+        return jax.lax.scan(step, toret, ishifts)[0]
+
+    def read(kout, k, value):
+        # kout tuple of flattened output k's, k tuple defining the k-grid, value is grid
+        id0, s = [], []
+        mask = 1.
+        for kk, kkout in zip(k, kout):
+            id0_ = jnp.searchsorted(kk, kkout, side='right') - 1
+            mask = mask * ((id0_ >= 0) & (id0_ < len(kk) - 1.))
+            id0_ = jnp.clip(id0_, 0, len(kk) - 2)
+            id0.append(id0_)
+            s.append((kkout - kk[id0_]) / (kk[id0_ + 1] - kk[id0_]))
+        id0, s = jnp.column_stack(id0), jnp.column_stack(s)
+        ishifts = np.array(list(itertools.product(* len(k) * (np.arange(2),))), dtype=('i4'))
+
+        def step(carry, ishift):
+            idx = id0 + ishift
+            ker = jnp.prod((ishift == 0) * (1 - s) + (ishift == 1) * s, axis=-1)
+            idx = jnp.unstack(idx, axis=-1)
+            carry += value[idx] * ker * mask
+            return carry, None
+
+        toret = jnp.zeros_like(value, shape=kout[0].size)
+        return jax.lax.scan(step, toret, ishifts)[0]
+
+
+    x = jnp.linspace(-3, 3, 100)
+    xin = jnp.linspace(-1, 1, 20)
+    vin = jnp.sin(xin) / (1. + 0.1 * xin)
+    vv = read((x,), (xin,), vin)
+
     def interp2d(x, y, xp, yp, fp):
         # fp shape: (len(xp), len(yp))
         interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f), in_axes=1, out_axes=1)(fp)
@@ -693,8 +747,6 @@ def test_interp2d():
     xnew = jnp.logspace(-3, 3, 150)
     ynew = jnp.logspace(-2, 2, 120)
     zznew = interp2d(xnew, ynew, x, y, zz)
-
-    from matplotlib import pyplot as plt
 
     fig, lax = plt.subplots(2, 1, figsize=(6, 10))
     ax = lax[0]
@@ -815,7 +867,7 @@ def test_smooth_window(plot=False):
         plt.show()
 
 
-def test_smooth_window_synthetic(plot=False):
+def test_smooth_window_sugiyama_synthetic(plot=False):
     from matplotlib import pyplot as plt
     from cosmoprimo.fiducial import DESI
 
@@ -834,7 +886,7 @@ def test_smooth_window_synthetic(plot=False):
 
     from jaxpower import get_smooth3_window_bin_attrs
     kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=2, return_ellsin=True)
-    poles = [1. / (1 + sum(ell)) * bk for ell in ellsin]
+    theory = [1. / (1 + sum(ell)) * bk for ell in ellsin]
 
     from jaxpower.utils import plotter
 
@@ -876,7 +928,7 @@ def test_smooth_window_synthetic(plot=False):
         plot_zeta(zeta, s=1., show=True)
 
     wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
-    wpoles = wmatrix.dot(np.concatenate([p.ravel() for p in poles]), return_type=None)
+    wpoles = wmatrix.dot(np.concatenate([tt.ravel() for tt in theory]), return_type=None)
     if plot:
         ax = plt.gca()
         for ill, ell in enumerate(wpoles.ells):
@@ -890,9 +942,79 @@ def test_smooth_window_synthetic(plot=False):
             if ell in ellsin:
                 i = ellsin.index(ell)
                 from scipy import interpolate
-                spline = interpolate.RectBivariateSpline(*kin, poles[i], kx=1, ky=1, s=0)
+                spline = interpolate.RectBivariateSpline(*kin, theory[i], kx=1, ky=1, s=0)
                 pole = spline(*pole.coords('k').T, grid=False)
                 ax.plot(k, factor * pole, color=color, linestyle=':', label=str(ell))
+        plt.show()
+
+
+def test_smooth_window_scoccimarro_synthetic(plot=False):
+    from matplotlib import pyplot as plt
+    from cosmoprimo.fiducial import DESI
+
+    cosmo = DESI(engine='eisenstein_hu')
+    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+
+    mattrs = MeshAttrs(boxsize=2000., meshsize=64, boxcenter=800.)
+    ells = [0, 2]
+    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.04}, basis='scoccimarro', ells=ells, mask_edges='')
+    edgesin = np.arange(0., 1.2 * mattrs.knyq.max(), 0.02)
+
+    from jaxpower import get_smooth3_window_bin_attrs
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=2, basis=bin.basis, return_ellsin=True)
+
+    from jaxpower.utils import plotter
+
+    @plotter
+    def plot_zeta(self, s=30., fig=None):
+        from matplotlib import pyplot as plt
+        if fig is None:
+            fig, ax = plt.subplots()
+        else:
+            ax = fig.axes[0]
+        for ill, ell in enumerate(self.ells):
+            pole = self.get(ells=ell)
+            idx = np.abs(pole.coords('s2') - s).argmin()
+            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=f'$\ell={ell}$')
+        ax.legend()
+        ax.grid(True)
+        ax.set_xscale('log')
+        return fig
+
+    coords = [jnp.logspace(-2, 4, 2048)] * 2 #, jnp.logspace(-3, 4, 512)]
+    def get_gaussian_damping(*s):
+        s = np.meshgrid(*s, indexing='ij')
+        return np.exp(-sum(ss**2 for ss in s) / 100.**2)
+        #return np.exp(-sum(ss**2 for ss in s) / 40.**2)
+        #return np.exp(-sum(ss**2 for ss in s) / 10.**2)
+
+    from lsstypes import ObservableLeaf, ObservableTree
+
+    zpoles = []
+    kw['ells'] = [(0, 0, 0)]
+    for ell in kw['ells']:
+        value = get_gaussian_damping(*coords)
+        if ell != (0, 0, 0): value[...] = 0.
+        #else: value[...] = 1.
+        pole = ObservableLeaf(s1=coords[0], s2=coords[1], value=value, coords=['s1', 's2'], meta={'ell': ell})
+        zpoles.append(pole)
+    zeta = ObservableTree(zpoles, ells=kw['ells'])
+    if False: #plot:
+        plot_zeta(zeta, s=1., show=True)
+
+    wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    kin = wmatrix.theory.get(ells=0).coords('k')
+    bk = pk(kin[:, 0]) * pk(kin[:, 1]) * pk(kin[:, 2])
+    theory = [1. / (1 + ell) * bk for ell in ellsin]
+
+    wpoles = wmatrix.dot(np.concatenate([tt.ravel() for tt in theory]), return_type=None)
+    if plot:
+        ax = plt.gca()
+        for ill, ell in enumerate(wpoles.ells):
+            color = f'C{ill:d}'
+            pole = wpoles.get(ells=ell)
+            factor = pole.coords('k').prod(axis=-1)
+            ax.plot(factor * pole.value(), color=color, linestyle='-', label=str(ell))
         plt.show()
 
 
@@ -949,6 +1071,6 @@ if __name__ == '__main__':
     test_triumvirate_survey()
     test_normalization()
     test_fftlog2()
-    test_smooth_window_synthetic()
+    test_smooth_window_sugiyama_synthetic()
     test_smooth_window()
     #test_mesh3_spectrum_soccimarro_shotnoise()

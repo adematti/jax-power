@@ -140,15 +140,16 @@ class BinMesh2CorrelationPoles(object):
     ells: tuple = None
     basis: str = None
     batch_size: int = None
-    kcut: tuple = None
+    klimit: tuple = None
     mattrs: MeshAttrs = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, kcut=None, batch_size: int=None):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, klimit=None, batch_size: int=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
         kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='real', mode_oversampling=mode_oversampling)
         kw.pop('wmodes')
-        kw.update(basis=basis, batch_size=batch_size, kcut=kcut)
+        if isinstance(klimit, bool) and klimit: klimit = (0, mattrs.knyq.min())
+        kw.update(basis=basis, batch_size=batch_size, klimit=klimit)
         self.__dict__.update(kw)
 
     def __call__(self, mesh, ell=0, remove_zero=False):
@@ -174,7 +175,7 @@ class BinMesh2CorrelationPoles(object):
 
             def bin(ibin):
                 jn = get_spherical_jn(ell)(knorm * self.xavg[ibin])
-                if self.kcut is not None: jn *= (knorm >= self.kcut[0]) * (knorm < self.kcut[1])
+                if self.klimit is not None: jn *= (knorm >= self.klimit[0]) * (knorm < self.klimit[1])
                 return (-1)**(ell // 2) * jnp.sum(value * jn) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
 
             return jax.lax.map(bin, jnp.arange(len(self.xavg)), batch_size=self.batch_size)
@@ -200,12 +201,12 @@ def _format_meshes(*meshes):
     meshes = list(meshes)
     assert 1 <= len(meshes) <= 2
     meshes = meshes + [None] * (2 - len(meshes))
-    ifields = [0]
-    for mesh in meshes[1:]: ifields.append(ifields[-1] if mesh is None else ifields[-1] + 1)
+    fields = [0]
+    for mesh in meshes[1:]: fields.append(fields[-1] if mesh is None else fields[-1] + 1)
     for imesh, mesh in enumerate(meshes):
         if mesh is None:
             meshes[imesh] = meshes[imesh - 1]
-    return meshes, ifields[1] == ifields[0]
+    return meshes, fields[1] == fields[0]
 
 
 def _format_ells(ells):
@@ -372,123 +373,6 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm,
                                               volume=mattrs.kfun.prod() * bin.nmodes, ell=ell, attrs=attrs))
         return Mesh2SpectrumPoles(spectrum)
-
-
-def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2CorrelationPoles=None, los: str | np.ndarray='z') -> Mesh2CorrelationPoles:
-    """
-    Compute the correlation function multipoles from mesh.
-
-    Parameters
-    ----------
-    meshs : RealMeshField or ComplexMeshField
-        Input meshes.
-    bin : BinMesh2CorrelationPoles
-        Binning operator.
-    los : str or array-like, optional
-        Line-of-sight specification.
-        If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
-        Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector.
-
-    Returns
-    -------
-    result : Mesh2CorrelationPoles
-    """
-    meshes, autocorr = _format_meshes(*meshes)
-    rdtype = meshes[0].real.dtype
-    mattrs = meshes[0].attrs
-    norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
-
-    los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
-    attrs = dict(los=vlos if vlos is not None else los)
-    ells = bin.ells
-
-    def _2r(mesh):
-        if not isinstance(mesh, RealMeshField):
-            mesh = mesh.c2r()
-        return mesh
-
-    def _2c(mesh):
-        if not isinstance(mesh, ComplexMeshField):
-            mesh = mesh.r2c()
-        return mesh
-
-    if vlos is None:  # local, varying line-of-sight
-        nonzeroells = ells
-        if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
-        if swap: meshes = meshes[::-1]
-
-        rmesh1 = meshes[0]
-        A0 = _2c(rmesh1 if autocorr else meshes[1])
-        del meshes
-
-        num = []
-        if 0 in ells:
-            if autocorr:
-                Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
-            else:
-                Aell = _2c(rmesh1) * A0.conj()
-            Aell = Aell.c2r()  # convert to real space
-            num.append(bin(Aell))
-            del Aell
-
-        if nonzeroells:
-            rmesh1 = _2r(rmesh1)
-            # The real-space grid
-            xvec = mattrs.rcoords(sparse=True)
-            # The separation grid
-            svec = mattrs.rcoords(kind='separation', sparse=True)
-
-            @partial(jax.checkpoint, static_argnums=0)
-            def f(Ylm, carry, im):
-                carry += _2r(_2c(rmesh1 * jax.lax.switch(im, Ylm, *xvec)).conj() * A0) * jax.lax.switch(im, Ylm, *svec)
-                return carry, im
-
-            for ell in nonzeroells:
-                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
-                xs = np.arange(len(Ylms))
-                Aell = jax.lax.scan(partial(f, Ylms), init=rmesh1.clone(value=jnp.zeros_like(rmesh1.value)), xs=xs)[0]
-                num.append(4. * jnp.pi * bin(Aell, remove_zero=True))
-                del Aell
-
-        if swap: num = list(map(jnp.conj, num))
-        # Format the num results into :class:`Mesh2CorrelationPoles` instance
-        correlation = []
-        for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
-                                                    volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
-        return Mesh2CorrelationPoles(correlation)
-
-    else:  # fixed line-of-sight
-
-        for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
-            meshes[imesh] = _2c(mesh)
-        if autocorr:
-            Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
-        else:
-            Aell = meshes[0] * meshes[1].conj()
-        Aell = Aell.c2r()  # convert to real space
-        del meshes
-
-        nonzeroells = ells
-        if nonzeroells[0] == 0: nonzeroells = nonzeroells[1:]
-
-        num = []
-        if 0 in ells:
-            num.append(bin(Aell))
-
-        if nonzeroells:
-            svec = mattrs.rcoords(kind='separation', sparse=True)
-            mu = sum(ss * ll for ss, ll in zip(svec, vlos)) / jnp.sqrt(sum(ss**2 for ss in svec)).at[(0,) * mattrs.ndim].set(1.)
-            for ell in nonzeroells:  # TODO: jax.lax.scan
-                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), remove_zero=True))
-
-        correlation = []
-        for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
-                                                    volume=mattrs.cellsize.prod() * bin.nmodes, ell=ell, attrs=attrs))
-        return Mesh2CorrelationPoles(correlation)
-
 
 
 def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh2CorrelationPoles=None, los: str | np.ndarray='z') -> Mesh2CorrelationPoles:
@@ -851,11 +735,11 @@ def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2Spectru
             particles = fkp.particles
         shotnoise = jnp.sum(particles.weights**2)
         scale = 1.
-        kcut = getattr(bin, 'kcut', None)
-        if kcut is not None:  # count number of modes
+        klimit = getattr(bin, 'klimit', None)
+        if klimit is not None:  # count number of modes
             kvec = bin.mattrs.kcoords(sparse=True)
             knorm = jnp.sqrt(sum(kk**2 for kk in kvec))
-            scale = jnp.sum((knorm >= kcut[0]) & (knorm <= kcut[-1])) / knorm.size
+            scale = jnp.sum((knorm >= klimit[0]) & (knorm <= klimit[-1])) / knorm.size
             del knorm
         shotnoise = scale * shotnoise
     else:
@@ -1122,22 +1006,16 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
                 to_spectrum = CorrelationToSpectrum(s=next(iter(window)).coords('s'), ell=ell, check_level=1, lowring=False)
                 to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, lowring=False)
-                kin = jnp.mean(edgesin, axis=-1)
 
-                def convolve(theory):
-                    #return (ell == ellin) * jnp.interp(kout, kin, theory, left=0., right=0.)
-                    theory = jnp.interp(to_spectrum.k, kin, theory, left=0., right=0.)
+                def convolve(idx):
+                    edge = edgesin[idx]
+                    theory = (to_spectrum.k >= edge[0]) & (to_spectrum.k < edge[1])
                     correlation = to_correlation(theory)[1]
                     #correlation = (ell == ellin) * correlation
                     correlation = correlation * Qs * to_correlation.s**wain
                     return jnp.interp(kout, to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)
 
-                #tmp = jax.jacfwd(convolve)(jnp.zeros_like(edgesin[..., 0]))
-                def f(idxin):
-                    theory = jnp.zeros(edgesin.shape[0], dtype=edgesin.dtype).at[idxin].set(1.)
-                    return convolve(theory)
-
-                tmp = jax.lax.map(f, jnp.arange(edgesin.shape[0])).T
+                tmp = jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
 
             wmat_tmp[ellin, wain].append(tmp)
         wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)

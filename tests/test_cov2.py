@@ -110,9 +110,9 @@ def test_box2_covariance(plot=False):
 def survey_selection(size=int(1e7), seed=random.key(42), scale=0.25, paint=True):
     from jaxpower import ParticleField
     mattrs = MeshAttrs(boxsize=2000., boxcenter=[0., 0., 2200], meshsize=128)
-    xvec = mattrs.xcoords(kind='position', sparse=False)
-    limits = mattrs.boxcenter - mattrs.boxsize / 4., mattrs.boxcenter + mattrs.boxsize / 4.
     if False:
+        xvec = mattrs.xcoords(kind='position', sparse=False)
+        limits = mattrs.boxcenter - mattrs.boxsize / 4., mattrs.boxcenter + mattrs.boxsize / 4.
         mask = True
         for i, xx in enumerate(xvec): mask &= (xx >= limits[0][i]) & (xx < limits[1][i])
         return mattrs.create(kind='real', fill=0.).clone(value=1. * mask)
@@ -123,7 +123,7 @@ def survey_selection(size=int(1e7), seed=random.key(42), scale=0.25, paint=True)
     mask = jnp.all((positions > -bscale) & (positions < bscale), axis=-1)
     positions = positions * mattrs.boxsize + mattrs.boxcenter
     toret = ParticleField(positions, weights=1. * mask, attrs=mattrs)
-    if paint: toret = toret.paint(resampler='ngp', interlacing=1, compensate=False)
+    if paint: toret = toret.paint(resampler='cic', interlacing=0, compensate=False)
     return toret
 
 
@@ -152,7 +152,8 @@ def save_cutsky_mocks():
 
 def test_cutsky2_covariance(plot=False):
 
-    selection = survey_selection()
+    selection = survey_selection(paint=False)
+    selection = selection.clone(attrs=selection.attrs.clone(boxsize=3000.)).paint(resampler='cic', interlacing=0, compensate=False)
     mattrs = selection.attrs
     theory = get_theory(kmax=mattrs.knyq.max(), dk=0.001)
 
@@ -166,8 +167,8 @@ def test_cutsky2_covariance(plot=False):
 
     delta = 0.08
     #edges = {'step': attrs.cellsize.min()}
-    edges = None
-    los = 'local'
+    #kw_window = dict(edges=None, basis=None, los='local')
+    kw_window = dict(edges={'step': mattrs.cellsize.min()}, basis='bessel', los='local')
 
     from jaxpower.utils import plotter
 
@@ -185,7 +186,8 @@ def test_cutsky2_covariance(plot=False):
         ax.grid(True)
         #ax.set_xscale('log')
         return fig
-    windows = compute_mesh2_covariance_window(selection, los=los, edges=edges)
+
+    windows = compute_mesh2_covariance_window(selection, **kw_window)
 
     def smooth_window(windows, xmin):
         num = []
@@ -198,15 +200,14 @@ def test_cutsky2_covariance(plot=False):
         return windows.clone(value=np.concatenate(num))
 
     windows = smooth_window(windows, 4 * mattrs.cellsize.min())
-
     if plot:
-        plot(windows.get(tracers=(0, 0, 0, 0)), show=True)
+        plot(windows.get(fields=(0, 0, 0, 0)), show=True)
 
     klim = (0., mattrs.knyq.max())
     cov = compute_spectrum2_covariance(windows, theory, delta=delta).at.observable.select(k=slice(0, None, 5)).at.observable.select(k=klim)
     cov_fftlog = compute_spectrum2_covariance(windows, theory, delta=delta, flags=['smooth', 'fftlog']).at.observable.select(k=slice(0, None, 5)).at.observable.select(k=klim)
     cov_mocks = Mesh2SpectrumPoles.cov(list(map(read, mock_fn(basename='cutsky')))).at.observable.select(k=klim)
-    pattrs = mattrs.clone(boxsize=2. * 0.25 * mattrs.boxsize)
+    #pattrs = mattrs.clone(boxsize=2. * 0.25 * mattrs.boxsize)
     #cov_smooth = compute_spectrum2_covariance(pattrs, theory, delta=delta).at.observable.select(k=slice(0, None, 5))at.observable.select(k=klim)
 
     #cov, cov_smooth, cov_mocks = (cov.at.observable.get(ells=0) for cov in [cov, cov_smooth, cov_mocks])
