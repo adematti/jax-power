@@ -26,11 +26,11 @@ class Correlation2Spectrum(object):
     s : array-like
         Separation array.
     """
-    def __init__(self, k, ells):
+    def __init__(self, k, ells, check_level=0):
         from .fftlog import SpectrumToCorrelation
-        fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False).fftlog
+        fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, check_level=check_level, minfolds=0).fftlog
         self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-        self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False).fftlog
+        self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=0).fftlog
         dlnk = jnp.diff(jnp.log(k)).mean()
         self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
 
@@ -63,7 +63,7 @@ class Correlation2Spectrum(object):
         return self.k, self._postfactor * fun
 
 
-def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, fields=None, **kwargs):
+def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fields=None, **kwargs):
     """
     Compute the window matrices (WW, WS, SS) for the FKP 2-point covariance.
 
@@ -79,6 +79,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, fiel
         Else, a 3-vector.
     alpha : float, optional
         Normalization factor for the randoms: sum(data_weights) / sum(randoms_weights).
+        If ``None``, measured from input FKP particules.
     fields : list of str, optional
         List of field names (default: [0, 1, 2, ...]).
     kwargs : dict
@@ -117,34 +118,33 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', alpha=None, fiel
 
     def get_S(fkp):
         randoms = fkp.randoms if isinstance(fkp, FKPField) else fkp
-        mesh = randoms.clone(weights=randoms.weights**2).paint(**kwargs, out='real')
-        return get_alpha(fkp) * mesh / mesh.cellsize.prod()
+        mesh = get_alpha(fkp) * randoms.clone(weights=randoms.weights**2).paint(**kwargs, out='real')
+        return mesh / mesh.cellsize.prod()
 
     Ws = [get_W(fkp) for fkp in fkps]  # for several fields
     Ss = [get_S(fkp) for fkp in fkps]
-    i2pts = tuple(itertools.combinations_with_replacement(tuple(range(len(Ws))), 2))  # pairs of fields for each P(k)
-    # TODO: compute shot-noise
-    for iW in itertools.combinations_with_replacement(i2pts, 2):  # then choose two pairs of fields
+    ipairs = tuple(itertools.combinations_with_replacement(tuple(range(len(Ws))), 2))  # pairs of fields for each P(k)
+    for iW in itertools.combinations_with_replacement(ipairs, 2):  # then choose two pairs of fields
         iW = iW[0] + iW[1]
         if iW not in WW:
-            W = [Ws[iW[0]] * Ws[iW[1]]]
-            if iW[2:] != iW[:2]:
-                W.append(Ws[iW[2]] * Ws[iW[3]])
+            W = ws = [Ws[iW[0]] * Ws[iW[1]], Ws[iW[2]] * Ws[iW[3]]]
             mattrs = W[0].attrs
-            norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) * sum(cellsize * W^2)
-            # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
-            norm = norm / mattrs.cellsize.prod()**2
-            update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells), attrs={'mattrs': dict(mattrs)})
-            WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(**update)
+            # norm is sum(cellsize * W^2) * sum(cellsize * W^2)
+            # compute_mesh2 computes ~ sum(cellsize * W^2) / cellsize^2, so correct norm by cellsize^2
+            #norm = ws[0].sum() * ws[-1].sum() #* mattrs.cellsize.prod()**2 / mattrs.cellsize.prod()**2
+            # We could have used the normalization from the power spectrum estimation,
+            # but this is anyway degenerate with the approximation we're making that W * W ~ W^2
+            update = dict(norm=[ws[0].sum() * ws[1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
+            WW[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
             if iW[3] == iW[2]:
-                WS[iW] = compute_mesh2(W[0], Ss[iW[2]], bin=bin, los=los).clone(**update)
+                ws = [W[0], Ss[iW[2]]]
+                WS[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
             if iW[1] == iW[0]:
-                WS[iW[2:] + iW[:2]] = compute_mesh2(W[-1], Ss[iW[0]], bin=bin, los=los).clone(**update)
+                ws = [W[1], Ss[iW[0]]]
+                WS[iW[2:] + iW[:2]] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
             if iW[1] == iW[0] and iW[3] == iW[2]:
-                S = [Ss[iW[0]]]
-                if iW[2] != iW[0]:
-                    S.append(Ss[iW[2]])
-                SS[iW] = compute_mesh2(*S, bin=bin, los=los).clone(**update)
+                ws = [Ss[iW[0]], Ss[iW[2]]]
+                SS[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
     if fields is None: fields = list(range(len(fkps)))
     tuple_fields = [tuple(fields[ii] for ii in iW) for iW in WW]
     WW, WS, SS = [ObservableTree(list(_.values()), fields=tuple_fields) for _ in (WW, WS, SS)]
@@ -196,19 +196,18 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
         return mesh / mesh.cellsize.prod()
 
     Ws = [get_W(mesh) for mesh in meshes]
-    i2pts = tuple(itertools.combinations_with_replacement(tuple(range(len(Ws))), 2))  # pairs of fields for each P(k)
-    for iW in itertools.combinations_with_replacement(i2pts, 2):  # then choose two pairs of fields
+    ipairs = tuple(itertools.combinations_with_replacement(tuple(range(len(Ws))), 2))  # pairs of fields for each P(k)
+    for iW in itertools.combinations_with_replacement(ipairs, 2):  # then choose two pairs of fields
         iW = iW[0] + iW[1]
         if iW not in WW:
             W = [Ws[iW[0]] * Ws[iW[1]]]
             if iW[2:] != iW[:2]:
                 W.append(Ws[iW[2]] * Ws[iW[3]])
             mattrs = W[0].attrs
-            norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
+            #norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
-            norm = norm / mattrs.cellsize.prod()**2
-            update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells))
-            WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(**update)
+            #norm = norm / mattrs.cellsize.prod()**2
+            WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(norm=[W[0].sum() * W[1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
     if fields is None: fields = list(range(len(meshes)))
     tuple_fields = [tuple(fields[ii] for ii in iW) for iW in WW]
     WW = ObservableTree(list(WW.values()), fields=tuple_fields)
@@ -334,7 +333,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
 
             if 'fftlog' in flags:
                 s = tmpw.coords('s')
-                fftlog = Correlation2Spectrum(s, (q1, q2))
+                fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
                 from scipy.interpolate import RectBivariateSpline
                 tmp = fftlog(w)[1]
                 toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)

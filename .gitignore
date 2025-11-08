@@ -17,6 +17,7 @@ doc/_build/
 **/.ipynb_checkpoints
 **/*.png
 **/bak
+**/_plots/*
 
 # Unit test / coverage reports
 **/.coverage
