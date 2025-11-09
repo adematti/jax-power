@@ -87,7 +87,7 @@ def test_box2_covariance(plot=False):
 
     cov_mocks = Mesh2SpectrumPoles.cov(list(map(read, mock_fn(basename='box'))))
 
-    if False: #plot:
+    if plot:
         observable = cov_mocks.observable
         fig = observable.plot()
         theory.plot(fig=fig, show=True)
@@ -166,9 +166,6 @@ def test_cutsky2_covariance(plot=False):
         exit()
 
     delta = 0.08
-    #edges = {'step': attrs.cellsize.min()}
-    #kw_window = dict(edges=None, basis=None, los='local')
-    kw_window = dict(edges={'step': mattrs.cellsize.min()}, basis='bessel', los='local')
 
     from jaxpower.utils import plotter
 
@@ -187,6 +184,7 @@ def test_cutsky2_covariance(plot=False):
         #ax.set_xscale('log')
         return fig
 
+    kw_window = dict(edges=None, basis=None, los='local')
     windows = compute_mesh2_covariance_window(selection, **kw_window)
 
     def smooth_window(windows, xmin):
@@ -200,11 +198,16 @@ def test_cutsky2_covariance(plot=False):
         return windows.clone(value=np.concatenate(num))
 
     windows = smooth_window(windows, 4 * mattrs.cellsize.min())
-    if plot:
+    if False: #plot:
         plot(windows.get(fields=(0, 0, 0, 0)), show=True)
 
     klim = (0., mattrs.knyq.max())
     cov = compute_spectrum2_covariance(windows, theory, delta=delta).at.observable.select(k=slice(0, None, 5)).at.observable.select(k=klim)
+
+    kw_window = dict(edges={'step': mattrs.cellsize.min()}, basis='bessel', los='local')
+    #windows = compute_mesh2_covariance_window(selection, **kw_window)
+    coords = jnp.logspace(-2., 4., 1024)
+    windows = interpolate_window_function(windows, coords)
     cov_fftlog = compute_spectrum2_covariance(windows, theory, delta=delta, flags=['smooth', 'fftlog']).at.observable.select(k=slice(0, None, 5)).at.observable.select(k=klim)
     cov_mocks = Mesh2SpectrumPoles.cov(list(map(read, mock_fn(basename='cutsky')))).at.observable.select(k=klim)
     #pattrs = mattrs.clone(boxsize=2. * 0.25 * mattrs.boxsize)
@@ -216,7 +219,8 @@ def test_cutsky2_covariance(plot=False):
         ytransform = lambda x, y: x**4 * y
         #ytransform = lambda x, y: x**2 * y
         kw = dict(ytransform=ytransform, offset=np.arange(3))
-        cov.plot(corrcoef=True, show=True)
+        #cov.plot(corrcoef=True, show=True)
+        cov_fftlog.plot(corrcoef=True, show=True)
         #cov_mocks.plot(corrcoef=True, show=True)
         #fig = None
         fig = cov.plot_diag(**kw, color='C0')
@@ -383,17 +387,36 @@ def test_fftlog2():
     H0 = jax.jacfwd(lambda fun: fftlog(fun, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
 
 
-    class Correlation2Spectrum(object):
+    class Correlation2SpectrumK(object):
 
         def __init__(self, k, ells):
             from jaxpower.fftlog import SpectrumToCorrelation
-            fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False).fflog
+            fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False).fftlog
             self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
             self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False).fftlog
             dlnk = jnp.diff(jnp.log(k)).mean()
             self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
             self.k = k
             self.s = fftlog.y
+
+        def __call__(self, fun):
+            fun = self._H * fun
+            _, fun = self._fftlog(fun, extrap=False, ignore_prepostfactor=True)
+            return self.k, self._postfactor * fun
+
+
+    class Correlation2Spectrum(object):
+
+        def __init__(self, s, ells):
+            from jaxpower.fftlog import CorrelationToSpectrum
+            fftlog = CorrelationToSpectrum(s, ell=ells[0], lowring=False, minfolds=False).fftlog
+            self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(s))
+            self._fftlog = CorrelationToSpectrum(s, ell=ells[1], lowring=False, minfolds=False).fftlog
+            k = self._fftlog.y
+            dlnk = jnp.diff(jnp.log(k)).mean()
+            self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
+            self.k = k
+            self.s = s
 
         def __call__(self, fun):
             fun = self._H * fun
@@ -453,8 +476,10 @@ def test_fftlog2():
         for j, lp in enumerate(ell_prime):
             for i, l in enumerate(ell):
                 #Q[i, j] = Q[i, j] @ H[j]
-                fftlog = Correlation2Spectrum(k, (l, lp))
-                assert np.allclose(fftlog.s, s)
+                #fftlog = Correlation2SpectrumK(k, (l, lp))
+                #assert np.allclose(fftlog.s, s)
+                fftlog = Correlation2Spectrum(s, (l, lp))
+                assert np.allclose(fftlog.k, k)
                 _, Q[i, j] = fftlog(Qll[i, j])
 
         return Q
@@ -472,7 +497,6 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-    #test_fftlog2()
     #export_sympy()
     #save_box_mocks()
     #test_box2_covariance(plot=True)

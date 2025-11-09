@@ -16,31 +16,27 @@ class Correlation2Spectrum(object):
 
     Parameters
     ----------
-    k : array-like
-        Wavenumber array.
-    ells : tuple
-        Tuple of two multipole orders (ell1, ell2).
-
-    Attributes
-    ----------
     s : array-like
         Separation array.
+    ells : tuple
+        Tuple of two multipole orders (ell1, ell2).
     """
-    def __init__(self, k, ells, check_level=0):
-        from .fftlog import SpectrumToCorrelation
-        fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, check_level=check_level, minfolds=0).fftlog
-        self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-        self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=0).fftlog
+    def __init__(self, s, ells, check_level=0):
+        from .fftlog import CorrelationToSpectrum
+        fftlog = CorrelationToSpectrum(s, ell=ells[0], lowring=False, minfolds=False, check_level=check_level).fftlog
+        self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(s))
+        self._fftlog = CorrelationToSpectrum(s, ell=ells[1], lowring=False, minfolds=False).fftlog
+        k = self.k
         dlnk = jnp.diff(jnp.log(k)).mean()
         self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
 
     @property
     def k(self):
-        return self._fftlog.x
+        return self._fftlog.y
 
     @property
     def s(self):
-        return self._fftlog.y
+        return self._fftlog.x
 
     def __call__(self, fun):
         """
@@ -73,13 +69,14 @@ def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fiel
         (List of) FKP or Particle fields.
     bin : BinMesh2CorrelationPoles, optional
         Binning operator.
+    alpha : float, optional
+        Normalization factor for the randoms: sum(data_weights) / sum(randoms_weights).
+        If ``None``, measured from input FKP particules.
+        Used to compute shotnoise terms.
     los : str, optional
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector.
-    alpha : float, optional
-        Normalization factor for the randoms: sum(data_weights) / sum(randoms_weights).
-        If ``None``, measured from input FKP particules.
     fields : list of str, optional
         List of field names (default: [0, 1, 2, ...]).
     kwargs : dict
@@ -207,7 +204,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
             #norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
             #norm = norm / mattrs.cellsize.prod()**2
-            WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(norm=[W[0].sum() * W[1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
+            WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(norm=[W[0].sum() * W[-1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
     if fields is None: fields = list(range(len(meshes)))
     tuple_fields = [tuple(fields[ii] for ii in iW) for iW in WW]
     WW = ObservableTree(list(WW.values()), fields=tuple_fields)
@@ -231,6 +228,12 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
         Flags controlling the computation:
         - 'smooth' (default for non-trivial selection function): no binning effects
         - 'fftlog': same as 'smooth', but using 2D fftlog instead of naive spherical Bessel integration.
+
+    Notes
+    -----
+    If 'fftlog' in ``flags``, compute windows (:func:`compute_fkp2_covariance_window`) with arguments ``basis='bessel'``,
+    and interpolate with :func:`interpolate_window_function`.
+    Else, use fine :math:`s`-binning (smaller than the :math:`pi / k_\mathrm{max}`, where :math:`k_\mathrm{max}` is the maximum wavenumber of the covariance matrix).
 
     Returns
     -------
@@ -334,8 +337,8 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             if 'fftlog' in flags:
                 s = tmpw.coords('s')
                 fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
-                from scipy.interpolate import RectBivariateSpline
                 tmp = fftlog(w)[1]
+                from scipy.interpolate import RectBivariateSpline
                 toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
                 return toret
 
