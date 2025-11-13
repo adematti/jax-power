@@ -583,6 +583,8 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 tmp = (2 * ell3 + 1) * bin(*tmp) / bin.nmodes[ill3]
                 num.append(tmp)
 
+            num = [num.real if ell % 2 == 0 else num.imag for ell, num in zip(ells, num)]
+
     else:
 
         meshes = [_2c(mesh) for mesh in meshes[:2]] + [_2r(meshes[2])]
@@ -876,9 +878,9 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     resampler = resamplers.get_resampler(resampler)
     interlacing = max(interlacing, 1) >= 2
 
-    def bin_mesh2(mesh, axis, antisymmetric=False):
+    def bin_mesh2(mesh, axis):
         nmodes1d = bin.nmodes1d[axis]
-        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d), antisymmetric=antisymmetric) / nmodes1d
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
     if fields[2] == fields[1] + 1 == fields[0] + 2:
         return tuple(shotnoise)
@@ -959,6 +961,8 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
                 Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
                 xs = np.arange(len(Ylms))
                 shotnoise[ill] = (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=sn_ell, xs=xs)[0]
+
+        shotnoise = [sn.real if ell % 2 == 0 else sn.imag for ell, sn in zip(ells, shotnoise)]
 
     else:
         # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132

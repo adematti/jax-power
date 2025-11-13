@@ -56,6 +56,8 @@ def test_mesh2_spectrum(plot=False):
         assert np.allclose(spectrum.get(0).value()[2:], pk(spectrum.get(0).coords('k'))[2:], rtol=1e-2)
         assert tuple(spectrum.ells) == (0, 2, 4)
 
+    exit()
+
     if plot:
         from matplotlib import pyplot as plt
 

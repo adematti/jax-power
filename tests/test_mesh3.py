@@ -31,7 +31,7 @@ def test_mesh3_spectrum(plot=False):
 
     for basis in ['scoccimarro', 'sugiyama-diagonal']:
 
-        ells = [0] if 'scoccimarro' in basis else [(0, 0, 0)]
+        ells = [0, 2] if 'scoccimarro' in basis else [(0, 0, 0), (2, 0, 2)]
         bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.1}, basis=basis, ells=ells)
 
         @partial(jax.jit, static_argnames=['los'])
@@ -40,7 +40,6 @@ def test_mesh3_spectrum(plot=False):
             return compute_mesh3_spectrum(mesh, los=los, bin=bin)
 
         for los in list_los:
-
             nmock = 2
             t0 = time.time()
             spectrum = mock(mattrs, bin, random.key(43), los=los)

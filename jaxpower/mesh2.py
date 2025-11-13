@@ -50,7 +50,9 @@ def _make_edges2(mattrs, edges, ells, kind='complex', mode_oversampling=0):
         xsum += bin[2]
     edges = np.column_stack([edges[:-1], edges[1:]])
     ells = _format_ells(ells)
-    return dict(edges=edges, nmodes=nmodes / len(shifts), xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells, mattrs=mattrs)
+    if len(shifts) > 1:  # else keep as an integer
+        nmodes = nmodes / len(shifts)
+    return dict(edges=edges, nmodes=nmodes, xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells, mattrs=mattrs)
 
 
 @partial(register_pytree_dataclass, meta_fields=['ells'])
@@ -88,7 +90,7 @@ class BinMesh2SpectrumPoles(object):
         kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='complex', mode_oversampling=mode_oversampling)
         self.__dict__.update(kw)
 
-    def __call__(self, mesh, antisymmetric=False, remove_zero=False):
+    def __call__(self, mesh, remove_zero=False):
         """
         Bin the mesh to compute the power spectrum.
 
@@ -96,8 +98,6 @@ class BinMesh2SpectrumPoles(object):
         ----------
         mesh : array-like or BaseMeshField
             Input mesh.
-        antisymmetric : bool, optional
-            Whether the mesh is hermitian antisymmetric.
         remove_zero : bool, optional
             Whether to remove the zero mode.
 
@@ -109,7 +109,7 @@ class BinMesh2SpectrumPoles(object):
         value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
         if remove_zero:
             value = value.at[(0,) * value.ndim].set(0.)
-        return _bincount(self.ibin, value, weights=weights, length=len(self.xavg), antisymmetric=antisymmetric) / self.nmodes
+        return _bincount(self.ibin, value, weights=weights, length=len(self.xavg)) / self.nmodes
 
 
 @partial(register_pytree_dataclass, meta_fields=['ells', 'basis', 'batch_size'])
@@ -309,7 +309,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
                 Aell = _2c(rmesh1) * A0.conj()
-            num.append(bin(Aell, antisymmetric=False))
+            num.append(bin(Aell))
             del Aell
 
         if nonzeroells:
@@ -333,11 +333,12 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 #Aell = sum(_2c(rmesh1 * Ylm(*xvec)) * Ylm(*kvec) for Ylm in Ylms).conj() * A0
                 # Project on to 1d k-basis (averaging over mu=[-1, 1])
                 #print('jax', ell, A0.value.std(), Aell.value.std())
-                num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2), remove_zero=True))
+                num.append(4. * jnp.pi * bin(Aell, remove_zero=True))
                 del Aell
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
         if swap: num = list(map(jnp.conj, num))
+        num = [num.real if ell % 2 == 0 else num.imag for ell, num in zip(ells, num)]
         # Format the num results into :class:`Mesh2SpectrumPoles` instance
         spectrum = []
         for ill, ell in enumerate(ells):
@@ -360,14 +361,15 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
         num = []
         if 0 in ells:
-            num.append(bin(Aell, antisymmetric=False))
+            num.append(bin(Aell))
 
         if nonzeroells:
             kvec = mattrs.kcoords(sparse=True)
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
             for ell in nonzeroells:  # TODO: jax.lax.scan
-                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), antisymmetric=bool(ell % 2), remove_zero=True))
+                num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), remove_zero=True))
 
+        num = [num.real if ell % 2 == 0 else num.imag for ell, num in zip(ells, num)]
         spectrum = []
         for ill, ell in enumerate(ells):
             spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill], num_shotnoise=jnp.zeros_like(num[ill]), norm=norm,
@@ -460,7 +462,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
                 num.append(4. * jnp.pi * bin(Aell, ell=ell, remove_zero=True))
                 del Aell
 
-        if swap: num = list(map(jnp.conj, num))
+        num = [num.real for num in num]
         # Format the num results into :class:`Mesh2CorrelationPoles` instance
         correlation = []
         for ill, ell in enumerate(ells):
@@ -496,6 +498,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
             for ell in nonzeroells:  # TODO: jax.lax.scan
                 num.append((2 * ell + 1) * bin(Aell * get_legendre(ell)(mu), ell=ell, remove_zero=True))
 
+        num = [num.real for num in num]
         correlation = []
         for ill, ell in enumerate(ells):
             correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, nmodes=bin.nmodes, num_raw=num[ill] / mattrs.cellsize.prod(), norm=norm,
@@ -1376,7 +1379,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
                             def f(edgein):
                                 tophat_Qs = BesselIntegral(edgein, snorm, ell=ellin, edges=True, method=tophat_method, mode='backward').w[..., 0] * Qs
-                                spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(tophat_Qs), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1. / sum(len(Ylms[ell]) for ell in ells) / len(ellsin)))
                                 spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
@@ -1406,7 +1409,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im1])
 
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                    spectrum = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                    spectrum = 4 * jnp.pi * bin(Aell[ell], remove_zero=ell == 0) * rnorm[ill]
                                     del Aell[ell]
                                     if pbar:
                                         t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell in ells)) / sum(len(Ylms[ell]) for ell, _ in ellsin))
@@ -1428,7 +1431,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             spectrum = []
                             for ill, ell in enumerate(ells):
                                 Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                spectrum.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
+                                spectrum.append(4 * jnp.pi * bin(Aell[ell], remove_zero=ell == 0) * rnorm[ill])
                                 del Aell[ell]
                             if pbar:
                                 t.update(n=round((im1 + 1) / sum(len(Ylms[ell]) for ell, _ in ellsin)))
@@ -1512,7 +1515,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     tophat = BesselIntegral(edgein, snorm, ell=p, edges=True, method=tophat_method, mode='backward').w[..., 0]
                                     Q = load_from_buffer(Qs[p])
                                     xi += tophat * Q
-                                spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                spectrum = 4 * jnp.pi * bin(Ylm(*kvec) * _2c(xi), remove_zero=ell == 0) * rnorm[ill]
                                 if pbar:
                                     t.update(n=round(1 / sum(len(Ylms[ell]) for ell in ells) / 4))
                                 spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
@@ -1539,7 +1542,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                                     for im in Aell[ell]:
                                         Aell[ell][im] += xi * load_from_buffer(Qs[ell, im, im12])
                                     Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                    spectrum = 4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill]
+                                    spectrum = 4 * jnp.pi * bin(Aell[ell], remove_zero=ell == 0) * rnorm[ill]
                                     if pbar:
                                         t.update(n=round((im + 1) / sum(len(Ylms[ell]) for ell in ells) / 36))
                                     spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
@@ -1561,7 +1564,7 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                             spectrum = []
                             for ill, ell in enumerate(ells):
                                 Aell[ell] = sum(Aell[ell][im].r2c() * Ylms[ell][im](*kvec) for im in Aell[ell])
-                                spectrum.append(4 * jnp.pi * bin(Aell[ell], antisymmetric=bool(ell % 2), remove_zero=ell == 0) * rnorm[ill])
+                                spectrum.append(4 * jnp.pi * bin(Aell[ell], remove_zero=ell == 0) * rnorm[ill])
                                 del Aell[ell]
                             if pbar:
                                 t.update(n=round((im12 + 1) / 36))
@@ -1783,7 +1786,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
                 Aell += _2c(Q) * Ylm(*khat)
             # Project on to 1d k-basis (averaging over mu=[-1, 1])
-            num.append(4. * jnp.pi * bin(Aell, antisymmetric=bool(ell % 2)))
+            num.append(4. * jnp.pi * bin(Aell))
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
         if swap: num = list(map(jnp.conj, num))

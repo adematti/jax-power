@@ -2029,8 +2029,8 @@ def _get_bin_attrs_edges2d(coords, edges: jax.Array, weights: None | jax.Array=N
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('length', 'antisymmetric', 'sharding_mesh'))
-def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, sharding_mesh=None):
+@partial(jax.jit, static_argnames=('length', 'sharding_mesh'))
+def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
 
     if not isinstance(ibin, (tuple, list)):
         ibin = [ibin]
@@ -2038,8 +2038,6 @@ def _bincount(ibin, value, weights=None, length=None, antisymmetric=False, shard
     def _count(value, *ibin):
         value = value.ravel()
         if weights is not None:
-            if antisymmetric: value = value.imag
-            else: value = value.real
             value *= weights
 
         def count(ib):
