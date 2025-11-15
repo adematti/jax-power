@@ -20,7 +20,7 @@ prod = functools.partial(functools.reduce, operator.mul)
 
 
 
-def _make_edges3(mattrs, edges, ells, basis='scoccimarro', kind='complex', batch_size=None, buffer_size=0, mask_edges=None):
+def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None, buffer_size=0, mask_edges=None):
     assert basis in ['sugiyama', 'sugiyama-diagonal', 'scoccimarro', 'scoccimarro-diagonal']
     if 'scoccimarro' in basis:
         ndim = 3
@@ -212,7 +212,7 @@ class BinMesh3SpectrumPoles(object):
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='complex', batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
+        kw = _make_edges3('complex', mattrs, edges, ells, basis=basis, batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
         self.__dict__.update(kw)
         xmid = jnp.mean(self.edges, axis=-1).T
 
@@ -350,7 +350,7 @@ class BinMesh3CorrelationPoles(object):
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells=0, basis='sugiyama', batch_size=None, buffer_size=0, mask_edges=None, klimit=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges3(mattrs, edges, ells, basis=basis, kind='real', batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
+        kw = _make_edges3('real', mattrs, edges, ells, basis=basis, batch_size=batch_size, buffer_size=buffer_size, mask_edges=mask_edges)
         self.__dict__.update(kw)
         if isinstance(klimit, bool) and klimit: klimit = (0, mattrs.knyq.min())
         self.__dict__.update(klimit=klimit)

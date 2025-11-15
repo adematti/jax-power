@@ -15,7 +15,7 @@ from .utils import get_legendre, get_spherical_jn, get_Ylm, real_gaunt, legendre
 from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
 
 
-def _make_edges2(mattrs, edges, ells, kind='complex', mode_oversampling=0):
+def _make_edges2(kind, mattrs, edges, ells, mode_oversampling=0):
     wmodes = None
     if kind == 'complex':
         vec = mattrs.kcoords(kind='separation', sparse=True)
@@ -87,7 +87,7 @@ class BinMesh2SpectrumPoles(object):
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='complex', mode_oversampling=mode_oversampling)
+        kw = _make_edges2('complex', mattrs, edges=edges, ells=ells, mode_oversampling=mode_oversampling)
         self.__dict__.update(kw)
 
     def __call__(self, mesh, remove_zero=False):
@@ -146,7 +146,7 @@ class BinMesh2CorrelationPoles(object):
     def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, klimit=None, batch_size: int=None):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges2(mattrs, edges=edges, ells=ells, kind='real', mode_oversampling=mode_oversampling)
+        kw = _make_edges2('real', mattrs, edges=edges, ells=ells, mode_oversampling=mode_oversampling)
         kw.pop('wmodes')
         if isinstance(klimit, bool) and klimit: klimit = (0, mattrs.knyq.min())
         kw.update(basis=basis, batch_size=batch_size, klimit=klimit)
@@ -717,7 +717,7 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
 
 def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None):
     """
-    Compute the FKP shot noise for the power spectrum.
+    Compute the FKP shot noise for the power spectrum and correlation function.
 
     Parameters
     ----------

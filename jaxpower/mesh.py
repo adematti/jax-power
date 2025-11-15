@@ -592,31 +592,6 @@ def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
     # TODO: generalize to any axis
     per_host_indices, per_host_final_arrays, slices = [], [], []
     tag = 42
-    start = 0
-    for irank in range(mpicomm.size):
-        mask_irank = process == irank
-        tmp = array[mask_irank]
-        if mpicomm.rank != irank:
-            _send_mpi(tmp, dest=irank, tag=tag, mpicomm=mpicomm)
-            tmp = _recv_mpi(source=irank, tag=tag, mpicomm=mpicomm)
-        per_host_final_arrays.append(tmp)
-        if return_indices:
-            per_host_indices.append(np.flatnonzero(mask_irank))
-            slices.append(slice(start, start + tmp.shape[0]))
-            start += tmp.shape[0]
-    final = np.concatenate(per_host_final_arrays, axis=0)
-    del per_host_final_arrays
-    if return_indices:
-        per_host_indices = np.concatenate(per_host_indices, axis=0)
-        return final, (per_host_indices, slices)
-    return final
-
-
-def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
-    # Exchange array along the first (0) axis
-    # TODO: generalize to any axis
-    per_host_indices, per_host_final_arrays, slices = [], [], []
-    tag = 42
 
     for irank in range(mpicomm.size):
         mask_irank = process == irank
@@ -699,6 +674,7 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
 
         return positions, exchange, inverse
     return positions, exchange
+
 
 def _get_distributed_backend(array, backend='auto', **kwargs):
 
@@ -1645,7 +1621,6 @@ class ParticleField(object):
     attrs: MeshAttrs | None = field(init=False, repr=False)
 
     def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, backend='auto', **kwargs):
-
         if attrs is None: raise ValueError('attrs must be provided')
         if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
         sharding_mesh = attrs.sharding_mesh
@@ -1662,7 +1637,8 @@ class ParticleField(object):
         input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
         input_is_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is not None
 
-        inverse = tuple()
+        exchange_direct = lambda x: x
+        exchange_inverse = lambda x: x
         if with_sharding and exchange:
             if backend == 'mpi' and input_is_sharded:
 
@@ -1678,8 +1654,10 @@ class ParticleField(object):
             if backend == 'jax':
                 positions, weights = jax.device_put((positions, weights), sharding)
 
-            positions, exchange, *inverse = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
-            weights = exchange(weights)
+            positions, exchange_direct, *_exchange_inverse = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
+            weights = exchange_direct(weights)
+            if _exchange_inverse:
+                exchange_inverse = _exchange_inverse[0]
 
         # If sharding and not exchange, but input arrays aren't sharded, assume input arrays are local and shard them here
         if with_sharding and (not exchange):
@@ -1688,8 +1666,7 @@ class ParticleField(object):
             else:
                 positions, weights = jax.device_put((positions, weights), sharding)
 
-        self.__dict__.update(positions=positions, weights=weights, attrs=attrs)
-        if inverse: self.__dict__.update(exchange_inverse=inverse[0])
+        self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, attrs=attrs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
