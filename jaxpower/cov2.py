@@ -334,12 +334,21 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             tmpw = next(iter(ww))
             s = tmpw.coords('s')
 
+            def interp2d(x, y, xp, yp, fp, left=0., right=0.):
+                # fp shape: (len(xp), len(yp))
+                interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
+                return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
+
             if 'fftlog' in flags:
                 s = tmpw.coords('s')
                 fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
                 tmp = fftlog(w)[1]
-                from scipy.interpolate import RectBivariateSpline
-                toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
+                #from scipy.interpolate import RectBivariateSpline
+                #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
+                #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
+                toret = interp2d(k, k, fftlog.k, fftlog.k, tmp, left=0., right=0.)
+                #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
+                #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
                 return toret
 
             else:
@@ -360,7 +369,6 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                     k1, k2 = k12
                     return jnp.sum(w * get_spherical_jn(q1)(k1 * s) * get_spherical_jn(q2)(k2 * s))
 
-                import jax
                 batch_size = int(min(max(1e7 / (k1.size * s.size), 1), k1.size))
                 tmp = jax.lax.map(f, (k1, k2), batch_size=batch_size)
                 toret = np.zeros(shape)
