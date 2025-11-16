@@ -111,13 +111,17 @@ class BinParticle2SpectrumPoles(object):
             return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs)['weight'].T
 
         if sharding_mesh.axis_names:
-
-            call = shard_map(lambda *particles: jax.lax.psum(call(*particles), sharding_mesh.axis_names), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(None)), out_specs=P(None))
-
-            # Loop to reduce computational footprint
+            # Note about parallel computation:
+            # To create a shard array, with same size on all process,
+            # we add particles with weight 0 located at the mean position of the data chunk.
+            # This creates a lot of repeats at the same location,
+            # which would lead to an increased computation time in the pair counting,
+            # as it is dominated by the pairs in that spatial bin.
+            # So in cucount we remove all particles with weight 0 prior to pair counting.
+            # Loop to reduce the memory footprint
             nshards = sharding_mesh.devices.size
             particles2 = jax.tree_map(lambda array: array.reshape(nshards, array.shape[0] // nshards, *array.shape[1:]), particles[1])
-            init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
+            init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0].positions.dtype)
             return jax.lax.scan(lambda carry, particles2: (carry + call(particles[0], particles2), 0), init, particles2)[0]
 
         return call(*particles)
@@ -215,15 +219,11 @@ class BinParticle2CorrelationPoles(object):
             # which would lead to an increased computation time in the pair counting,
             # as it is dominated by the pairs in that spatial bin.
             # So in cucount we remove all particles with weight 0 prior to pair counting.
-            call = shard_map(lambda *particles: jax.lax.psum(call(*particles), sharding_mesh.axis_names), mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names,), P(None)), out_specs=P(None))
-
-            # Loop to reduce computational footprint
+            # Loop to reduce the memory footprint
             nshards = sharding_mesh.devices.size
             particles2 = jax.tree_map(lambda array: array.reshape(nshards, array.shape[0] // nshards, *array.shape[1:]), particles[1])
-            init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0][0].dtype)
+            init = jnp.zeros((len(self.ells), len(self.edges)), dtype=particles[0].positions.dtype)
             return jax.lax.scan(lambda carry, particles2: (carry + call(particles[0], particles2), 0), init, particles2)[0]
-
-            #return sum(call(particles[0], particles2) for particles2 in _slice_particles(particles[1], nslices=None, sharding_mesh=sharding_mesh))
 
         return call(*particles)
 
@@ -240,13 +240,21 @@ class BinParticle2CorrelationPoles(object):
         return new
 
 
-def convert_particles(particles: ParticleField, weights=tuple()):
-    """Convert :class:`ParticleField` to :class:`cucount.jax.Particles`, optionally adding (bitwise) weights."""
+def convert_particles(particles: ParticleField, weights=None, **kwargs):
+    """Convert :class:`ParticleField` to :class:`cucount.jax.Particles`, optionally updating weights."""
+    from cucount.jax import Particles, _make_list_weights
     if isinstance(particles, FKPField):
         particles = particles.particles
-    from cucount.jax import Particles
-    weights = [particles.exchange(weight) for weight in weights]
-    return Particles(particles.positions, [particles.weights] + weights)
+    sharding_mesh = particles.attrs.sharding_mesh
+    with_sharding = bool(sharding_mesh.axis_names)
+    if weights is not None:
+        sharding_mesh = particles.attrs.sharding_mesh
+        with_sharding = bool(sharding_mesh.axis_names)
+        if with_sharding and particles.exchange_direct is not None:
+            weights = _make_list_weights(weights)
+            from .mesh import make_array_from_process_local_data
+            weights = [particles.exchange_direct(make_array_from_process_local_data(weight, pad=0)) for weight in weights]
+    return Particles(particles.positions, weights, **kwargs)
 
 
 

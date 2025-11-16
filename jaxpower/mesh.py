@@ -360,7 +360,7 @@ def make_particles_from_local(positions, weights=None, sharding_mesh: jax.shardi
     positions = make_array_from_process_local_data(positions, pad='mean', sharding_mesh=sharding_mesh)
     if weights is None:
         return positions
-    weights = make_array_from_process_local_data(weights, pad=0., sharding_mesh=sharding_mesh)
+    weights = make_array_from_process_local_data(weights, pad=0, sharding_mesh=sharding_mesh)
     return positions, weights
 
 
@@ -474,7 +474,7 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
 
     if not len(sharding_mesh.axis_names):
 
-        def exchange(values, pad=0.):
+        def exchange(values, pad=0):
             return values
 
         def inverse(values):
@@ -496,7 +496,7 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     if return_inverse:
         positions, indices = positions
 
-    def exchange(values, pad=0.):
+    def exchange(values, pad=0):
         return _exchange_array_jax(values, idx_out_devices, pad=pad, return_indices=False)
 
     if return_inverse:
@@ -1637,8 +1637,7 @@ class ParticleField(object):
         input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
         input_is_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is not None
 
-        exchange_direct = lambda x: x
-        exchange_inverse = lambda x: x
+        exchange_direct, exchange_inverse = None, None
         if with_sharding and exchange:
             if backend == 'mpi' and input_is_sharded:
 
@@ -1666,7 +1665,7 @@ class ParticleField(object):
             else:
                 positions, weights = jax.device_put((positions, weights), sharding)
 
-        self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, attrs=attrs)
+        self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, exchange_direct=exchange_direct, attrs=attrs)
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
