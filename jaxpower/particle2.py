@@ -9,7 +9,7 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 from .mesh import MeshAttrs, staticarray, ParticleField, get_sharding_mesh
-from .mesh2 import _format_ells
+from .mesh2 import FKPField, _format_ells
 from .utils import get_legendre, get_spherical_jn, set_env
 from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Mesh2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
 
@@ -38,7 +38,7 @@ def _make_edges2(kind, mattrs, edges: staticarray | dict | None=None, sattrs: di
     ells = _format_ells(ells)
     sattrs = SelectionAttrs(**sattrs) if isinstance(sattrs, dict) else sattrs
     wattrs = WeightAttrs(**wattrs) if isinstance(wattrs, dict) else wattrs
-    return dict(edges=edges, xavg=xavg, sattrs=sattrs, wattrs=wattrs, linear=linear, boxsize=boxsize, ells=ells, engine=engine)
+    return dict(edges=edges, xavg=xavg, sattrs=sattrs, wattrs=wattrs, linear=linear, boxsize=boxsize, ells=ells)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -59,8 +59,6 @@ class BinParticle2SpectrumPoles(object):
         Weight attributes.
     ells : int or array-like, optional
         Multipole orders to compute.
-    engine : {'auto', 'jax', 'cucount'}, optional
-        Computation engine.
 
     Attributes
     ----------
@@ -74,8 +72,6 @@ class BinParticle2SpectrumPoles(object):
         Weight attributes.
     ells : ndarray
         Multipole orders.
-    engine : str
-        Computation engine.
     """
     edges: jax.Array = None
     boxsize: jax.Array = None
@@ -112,7 +108,7 @@ class BinParticle2SpectrumPoles(object):
         def call(*particles):
             setup_logging('error')
             battrs = BinAttrs(k=self.xavg, pole=(np.array(self.ells), los))
-            return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs).T
+            return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs)['weight'].T
 
         if sharding_mesh.axis_names:
 
@@ -157,8 +153,6 @@ class BinParticle2CorrelationPoles(object):
         Weight attributes.
     ells : int or array_like, optional
         Multipole orders to compute.
-    engine : {'auto', 'jax', 'cucount'}, optional
-        Computation engine.
 
     Attributes
     ----------
@@ -174,8 +168,6 @@ class BinParticle2CorrelationPoles(object):
         Multipole orders.
     linear : bool
         Whether binning is linear.
-    engine : str
-        Computation engine.
     """
     edges: jax.Array = None
     xavg: jax.Array = None
@@ -213,7 +205,7 @@ class BinParticle2CorrelationPoles(object):
             setup_logging('error')
             bins = np.append(self.edges[:, 0], self.edges[-1, 1])
             battrs = BinAttrs(s=bins, pole=(np.array(self.ells), los))
-            return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs).T
+            return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs)['weight'].T
 
         if sharding_mesh.axis_names:
             # Note about parallel computation:
@@ -250,8 +242,8 @@ class BinParticle2CorrelationPoles(object):
 
 def convert_particles(particles: ParticleField, weights=tuple()):
     """Convert :class:`ParticleField` to :class:`cucount.jax.Particles`, optionally adding (bitwise) weights."""
-    if isinstance(fkp, FKPField):
-        particles = fkp.particles
+    if isinstance(particles, FKPField):
+        particles = particles.particles
     from cucount.jax import Particles
     weights = [particles.exchange(weight) for weight in weights]
     return Particles(particles.positions, [particles.weights] + weights)
@@ -284,12 +276,12 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
     if isinstance(bin, BinParticle2CorrelationPoles):
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), num_shotnoise=num_shotnoise[ill] * mask_shotnoise, ell=ell))
+            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
         return Particle2CorrelationPoles(correlation)
     else:  # 'complex'
         spectrum = []
         for ill, ell in enumerate(ells):
-            spectrum.append(Particle2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), num_shotnoise=num_shotnoise[ill] * mask_shotnoise, ell=ell))
+            spectrum.append(Particle2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
         return Particle2SpectrumPoles(spectrum)
 
 

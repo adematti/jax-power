@@ -228,7 +228,7 @@ def test_particle2(plot=False):
     size = int(1e-3 * mattrs.boxsize.prod())
     data = generate_uniform_particles(mattrs, size + 1, seed=42)
     ells = (0, 2, 4)
-    kw = dict(ells=ells, selection={'theta': (0., 0.05)})
+    kw = dict(ells=ells, sattrs={'theta': (0., 0.05)})
     bin = BinParticle2CorrelationPoles(mattrs, edges={'step': 0.1, 'max': 100.}, **kw)
     #with jax.disable_jit():
     t0 = time.time()
@@ -236,7 +236,6 @@ def test_particle2(plot=False):
     pcount = jax.block_until_ready(pcount)
     print(time.time() - t0)
     assert isinstance(pcount, Mesh2CorrelationPoles)
-    from jaxpower.particle2 import correlation_to_spectrum
     pcount.to_spectrum(k=jnp.linspace(0.01, 0.1, 20))
     bin = BinParticle2SpectrumPoles(mattrs, edges={'step': 0.01, 'max': 0.2}, **kw)
     spectrum = compute_particle2(data, bin=bin)
@@ -255,6 +254,7 @@ def test_particle2(plot=False):
         ax.plot([], [], color='k', linestyle='--', label='real')
         ax.plot([], [], color='k', linestyle='-', label='complex')
         plt.show()
+
 
 def test():
     from jax.experimental.shard_map import shard_map
