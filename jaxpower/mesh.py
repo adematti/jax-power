@@ -1458,7 +1458,7 @@ def _get_extent(*positions):
 def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                    boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
                    cellsize: np.ndarray | float=None, boxpad: np.ndarray | float=2.,
-                   check: bool=False, dtype=None, sharding_mesh=None, **kwargs):
+                   check: bool=False, approximate: bool=False, dtype=None, sharding_mesh=None, **kwargs):
     """
     Compute enclosing box.
     Differentiable if ``meshsize`` is provided.
@@ -1539,7 +1539,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                 meshsize = (meshsize + shape_devices - 1) // shape_devices * shape_devices  # to make it a multiple of devices
             toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
-            if not positions:
+            if not positions and not bool(approximate):
                 if not np.allclose(toret['boxsize'], boxsize):
                     raise ValueError(f"cannot enforce cellsize = {cellsize} with meshsize = {meshsize}, as it would lead to boxsize = {toret['boxsize']} != input boxsize = {boxsize}")
         else:

@@ -1,5 +1,7 @@
 import os
 import numbers
+import operator
+import functools
 from functools import partial
 from dataclasses import dataclass, field, asdict
 from collections.abc import Callable
@@ -8,11 +10,15 @@ from pathlib import Path
 
 import numpy as np
 import jax
+from jax import random
 from jax import numpy as jnp
 
 from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, ObservableLeaf, ObservableTree
 from .utils import get_legendre, get_spherical_jn, get_Ylm, real_gaunt, legendre_product, register_pytree_dataclass
-from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs
+from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs, create_sharded_random
+
+
+prod = functools.partial(functools.reduce, operator.mul)
 
 
 def _make_edges2(kind, mattrs, edges, ells, mode_oversampling=0):
@@ -639,7 +645,9 @@ def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2S
         update_cellsize = 'cellsize' in attrs
         if update_cellsize:
             cattrs.pop('meshsize')
-        attrs = particles[0].attrs.clone(**get_mesh_attrs(**(cattrs | attrs)))
+            cattrs.setdefault('approximate', True)
+        kw = cattrs | attrs
+        attrs = particles[0].attrs.clone(**get_mesh_attrs(**kw))
         if update_cellsize:
             halo_add = int(np.ceil(np.max((attrs.boxsize - cattrs['boxsize']) / 2. / attrs.cellsize)))
         particles = [particle.clone(attrs=attrs) for particle in particles]
@@ -672,7 +680,50 @@ def compute_box2_normalization(*inputs: RealMeshField | ParticleField, bin: BinM
     return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
 
 
-def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10.):
+def split_particles(*particles, seed=0):
+    """
+    Split input particles for estimation of the bispectrum normalization.
+
+    Parameters
+    ----------
+    particles : ParticleField or None
+        Input particles.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    toret : list
+        List of split particles.
+    """
+    toret = list(particles)
+    particles_to_split, nsplits = [], 0
+    # Loop in reverse order
+    for particle in particles[::-1]:
+        if particle is None:
+            nsplits += 1
+        else:
+            particles_to_split.append((particle, nsplits + 1))
+            nsplits = 0
+    # Reorder
+    particles_to_split = particles_to_split[::-1]
+    # remove last one
+    if isinstance(seed, int):
+        seed = random.key(seed)
+    seeds = random.split(seed, len(particles_to_split))
+    toret = []
+    for i, (particle, nsplits) in enumerate(particles_to_split):
+        if nsplits == 1:
+            toret.append(particle)
+        else:
+            x = create_sharded_random(random.uniform, seeds[i], particle.size, out_specs=0)
+            for isplit in range(nsplits):
+                mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+                toret.append(particle.clone(weights=particle.weights * mask))
+    return toret
+
+
+def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10., split=None):
     """
     Compute the FKP normalization for the power spectrum.
 
@@ -690,26 +741,33 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
     norm : float, list
     """
     # This is the pypower normalization - move to new one?
-    fkps, autocorr = _format_meshes(*fkps)
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
-    if autocorr:
-        fkp = fkps[0]
-        randoms = [fkp.data, fkp.randoms]  # cross to remove common noise
-        #mask = random.uniform(random.key(42), shape=fkp.randoms.size) < 0.5
-        #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
-        #randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
-        alpha = fkp.data.sum() / fkp.randoms.sum()
-        norm = alpha * compute_normalization(*randoms, **kw)
+    if split is not None:
+        randoms = split_particles(*[fkp.randoms if isinstance(fkp, FKPField) else fkp for fkp in fkps], seed=split)
+        fkps, fields = _format_meshes(*fkps)
+        fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
+        alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
+        norm = alpha * compute_normalization(*[fkp.randoms if isinstance(fkp, FKPField) else fkp for fkp in fkps], **kw)
     else:
-        randoms = [fkps[0].data, fkps[1].randoms]  # cross to remove common noise
-        alpha2 = fkps[1].data.sum() / fkps[1].randoms.sum()
-        norm = alpha2 * compute_normalization(*randoms, **kw)
-        randoms = [fkps[1].data, fkps[0].randoms]
-        alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
-        norm += alpha2 * compute_normalization(*randoms, **kw)
-        norm = norm / 2
+        fkps, autocorr = _format_meshes(*fkps)
+        if autocorr:
+            fkp = fkps[0]
+            randoms = [fkp.data, fkp.randoms]  # cross to remove common noise
+            #mask = random.uniform(random.key(42), shape=fkp.randoms.size) < 0.5
+            #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
+            #randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
+            alpha = fkp.data.sum() / fkp.randoms.sum()
+            norm = alpha * compute_normalization(*randoms, **kw)
+        else:
+            randoms = [fkps[0].data, fkps[1].randoms]  # cross to remove common noise
+            alpha2 = fkps[1].data.sum() / fkps[1].randoms.sum()
+            norm = alpha2 * compute_normalization(*randoms, **kw)
+            randoms = [fkps[1].data, fkps[0].randoms]
+            alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
+            norm += alpha2 * compute_normalization(*randoms, **kw)
+            norm = norm / 2
     if bin is not None:
         return [norm] * len(bin.ells)
     return norm

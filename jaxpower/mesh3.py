@@ -699,55 +699,12 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     return Mesh3CorrelationPoles(correlation)
 
 
-from .mesh2 import compute_normalization, compute_box_normalization
+from .mesh2 import compute_normalization, compute_box_normalization, split_particles
 
 
 def compute_box3_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh3SpectrumPoles=None) -> jax.Array:
     """Compute normalization, assuming constant density, for the bispectrum."""
     return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
-
-
-def split_particles(*particles, seed=0):
-    """
-    Split input particles for estimation of the bispectrum normalization.
-
-    Parameters
-    ----------
-    particles : ParticleField or None
-        Input particles.
-    seed : int, optional
-        Random seed.
-
-    Returns
-    -------
-    toret : list
-        List of split particles.
-    """
-    toret = list(particles)
-    particles_to_split, nsplits = [], 0
-    # Loop in reverse order
-    for particle in particles[::-1]:
-        if particle is None:
-            nsplits += 1
-        else:
-            particles_to_split.append((particle, nsplits + 1))
-            nsplits = 0
-    # Reorder
-    particles_to_split = particles_to_split[::-1]
-    # remove last one
-    if isinstance(seed, int):
-        seed = random.key(seed)
-    seeds = random.split(seed, len(particles_to_split))
-    toret = []
-    for i, (particle, nsplits) in enumerate(particles_to_split):
-        if nsplits == 1:
-            toret.append(particle)
-        else:
-            x = create_sharded_random(random.uniform, seeds[i], particle.size, out_specs=0)
-            for isplit in range(nsplits):
-                mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
-                toret.append(particle.clone(weights=particle.weights * mask))
-    return toret
 
 
 def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=10., split=None):
@@ -776,7 +733,7 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     """
     fkps =  list(fkps) + [None] * (3 - len(fkps))
     if split is not None:
-        randoms = split_particles(*[fkp.randoms if fkp is not None else fkp for fkp in fkps], seed=split)
+        randoms = split_particles(*[fkp.randoms if isinstance(fkp, FKPField) else fkp for fkp in fkps], seed=split)
         fkps, fields = _format_meshes(*fkps)
         fkps = [fkp.clone(randoms=randoms) for fkp, randoms in zip(fkps, randoms)]
     else:
@@ -784,8 +741,8 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
-    alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum(), fkps))
-    norm = alpha * compute_normalization(*[fkp.randoms for fkp in fkps], **kw)
+    alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
+    norm = alpha * compute_normalization(*[fkp.randoms if isinstance(fkp, FKPField) else fkp for fkp in fkps], **kw)
     if bin is not None:
         return [norm] * len(bin.ells)
     return norm

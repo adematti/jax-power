@@ -255,6 +255,14 @@ def test_particle2(plot=False):
         ax.plot([], [], color='k', linestyle='-', label='complex')
         plt.show()
 
+    sep = np.linspace(0., 0.05, 10)
+    kw.update(wattrs=dict(angular={'sep': sep, 'weight': np.linspace(2., 1., sep.size)}))
+    from jaxpower.particle2 import convert_particles
+    data = convert_particles(data, weights=[data.weights, -data.weights])
+    bin = BinParticle2SpectrumPoles(mattrs, edges={'step': 0.01, 'max': 0.2}, **kw)
+    print(data.index_value)
+    spectrum = compute_particle2(data, bin=bin)
+
 
 def test():
     from jax.experimental.shard_map import shard_map

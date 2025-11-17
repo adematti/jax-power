@@ -36,8 +36,10 @@ def _make_edges2(kind, mattrs, edges: staticarray | dict | None=None, sattrs: di
     edges = np.column_stack([edges[:-1], edges[1:]])
     xavg = 3. / 4. * (edges[..., 1]**4 - edges[..., 0]**4) / (edges[..., 1]**3 - edges[..., 0]**3)
     ells = _format_ells(ells)
-    sattrs = SelectionAttrs(**sattrs) if isinstance(sattrs, dict) else sattrs
-    wattrs = WeightAttrs(**wattrs) if isinstance(wattrs, dict) else wattrs
+    if not isinstance(sattrs, SelectionAttrs):
+        sattrs = SelectionAttrs(**(sattrs or {}))
+    if not isinstance(wattrs, WeightAttrs):
+        wattrs = WeightAttrs(**(wattrs or {}))
     return dict(edges=edges, xavg=xavg, sattrs=sattrs, wattrs=wattrs, linear=linear, boxsize=boxsize, ells=ells)
 
 
@@ -248,10 +250,10 @@ def convert_particles(particles: ParticleField, weights=None, **kwargs):
     sharding_mesh = particles.attrs.sharding_mesh
     with_sharding = bool(sharding_mesh.axis_names)
     if weights is not None:
+        weights = _make_list_weights(weights)
         sharding_mesh = particles.attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding and particles.exchange_direct is not None:
-            weights = _make_list_weights(weights)
             from .mesh import make_array_from_process_local_data
             weights = [particles.exchange_direct(make_array_from_process_local_data(weight, pad=0)) for weight in weights]
     return Particles(particles.positions, weights, **kwargs)
