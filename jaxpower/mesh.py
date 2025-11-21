@@ -1647,9 +1647,9 @@ class ParticleField(object):
         else:
             weights = jnp.asarray(weights)
 
-        #input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
+        input_is_not_sharded = (getattr(positions, 'sharding', None) is not None) and (getattr(positions.sharding, 'mesh', None) is None)
         input_is_sharded = (getattr(positions, 'sharding', None) is not None) and (getattr(positions.sharding, 'mesh', None) is not None)
-        input_is_not_sharded = not input_is_sharded
+        #input_is_not_sharded = not input_is_sharded
 
         exchange_direct, exchange_inverse = None, None
         if with_sharding and exchange:
