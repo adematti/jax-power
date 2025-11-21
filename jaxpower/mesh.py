@@ -338,13 +338,13 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
                 if sizes is None:
                     sizes = get_sizes()
                 per_host_sum = np.repeat(per_host_array.sum(axis=0, keepdims=True), nlocal, axis=0)
-                pad = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0) / sizes.sum()[None, ...]
+                pad = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0, keepdims=True) / sizes.sum()[None, ...]
             elif pad == 'mean':
                 pad = np.mean(per_host_array, axis=0)[None, ...]
             else:
                 raise ValueError('mean or global_mean supported only')
         constant_values = pad
-        pad = lambda array, pad_width: np.append(array, np.repeat(constant_values, pad_width[0][1], axis=0), axis=0)
+        pad = lambda array, pad_width: np.concatenate([array, np.repeat(np.asarray(constant_values, dtype=array.dtype), pad_width[0][1], axis=0)], dtype=array.dtype, axis=0)
 
     if per_host_size is None:
         if sizes is None: sizes = get_sizes()
