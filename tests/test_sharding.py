@@ -9,8 +9,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read,
-                      compute_fkp2_spectrum, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
+from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
 
 
 dirname = Path('_tests')
@@ -390,6 +389,21 @@ def test_scaling2():
         print(time.time() - t0)
 
 
+def test_sharding_routines():
+    from jaxpower.mesh import make_array_from_process_local_data
+
+    with create_sharding_mesh() as sharding_mesh:
+        mattrs = MeshAttrs(boxsize=1000., meshsize=64)
+        particles = generate_uniform_particles(mattrs, size=1000, seed=42, exchange=False)
+        exchanged = particles.exchange(backend='jax')
+    
+        local_size = particles.weights.addressable_shards[0].data.shape[0]
+        rng = np.random.RandomState(seed=42)
+        values = rng.uniform(0., 1., size=(local_size, 10))
+        values = make_array_from_process_local_data(values, pad='mean')
+        values = exchanged.exchange_direct(values, pad='mean')
+        print(values.shape)
+
 
 if __name__ == '__main__':
     from jax import config
@@ -399,8 +413,9 @@ if __name__ == '__main__':
     #save_reference_mock()
     # Setting up distributed jax
     jax.distributed.initialize()
+    test_sharding_routines()
     #test_halo()
-    test_exchange_array()
+    #test_exchange_array()
     #test_jaxdecomp()
     #test_mesh_power()
     #test_sharding()

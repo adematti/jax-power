@@ -407,7 +407,7 @@ def allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwar
     return tmp
 
 
-def _exchange_array_jax(array, device, pad=jnp.nan, return_indices=False):
+def _exchange_array_jax(array, device, pad=0, return_indices=False):
     # Exchange array along the first (0) axis
     # TODO: generalize to any axis
     sharding = array.sharding
@@ -419,6 +419,13 @@ def _exchange_array_jax(array, device, pad=jnp.nan, return_indices=False):
     per_host_final_arrays = [None] * len(local_devices)
     per_host_indices = [[] for i in range(len(local_devices))]
     slices = [None] * ndevices
+
+    if isinstance(pad, str):
+        if pad == 'mean':
+            mean = array.mean(axis=0)
+            pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, ...], pad_width[0][1], axis=0), axis=0)
+        else:
+            raise ValueError('mean or global_mean supported only')
 
     for idevice in range(ndevices):
         # single-device arrays
@@ -490,19 +497,21 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
 
-    mean = positions.mean(axis=0)
-    pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, :], pad_width[0][1], axis=0), axis=0)
-    positions = _exchange_array_jax(positions, idx_out_devices, pad=pad, return_indices=return_inverse)
+    positions = _exchange_array_jax(positions, idx_out_devices, pad='mean', return_indices=return_inverse)
     if return_inverse:
         positions, indices = positions
 
     def exchange(values, pad=0):
         return _exchange_array_jax(values, idx_out_devices, pad=pad, return_indices=False)
 
+    exchange.backend = 'jax'
+
     if return_inverse:
 
         def inverse(values):
             return _exchange_inverse_jax(values, indices)
+
+        inverse.backend = 'jax'
 
         return positions, exchange, inverse
     return positions, exchange
@@ -666,11 +675,15 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
             return make_array_from_process_local_data(per_host_array, pad=pad, sharding_mesh=sharding_mesh)
         return per_host_array
 
+    exchange.backend = 'mpi'
+
     if return_inverse:
         positions, indices = positions
 
         def inverse(values):
             return _exchange_inverse_mpi(values, indices, mpicomm=mpicomm)
+
+        inverse.backend = 'mpi'
 
         return positions, exchange, inverse
     return positions, exchange
@@ -1634,8 +1647,9 @@ class ParticleField(object):
         else:
             weights = jnp.asarray(weights)
 
-        input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
-        input_is_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is not None
+        #input_is_not_sharded = getattr(positions, 'sharding', None) is not None and getattr(positions.sharding, 'mesh', None) is None
+        input_is_sharded = (getattr(positions, 'sharding', None) is not None) and (getattr(positions.sharding, 'mesh', None) is not None)
+        input_is_not_sharded = not input_is_sharded
 
         exchange_direct, exchange_inverse = None, None
         if with_sharding and exchange:

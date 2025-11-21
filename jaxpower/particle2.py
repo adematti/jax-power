@@ -200,8 +200,12 @@ def convert_particles(particles: ParticleField, weights=None, **kwargs):
         sharding_mesh = particles.attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding and particles.exchange_direct is not None:
-            from .mesh import make_array_from_process_local_data
-            weights = [particles.exchange_direct(make_array_from_process_local_data(weight, pad=0)) for weight in weights]
+            input_is_sharded = (getattr(weights[0], 'sharding', None) is not None) and (getattr(weights[0].sharding, 'mesh', None) is not None)
+            input_is_not_sharded = not input_is_sharded
+            if particles.exchange_direct.backend == 'jax' and input_is_not_sharded:
+                from .mesh import make_array_from_process_local_data
+                weights = [make_array_from_process_local_data(weight, pad=0) for weight in weights]
+            weights = [particles.exchange_direct(weight, pad=0) for weight in weights]
     else:
         weights = particles.weights
     return Particles(particles.positions, weights=weights, **kwargs)
