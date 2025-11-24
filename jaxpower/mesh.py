@@ -1647,6 +1647,7 @@ class ParticleField(object):
         else:
             weights = jnp.asarray(weights)
 
+        # In jitted function, positions.sharding is None, so first need to check it exists
         input_is_not_sharded = (getattr(positions, 'sharding', None) is not None) and (getattr(positions.sharding, 'mesh', None) is None)
         input_is_sharded = (getattr(positions, 'sharding', None) is not None) and (getattr(positions.sharding, 'mesh', None) is not None)
         #input_is_not_sharded = not input_is_sharded

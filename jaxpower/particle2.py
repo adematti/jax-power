@@ -103,7 +103,7 @@ class BinParticle2SpectrumPoles(object):
         if len(particles) == 1: particles = particles * 2
 
         def call(*particles):
-            setup_logging('error')
+            #setup_logging('error')
             battrs = BinAttrs(k=np.asarray(self.xavg), pole=(self.ells, los))
             return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs)['weight'].T
 
@@ -180,7 +180,7 @@ class BinParticle2CorrelationPoles(object):
         if len(particles) == 1: particles = particles * 2
 
         def call(*particles):
-            setup_logging('error')
+            #setup_logging('error')
             edges = np.append(self.edges[:, 0], self.edges[-1, 1])
             battrs = BinAttrs(s=edges, pole=(self.ells, los))
             return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs)['weight'].T
