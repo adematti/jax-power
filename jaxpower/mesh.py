@@ -1357,7 +1357,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
         #idx = idx + jnp.array([44, 0, 0], dtype=int)
         #print('3', positions[12], jnp.round(positions[12]).astype(int), idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
         value = exchange_halo(value, **kw_sharding)
-        _read = shard_map(_read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names))
+        _read = shard_map(_read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names), check_rep=False)  # check_rep=False otherwise error un jvp
     #else:
     #    idx = jnp.round(positions[8]).astype(int)
     #    print('0', positions[8], idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
@@ -1674,11 +1674,11 @@ class ParticleField(object):
                 exchange_inverse = _exchange_inverse[0]
 
         # If sharding and not exchange, but input arrays aren't sharded, assume input arrays are local and shard them here
-        if with_sharding and (not exchange):
-            if input_is_not_sharded:
-                positions, weights = make_particles_from_local(positions, weights)
-            else:
-                positions, weights = jax.device_put((positions, weights), sharding)
+        #if with_sharding and (not exchange):
+        #    if input_is_not_sharded:
+        #        positions, weights = make_particles_from_local(positions, weights)
+        #    else:
+        #        positions, weights = jax.device_put((positions, weights), sharding)
 
         self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, exchange_direct=exchange_direct, attrs=attrs)
 
@@ -1850,7 +1850,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
-        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))
+        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names), check_rep=False)  # check_rep=False otherwise error in jvp
 
     def ppaint(positions, weights=None):
         mesh = attrs.create(kind='real', fill=0.)
