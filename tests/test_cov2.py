@@ -7,8 +7,8 @@ from jax import numpy as jnp
 from matplotlib import pyplot as plt
 
 from jaxpower import (MeshAttrs, compute_mesh2_covariance_window, compute_fkp2_covariance_window, compute_spectrum2_covariance,
-                      generate_anisotropic_gaussian_mesh, generate_uniform_particles, BinMesh2SpectrumPoles, Mesh2SpectrumPole, Mesh2SpectrumPoles,
-                      read, compute_mesh2_spectrum, interpolate_window_function)
+                      generate_anisotropic_gaussian_mesh, generate_uniform_particles, BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, Mesh2SpectrumPole, Mesh2SpectrumPoles,
+                      read, compute_mesh2_spectrum, compute_mesh2_correlation, interpolate_window_function, Mesh2CorrelationPole, Mesh2CorrelationPoles)
 from jaxpower.types import ObservableTree
 
 
@@ -25,11 +25,11 @@ def export_sympy():
     #for ell in range(11): print('_registered_legendre[{:d}] = lambda x: {}'.format(ell, compute_sympy_legendre(ell)))
 
 
-def get_theory(kmax=0.3, dk=0.005):
+def get_theory(kmax=0.3, dk=0.005, smax=200., ds=1., return_correlation=False):
     from cosmoprimo.fiducial import DESI
 
     cosmo = DESI(engine='eisenstein_hu')
-    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
+    pk1d = cosmo.get_fourier().pk_interpolator().to_1d(z=0.)
     ellsin = (0, 2, 4)
     edgesin = np.arange(0., kmax, dk)
     edgesin = np.column_stack([edgesin[:-1], edgesin[1:]])
@@ -37,17 +37,39 @@ def get_theory(kmax=0.3, dk=0.005):
     f, b = 0.8, 2.
     #f = 0.
     beta = f / b
-    pk = 5 * pk(kin)
     #pk = jnp.full(kin.shape, pk(0.1))
     shotnoise = (1e-4)**(-1)
-    theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
-                0.99 * (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
-                8. / 35 * beta ** 2 * pk]
+    boost = 5
 
-    poles = []
-    for ell, value in zip(ellsin, theory):
-        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, num_shotnoise=shotnoise * np.ones_like(kin) * (ell == 0), ell=ell))
-    return Mesh2SpectrumPoles(poles)
+    def get_pk(k):
+        return np.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * boost * pk1d(k) + shotnoise,
+                          0.99 * (4. / 3. * beta + 4. / 7. * beta ** 2) * boost * pk1d(k),
+                          8. / 35 * beta ** 2 * boost * pk1d(k)])
+
+    def get_xi(s):
+        return np.array([(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * boost * pk1d.to_xi(fftlog_kwargs={'ell': 0})(s),
+                        0.99 * (4. / 3. * beta + 4. / 7. * beta ** 2) * boost * pk1d.to_xi(fftlog_kwargs={'ell': 2})(s),
+                        8. / 35 * beta ** 2 * boost * pk1d.to_xi(fftlog_kwargs={'ell': 4})(s)])
+
+    spectrum = []
+    for ell, value in zip(ellsin, get_pk(kin)):
+        spectrum.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, num_shotnoise=shotnoise * np.ones_like(kin) * (ell == 0), ell=ell))
+    spectrum = Mesh2SpectrumPoles(spectrum)
+
+    if not return_correlation:
+        return spectrum
+
+
+    edgesin = np.arange(0., smax, ds)
+    edgesin = np.column_stack([edgesin[:-1], edgesin[1:]])
+    sin = np.mean(edgesin, axis=-1)
+    correlation = []
+    for ell, value in zip(ellsin, get_xi(sin)):
+        correlation.append(Mesh2CorrelationPole(s=sin, s_edges=edgesin, num_raw=value, ell=ell))
+    correlation = Mesh2CorrelationPoles(correlation)
+
+    return spectrum, correlation
+
 
 
 def mock_fn(basename='box', imock=None):
@@ -133,24 +155,28 @@ def save_cutsky_mocks():
     selection = survey_selection()
     mattrs = selection.attrs
     theory = get_theory(kmax=np.sqrt(3) * mattrs.knyq.max(), dk=0.001)
-    bin = BinMesh2SpectrumPoles(mattrs, edges=theory.select(k=slice(0, None, 5)).select(k=(0., mattrs.knyq.max())).get(ells=0).edges('k'), ells=(0, 2, 4))
+    kbin = BinMesh2SpectrumPoles(mattrs, edges=theory.select(k=slice(0, None, 5)).select(k=(0., mattrs.knyq.max())).get(ells=0).edges('k'), ells=(0, 2, 4))
+    sbin = BinMesh2CorrelationPoles(mattrs, edges={'step': 5.}, ells=(0, 2, 4))
     los = 'local'
 
-    norm = compute_normalization(selection, selection, bin=bin)
+    norm = compute_normalization(selection, selection, bin=kbin)
 
     @jit
     def mock(seed):
-        mesh = generate_anisotropic_gaussian_mesh(mattrs, poles=theory, los=los, seed=seed)
-        return compute_mesh2_spectrum(mesh * selection, bin=bin, los=los).clone(norm=norm)
+        mesh = generate_anisotropic_gaussian_mesh(mattrs, poles=theory, los=los, seed=seed) * selection
+        spectrum = compute_mesh2_spectrum(mesh, bin=kbin, los=los).clone(norm=norm)
+        correlation = compute_mesh2_correlation(mesh, bin=sbin, los=los).clone(norm=norm)
+        return spectrum, correlation
 
-    for i, fn in enumerate(mock_fn(basename='cutsky')):
-        print(i, end=" ", flush=True)
-        poles = mock(random.key(i))
-        poles.write(fn)
+    for imock in range(100):
+        spectrum_fn, correlation_fn = [mock_fn(basename=basename, imock=imock) for basename in ['cutsky_spectrum', 'cutsky_correlation']]
+        spectrum, correlation = mock(random.key(imock))
+        spectrum.write(spectrum_fn)
+        correlation.write(correlation_fn)
     print()
 
 
-def test_cutsky2_covariance(plot=False):
+def test_cutsky2_spectrum_covariance(plot=False):
 
     selection = survey_selection(paint=False)
     selection = selection.clone(attrs=selection.attrs.clone(boxsize=3000.)).paint(resampler='cic', interlacing=0, compensate=False)
@@ -209,7 +235,7 @@ def test_cutsky2_covariance(plot=False):
     coords = jnp.logspace(-2., 4., 1024)
     windows = interpolate_window_function(windows, coords)
     cov_fftlog = compute_spectrum2_covariance(windows, theory, delta=delta, flags=['smooth', 'fftlog']).at.observable.select(k=slice(0, None, 5)).at.observable.select(k=klim)
-    cov_mocks = Mesh2SpectrumPoles.cov(list(map(read, mock_fn(basename='cutsky')))).at.observable.select(k=klim)
+    cov_mocks = Mesh2SpectrumPoles.cov(list(map(read, mock_fn(basename='cutsky_spectrum')))).at.observable.select(k=klim)
     #pattrs = mattrs.clone(boxsize=2. * 0.25 * mattrs.boxsize)
     #cov_smooth = compute_spectrum2_covariance(pattrs, theory, delta=delta).at.observable.select(k=slice(0, None, 5))at.observable.select(k=klim)
 
@@ -229,6 +255,118 @@ def test_cutsky2_covariance(plot=False):
         fig = cov_mocks.plot_diag(**kw, color='C3', fig=fig)
         fig.axes[0].get_legend().remove()
         plt.show()
+
+
+
+def test_cutsky2_correlation_covariance(plot=False):
+    import scipy as sp
+
+    selection = survey_selection(paint=False)
+    selection = selection.clone(attrs=selection.attrs.clone(boxsize=3000.)).paint(resampler='cic', interlacing=0, compensate=False)
+    mattrs = selection.attrs
+    theory, correlation = get_theory(kmax=mattrs.knyq.max(), dk=0.002, return_correlation=True)
+
+    #kw_window = dict(edges={'step': mattrs.cellsize.min()}, basis='bessel', los='local')
+    kw_window = dict()
+    window_fn = dirname / 'window.h5'
+    spectrum_covariance_fn = dirname / 'spectrum_covariance.h5'
+
+    if window_fn.exists():
+        windows = read(window_fn)
+    else:
+        windows = compute_mesh2_covariance_window(selection, **kw_window)
+        windows.write(window_fn)
+
+    if spectrum_covariance_fn.exists():
+        spectrum_covariance = read(spectrum_covariance_fn)
+    else:
+        #coords = jnp.logspace(-2., 4., 1024)
+        #windows = interpolate_window_function(windows, coords)
+        spectrum_covariance = compute_spectrum2_covariance(windows, theory) #, flags=['smooth', 'fftlog'])
+        spectrum_covariance.write(spectrum_covariance_fn)
+
+    spectrum_covariance = spectrum_covariance.at.observable.select(k=(0., mattrs.knyq.max() * 0.8))
+
+    from jaxpower.cov2 import project_to_spectrum, project_to_correlation
+    k = spectrum_covariance.observable.get(ells=0).coords('k')
+
+    kedges = np.linspace(k[0], k[-1], 300)
+    kedges = np.column_stack([kedges[:-1], kedges[1:]])
+    #kedges = spectrum_covariance.observable.get(ells=0).edges('k')
+    observable = spectrum_covariance.observable
+    matrix = project_to_spectrum(kedges, observable)
+    observable_fine = observable.select(k=kedges)
+    observable_fine = observable_fine.map(lambda pole: pole.clone(k=np.mean(kedges, axis=-1)))
+    value_fine = matrix.dot(spectrum_covariance.value()).dot(matrix.T)
+    spectrum_covariance_fine = spectrum_covariance.clone(value=value_fine, observable=observable_fine)
+
+    cov_mocks = Mesh2CorrelationPoles.cov(list(map(read, mock_fn(basename='cutsky_spectrum')))).at.observable.select(k=(0., mattrs.knyq.max() * 0.8))
+
+    if False: #plot:
+        #spectrum_covariance_fine.plot(corrcoef=True, show=True)
+        ytransform = lambda x, y: x**4 * y
+        kw = dict(ytransform=ytransform, offset=np.arange(3))
+        fig = spectrum_covariance.plot_diag(**kw, color='k')
+        fig = cov_mocks.plot_diag(**kw, color='C1', fig=fig)
+        fig.axes[0].get_legend().remove()
+        plt.show()
+        spectrum_covariance_fine.plot_diag(**kw, color='k', show=True)
+
+    cov_mocks = Mesh2CorrelationPoles.cov(list(map(read, mock_fn(basename='cutsky_correlation')))).at.observable.select(s=(20., 200.))
+
+    if False:
+        observable = cov_mocks.observable
+        ax = plt.gca()
+        for ill, ell in enumerate(observable.ells):
+            color = f'C{ill:d}'
+            pole = observable.get(ells=ell)
+            ax.plot(s:=pole.coords('s'), s**2 * pole.value(), color=color, label=rf'$\ell = {ell:d}$')
+            pole = correlation.get(ells=ell)
+            ax.plot(s:=pole.coords('s'), s**2 * pole.value(), color=color, linestyle='--')
+        plt.show()
+
+
+    sedges = cov_mocks.observable.get(ells=0).edges('s')
+    s = np.mean(sedges, axis=-1)
+    nmodes = 4 * np.pi / 3. * (sedges[:, 1]**3 - sedges[:, 0]**3)
+    matrix = project_to_correlation(sedges, observable_fine)
+    ells = observable_fine.ells
+    observable_correlation = Mesh2CorrelationPoles([Mesh2CorrelationPole(s=s, s_edges=sedges, num_raw=np.zeros_like(s), nmodes=nmodes, ell=ell) for ell in ells])
+    value_correlation = matrix.dot(spectrum_covariance_fine.value()).dot(matrix.T)
+    correlation_covariance = spectrum_covariance_fine.clone(value=value_correlation, observable=observable_correlation)
+    if plot:
+        correlation_covariance.plot(corrcoef=True, show=True)
+        ytransform = lambda x, y: x**2 * y
+        kw = dict(ytransform=ytransform, offset=np.arange(3))
+        fig = correlation_covariance.plot_diag(**kw, color='k')
+        #fig = cov_smooth.plot_diag(**kw, color='C2', fig=fig)
+        fig = cov_mocks.plot_diag(**kw, color='C1', fig=fig)
+        fig.axes[0].get_legend().remove()
+        plt.show()
+
+
+def test_pre_post_covariance():
+
+    selection = survey_selection(paint=False)
+    selection = selection.clone(attrs=selection.attrs.clone(boxsize=3000.)).paint(resampler='cic', interlacing=0, compensate=False)
+    mattrs = selection.attrs
+    kmax = mattrs.knyq.max()
+    theory = get_theory(kmax=kmax, dk=0.002)
+    theory = ObservableTree([theory, theory.select(k=(0., 0.8 * kmax)), theory.select(k=(0., 0.5 * kmax))], fields=[('pre', 'pre'), ('pre', 'post'), ('post', 'post')])
+
+    #kw_window = dict(edges={'step': mattrs.cellsize.min()}, basis='bessel', los='local')
+    kw_window = dict()
+    window_fn = dirname / 'window.h5'
+
+    if window_fn.exists():
+        windows = read(window_fn)
+    else:
+        windows = compute_mesh2_covariance_window(selection, **kw_window)
+        windows.write(window_fn)
+
+    fields = [('pre',) * 4, ('post',) * 4, ('pre',) * 2 + ('post',) * 2]
+    windows = ObservableTree([windows.get(fields=(0, 0, 0, 0))] * len(fields), fields=fields)
+    spectrum_covariance = compute_spectrum2_covariance(windows, theory)
 
 
 def save_fkp_mocks():
@@ -323,9 +461,20 @@ def test_fkp2_covariance(plot=False):
     randoms = generate_uniform_particles(pattrs, size * ialpha, seed=32).clone(attrs=mattrs)
     #edges = {'step': attrs.cellsize.min()}
     edges = None
-    windows = compute_fkp2_covariance_window(randoms, edges=edges, interlacing=2, resampler='tsc', los='local', alpha=1. / ialpha)
+
+    window_fn = dirname / 'window_fkp.h5'
+
+    if window_fn.exists():
+        windows = list(read(window_fn))
+    else:
+        windows = compute_fkp2_covariance_window(randoms, edges=edges, interlacing=2, resampler='tsc', los='local', alpha=1. / ialpha)
+        ObservableTree(windows, types=['WW', 'WS', 'SS']).write(window_fn)
 
     covs = compute_spectrum2_covariance(windows, theory, delta=0.2)
+    for cov in covs:
+        cov = cov.value()
+        assert np.allclose(cov, cov.T)
+
     klim = (0., mattrs.knyq.max())
     covs = [cov.at.observable.select(k=klim) for cov in covs]
 
@@ -492,6 +641,42 @@ def test_fftlog2():
     #plt.show()
 
 
+def test_bspline():
+    import numpy as np
+    from scipy.interpolate import make_interp_spline, BSpline
+
+    def matrix_spline_interp(x, xeval, k=3):
+        from scipy.interpolate import make_interp_spline, BSpline
+        from scipy import sparse
+        # Build interpolating spline
+        bspl = make_interp_spline(x, np.ones_like(x), k=k)
+        # Extract its knot vector
+        t = bspl.t   # knot positions
+        c = bspl.c   # coefficients (same length as x for interpolating spline)
+        # Build the design matrix:
+        D = BSpline.design_matrix(x, t, k)
+        A = BSpline.design_matrix(xeval, t, k)
+        return sparse.linalg.spsolve(D.T, A.T).T.toarray()
+
+    def f(x):
+        return np.sin(x)
+
+    k = 3
+    x = np.linspace(0., 2. * np.pi, 10)
+    xeval = np.linspace(0., 2. * np.pi, 50)
+    y = f(x)
+
+    matrix = matrix_spline_interp(x, xeval, k=k)
+    yinterp = matrix.dot(y)
+    bspl = make_interp_spline(x, y, k=k)
+
+    ax = plt.gca()
+    ax.plot(x, y, color='k', linestyle='--')
+    ax.plot(xeval, yinterp, color='k', linestyle='-')
+    ax.plot(xeval, bspl(xeval), color='k', linestyle=':')
+    plt.show()
+
+
 
 if __name__ == '__main__':
 
@@ -501,7 +686,10 @@ if __name__ == '__main__':
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
-    test_cutsky2_covariance(plot=True)
+    #test_cutsky2_spectrum_covariance(plot=True)
+    #test_cutsky2_correlation_covariance(plot=True)
+    #test_pre_post_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
-    #test_fkp2_covariance(plot=True)
+    test_fkp2_covariance(plot=True)
+    #test_bspline()

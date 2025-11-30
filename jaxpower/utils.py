@@ -367,6 +367,11 @@ def Si_scipy(x):
     return jax.pure_callback(lambda x: special.sici(x)[0], x, x)
 
 
+def Si(x):
+    from .jax.special import sici
+    return sici(x)[0]
+
+
 def get_spherical_jn_scipy(ell):
     return lambda x: jax.pure_callback(partial(special.spherical_jn, ell), x, x)
 
@@ -400,11 +405,11 @@ _registered_bessel_tophat_integral[0] = (lambda x: (-jnp.cos(x)/x + jnp.sin(x)/x
                                          lambda x: -x**10/518918400 + x**8/3991680 - x**6/45360 + x**4/840 - x**2/30 + 1/3)
 _registered_bessel_tophat_integral[1] = (lambda x: (-jnp.sin(x) - 2*jnp.cos(x)/x)/x**2 + 2/x**3,
                                          lambda x: x**9/47900160 - x**7/453600 + x**5/6720 - x**3/180 + x/12)
-_registered_bessel_tophat_integral[2] = (lambda x: (x*jnp.cos(x) - 4*jnp.sin(x) + 3*Si_scipy(x))/x**3,
+_registered_bessel_tophat_integral[2] = (lambda x: (x*jnp.cos(x) - 4*jnp.sin(x) + 3*Si(x))/x**3,
                                          lambda x: x**10/674593920 - x**8/5488560 + x**6/68040 - x**4/1470 + x**2/75)
 _registered_bessel_tophat_integral[3] = (lambda x: 8/x**3 + (x**2*jnp.sin(x) + 7*x*jnp.cos(x) - 15*jnp.sin(x))/x**4,
                                          lambda x: -x**9/77837760 + x**7/831600 - x**5/15120 + x**3/630)
-_registered_bessel_tophat_integral[4] = (lambda x: (-x**3*jnp.cos(x) + 11*x**2*jnp.sin(x) + 15*x**2*Si_scipy(x)/2 + 105*x*jnp.cos(x)/2 - 105*jnp.sin(x)/2)/x**5,
+_registered_bessel_tophat_integral[4] = (lambda x: (-x**3*jnp.cos(x) + 11*x**2*jnp.sin(x) + 15*x**2*Si(x)/2 + 105*x*jnp.cos(x)/2 - 105*jnp.sin(x)/2)/x**5,
                                          lambda x: -x**10/1264863600 + x**8/11891880 - x**6/187110 + x**4/6615)
 _registered_bessel_tophat_integral[5] = (lambda x: 16/x**3 + (-x**4*jnp.sin(x) - 16*x**3*jnp.cos(x) + 105*x**2*jnp.sin(x) + 315*x*jnp.cos(x) - 315*jnp.sin(x))/x**6,
                                          lambda x: x**9/194594400 - x**7/2702700 + x**5/83160)
@@ -445,6 +450,18 @@ def get_spherical_jn(ell):
     return jn
 
 
+def get_spherical_jn_tophat_integral(ell):
+
+    def jn_tophat(xeval, edges):
+        x = xeval[..., None, None] * edges
+        mask = x > 0.1
+        tophat = _registered_bessel_tophat_integral[ell]
+        w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3
+        return 4. * np.pi * (w[..., 1] - w[..., 0])
+
+    return jn_tophat
+
+
 def weights_trapz(x):
     """Return weights for trapezoidal integration."""
     return jnp.concatenate([[x[1] - x[0]], x[2:] - x[:-2], [x[-1] - x[-2]]]) / 2.
@@ -455,55 +472,7 @@ class BesselIntegral(object):
     def __init__(self, xp, xeval, ell=0, edges=True, method='exact', mode='forward', volume=True):
         # If mode = 'forward', xp is 's', xeval 'k'
         # If mode = 'backward', xp is 'k', xeval 's'
-        if edges:
-            edges = xp
-            xp = None
-        else:
-            edges = jnp.concatenate([xp[:1], (xp[1:] + xp[:-1]) / 2., xp[-1:]], axis=0)
-        if edges.ndim == 1:
-            edges = jnp.column_stack([edges[:-1], edges[1:]])
-        if xp is None:
-            xp = jnp.mean(edges, axis=-1)
-        xeval = xeval[..., None]
-        assert mode in ['forward', 'backward']
-        if mode == 'forward':
-            norm = (-1)**(ell // 2)
-        else:
-            norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
-        if method == 'rect':
-            w = norm
-            x = xeval * xp
-            self.w = norm * get_spherical_jn(ell)(x)
-            if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
-        elif method == 'trapz':
-            x = xeval[..., None] * edges
-            self.w = norm * jnp.sum(get_spherical_jn(ell)(x), axis=-1) / 2.
-            if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
-        else:  # exact
-            x = xeval[..., None] * edges
-            xmin = 0.1
-            mask = x > xmin
-            tophat = _registered_bessel_tophat_integral[ell]
-            w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3
-            self.w =  norm * (w[..., 1] - w[..., 0])
-            if volume: self.w *= (4. * np.pi)
-            else: self.w /= (edges[:, 1]**3 - edges[:, 0]**3) / 3.
-
-    def __call__(self, fun: jax.Array):
-        return jnp.sum(self.w * fun, axis=-1)
-
-
-
-class BesselIntegral(object):
-
-    def __init__(self, xp, xeval, ell=0, edges=True, method='exact', mode='forward', volume=True):
-        # If mode = 'forward', xp is 's', xeval 'k'
-        # If mode = 'backward', xp is 'k', xeval 's'
         # edges = True if xp is edges
-        ndim = 1
-        if isinstance(xp, (tuple, list)):
-            ndim = len(xp)
-
         if edges:
             edges = xp
             xp = None
@@ -513,7 +482,6 @@ class BesselIntegral(object):
             edges = jnp.column_stack([edges[:-1], edges[1:]])
         if xp is None:
             xp = jnp.mean(edges, axis=-1)
-        xeval = xeval[..., None]
         assert mode in ['forward', 'backward']
         if mode == 'forward':
             norm = (-1)**(ell // 2)
@@ -521,22 +489,17 @@ class BesselIntegral(object):
             norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
         if method == 'rect':
             w = norm
-            x = xeval * xp
+            x = xeval[..., None] * xp
             self.w = norm * get_spherical_jn(ell)(x)
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         elif method == 'trapz':
-            x = xeval[..., None] * edges
+            x = xeval[..., None, None] * edges
             self.w = norm * jnp.sum(get_spherical_jn(ell)(x), axis=-1) / 2.
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         else:  # exact
-            x = xeval[..., None] * edges
-            xmin = 0.1
-            mask = x > xmin
-            tophat = _registered_bessel_tophat_integral[ell]
-            w = jnp.where(mask, tophat[0](x), tophat[1](x)) * edges**3
-            self.w =  norm * (w[..., 1] - w[..., 0])
-            if volume: self.w *= (4. * np.pi)
-            else: self.w /= (edges[:, 1]**3 - edges[:, 0]**3) / 3.
+            self.w = get_spherical_jn_tophat_integral(ell)(xeval, edges)
+            if not volume:
+                self.w /= (4. * np.pi) / 3. * (edges[:, 1]**3 - edges[:, 0]**3)
 
     def __call__(self, fun: jax.Array):
         return jnp.sum(self.w * fun, axis=-1)

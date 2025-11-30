@@ -243,6 +243,9 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
     # TODO: check for multiple fields
     single_field = False
 
+    def with_fields(poles):
+        return 'fields' in poles.labels(return_type='keys')
+
     def finalize(cov):
         nfields = len(fields)
         value = [[None for i in range(nfields)] for i in range(nfields)]
@@ -260,7 +263,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
 
     if isinstance(window2, MeshAttrs):
         mattrs = window2
-        if isinstance(poles, Mesh2SpectrumPoles):
+        if not with_fields(poles):
             single_field = True
             poles = ObservableTree([poles], fields=[(0, 0)])
         fields = []
@@ -316,18 +319,16 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             if field not in fields:
                 fields.append(field)
 
-        if isinstance(poles, Mesh2SpectrumPoles):
+        if not with_fields(poles):
             single_field = True
             assert len(WW.fields) == 1, 'single poles can be provided if only one window (field)'
             field = WW.fields[0]
             poles = ObservableTree([poles], fields=[field[::2]])
-        for pole in poles:
-            assert isinstance(pole, Mesh2SpectrumPoles), 'input poles must be Mesh2SpectrumPoles'
         for field in fields:
             assert field in poles.fields, f'input pole {field} is required'
 
-        def get_wj(ww, k, q1, q2):
-            shape = k.shape * 2
+        def get_wj(ww, k1, k2, q1, q2):
+            shape = k1.shape + k2.shape
             w = sum(legendre_product(q1, q2, q) * ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
             if w.size <= 1:
                 return np.zeros(shape)
@@ -346,13 +347,13 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                 #from scipy.interpolate import RectBivariateSpline
                 #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
                 #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
-                toret = interp2d(k, k, fftlog.k, fftlog.k, tmp, left=0., right=0.)
+                toret = interp2d(k1, k2, fftlog.k, fftlog.k, tmp, left=0., right=0.)
                 #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
                 #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
                 return toret
 
             else:
-                k1, k2 = np.meshgrid(k, k, indexing='ij', sparse=False)
+                k1, k2 = np.meshgrid(k1, k2, indexing='ij', sparse=False)
                 k1, k2 = k1.ravel(), k2.ravel()
                 kmask = Ellipsis
                 if delta is not None:
@@ -379,16 +380,20 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
         for field in WW.fields:
             pole1, pole2 = poles.get(field[:2]), poles.get(field[2:])
             assert pole1.ells == pole2.ells
-            ills = list(range(len(pole1.ells)))
+            ills1 = list(range(len(pole1.ells)))
+            ills2 = list(range(len(pole2.ells)))
 
             def init():
-                return [[np.zeros((len(pole1.get(pole1.ells[ill]).coords('k')),) * 2) for ill in ills] for ill in ills]
+                return [[np.zeros((len(pole1.get(pole1.ells[ill1]).coords('k')), len(pole2.get(pole2.ells[ill2]).coords('k')))) for ill2 in ills2] for ill1 in ills1]
 
             cov_WW[field] = init()
             if has_shotnoise: cov_WS[field], cov_SS[field] = init(), init()
             cache_WW, cache_WS1, cache_WS2 = {}, {}, {}
-            for ill1, ill2 in itertools.product(ills, ills):
+            center = 'mid_if_edges_and_nan'
+            for ill1, ill2 in itertools.product(ills1, ills2):
                 ell1, ell2 = pole1.ells[ill1], pole2.ells[ill2]
+                k1 = pole1.get(ell1).coords('k', center=center)
+                k2 = pole2.get(ell2).coords('k', center=center)
                 for p1, p2 in itertools.product(pole1.ells, pole2.ells):
                     q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
                     q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
@@ -399,7 +404,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, q2) in cache_WW:
                             tmp = cache_WW[q1, q2]
                         else:
-                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW.get(field), pole1.get(p1).coords('k', center='mid_if_edges_and_nan'), q1, q2)
+                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW.get(field), k1, k2, q1, q2)
                             cache_WW[q1, q2] = tmp
                         cov_WW[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()[..., None] * pole2.get(p2).value()
                 if not has_shotnoise: continue
@@ -413,9 +418,10 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, ell2) in cache_WS1:
                             tmp = cache_WS1[q1, ell2]
                         else:
-                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS.get(field), pole1.get(ell1).coords('k', center='mid_if_edges_and_nan'), q1, ell2)
+                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS.get(field), k1, k2, q1, ell2)
                             cache_WS1[q1, ell2] = tmp
-                        cov_WS[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()
+                        cov_WS[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()[:, None]
+
                 # WS swap
                 for p2 in pole2.ells:
                     q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
@@ -426,14 +432,74 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q2, ell1) in cache_WS2:
                             tmp = cache_WS2[q2, ell1]
                         else:
-                            tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(WS.get(field), pole2.get(ell2).coords('k', center='mid_if_edges_and_nan'), q2, ell1)
+                            tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(WS.get(field), k1, k2, ell1, q2)
                             cache_WS2[q2, ell1] = tmp
                         cov_WS[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole2.get(p2).value()
                 # SS
-                cov_SS[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(SS.get(field), pole1.get(ell1).coords('k', center='mid_if_edges_and_nan'), ell1, ell2)
+                cov_SS[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(SS.get(field), k1, k2, ell1, ell2)
 
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
         else:
             covs = finalize(cov_WW)
         return covs
+
+
+def matrix_spline_interp(x, xeval, interp_order=3):
+    from scipy.interpolate import make_interp_spline, BSpline
+    from scipy import sparse
+    # Build interpolating spline
+    bspl = make_interp_spline(x, np.ones_like(x), k=interp_order)
+    # Extract its knot vector
+    t = bspl.t   # knot positions
+    # Build the design matrix:
+    D = BSpline.design_matrix(x, t, interp_order)
+    A = BSpline.design_matrix(xeval, t, interp_order)
+    return sparse.linalg.spsolve(D.T, A.T).T.toarray()
+
+
+
+def project_to_spectrum(edges, theory, interp_order=3):
+    if edges.ndim < 2:
+        edges = np.column_stack((edges[:-1], edges[1:]))
+    matrices = []
+    for pole in theory.flatten(level=1):
+        kin = pole.coords('k')
+        #edgesin = pole.edges('k')
+        k = np.mean(edges, axis=-1)
+        w = matrix_spline_interp(kin, k, interp_order=interp_order)
+        #w *= np.diff(edgesin**3, axis=-1)[None, :, 0] / np.diff(edges**3, axis=-1)
+        matrices.append(w)
+    from scipy.linalg import block_diag
+    matrix = block_diag(*matrices)
+    return matrix
+
+
+
+from .utils import get_spherical_jn_tophat_integral
+
+
+def project_to_correlation(edges, theory, window_deconvolution=None):
+    """Return matrix to project spectrum covariance to correlation multipoles."""
+    # Window_deconvolution: convolved correlation multipoles -> deconvolved correlation multipoles
+    if edges.ndim < 2:
+        edges = np.column_stack((edges[:-1], edges[1:]))
+    matrices = []
+    for label, pole in theory.items(level=1):
+        k = pole.coords('k')
+        kedges = pole.edges('k')
+        ell = label['ells']
+        norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
+        norm *= 4. / 3. * np.pi * np.diff(kedges**3, axis=-1).T  # (1, k.size)
+        if False:
+            s = np.mean(edges, axis=-1)
+            w = norm * get_spherical_jn(ell)(k[None, :] * s[:, None])
+        else:
+            norm = norm / ((4. * np.pi) / 3. * np.diff(edges**3, axis=-1))  # (s.size, 1)
+            w = norm * get_spherical_jn_tophat_integral(ell)(k, edges).T
+        matrices.append(w)
+    from scipy.linalg import block_diag
+    matrix = block_diag(*matrices)
+    if window_deconvolution is not None:
+        matrix = window_deconvolution @ matrix
+    return matrix
