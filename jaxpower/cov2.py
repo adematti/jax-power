@@ -249,11 +249,11 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
     def finalize(cov):
         nfields = len(fields)
         value = [[None for i in range(nfields)] for i in range(nfields)]
-        for iobs1, iobs2 in itertools.combinations_with_replacement(range(nfields), 2):
-            field = fields[iobs1] + fields[iobs2]
-            value[iobs1][iobs2] = np.block(cov[field])
-            if iobs2 > iobs1:
-                value[iobs2][iobs1] = value[iobs1][iobs2].T
+        for ifield1, ifield2 in itertools.combinations_with_replacement(range(nfields), 2):
+            field = fields[ifield1] + fields[ifield2]
+            value[ifield1][ifield2] = np.block(cov[field])
+            if ifield2 > ifield1:
+                value[ifield2][ifield1] = value[ifield1][ifield2].T
         value = np.block(value)
         if single_field:
             observable = next(iter(poles))
@@ -273,7 +273,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
 
         cov = {}
         for field in itertools.combinations_with_replacement(fields, 2):
-            field = field[0] + field[1]
+            field = sum(field, start=tuple())
             pole1, pole2 = poles.get(fields=field[:2]), poles.get(fields=field[2:])
             assert pole1.ells == pole2.ells
             ills = list(range(len(pole1.ells)))
@@ -315,7 +315,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
             WW = window2
         fields = []
         for field in WW.fields:
-            field = field[:2]
+            field = field[::2]
             if field not in fields:
                 fields.append(field)
 
@@ -377,8 +377,11 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                 return toret
 
         cov_WW, cov_WS, cov_SS = {}, {}, {}
-        for field in WW.fields:
-            pole1, pole2 = poles.get(field[:2]), poles.get(field[2:])
+        for field in itertools.combinations_with_replacement(fields, 2):
+            field = sum(field, start=tuple())
+            cross_fields = [(field[0], field[2]), (field[1], field[3])]
+            window_fields = sum(cross_fields, start=tuple())
+            pole1, pole2 = poles.get(cross_fields[0]), poles.get(cross_fields[1])
             assert pole1.ells == pole2.ells
             ills1 = list(range(len(pole1.ells)))
             ills2 = list(range(len(pole2.ells)))
@@ -404,10 +407,10 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, q2) in cache_WW:
                             tmp = cache_WW[q1, q2]
                         else:
-                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW.get(field), k1, k2, q1, q2)
+                            tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(WW.get(window_fields), k1, k2, q1, q2)
                             cache_WW[q1, q2] = tmp
                         cov_WW[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()[..., None] * pole2.get(p2).value()
-                if not has_shotnoise: continue
+                if not has_shotnoise or window_fields not in SS.fields: continue
                 # WS
                 for p1 in pole1.ells:
                     q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
@@ -418,7 +421,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                         if (q1, ell2) in cache_WS1:
                             tmp = cache_WS1[q1, ell2]
                         else:
-                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS.get(field), k1, k2, q1, ell2)
+                            tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(WS.get(window_fields), k1, k2, q1, ell2)
                             cache_WS1[q1, ell2] = tmp
                         cov_WS[field][ill1][ill2] += 2 * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pole1.get(p1).value()[:, None]
 

@@ -351,8 +351,69 @@ def test_pre_post_covariance():
     selection = selection.clone(attrs=selection.attrs.clone(boxsize=3000.)).paint(resampler='cic', interlacing=0, compensate=False)
     mattrs = selection.attrs
     kmax = mattrs.knyq.max()
-    theory = get_theory(kmax=kmax, dk=0.002)
-    theory = ObservableTree([theory, theory.select(k=(0., 0.8 * kmax)), theory.select(k=(0., 0.5 * kmax))], fields=[('pre', 'pre'), ('pre', 'post'), ('post', 'post')])
+    pre_pre = get_theory(kmax=kmax, dk=0.01)
+    pre_post = pre_pre.clone(value=pre_pre.value() * 0.5)
+    post_post = pre_pre.clone(value=pre_pre.value() * 1.)
+
+    from cosmoprimo import PowerSpectrumBAOFilter
+    from scipy import special, integrate
+
+    def get_post_recon_spectrum(cosmo, k=None, z=1., b1=1., smoothing_radius=15., ells=(0, 2, 4), fields=('post', 'post')):
+        if k is None:
+            k = np.linspace(0.01, 0.2, 100)
+        def weights_leggauss(nx, sym=True):
+            """Return weights for Gauss-Legendre integration."""
+            x, wx = np.polynomial.legendre.leggauss((1 + sym) * nx)
+            if sym:
+                x, wx = x[nx:], (wx[nx:] + wx[nx - 1::-1]) / 2.
+            return x, wx
+
+        mu, wmu = weights_leggauss(8)
+        q = cosmo.rs_drag
+        klin = np.logspace(-3., 2., 1000)
+        pklin = cosmo.get_fourier().pk_interpolator(of='delta_cb').to_1d(z=z)
+        pknow = PowerSpectrumBAOFilter(pklin, engine='wallish2018').smooth_pk_interpolator()
+        k = k[:, None]
+        wiggles = pklin(k) - pknow(k)
+        f = cosmo.growth_rate(z)
+        wmu = np.array([wmu * (2 * ell + 1) * special.legendre(ell)(mu) for ell in ells])
+        if fields == ('post', 'post'):
+            j0 = special.jn(0, q * klin)
+            sk = jnp.exp(-1. / 2. * (klin * smoothing_radius)**2)
+            skc = 1. - sk
+            sigma = 1. / (3. * np.pi**2) * integrate.simpson((1. - j0) * skc**2 * pklin(klin), klin)
+            ksq = (1 + f * (f + 2) * mu**2) * k**2
+            resummed_wiggles = (b1 + f * mu**2)**2 * jnp.exp(-1. / 2. * ksq * sigma) * wiggles
+            pkmu = (b1 + f * mu**2)**2 * pknow(k) + resummed_wiggles
+        elif fields == ('pre', 'post'):
+            sk = jnp.exp(-1. / 2. * (klin * smoothing_radius)**2)
+            sigma = 1. / (6. * np.pi**2) * integrate.simpson(sk * pklin(klin), klin)
+            ksq = (1 + f * (f + 1) * mu**2) * k**2
+            pkmu = (b1 + f * mu**2)**2 * np.exp(- 1. / 2. * ksq * sigma) * pklin(k)
+        poles = np.sum(pkmu * wmu[:, None, :], axis=-1)
+        return poles
+
+    from cosmoprimo.fiducial import DESI
+    cosmo = DESI()
+    k = pre_pre.get(ells=0).coords('k')
+    kw = dict(k=k, z=1., b1=1.5, ells=pre_pre.ells, smoothing_radius=15.)
+    post_post = get_post_recon_spectrum(cosmo, fields=('post', 'post'), **kw)
+    post_post = pre_pre.clone(value=post_post.ravel())
+
+    pre_post = get_post_recon_spectrum(cosmo, fields=('pre', 'post'), **kw)
+    pre_post = pre_pre.clone(value=pre_post.ravel())
+
+    ax = plt.gca()
+    for ill, ell in enumerate(pre_pre.ells):
+        color = f'C{ill:d}'
+        pole = post_post.get(ells=ell)
+        ax.plot(k:=pole.coords('k'), k * pole.value(), color=color, linestyle='-')
+        pole = pre_post.get(ells=ell)
+        ax.plot(k:=pole.coords('k'), k * pole.value(), color=color, linestyle='--')
+    plt.show()
+
+
+    theory = ObservableTree([pre_pre, pre_post, post_post], fields=[('pre', 'pre'), ('pre', 'post'), ('post', 'post')])
 
     #kw_window = dict(edges={'step': mattrs.cellsize.min()}, basis='bessel', los='local')
     kw_window = dict()
@@ -364,9 +425,40 @@ def test_pre_post_covariance():
         windows = compute_mesh2_covariance_window(selection, **kw_window)
         windows.write(window_fn)
 
-    fields = [('pre',) * 4, ('post',) * 4, ('pre',) * 2 + ('post',) * 2]
+    fields = [('pre',) * 4, ('post',) * 4, ('pre', 'post') * 2, ('post', 'pre') * 2]
     windows = ObservableTree([windows.get(fields=(0, 0, 0, 0))] * len(fields), fields=fields)
-    spectrum_covariance = compute_spectrum2_covariance(windows, theory)
+    covariance = compute_spectrum2_covariance(windows, theory)
+    value = covariance.value()
+    assert np.allclose(value, value.T)
+    ytransform = lambda x, y: x**4 * y
+    kw = dict(ytransform=ytransform, offset=np.arange(3))
+    #covariance.plot(show=True)
+    #fig = covariance.plot_diag(**kw, color='C1')
+    #fig.axes[0].get_legend().remove()
+    #plt.show()
+
+    sedges = np.arange(50., 150., 4)
+    sedges = np.column_stack([sedges[:-1], sedges[1:]])
+    s = np.mean(sedges, axis=-1)
+    nmodes = 4 * np.pi / 3. * (sedges[:, 1]**3 - sedges[:, 0]**3)
+    from jaxpower.cov2 import project_to_correlation
+    spectrum_pre = covariance.observable.get(fields=('pre', 'pre'))
+    spectrum_post = covariance.observable.get(fields=('post', 'post'))
+    # project spectrum_post to xi
+    projector = project_to_correlation(sedges, spectrum_post)
+    correlation_post = Mesh2CorrelationPoles([Mesh2CorrelationPole(s=s, s_edges=sedges, num_raw=np.zeros_like(s), nmodes=nmodes, ell=ell) for ell in spectrum_post.ells])
+    rotation = [np.eye(spectrum_pre.size), projector]
+    from scipy.linalg import block_diag
+    rotation = block_diag(*rotation)
+    observable = ObservableTree([spectrum_pre, correlation_post], labels=[('pre', 'pre'), ('post', 'post')])
+    covariance = covariance.clone(value=rotation.dot(covariance.value()).dot(rotation.T), observable=observable)
+    #covariance = covariance.at.observable.at(fields=('post', 'post')).get(ells=[0, 2])
+    value = covariance.value()
+    assert np.allclose(value, value.T)
+    covariance.plot(corrcoef=True, show=True)
+    fig = covariance.plot_diag(**kw, color='C1')
+    fig.axes[0].get_legend().remove()
+    plt.show()
 
 
 def save_fkp_mocks():
@@ -688,8 +780,8 @@ if __name__ == '__main__':
     #save_cutsky_mocks()
     #test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
-    #test_pre_post_covariance()
+    test_pre_post_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
-    test_fkp2_covariance(plot=True)
+    #test_fkp2_covariance(plot=True)
     #test_bspline()
