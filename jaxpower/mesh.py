@@ -11,9 +11,10 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 from jax import sharding
+from jax import shard_map
+#from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
-from jax.experimental import mesh_utils
-from jax.experimental.shard_map import shard_map
+
 from dataclasses import dataclass, field, fields, asdict
 from . import resamplers, utils
 
@@ -117,8 +118,7 @@ def create_sharding_mesh(meshsize=None, device_mesh_shape=None):
     if len(device_mesh_shape) > 2:
         raise NotImplementedError('device mesh with ndim {:d} > 2 not implemented'.format(len(device_mesh_shape)))
     device_mesh_shape = (1,) * (2 - len(device_mesh_shape)) + device_mesh_shape
-    devices = mesh_utils.create_device_mesh(device_mesh_shape)
-    return sharding.Mesh(devices, axis_names=('x', 'y'))
+    return jax.make_mesh(device_mesh_shape, axis_names=('x', 'y'), axis_types=(jax.sharding.AxisType.Auto,) * 2)
 
 
 def default_sharding_mesh(func: Callable):
@@ -205,7 +205,7 @@ def _get_freq_mesh(*freqs, sparse=None, sharding_mesh: jax.sharding.Mesh=None):
             out_specs = tuple(out_specs)
         else:
             out_specs = tuple(P(*sharding_mesh.axis_names) for i in range(ndim))
-        get_mesh = shard_map(get_mesh, sharding_mesh, in_specs=in_specs, out_specs=out_specs)
+        get_mesh = shard_map(get_mesh, mesh=sharding_mesh, in_specs=in_specs, out_specs=out_specs)
     return get_mesh(*freqs)
 
 
@@ -927,8 +927,10 @@ class MeshAttrs(object):
     def r2c(self, value):
         """FFT, from real to complex."""
         if self.fft_engine == 'jaxdecomp':
-            if self.sharding_mesh.axis_names: value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
-            value = jaxdecomp.fft.pfft3d(value)
+            fft = jaxdecomp.fft.pfft3d
+            if self.sharding_mesh.axis_names:
+                value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
+            value = fft(value)
         else:
             if self.is_hermitian:
                 value = jnp.fft.rfftn(value)
@@ -945,8 +947,10 @@ class MeshAttrs(object):
     def c2r(self, value):
         """FFT, from complex to real."""
         if self.fft_engine == 'jaxdecomp':
-            if self.sharding_mesh.axis_names: value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
-            value = jaxdecomp.fft.pifft3d(value)
+            fft = jaxdecomp.fft.pifft3d
+            if self.sharding_mesh.axis_names:
+                value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
+            value = fft(value)
             if self.is_real:
                 value = value.real.astype(self.dtype)
         else:
@@ -1357,7 +1361,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
         #idx = idx + jnp.array([44, 0, 0], dtype=int)
         #print('3', positions[12], jnp.round(positions[12]).astype(int), idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
         value = exchange_halo(value, **kw_sharding)
-        _read = shard_map(_read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names), check_rep=False)  # check_rep=False otherwise error un jvp
+        _read = shard_map(_read, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(sharding_mesh.axis_names))  # check_rep=False otherwise error un jvp
     #else:
     #    idx = jnp.round(positions[8]).astype(int)
     #    print('0', positions[8], idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
@@ -1850,9 +1854,9 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
 
-        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names), check_rep=False)  # check_rep=False otherwise error in jvp
+        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))  # check_rep=False otherwise error in jvp
 
-    def ppaint(positions, weights=None):
+    def paint(positions, weights=None):
         mesh = attrs.create(kind='real', fill=0.)
         value = mesh.value
         w = None
@@ -1877,25 +1881,24 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         return mesh.clone(value=value)
 
     if interlacing <= 1:
-        toret = ppaint(positions, weights)
+        toret = paint(positions, weights)
         if kernel_compensate is not None:
             toret = toret.r2c().apply(kernel_compensate)
             if out == 'real': toret = toret.c2r()
         elif out != 'real': toret = toret.r2c()
     else:
         @jax.checkpoint
-        def f(carry, shift):
+        def paint_with_interlacing(carry, shift):
             def kernel_shift(value, kvec):
                 kvec = sum(kvec)
                 return value * jnp.exp(shift * 1j * kvec) / interlacing
 
-            tmp = ppaint(positions + shift, weights).r2c()
-            carry += tmp.apply(kernel_shift, kind='circular')
+            carry += paint(positions + shift, weights).r2c().apply(kernel_shift, kind='circular')
             return carry, shift
 
-        toret = jax.lax.scan(f, init=attrs.create(kind='complex', fill=0.), xs=interlacing_shifts)[0]
+        toret = jax.lax.scan(paint_with_interlacing, init=attrs.create(kind='complex', fill=0.), xs=interlacing_shifts)[0]
         #toret = attrs.create(kind='complex', fill=0.)
-        #for shift in interlacing_shifts: toret, _ = f(toret, shift)
+        #for shift in interlacing_shifts: toret, _ = paint_with_interlacing(toret, shift)
         if kernel_compensate is not None:
             toret = toret.apply(kernel_compensate)
         if out == 'real': toret = toret.c2r()

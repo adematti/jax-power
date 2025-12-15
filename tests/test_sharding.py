@@ -5,9 +5,9 @@ from functools import partial
 import numpy as np
 import jax
 from jax import random
+from jax import shard_map
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
-from jax.experimental.shard_map import shard_map
 
 from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
 
@@ -340,11 +340,43 @@ def compute_power_spectrum():
     #print(power.view().sum(), ref.view().sum(), diff, diff[~jnp.isnan(diff)].max())
 
 
+def test_scaling_raw():
+    import jax
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+    import jaxdecomp
+
+    device_mesh_shape = (2, 2)
+    sharding_mesh = jax.make_mesh(device_mesh_shape, axis_names=('x', 'y'), axis_types=(jax.sharding.AxisType.Auto,) * len(device_mesh_shape))
+
+    with jax.set_mesh(sharding_mesh):
+
+        def mesh_shard_shape(shape: tuple):
+            return tuple(s // pdim for s, pdim in zip(shape, sharding_mesh.devices.shape)) + shape[sharding_mesh.devices.ndim:]
+
+        shape = (1024,) * 3
+        key = jax.random.key(43)
+        value = shard_map(partial(jax.random.normal, shape=mesh_shard_shape(shape), dtype='float32'), mesh=sharding_mesh, in_specs=P(), out_specs=P('x', 'y'))(key)  # yapf: disable
+
+        @jax.jit
+        #@partial(shard_map, mesh=sharding_mesh, in_specs=P('x', 'y'), out_specs=P('y', 'x'))
+        def fft(value):
+            #value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(sharding_mesh, spec=P('x', 'y')))
+            return jaxdecomp.fft.pfft3d(value)
+
+        cvalue = fft(value)
+        jax.debug.inspect_array_sharding(cvalue, callback=print)
+        n = 15
+        t0 = time.time()
+        for i in range(n): jax.block_until_ready(fft(value + 0.001))
+        print(time.time() - t0)
+
+
 def test_scaling():
 
     with create_sharding_mesh() as sharding_mesh:
         from jaxpower import MeshAttrs, create_sharded_random
-        mattrs = MeshAttrs(meshsize=600, boxsize=1000.)
+        mattrs = MeshAttrs(meshsize=1024, boxsize=1000.)
         mesh = mattrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=mattrs.meshsize))
 
         @jax.jit
@@ -355,37 +387,6 @@ def test_scaling():
         n = 15
         t0 = time.time()
         for i in range(n): jax.block_until_ready(f(mesh + 0.001))
-        print(time.time() - t0)
-
-
-def test_scaling2():
-    import jax
-    from jax.sharding import PartitionSpec as P
-    from jax.experimental import mesh_utils
-    from jax.experimental.shard_map import shard_map
-    import jaxdecomp
-
-    device_mesh_shape = (4, 4)
-    devices = mesh_utils.create_device_mesh(device_mesh_shape)
-
-    with jax.sharding.Mesh(devices, axis_names=('x', 'y')) as sharding_mesh:
-
-        def mesh_shard_shape(shape: tuple):
-            return tuple(s // pdim for s, pdim in zip(shape, sharding_mesh.devices.shape)) + shape[sharding_mesh.devices.ndim:]
-
-        shape = (512,) * 3
-        key = jax.random.key(43)
-        value = shard_map(partial(jax.random.normal, shape=mesh_shard_shape(shape), dtype='float32'), sharding_mesh, in_specs=P(), out_specs=P('x', 'y'))(key)  # yapf: disable
-
-        @jax.jit
-        def f(value):
-            value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(sharding_mesh, spec=P('x', 'y')))
-            return jaxdecomp.fft.pfft3d(value)
-
-        jax.block_until_ready(f(value))
-        n = 15
-        t0 = time.time()
-        for i in range(n): jax.block_until_ready(f(value + 0.001))
         print(time.time() - t0)
 
 
@@ -413,7 +414,7 @@ if __name__ == '__main__':
     #save_reference_mock()
     # Setting up distributed jax
     jax.distributed.initialize()
-    test_sharding_routines()
+    #test_sharding_routines()
     #test_halo()
     #test_exchange_array()
     #test_jaxdecomp()
@@ -421,6 +422,7 @@ if __name__ == '__main__':
     #test_sharding()
     #test_mem()
     #compute_power_spectrum()
-    #test_scaling2()
+    #test_scaling_raw()
+    test_scaling()
     # Closing distributed jax
     jax.distributed.shutdown()
