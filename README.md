@@ -68,7 +68,7 @@ with create_sharding_mesh() as sharding_mesh:  # distribute mesh and particles
     # This is such that the local portion of the 3D mesh receives the relevant particles
 
     # Define k-bin edges and multipoles
-    bin = BinMesh2SpectrumPoles(mesh.attrs, edges={'step': 0.001}, ells=(0, 2, 4))
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.001}, ells=(0, 2, 4))
 
     # Compute normalization and shot noise terms
     norm = compute_fkp2_normalization(fkp, bin=bin)

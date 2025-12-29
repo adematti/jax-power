@@ -345,7 +345,7 @@ def test_cutsky2_correlation_covariance(plot=False):
         plt.show()
 
 
-def test_pre_post_covariance():
+def test_pre_post_covariance(plot=False):
 
     selection = survey_selection(paint=False)
     selection = selection.clone(attrs=selection.attrs.clone(boxsize=3000.)).paint(resampler='cic', interlacing=0, compensate=False)
@@ -388,7 +388,7 @@ def test_pre_post_covariance():
         elif fields == ('pre', 'post'):
             sk = jnp.exp(-1. / 2. * (klin * smoothing_radius)**2)
             sigma = 1. / (6. * np.pi**2) * integrate.simpson(sk * pklin(klin), klin)
-            ksq = (1 + f * (f + 1) * mu**2) * k**2
+            ksq = (1 + (1 + f)**2 * mu**2) * k**2
             pkmu = (b1 + f * mu**2)**2 * np.exp(- 1. / 2. * ksq * sigma) * pklin(k)
         poles = np.sum(pkmu * wmu[:, None, :], axis=-1)
         return poles
@@ -403,14 +403,15 @@ def test_pre_post_covariance():
     pre_post = get_post_recon_spectrum(cosmo, fields=('pre', 'post'), **kw)
     pre_post = pre_pre.clone(value=pre_post.ravel())
 
-    ax = plt.gca()
-    for ill, ell in enumerate(pre_pre.ells):
-        color = f'C{ill:d}'
-        pole = post_post.get(ells=ell)
-        ax.plot(k:=pole.coords('k'), k * pole.value(), color=color, linestyle='-')
-        pole = pre_post.get(ells=ell)
-        ax.plot(k:=pole.coords('k'), k * pole.value(), color=color, linestyle='--')
-    plt.show()
+    if plot:
+        ax = plt.gca()
+        for ill, ell in enumerate(pre_pre.ells):
+            color = f'C{ill:d}'
+            pole = post_post.get(ells=ell)
+            ax.plot(k:=pole.coords('k'), k * pole.value(), color=color, linestyle='-')
+            pole = pre_post.get(ells=ell)
+            ax.plot(k:=pole.coords('k'), k * pole.value(), color=color, linestyle='--')
+        plt.show()
 
 
     theory = ObservableTree([pre_pre, pre_post, post_post], fields=[('pre', 'pre'), ('pre', 'post'), ('post', 'post')])
@@ -455,10 +456,11 @@ def test_pre_post_covariance():
     #covariance = covariance.at.observable.at(fields=('post', 'post')).get(ells=[0, 2])
     value = covariance.value()
     assert np.allclose(value, value.T)
-    covariance.plot(corrcoef=True, show=True)
-    fig = covariance.plot_diag(**kw, color='C1')
-    fig.axes[0].get_legend().remove()
-    plt.show()
+    if plot:
+        covariance.plot(corrcoef=True, show=True)
+        fig = covariance.plot_diag(**kw, color='C1')
+        fig.axes[0].get_legend().remove()
+        plt.show()
 
 
 def save_fkp_mocks():
@@ -589,6 +591,42 @@ def test_fkp2_covariance(plot=False):
         cov_ss = covs[2].clone(value=ratio_shotnoise**2 * covs[2].value())
         fig = covs[0].clone(value=covs[0].value() + cov_ws.value() + cov_ss.value()).plot_diag(**kw, color='C0')
         cov_mocks.plot_diag(**kw, color='C1', fig=fig, show=True)
+
+
+def test_multitracer_covariance(plot=False):
+    boxcenter = np.array([0., 0., 1200])
+    boxcenter2 = np.array([0., 0., 2000])
+    mattrs = MeshAttrs(boxsize=2000., boxcenter=boxcenter, meshsize=128)
+    pattrs = mattrs.clone(boxsize=1000., meshsize=64)
+
+    theory = get_theory(kmax=mattrs.knyq.max(), dk=0.04)
+    size = int(1e-4 * pattrs.boxsize.prod())
+
+    ialpha = 5
+    randoms1 = generate_uniform_particles(pattrs, size * ialpha, seed=32).clone(attrs=mattrs)
+    randoms2 = generate_uniform_particles(pattrs.clone(boxcenter=boxcenter2), size * ialpha, seed=32).clone(attrs=mattrs.clone(boxcenter=boxcenter2))
+    #edges = {'step': attrs.cellsize.min()}
+    edges = None
+
+    window_fn = dirname / 'window_fkp_multitracer.h5'
+
+    if window_fn.exists():
+        windows = list(read(window_fn))
+    else:
+        windows = compute_fkp2_covariance_window([randoms1, randoms2], edges=edges, interlacing=2, resampler='tsc', los='local', alpha=1. / ialpha, fields=['a', 'b'])
+        ObservableTree(windows, types=['WW', 'WS', 'SS']).write(window_fn)
+
+    windows = list(windows)
+    for i, window in enumerate(windows):
+        windows[i] = ObservableTree([next(iter(window))] * len(window.fields), fields=window.fields)
+
+    #theory = ObservableTree([theory] * 4, fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
+    theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())], fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
+    covs = compute_spectrum2_covariance(windows, theory)
+
+    for name, cov in zip(['WW', 'WS', 'SS'], covs):
+        cov = cov.value()
+        assert np.allclose(cov, cov.T), name
 
 
 def test_fftlog2():
@@ -780,7 +818,8 @@ if __name__ == '__main__':
     #save_cutsky_mocks()
     #test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
-    test_pre_post_covariance()
+    #test_pre_post_covariance()
+    test_multitracer_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)
