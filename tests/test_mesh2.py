@@ -719,7 +719,7 @@ def test_smooth_window(plot=False):
         for ill, ell in enumerate(self.ells):
             pole = self.get(ells=ell)
             color = f'C{ill:d}'
-            ax.plot(pole.coords('s'), pole.value().real, color=color, label=f'$\ell={ell}$')
+            ax.plot(pole.coords('s'), pole.value().real, color=color, label=rf'$\ell={ell}$')
         ax.legend()
         ax.grid(True)
         ax.set_xscale('log')

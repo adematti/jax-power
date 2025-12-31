@@ -320,7 +320,7 @@ def make_array_from_global_data(array, sharding_mesh: jax.sharding.Mesh=None):
 
 
 @default_sharding_mesh
-def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0., sharding_mesh: jax.sharding.Mesh=None):
+def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0, sharding_mesh: jax.sharding.Mesh=None):
 
     if not len(sharding_mesh.axis_names):
         return per_host_array
@@ -425,7 +425,7 @@ def _exchange_array_jax(array, device, pad=0, return_indices=False):
             mean = array.mean(axis=0)
             pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, ...], pad_width[0][1], axis=0), axis=0)
         else:
-            raise ValueError('mean or global_mean supported only')
+            raise ValueError('mean supported only')
 
     for idevice in range(ndevices):
         # single-device arrays
@@ -517,112 +517,107 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     return positions, exchange
 
 
-
-def _send_mpi(data, dest, tag=0, mpicomm=None):
+def _all_to_all_mpi(data, counts=None, mpicomm=None, return_recvcounts=False):
     """
-    Send input array ``data`` to process ``dest``.
+    All-to-all communication.
+    This uses ``Scatterv``, which avoids mpi4py pickling, and also
+    avoids the 2 GB mpi4py limit for bytes using a custom datatype
 
     Parameters
     ----------
-    data : array
-        Array to send.
-
-    dest : int
-        Rank of process to send array to.
-
-    tag : int, default=0
-        Message identifier.
-
+    data : array_like or None
+        On `mpiroot`, this gives the data to split and scatter.
+    counts : array, default=None
+        Size of data chunks to send to each rank.
+        An array or list of size ``mpicomm.size``.
     mpicomm : MPI communicator, default=None
-        Communicator. Defaults to current communicator.
+        The MPI communicator.
+
+    Returns
+    -------
+    recvbuffer : array_like
+        The chunk of ``data`` that each rank gets.
     """
     from mpi4py import MPI
+    if counts is None:
+        # balance
+        current_sizes = mpicomm.allgather(len(data))
+        total_size = sum(current_sizes)
+        current_stops = np.cumsum(current_sizes)
+        current_starts = current_stops - current_sizes
+        new_sizes = [(rank + 1) * total_size // mpicomm.size - rank * total_size // mpicomm.size for rank in range(mpicomm.size)]
+        new_stops = np.cumsum(new_sizes)
+        new_starts = new_stops - new_sizes
+        current_start, current_stop = current_starts[mpicomm.rank], current_stops[mpicomm.rank]
+        # Intersection of intervals current inter new
+        counts = [max(0, min(current_stop, new_stop) - max(current_start, new_start)) for new_start, new_stop in zip(new_starts, new_stops)]
+    sendcounts = np.asarray(counts, dtype=np.int32)
 
-    data = np.asarray(data)
-    shape, dtype = (data.shape, data.dtype)
+    # Exchange counts to know what we will receive
+    recvcounts = np.empty(mpicomm.size, dtype=np.int32)
+    mpicomm.Alltoall(sendcounts, recvcounts)
+
+    # Compute displacements
+    sendoffsets = np.insert(np.cumsum(sendcounts[:-1]), 0, 0)
+    recvoffsets = np.insert(np.cumsum(recvcounts[:-1]), 0, 0)
+    recvsize = sum(recvcounts)
+
+    mpiroot = 0
     data = np.ascontiguousarray(data)
+    if mpicomm.rank == mpiroot:
+        # Need C-contiguous order
+        shape_and_dtype = (data.shape, data.dtype)
+    else:
+        shape_and_dtype = None
+    # each rank needs shape/dtype of input data
+    shape, dtype = mpicomm.bcast(shape_and_dtype, root=mpiroot)
 
+    # object dtype is not supported
     fail = False
     if dtype.char == 'V':
         fail = any(dtype[name] == 'O' for name in dtype.names)
     else:
         fail = dtype == 'O'
     if fail:
-        raise ValueError('"object" data type not supported in send; please specify specific data type')
+        raise ValueError('"object" data type not supported in scatter; please specify specific data type')
 
+    # setup the custom dtype
     duplicity = np.prod(shape[1:], dtype='intp')
     itemsize = duplicity * dtype.itemsize
     dt = MPI.BYTE.Create_contiguous(itemsize)
     dt.Commit()
 
-    mpicomm.send((shape, dtype), dest=dest, tag=tag)
-    mpicomm.Send([data, dt], dest=dest, tag=tag)
+    # the return array
+    recvbuffer = np.empty(recvsize, dtype=dtype, order='C')
+
+    # do the scatter
+    mpicomm.Barrier()
+    mpicomm.Alltoallv([data, (sendcounts, sendoffsets), dt], [recvbuffer, (recvcounts, recvoffsets), dt])
     dt.Free()
-
-
-def _recv_mpi(source=None, tag=None, mpicomm=None):
-    """
-    Receive array from process ``source``.
-
-    Parameters
-    ----------
-    source : int, default=MPI.ANY_SOURCE
-        Rank of process to receive array from.
-
-    tag : int, default=MPI.ANY_TAG
-        Message identifier.
-
-    mpicomm : MPI communicator, default=None
-        Communicator. Defaults to current communicator.
-
-    Returns
-    -------
-    data : array
-    """
-    from mpi4py import MPI
-    if source is None: source = MPI.ANY_SOURCE
-    if tag is None: tag = MPI.ANY_TAG
-
-    shape, dtype = mpicomm.recv(source=source, tag=tag)
-    data = np.zeros(shape, dtype=dtype)
-
-    duplicity = np.prod(shape[1:], dtype='intp')
-    itemsize = duplicity * dtype.itemsize
-    dt = MPI.BYTE.Create_contiguous(itemsize)
-    dt.Commit()
-
-    mpicomm.Recv([data, dt], source=source, tag=tag)
-    dt.Free()
-    return data
+    if return_recvcounts:
+        return recvbuffer, recvcounts
+    return recvbuffer
 
 
 def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
     # Exchange array along the first (0) axis
     # TODO: generalize to any axis
-    per_host_indices, per_host_final_arrays, slices = [], [], []
-    tag = 42
-
+    per_host_indices, per_host_arrays, slices = [], [], []
     for irank in range(mpicomm.size):
         mask_irank = process == irank
         if return_indices:
             per_host_indices.append(np.flatnonzero(mask_irank))
         tmp = array[mask_irank]
-        if mpicomm.rank != irank:
-            _send_mpi(tmp, dest=irank, tag=tag, mpicomm=mpicomm)
-        if mpicomm.rank == irank:
-            start = 0
-            for source in range(mpicomm.size):
-                if source == irank:
-                    per_host_final_arrays.append(tmp)
-                else:
-                    per_host_final_arrays.append(_recv_mpi(source=source, tag=tag, mpicomm=mpicomm))
-                if return_indices:
-                    slices.append(slice(start, start + per_host_final_arrays[-1].shape[0]))
-                    start += per_host_final_arrays[-1].shape[0]
-    final = np.concatenate(per_host_final_arrays, axis=0)
-    del per_host_final_arrays
+        per_host_arrays.append(tmp)
+
+    counts = [array.size for array in per_host_arrays]
+    final, recvcounts = _all_to_all_mpi(np.concatenate(per_host_arrays, axis=0), counts=counts, mpicomm=mpicomm, return_recvcounts=True)
+    del per_host_arrays
+
     if return_indices:
         per_host_indices = np.concatenate(per_host_indices, axis=0)
+        per_host_sizes = np.insert(np.cumsum(recvcounts), 0, 0)
+        slices = [slice(start, stop) for start, stop in zip(per_host_sizes[:-1], per_host_sizes[1:])]
         return final, (per_host_indices, slices)
     return final
 
@@ -636,19 +631,9 @@ def _exchange_inverse_mpi(array, indices, mpicomm=None):
         toret[indices] = array
         return toret
 
-    per_host_final_arrays = []
-    tag = 42
-    for irank in range(mpicomm.size):
-        tmp = array[slices[irank]]
-        if mpicomm.rank != irank:
-            _send_mpi(tmp, dest=irank, tag=tag, mpicomm=mpicomm)
-        if mpicomm.rank == irank:
-            for source in range(mpicomm.size):
-                if source == irank:
-                    per_host_final_arrays.append(tmp)
-                else:
-                    per_host_final_arrays.append(_recv_mpi(source=source, tag=tag, mpicomm=mpicomm))
-    final = reorder(np.concatenate(per_host_final_arrays, axis=0), per_host_indices)
+    counts = [sl.stop - sl.start for sl in slices]
+    final = _all_to_all_mpi(array, counts=counts, mpicomm=mpicomm, return_recvcounts=False)
+    final = reorder(final, per_host_indices)
     return final
 
 
@@ -1454,20 +1439,25 @@ def _get_extent(*positions):
     """Return minimum physical extent (min, max) corresponding to input positions."""
     if not positions:
         raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
+    backend, kw = _get_distributed_backend(positions[0])
     # Find bounding coordinates
     nonempty_positions = [pos for pos in positions if pos.size]
-    if not nonempty_positions:
-        raise ValueError('<= 1 particles found; cannot infer boxsize')
-    axis = tuple(range(len(nonempty_positions[0].shape[:-1])))
-    backend, kw = _get_distributed_backend(nonempty_positions[0])
     if backend == 'jax':
-        pos_min = jnp.array([jnp.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
-        pos_max = jnp.array([jnp.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+        if nonempty_positions:
+            raise ValueError('<= 1 particles found; cannot infer boxsize')
+        pos_min = jnp.array([jnp.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
+        pos_max = jnp.array([jnp.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
     else:
-        pos_min = np.array([np.min(p, axis=axis) for p in nonempty_positions]).min(axis=0)
-        pos_max = np.array([np.max(p, axis=axis) for p in nonempty_positions]).max(axis=0)
+        pos_min, pos_max = None, None
+        if nonempty_positions:
+            pos_min = np.array([np.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
+            pos_max = np.array([np.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
         mpicomm = kw['mpicomm']
-        pos_min, pos_max = np.min(mpicomm.allgather(pos_min), axis=0), np.max(mpicomm.allgather(pos_max), axis=0)
+        pos_min, pos_max = mpicomm.allgather(pos_min), mpicomm.allgather(pos_max)
+        pos_min, pos_max = [p for p in pos_min if p is not None], [p for p in pos_max if p is not None]
+        if not pos_min or not pos_max:
+            raise ValueError('<= 1 particles found; cannot infer boxsize')
+        pos_min, pos_max = np.min(pos_min, axis=0), np.max(pos_max, axis=0)
     return pos_min, pos_max
 
 

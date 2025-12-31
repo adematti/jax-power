@@ -583,7 +583,7 @@ class FKPField(object):
 
     def paint(self, resampler: str | Callable='cic', interlacing: int=1,
               compensate: bool=False, dtype=None, out: str='real', **kwargs):
-        """
+        r"""
         Paint the FKP field onto a mesh.
 
         Parameters

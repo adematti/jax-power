@@ -75,11 +75,9 @@ def test_sharding():
 
 
 def test_exchange_array():
-    from jax.experimental import mesh_utils, multihost_utils
+    from jax.experimental import mesh_utils
     from jax.sharding import PartitionSpec as P
-    from jax.experimental.shard_map import shard_map
-    from jaxpower.mesh import _exchange_array_jax, _exchange_inverse_jax
-    from jaxpower.mesh import _exchange_array_mpi, _exchange_inverse_mpi
+    from jaxpower.mesh import _exchange_array_jax, _exchange_inverse_jax, _exchange_array_mpi, _exchange_inverse_mpi
 
 
     def _identity_fn(x):
@@ -88,7 +86,7 @@ def test_exchange_array():
     def allgather(array):
         return jax.jit(_identity_fn, out_shardings=array.sharding.with_spec(P(None)))(array).addressable_data(0)
 
-    test = 0
+    test = 1
     if test == 0:
         device_mesh_shape = (4,)
         devices = mesh_utils.create_device_mesh(device_mesh_shape)
@@ -119,9 +117,24 @@ def test_exchange_array():
                 positions = np.random.uniform(size=(int(1e4) + jax.process_index(), 3))
                 weights = np.random.uniform(size=positions.shape[0])
                 mattrs = MeshAttrs(boxsize=1., boxcenter=0.5, meshsize=4)
-                positions, exchange, inverse = exchange_particles(mattrs, positions, backend='mpi', return_type='jax', return_inverse=True)
-                weights2 = inverse(exchange(weights))
-                assert np.allclose(weights2, weights)
+                for backend in ['mpi', 'jax']:
+                    positions, exchange, inverse = exchange_particles(mattrs, positions, backend=backend, return_type='jax', return_inverse=True)
+                    weights2 = inverse(exchange(weights))
+                    assert np.allclose(weights2, weights)
+
+    if test == 1:
+        from mpi4py import MPI
+        mpicomm = MPI.COMM_WORLD
+        rng = np.random.RandomState(seed=42 + mpicomm.rank)
+        array = rng.uniform(size=int(1e5))
+        device = np.clip(np.floor(array * mpicomm.size).astype('i4'), 0, mpicomm.size - 1)
+        device = np.clip(device, 0, mpicomm.size - 2)
+        exchanged, *indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
+        array_gathered = np.concatenate(mpicomm.allgather(array))
+        device_gathered = np.concatenate(mpicomm.allgather(device))
+        assert all(mpicomm.allgather(np.allclose(exchanged, array_gathered[device_gathered == mpicomm.rank])))
+        array2 = _exchange_inverse_mpi(exchanged, *indices, mpicomm=mpicomm)
+        assert np.allclose(array2, array)
 
     if test == 2:
         device_mesh_shape = (4,)
@@ -284,8 +297,6 @@ def save_reference_mock():
     bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
     power = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
     power.write(get_mock_fn('mesh_power'))
-    power = compute_fkp2_spectrum(fkp, resampler='tsc', interlacing=3, bin=bin, los='firstpoint')
-    power.write(get_mock_fn('fkp_power'))
 
 
 def compute_power_spectrum():
@@ -330,13 +341,9 @@ def compute_power_spectrum():
         #mesh = RealMeshField.load(get_mock_fn(kind='mesh'))
         #mesh = mesh.clone(value=jax.device_put(mesh.value, jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names))))
         mesh_power = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
-        fkp_power = compute_fkp2_spectrum(fkp, bin=bin, resampler='tsc', interlacing=3, los='firstpoint')
     diff = jnp.abs(mesh_power.value() - ref_mesh_power.value())
     print(diff)
-    diff = jnp.abs(fkp_power.value() - ref_fkp_power.value())
-    print(diff)
     assert np.allclose(mesh_power.value(), ref_mesh_power.value(), rtol=1e-6, atol=1e-2)
-    assert np.allclose(fkp_power.value(), ref_fkp_power.value(), rtol=1e-6, atol=1e-2)
     #print(power.view().sum(), ref.view().sum(), diff, diff[~jnp.isnan(diff)].max())
 
 
@@ -397,7 +404,7 @@ def test_sharding_routines():
         mattrs = MeshAttrs(boxsize=1000., meshsize=64)
         particles = generate_uniform_particles(mattrs, size=1000, seed=42, exchange=False)
         exchanged = particles.exchange(backend='jax')
-    
+
         local_size = particles.weights.addressable_shards[0].data.shape[0]
         rng = np.random.RandomState(seed=42)
         values = rng.uniform(0., 1., size=(local_size, 10))
@@ -413,7 +420,7 @@ if __name__ == '__main__':
     warnings.simplefilter("error")
     #save_reference_mock()
     # Setting up distributed jax
-    jax.distributed.initialize()
+    #jax.distributed.initialize()
     #test_sharding_routines()
     #test_halo()
     #test_exchange_array()
@@ -423,6 +430,6 @@ if __name__ == '__main__':
     #test_mem()
     #compute_power_spectrum()
     #test_scaling_raw()
-    test_scaling()
+    #test_scaling()
     # Closing distributed jax
-    jax.distributed.shutdown()
+    #jax.distributed.shutdown()

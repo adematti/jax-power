@@ -368,7 +368,7 @@ def Si_scipy(x):
 
 
 def Si(x):
-    from .jax.special import sici
+    from jax.scipy.special import sici
     return sici(x)[0]
 
 
