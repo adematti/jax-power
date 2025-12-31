@@ -560,7 +560,6 @@ def _all_to_all_mpi(data, counts=None, mpicomm=None, return_recvcounts=False):
     # Compute displacements
     sendoffsets = np.insert(np.cumsum(sendcounts[:-1]), 0, 0)
     recvoffsets = np.insert(np.cumsum(recvcounts[:-1]), 0, 0)
-    recvsize = sum(recvcounts)
 
     mpiroot = 0
     data = np.ascontiguousarray(data)
@@ -587,13 +586,17 @@ def _all_to_all_mpi(data, counts=None, mpicomm=None, return_recvcounts=False):
     dt = MPI.BYTE.Create_contiguous(itemsize)
     dt.Commit()
 
-    # the return array
-    recvbuffer = np.empty(recvsize, dtype=dtype, order='C')
+    # compute the new shape for each rank
+    newshape = list(shape)
+    newshape[0] = sum(recvcounts)
 
+    # the return array
+    recvbuffer = np.empty(newshape, dtype=dtype, order='C')
     # do the scatter
     mpicomm.Barrier()
     mpicomm.Alltoallv([data, (sendcounts, sendoffsets), dt], [recvbuffer, (recvcounts, recvoffsets), dt])
     dt.Free()
+
     if return_recvcounts:
         return recvbuffer, recvcounts
     return recvbuffer
@@ -610,7 +613,8 @@ def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
         tmp = array[mask_irank]
         per_host_arrays.append(tmp)
 
-    counts = [array.size for array in per_host_arrays]
+    counts = [array.shape[0] for array in per_host_arrays]
+
     final, recvcounts = _all_to_all_mpi(np.concatenate(per_host_arrays, axis=0), counts=counts, mpicomm=mpicomm, return_recvcounts=True)
     del per_host_arrays
 
