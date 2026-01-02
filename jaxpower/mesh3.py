@@ -731,11 +731,13 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     -------
     norm : float, list
     """
-    fkps_none =  list(fkps) + [None] * (2 - len(fkps))
+    fkps_none =  list(fkps) + [None] * (3 - len(fkps))
     fkps, fields = _format_meshes(*fkps)
     alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
+
     def get_randoms(fkp):
         return fkp.randoms if isinstance(fkp, FKPField) else fkp
+
     if split is not None:
         randoms = split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split)
         alpha *= prod(get_randoms(fkp).sum() / randoms.sum() for fkp, randoms in zip(fkps, randoms, strict=True))

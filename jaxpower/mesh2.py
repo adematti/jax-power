@@ -740,13 +740,14 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
     -------
     norm : float, list
     """
-    # This is the pypower normalization - move to new one?
     kw = dict(cellsize=cellsize)
     for name in list(kw):
         if kw[name] is None: kw.pop(name)
     if split is not None:
+
         def get_randoms(fkp):
             return fkp.randoms if isinstance(fkp, FKPField) else fkp
+
         fkps_none =  list(fkps) + [None] * (2 - len(fkps))
         fkps, autocorr = _format_meshes(*fkps)
         alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
@@ -754,6 +755,7 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
         alpha *= prod(get_randoms(fkp).sum() / randoms.sum() for fkp, randoms in zip(fkps, randoms, strict=True))
         norm = alpha * compute_normalization(*randoms, **kw)
     else:
+        # This is the pypower normalization
         fkps, autocorr = _format_meshes(*fkps)
         if autocorr:
             fkp = fkps[0]
