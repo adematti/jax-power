@@ -63,19 +63,6 @@ def test_mesh3_spectrum(plot=False):
                 plt.show()
 
 
-def test_mesh3_spectrum_soccimarro_shotnoise():
-
-    list_los = ['z', 'local']
-    mattrs = MeshAttrs(meshsize=128, boxsize=1000., boxcenter=[0., 0., 100000.])
-
-    particles = generate_uniform_particles(mattrs, size=int(1e-4 * mattrs.boxsize.prod()), seed=42)
-    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.05}, ells=[0], basis='scoccimarro', batch_size=2)
-
-    for los in list_los:
-        shotnoise = compute_fkp3_shotnoise(particles, bin=bin, los=los, resampler='cic', interlacing=False)
-        print(los, shotnoise)
-
-
 def test_timing():
 
     import time
@@ -181,8 +168,6 @@ def test_buffer():
 
 def test_polybin3d(plot=False):
 
-    from PolyBin3D import PolyBin3D, BSpec
-
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -206,41 +191,47 @@ def test_polybin3d(plot=False):
 
     for los in ['z', 'local'][:1]:
 
-        kw_pb = dict(gridsize=mattrs.meshsize, boxsize=mattrs.boxsize, boxcenter=mattrs.boxcenter * (0. if los == 'z' else 1.))
-        base = PolyBin3D(sightline='global' if los == 'z' else los, **kw_pb, backend='jax', real_fft=False)
-        bspec = BSpec(base, k_bins=edges[0],
-                      lmax=2, k_bins_squeeze=edges[1],
-                      include_partial_triangles=False)
+        jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'])
+        jitted_compute_fkp3_shotnoise = jax.jit(compute_fkp3_shotnoise, static_argnames=['los'] + list(kw))
 
         for imock in [0]:
             t0 = time.time()
-            spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+            spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
             spectrum = spectrum.clone(norm=[mean**3 * pole.norm for pole in spectrum])
-            num_shotnoise = compute_fkp3_shotnoise(data, los=los, bin=bin, **kw)
+            num_shotnoise = jitted_compute_fkp3_shotnoise(data, los=los, bin=bin, **kw)
             spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
             jax.block_until_ready(spectrum)
             t1 = time.time()
+            print(f'jax-power took {t1 - t0:.2f} s')
+
+            from PolyBin3D import PolyBin3D, BSpec
+            kw_pb = dict(gridsize=mattrs.meshsize, boxsize=mattrs.boxsize, boxcenter=mattrs.boxcenter * (0. if los == 'z' else 1.))
+            base = PolyBin3D(sightline='global' if los == 'z' else los, **kw_pb, backend='jax', real_fft=False)
+            bspec = BSpec(base, k_bins=edges[0],
+                        lmax=2, k_bins_squeeze=edges[1],
+                        include_partial_triangles=False)
+
+            t1 = time.time()
             bk = bspec.Bk_ideal(data=mesh.value / mean, discreteness_correction=False)
             k123 = bspec.get_ks()
             t2 = time.time()
-            print(f'jax-power took {t1 - t0:.2f} s')
             print(f'polybin took {t2 - t1:.2f} s')
 
-            if plot and imock == 0:
-                k = spectrum.get(0).coords('k', center='mid')
-                weight = k.prod(axis=-1)
-                spectrum_raw = spectrum.clone(num_shotnoise=[0. * pole.num_shotnoise for pole in spectrum])
+        if plot:
+            k = spectrum.get(0).coords('k', center='mid')
+            weight = k.prod(axis=-1)
+            spectrum_raw = spectrum.clone(num_shotnoise=[0. * pole.num_shotnoise for pole in spectrum])
 
-                ax = plt.gca()
-                weight = k123.prod(axis=0)
-                for name in ['b0', 'b2']:
-                    ax.plot(weight * bk[name], color='C0')
+            ax = plt.gca()
+            weight = k123.prod(axis=0)
+            for name in ['b0', 'b2']:
+                ax.plot(weight * bk[name], color='C0')
 
-                for ell in [0, 2]:
-                    ax.plot(weight * spectrum_raw.get(ell).value(), color='C1')
-                    ax.plot(weight * spectrum.get(ell).value(), color='C1', linestyle='--')
-                plt.show()
+            for ell in [0, 2]:
+                ax.plot(weight * spectrum_raw.get(ell).value(), color='C1')
+                ax.plot(weight * spectrum.get(ell).value(), color='C1', linestyle='--')
+            plt.show()
 
 
 def test_triumvirate_box(plot=False):
@@ -277,8 +268,10 @@ def test_triumvirate_box(plot=False):
             return array.real
         return array.imag
 
-    spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
+    jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'])
+    jitted_compute_fkp3_shotnoise = jax.jit(compute_fkp3_shotnoise, static_argnames=['los'] + list(kw))
+    spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    num_shotnoise = jitted_compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
     nz = size / mattrs.boxsize.prod()
     norm = jnp.sum(data.weights * nz**2)
     spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
@@ -423,9 +416,11 @@ def test_triumvirate_survey(plot=False):
             return array.real
         return array.imag
 
-    spectrum = compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'])
+    jitted_compute_fkp3_shotnoise = jax.jit(compute_fkp3_shotnoise, static_argnames=['los'] + list(kw))
 
-    num_shotnoise = compute_fkp3_shotnoise(fkp, bin=bin, los=los, **kw)
+    spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
+    num_shotnoise = jitted_compute_fkp3_shotnoise(fkp, bin=bin, los=los, **kw)
     nz = size / mattrs.boxsize.prod()
     norm = jnp.sum(data.weights * nz**2)
     spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
@@ -811,7 +806,7 @@ def test_smooth_window(plot=False):
         for ill, ell in enumerate(self.ells):
             pole = self.get(ells=ell)
             idx = np.abs(pole.coords('s2') - s).argmin()
-            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=f'$\ell={ell}$')
+            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=rf'$\ell={ell}$')
         ax.legend()
         ax.grid(True)
         ax.set_xscale('log')
@@ -899,7 +894,7 @@ def test_smooth_window_sugiyama_synthetic(plot=False):
         for ill, ell in enumerate(self.ells):
             pole = self.get(ells=ell)
             idx = np.abs(pole.coords('s2') - s).argmin()
-            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=f'$\ell={ell}$')
+            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=rf'$\ell={ell}$')
         ax.legend()
         ax.grid(True)
         ax.set_xscale('log')
@@ -974,7 +969,7 @@ def test_smooth_window_scoccimarro_synthetic(plot=False):
         for ill, ell in enumerate(self.ells):
             pole = self.get(ells=ell)
             idx = np.abs(pole.coords('s2') - s).argmin()
-            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=f'$\ell={ell}$')
+            ax.plot(pole.coords('s1'), pole.value().real[:, idx], label=rf'$\ell={ell}$')
         ax.legend()
         ax.grid(True)
         ax.set_xscale('log')
@@ -1063,7 +1058,7 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
 
     #test_fftlog2(plot=True)
-    test_buffer()
+    #test_buffer()
     test_mesh3_spectrum()
     test_polybin3d()
     test_triumvirate_box()

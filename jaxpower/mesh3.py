@@ -473,8 +473,8 @@ def _iter_triposh(*ells, los='local'):
         toret.append([m1 + ell1, m2 + ell2, m3 + ell3, gaunt, sym])  # m indexing starting from 0
         acc.append(toret[-1][:3])
     if toret:
-        return [jnp.array(xx) for xx in zip(*toret)]
-    return [jnp.zeros((0,), dtype=int) for _ in range(5)]
+        return [np.array(xx) for xx in zip(*toret)]
+    return [np.zeros((0,), dtype=int) for _ in range(5)]
 
 
 
@@ -754,7 +754,7 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
 
 
 def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, **kwargs):
-    """
+    r"""
     Compute the FKP shot noise for the bispectrum or 3pcf.
 
     Parameters
@@ -794,7 +794,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
 
 
 def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
-    """
+    r"""
     Compute the FKP shot noise for the bispectrum.
 
     Parameters
@@ -1053,7 +1053,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
 
 
 def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
-    """
+    r"""
     Compute the FKP shot noise for the 3pcf.
 
     Parameters
