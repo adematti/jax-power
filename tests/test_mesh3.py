@@ -63,6 +63,30 @@ def test_mesh3_spectrum(plot=False):
                 plt.show()
 
 
+def test_fkp3_shotnoise():
+
+    mattrs = MeshAttrs(meshsize=100, boxsize=1000., boxcenter=1000.)
+    size = int(1e4)
+    data = generate_uniform_particles(mattrs, size, seed=32)
+    #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+    kw = dict(resampler='tsc', interlacing=2, compensate=True)
+
+    edges = [np.arange(0.01, knyq / 2., 0.01) for knyq in mattrs.knyq]
+    bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='scoccimarro', ells=[0, 2])
+    shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
+    assert np.allclose([np.mean(sn) for sn in shotnoise], [10013.975399104605, -104.97685444849071])
+
+    bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0), (2, 0, 2)])
+    shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
+    assert np.allclose([np.mean(sn) for sn in shotnoise], [10139.357378112192, 380.2427505962978])
+
+    edges = [np.arange(0., 100, 20.) for knyq in mattrs.knyq]
+    bin = BinMesh3CorrelationPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0), (2, 0, 2)])
+    shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
+    assert np.allclose([np.mean(sn) for sn in shotnoise], [0.0010000712178773513, 3.766614752457692e-07])
+
+
+
 def test_timing():
 
     import time
@@ -192,13 +216,12 @@ def test_polybin3d(plot=False):
     for los in ['z', 'local'][:1]:
 
         jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'])
-        jitted_compute_fkp3_shotnoise = jax.jit(compute_fkp3_shotnoise, static_argnames=['los'] + list(kw))
 
         for imock in [0]:
             t0 = time.time()
             spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
             spectrum = spectrum.clone(norm=[mean**3 * pole.norm for pole in spectrum])
-            num_shotnoise = jitted_compute_fkp3_shotnoise(data, los=los, bin=bin, **kw)
+            num_shotnoise = compute_fkp3_shotnoise(data, los=los, bin=bin, **kw)
             spectrum = spectrum.clone(num_shotnoise=num_shotnoise)
 
             jax.block_until_ready(spectrum)
@@ -234,7 +257,7 @@ def test_polybin3d(plot=False):
             plt.show()
 
 
-def test_triumvirate_box(plot=False):
+def test_triumvirate_box_spectrum(plot=False):
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -269,9 +292,8 @@ def test_triumvirate_box(plot=False):
         return array.imag
 
     jitted_compute_mesh3_spectrum = jax.jit(compute_mesh3_spectrum, static_argnames=['los'])
-    jitted_compute_fkp3_shotnoise = jax.jit(compute_fkp3_shotnoise, static_argnames=['los'] + list(kw))
     spectrum = jitted_compute_mesh3_spectrum(mesh, los=los, bin=bin)
-    num_shotnoise = jitted_compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
+    num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, los=los, **kw)
     nz = size / mattrs.boxsize.prod()
     norm = jnp.sum(data.weights * nz**2)
     spectrum = spectrum.map(lambda pole: pole.clone(norm=norm))
@@ -382,7 +404,7 @@ def test_triumvirate_box_correlation(plot=False):
         plt.show()
 
 
-def test_triumvirate_survey(plot=False):
+def test_triumvirate_survey_spectrum(plot=False):
     def pk(k):
         kp = 0.03
         return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
@@ -1060,9 +1082,10 @@ if __name__ == '__main__':
     #test_fftlog2(plot=True)
     #test_buffer()
     test_mesh3_spectrum()
+    test_fkp3_shotnoise()
     test_polybin3d()
-    test_triumvirate_box()
-    test_triumvirate_survey()
+    test_triumvirate_box_spectrum()
+    test_triumvirate_survey_spectrum()
     test_normalization()
     test_fftlog2()
     test_smooth_window_sugiyama_synthetic()

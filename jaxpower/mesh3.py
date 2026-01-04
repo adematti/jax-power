@@ -495,6 +495,11 @@ def compute_mesh3(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh3Spectr
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
 
+    Note
+    ----
+    jit is recommended when running for many realizations.
+    Otherwise OOM may occur.
+
     Returns
     -------
     result : Mesh3SpectrumPoles or Mesh3CorrelationPoles
@@ -522,6 +527,11 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+
+    Note
+    ----
+    jit is recommended when running for many realizations.
+    Otherwise OOM may occur.
 
     Returns
     -------
@@ -631,6 +641,11 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+
+    Note
+    ----
+    jit is recommended when running for many realizations.
+    Otherwise OOM may occur.
 
     Returns
     -------
@@ -753,47 +768,221 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     return norm
 
 
-def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, **kwargs):
-    r"""
-    Compute the FKP shot noise for the bispectrum or 3pcf.
+@partial(jax.jit, donate_argnums=[0, 1], static_argnames=['los'])
+def _compute_scoccimarro_S(cmeshw, cmeshw2, sumw3, bin=None, los='z'):
 
-    Parameters
-    ----------
-    fkps : FKPField
-        FKP fields.
-    bin : BinMesh3SpectrumPoles, BinMesh3CorrelationPoles, optional
-        Binning operator.
-    los : str or array-like, optional
-        Line-of-sight specification.
-        If ``los`` is 'local', use local (varying) line-of-sight.
-        Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
-    resampler : str, Callable
-        Resampler to read particule weights from mesh.
-        One of ['ngp', 'cic', 'tsc', 'pcs'].
-    interlacing : int, default=0
-        If 0 or 1, no interlacing correction.
-        If > 1, order of interlacing correction.
-        Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
-    compensate : bool, default=False
-        If ``True``, applies compensation to the mesh after painting.
-    kwargs : dict
-        Additional arguments for :meth:`ParticleField.paint`.
+    mattrs = cmeshw.attrs
+    ells = bin.ells
+    shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
 
-    Returns
-    -------
-    shotnoise : list
-        Shot noise for each multipole.
-    """
-    if isinstance(bin, BinMesh3SpectrumPoles):
-        return compute_fkp3_spectrum_shotnoise(*fkps, bin=bin, los=los, resampler=resampler, interlacing=interlacing, **kwargs)
-    if isinstance(bin, BinMesh3CorrelationPoles):
-        return compute_fkp3_correlation_shotnoise(*fkps, bin=bin, los=los, resampler=resampler, interlacing=interlacing, **kwargs)
-    raise ValueError(f'bin must be either BinMesh3SpectrumPoles or BinMesh3CorrelationPoles, not {type(bin)}')
+    los, vlos = _format_los(los, ndim=mattrs.ndim)
+    # The real-space grid
+    xvec = mattrs.rcoords(sparse=True)
+    # The Fourier-space grid
+    kvec = mattrs.kcoords(sparse=True)
+
+    mattrs = cmeshw.attrs
+
+    def bin_mesh2(mesh, axis):
+        nmodes1d = bin.nmodes1d[axis]
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
+
+    def apply_fourier_legendre(ell, cmesh):
+        mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
+        return get_legendre(ell)(mu) * cmesh
+
+    def apply_fourier_harmonics(ell, rmesh):
+        rmesh = getattr(rmesh, 'value', rmesh)
+        Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
+
+        @partial(jax.checkpoint, static_argnums=(0, 1))
+        def f(Ylm, carry, im):
+            carry += mattrs.r2c(rmesh * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
+            return carry, im
+
+        xs = np.arange(len(Ylms))
+        return (4. * jnp.pi) / (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
+
+    for ill, ell in enumerate(ells):
+        if ell == 0:
+            cmeshw3_ell = cmeshw * cmeshw2.conj()
+            shotnoise[ill] = sum(bin_mesh2(cmeshw3_ell, axis=axis)[bin._iedges[..., axis]] for axis in range(mattrs.ndim)) - 2. * sumw3
+        else:
+            # First line of eq. 58, q1 => q3
+            if vlos is not None:
+                cmeshw_ell = apply_fourier_legendre(ell, cmeshw)
+            else:
+                cmeshw_ell = apply_fourier_harmonics(ell, cmeshw.c2r())
+            sn_ell = bin_mesh2(cmeshw_ell * cmeshw2.conj(), axis=mattrs.ndim - 1)[bin._iedges[..., mattrs.ndim - 1]]
+            del cmeshw_ell
+
+            if vlos is not None:
+                cmeshw3_ell = cmeshw * apply_fourier_legendre(ell, cmeshw2).conj()
+            else:
+                cmeshw3_ell = cmeshw * apply_fourier_harmonics(ell, cmeshw2.c2r()).conj()
+
+            @partial(jax.checkpoint, static_argnums=0)
+            def f(Ylm, carry, im):
+                Ylm = jax.lax.switch(im, Ylm, *kvec) * jnp.ones_like(cmeshw3_ell)
+                # Second line of eq. 58
+                tmp = cmeshw3_ell * Ylm
+                tmp = [bin_mesh2(tmp, axis=axis) for axis in range(mattrs.ndim - 1)] + [bin_mesh2(Ylm, axis=mattrs.ndim - 1)]
+                carry += (4 * jnp.pi) * sum(tmp[axis][bin._iedges[..., axis]] * tmp[mattrs.ndim - 1][bin._iedges[..., mattrs.ndim - 1]] for axis in range(mattrs.ndim - 1))
+                return carry, im
+
+            Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
+            xs = np.arange(len(Ylms))
+            shotnoise[ill] = (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=sn_ell, xs=xs)[0]
+
+    return shotnoise
 
 
+@partial(jax.jit, donate_argnums=[0, 1, 2, 3], static_argnames=['ells', 'los', 'axis'])
+def _compute_sugiyama_spectrum_S122(rmesh, cmesh, s111=dict(), cmesh_s111=1., bin=None, ells=tuple(), los='z', axis=0):
 
-def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
+    mattrs = rmesh.attrs
+    los, vlos = _format_los(los, ndim=mattrs.ndim)
+
+    def bin_mesh2(bin, mesh, axis):
+        nmodes1d = bin.nmodes1d[axis]
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
+
+    rmesh -= rmesh.mean()
+    cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
+    xvec = mattrs.rcoords(sparse=True)
+    kvec = mattrs.kcoords(sparse=True)
+
+    @partial(jax.checkpoint, static_argnums=0)
+    def f(Ylm, carry, im):
+        im, s111 = im
+        # Second and third lines
+        los = xvec if vlos is None else vlos
+        carry += jax.lax.switch(im, Ylm, *kvec) * (cmesh * (rmesh * jax.lax.switch(im, Ylm, *los)).r2c().conj() - s111 * cmesh_s111)
+        return carry, im
+
+    s122 = []
+    for ell in ells:
+        Ylms = [get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)]
+        xs = (jnp.arange(len(Ylms)), jnp.array([s111[ell, m] for m in range(-ell, ell + 1)]))
+        s122.append((2 * ell + 1) * bin_mesh2(bin, jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0], axis))
+    return s122
+
+
+@partial(jax.jit, donate_argnums=[0, 1, 2], static_argnames=['ells', 'los'])
+def _compute_sugiyama_spectrum_S113(rmesh, cmesh, s111=dict(), cmesh_s111=1., bin=None, ells=tuple(), los='z'):
+
+    mattrs = rmesh.attrs
+    los, vlos = _format_los(los, ndim=mattrs.ndim)
+
+    rmesh -= rmesh.mean()
+    cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
+    xvec = mattrs.rcoords(sparse=True)
+    svec = mattrs.rcoords(kind='separation', sparse=True)
+
+    @partial(jax.checkpoint, static_argnums=(0, 1))
+    def f(Ylms, jl, carry, im):
+        los = xvec if vlos is None else vlos
+        s111, coeff, sym, im = im[-1], im[3], im[4], im[:3]
+        # Fourth line
+        tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los).conj()).r2c() * cmesh.conj() - s111 * cmesh_s111)
+        snorm = jnp.sqrt(sum(xx**2 for xx in svec))
+        tmp = tmp.c2r() * (jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)).conj()
+
+        def fk(k):
+            return jnp.sum(tmp.value * jl[0](snorm * k[0]) * jl[1](snorm * k[1]))
+
+        tmp = jax.lax.map(fk, bin.xavg)
+        carry += tmp + sym * tmp.conj()
+        return carry, im
+
+    s113 = []
+    for ell1, ell2, ell3 in ells:
+        Ylms = [[get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
+        xs = _iter_triposh(ell1, ell2, ell3, los=los)
+        if xs[0].size:
+            # Add s111 for s, im in xs are offset by ell
+            xs = xs + [jnp.array([s111[ell3, int(im3) - ell3] for im3 in xs[2]])]
+            sign = (1j)**(ell1 + ell2)
+            s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0], dtype=mattrs.cdtype), xs=xs)[0])
+        else:
+            s113.append(jnp.zeros_like(bin.xavg[..., 0]))
+    return s113
+
+
+@partial(jax.jit, donate_argnums=[0, 1, 2, 3], static_argnames=['ells', 'los', 'axis'])
+def _compute_sugiyama_correlation_S122(rmesh, cmesh, s111=dict(), cmesh_s111=1., bin=None, ells=tuple(), los='z', axis=0):
+
+    mattrs = rmesh.attrs
+    los, vlos = _format_los(los, ndim=mattrs.ndim)
+
+    def bin_mesh2(mesh, axis):
+        nmodes1d = bin.nmodes1d[axis]
+        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
+
+    rmesh -= rmesh.mean()
+    cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
+    xvec = mattrs.rcoords(sparse=True)
+    svec = mattrs.rcoords(kind='separation', sparse=True)
+
+    @partial(jax.checkpoint, static_argnums=0)
+    def f(Ylm, carry, im):
+        im, s111 = im
+        # Second and third lines
+        los = xvec if vlos is None else vlos
+        carry += jax.lax.switch(im, Ylm, *svec) * (cmesh * (rmesh * jax.lax.switch(im, Ylm, *los)).r2c().conj() - s111 * cmesh_s111).c2r()
+        return carry, im
+
+    s122 = []
+    for ell in ells:
+        Ylms = [get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)]
+        xs = (jnp.arange(len(Ylms)), jnp.array([s111[ell, m] for m in range(-ell, ell + 1)]))
+        s122.append((2 * ell + 1) * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=rmesh.clone(value=jnp.zeros_like(rmesh.value, dtype=mattrs.cdtype)), xs=xs)[0], axis))
+    return s122
+
+
+@partial(jax.jit, donate_argnums=[0, 1, 2], static_argnames=['ells', 'los'])
+def _compute_sugiyama_correlation_S113(rmesh, cmesh, s111=dict(), cmesh_s111=1., bin=None, inter_bin=None, ells=tuple(), los='z'):
+
+    mattrs = rmesh.attrs
+    los, vlos = _format_los(los, ndim=mattrs.ndim)
+
+    rmesh -= rmesh.mean()
+    cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
+    xvec = mattrs.rcoords(sparse=True)
+    svec = mattrs.rcoords(kind='separation', sparse=True)
+
+    inter_ibin, uinter_edges, M = inter_bin
+
+    def bin_mesh2_inter(mesh):
+        tmp = M @ _bincount(inter_ibin[0], getattr(mesh, 'value', mesh), length=len(uinter_edges) - 1)
+        return tmp / (bin.nmodes1d[0][bin._iedges[..., 0]] * bin.nmodes1d[1][bin._iedges[..., 1]])
+
+    @partial(jax.checkpoint, static_argnums=(0, 1))
+    def f(Ylms, carry, im):
+        los = xvec if vlos is None else vlos
+        s111, coeff, sym, im = im[-1], im[3], im[4], im[:3]
+        # Fourth line
+        tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los).conj()).r2c() * cmesh.conj() - s111 * cmesh_s111)
+        tmp = tmp.c2r() * (jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)).conj()
+        tmp = bin_mesh2_inter(tmp)
+        carry += tmp + sym * tmp.conj()
+        return carry, im
+
+    s113 = []
+    for ell1, ell2, ell3 in ells:
+        Ylms = [[get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
+        xs = _iter_triposh(ell1, ell2, ell3, los=los)
+        if xs[0].size:
+            # Add s111 for s, im in xs are offset by ell
+            xs = xs + [jnp.array([s111[ell3, int(im3) - ell3] for im3 in xs[2]])]
+            sign = (-1)**(ell1 + ell2)
+            s113.append(sign * jax.lax.scan(partial(f, Ylms), init=jnp.zeros_like(bin.xavg[..., 0], dtype=mattrs.cdtype), xs=xs)[0])
+        else:
+            s113.append(jnp.zeros_like(bin.xavg[..., 0]))
+    return s113
+
+
+def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
     r"""
     Compute the FKP shot noise for the bispectrum.
 
@@ -801,7 +990,7 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     ----------
     fkps : FKPField
         FKP fields.
-    bin : BinMesh3SpectrumPoles, optional
+    bin : BinMesh3SpectrumPoles or BinMesh3CorrelationPoles, optional
         Binning operator.
     los : str or array-like, optional
         Line-of-sight specification.
@@ -839,268 +1028,6 @@ def compute_fkp3_spectrum_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', 
     from . import resamplers
     resampler = resamplers.get_resampler(resampler)
     interlacing = max(interlacing, 1) >= 2
-
-    def bin_mesh2(mesh, axis):
-        nmodes1d = bin.nmodes1d[axis]
-        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
-
-    if fields[2] == fields[1] + 1 == fields[0] + 2:
-        return tuple(shotnoise)
-
-    particles = []
-    for fkp, s in zip(fkps, fields):
-        if s < len(particles):
-            particles.append(particles[s])
-        else:
-            if isinstance(fkp, FKPField):
-                fkp = fkp.particles
-            particles.append(fkp)
-
-    los, vlos = _format_los(los, ndim=mattrs.ndim)
-    # The real-space grid
-    xvec = mattrs.rcoords(sparse=True)
-    svec = mattrs.rcoords(kind='separation', sparse=True)
-    # The Fourier-space grid
-    kvec = mattrs.kcoords(sparse=True)
-    kcirc = mattrs.kcoords(kind='circular', sparse=True)
-
-    if 'scoccimarro' in bin.basis:
-
-        # Eq. 58 of https://arxiv.org/pdf/1506.02729, 1 => 3
-        if not (fields[0] == fields[1] == fields[2]):
-            raise NotImplementedError
-        cmeshw = particles[0].paint(**kwargs, out='complex')
-        cmeshw = cmeshw.clone(value=cmeshw.value.at[(0,) * cmeshw.ndim].set(0.))  # remove zero-mode
-        cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
-        cmeshw2 = cmeshw2.clone(value=cmeshw2.value.at[(0,) * cmeshw2.ndim].set(0.))  # remove zero-mode
-        sumw3 = jnp.sum(particles[0].weights**3)
-        del particles
-
-        ndim = 3
-        def apply_fourier_legendre(ell, cmesh):
-            mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
-            return get_legendre(ell)(mu) * cmesh
-
-        def apply_fourier_harmonics(ell, rmesh):
-            rmesh = getattr(rmesh, 'value', rmesh)
-            Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
-
-            @partial(jax.checkpoint, static_argnums=(0, 1))
-            def f(Ylm, carry, im):
-                carry += mattrs.r2c(rmesh * jax.lax.switch(im, Ylm, *xvec)) * jax.lax.switch(im, Ylm, *kvec)
-                return carry, im
-
-            xs = np.arange(len(Ylms))
-            return (4. * jnp.pi) / (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=mattrs.create(fill=0., kind='complex'), xs=xs)[0]
-
-        for ill, ell in enumerate(ells):
-            if ell == 0:
-                cmeshw3_ell = cmeshw * cmeshw2.conj()
-                shotnoise[ill] = sum(bin_mesh2(cmeshw3_ell, axis=axis)[bin._iedges[..., axis]] for axis in range(ndim)) - 2. * sumw3
-            else:
-                # First line of eq. 58, q1 => q3
-                if vlos is not None:
-                    cmeshw_ell = apply_fourier_legendre(ell, cmeshw)
-                else:
-                    cmeshw_ell = apply_fourier_harmonics(ell, cmeshw.c2r())
-                sn_ell = bin_mesh2(cmeshw_ell * cmeshw2.conj(), axis=ndim - 1)[bin._iedges[..., ndim - 1]]
-                del cmeshw_ell
-
-                if vlos is not None:
-                    cmeshw3_ell = cmeshw * apply_fourier_legendre(ell, cmeshw2).conj()
-                else:
-                    cmeshw3_ell = cmeshw * apply_fourier_harmonics(ell, cmeshw2.c2r()).conj()
-
-                @partial(jax.checkpoint, static_argnums=0)
-                def f(Ylm, carry, im):
-                    Ylm = jax.lax.switch(im, Ylm, *kvec) * jnp.ones_like(cmeshw3_ell)
-                    # Second line of eq. 58
-                    tmp = cmeshw3_ell * Ylm
-                    tmp = [bin_mesh2(tmp, axis=axis) for axis in range(ndim - 1)] + [bin_mesh2(Ylm, axis=ndim - 1)]
-                    carry += (4 * jnp.pi) * sum(tmp[axis][bin._iedges[..., axis]] * tmp[ndim - 1][bin._iedges[..., ndim - 1]] for axis in range(ndim - 1))
-                    return carry, im
-
-                Ylms = [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)]
-                xs = np.arange(len(Ylms))
-                shotnoise[ill] = (2 * ell + 1) * jax.lax.scan(partial(f, Ylms), init=sn_ell, xs=xs)[0]
-
-        shotnoise = [sn.real if ell % 2 == 0 else sn.imag for ell, sn in zip(ells, shotnoise)]
-
-    else:
-        # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132
-
-        def compute_S111(particles, ellms):
-            ellms = list(ellms)
-            if ellms == [(0, 0)]:
-                s0 = jnp.sum(particles[0].weights**3)
-                s111 = [s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms]
-            else:
-                rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-                s111 = [jnp.sum(rmesh.value * get_Ylm(ell, m, reduced=True, real=False, conj=True)(*xvec)) for ell, m in ellms]
-            return s111
-
-        def compensate_shotnoise(s111):
-            # NOTE: when there is no interlacing, triumvirate compensates pk with aliasing_shotnoise in the shotnoise estimation (but in bk estimation?)
-            # In jaxpower, we always compensate by the standard compensate
-            #if convention == 'triumvirate' and not interlacing:
-            if not interlacing:
-                return s111 * resampler.aliasing_shotnoise(1., kcirc) * (resampler.compensate(1., kcirc)**2 if compensate else 1.)
-            return s111
-
-        def compute_S122(particles, ells, axis):  # 1 == 2
-            rmesh = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
-            rmesh -= rmesh.mean()
-            cmesh = particles[0].paint(**kwargs, out='complex')
-            cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
-
-            @partial(jax.checkpoint, static_argnums=0)
-            def f(Ylm, carry, im):
-                im, s111 = im
-                # Second and third lines
-                s111 = compensate_shotnoise(s111)
-                los = xvec if vlos is None else vlos
-                carry += jax.lax.switch(im, Ylm, *kvec) * (cmesh * (rmesh * jax.lax.switch(im, Ylm, *los)).r2c().conj() - s111)
-                return carry, im
-
-            s122 = []
-            for ell in ells:
-                Ylms = [get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)]
-                xs = (jnp.arange(len(Ylms)), jnp.array([s111[ellms.index((ell, m))] for m in range(-ell, ell + 1)]))
-                s122.append((2 * ell + 1) * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=cmesh.clone(value=jnp.zeros_like(cmesh.value)), xs=xs)[0], axis))
-            return s122
-
-        def compute_S113(particles, ells):
-
-            rmesh = particles[2].paint(**kwargs, out='real')
-            rmesh -= rmesh.mean()
-            cmesh = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
-            cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
-
-            @partial(jax.checkpoint, static_argnums=(0, 1))
-            def f(Ylms, jl, carry, im):
-                los = xvec if vlos is None else vlos
-                s111, coeff, sym, im = im[-1], im[3], im[4], im[:3]
-                s111 = compensate_shotnoise(s111)
-                # Fourth line
-                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los).conj()).r2c() * cmesh.conj() - s111)
-                snorm = jnp.sqrt(sum(xx**2 for xx in svec))
-                tmp = tmp.c2r() * (jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)).conj()
-
-                def fk(k):
-                    return jnp.sum(tmp.value * jl[0](snorm * k[0]) * jl[1](snorm * k[1]))
-
-                tmp = jax.lax.map(fk, bin.xavg)
-                carry += tmp + sym * tmp.conj()
-                return carry, im
-
-            s113 = []
-            for ell1, ell2, ell3 in ells:
-                Ylms = [[get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
-                xs = _iter_triposh(ell1, ell2, ell3, los=los)
-                if xs[0].size:
-                    # Add s111 for s, im in xs are offset by ell
-                    xs = xs + [jnp.array([s111[ellms.index((ell3, int(im3) - ell3))] for im3 in xs[2]])]
-                    sign = (1j)**(ell1 + ell2)
-                    s113.append(sign * jax.lax.scan(partial(f, Ylms, [get_spherical_jn(ell1), get_spherical_jn(ell2)]), init=jnp.zeros_like(bin.xavg[..., 0], dtype=mattrs.cdtype), xs=xs)[0])
-                else:
-                    s113.append(jnp.zeros_like(bin.xavg[..., 0]))
-            return s113
-
-        uells = sorted(sum(ells, start=tuple()))
-        ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
-        s111 = [0.] * len(ellms)
-        if fields[0] == fields[1] == fields[2]:
-            s111 = compute_S111(particles, ellms)
-            ell0 = (0, 0, 0)
-            if ell0 in ells:
-                shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))]
-
-        if fields[1] == fields[2]:
-            def select(ell):
-                return ell[2] == ell[0] and ell[1] == 0
-
-            ells1 = [ell[0] for ell in ells if select(ell)]
-            if ells1:
-                particles01 = particles
-                s122 = compute_S122(particles01, ells1, 0)
-
-                for ill, ell in enumerate(ells):
-                    if select(ell):
-                        idx = ells1.index(ell[0])
-                        shotnoise[ill] += s122[idx][bin._iedges[..., 0]]
-
-        if fields[0] == fields[2]:
-            def select(ell):
-                return ell[2] == ell[1] and ell[0] == 0
-
-            ells2 = [ell[1] for ell in ells if select(ell)]
-            if ells2:
-                particles01 = [particles[1], particles[0]]
-                s121 = compute_S122(particles01, ells2, 1)
-                for ill, ell in enumerate(ells):
-                    if select(ell):
-                        idx = ells2.index(ell[1])
-                        shotnoise[ill] += s121[idx][bin._iedges[..., 1]]
-
-        if fields[0] == fields[1]:
-            s113 = compute_S113(particles, ells)
-            for ill, ell in enumerate(ells):
-                shotnoise[ill] += s113[ill]
-
-        shotnoise = [sn.real if sum(ell[:2]) % 2 == 0 else sn.imag for ell, sn in zip(ells, shotnoise)]
-
-    return list(shotnoise)
-
-
-def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
-    r"""
-    Compute the FKP shot noise for the 3pcf.
-
-    Parameters
-    ----------
-    fkps : FKPField
-        FKP fields.
-    bin : BinMesh3SpectrumPoles, optional
-        Binning operator.
-    los : str or array-like, optional
-        Line-of-sight specification.
-        If ``los`` is 'local', use local (varying) line-of-sight.
-        Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
-    resampler : str, Callable
-        Resampler to read particule weights from mesh.
-        One of ['ngp', 'cic', 'tsc', 'pcs'].
-    interlacing : int, default=0
-        If 0 or 1, no interlacing correction.
-        If > 1, order of interlacing correction.
-        Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
-    compensate : bool, default=False
-        If ``True``, applies compensation to the mesh after painting.
-    kwargs : dict
-        Additional arguments for :meth:`ParticleField.paint`.
-
-    Returns
-    -------
-    shotnoise : list
-        Shot noise for each multipole.
-    """
-    fkps, fields = _format_meshes(*fkps)
-    mattrs = fkps[0].attrs
-    if 'sugiyama' in bin.basis:
-        mattrs = mattrs.clone(dtype=mattrs.cdtype)
-    fkps = [fkp.clone(attrs=mattrs) for fkp in fkps]
-    # ells
-    ells = bin.ells
-    shotnoise = [jnp.zeros_like(bin.xavg[..., 0]) for ill in range(len(ells))]
-    kwargs.update(resampler=resampler, interlacing=interlacing, compensate=compensate)
-
-    from . import resamplers
-    resampler = resamplers.get_resampler(resampler)
-    interlacing = max(interlacing, 1) >= 2
-
-    def bin_mesh2(mesh, axis):
-        nmodes1d = bin.nmodes1d[axis]
-        return _bincount(bin.ibin1d[axis] + 1, getattr(mesh, 'value', mesh), weights=bin.wmodes, length=len(nmodes1d)) / nmodes1d
 
     if fields[2] == fields[1] + 1 == fields[0] + 2:
         return tuple(shotnoise)
@@ -1115,156 +1042,125 @@ def compute_fkp3_correlation_shotnoise(*fkps, bin=None, los: str | np.ndarray='z
             particles.append(fkp)
 
     mattrs = particles[0].attrs
-    los, vlos = _format_los(los, ndim=mattrs.ndim)
-    # The real-space grid
-    xvec = mattrs.rcoords(sparse=True)
-    svec = mattrs.rcoords(kind='separation', sparse=True)
-    # The Fourier-space grid
-    kvec = mattrs.kcoords(sparse=True)
-    kcirc = mattrs.kcoords(kind='circular', sparse=True)
+
+    is_correlation = isinstance(bin, BinMesh3CorrelationPoles)
 
     if 'scoccimarro' in bin.basis:
 
-        raise NotImplementedError
+        if is_correlation: raise NotImplementedError
 
-    else: # sugiyama
+        # Eq. 58 of https://arxiv.org/pdf/1506.02729, 1 => 3
+        if not (fields[0] == fields[1] == fields[2]):
+            raise NotImplementedError
+        cmeshw = particles[0].paint(**kwargs, out='complex')
+        cmeshw = cmeshw.clone(value=cmeshw.value.at[(0,) * cmeshw.ndim].set(0.))  # remove zero-mode
+        cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
+        cmeshw2 = cmeshw2.clone(value=cmeshw2.value.at[(0,) * cmeshw2.ndim].set(0.))  # remove zero-mode
+        sumw3 = jnp.sum(particles[0].weights**3)
+        del particles
+
+        shotnoise = _compute_scoccimarro_S(cmeshw, cmeshw2, sumw3, bin=bin, los=los)
+        shotnoise = [sn.real if ell % 2 == 0 else sn.imag for ell, sn in zip(ells, shotnoise)]
+
+    else:
         # Eq. 45 - 46 of https://arxiv.org/pdf/1803.02132
-
         def compute_S111(particles, ellms):
             ellms = list(ellms)
             if ellms == [(0, 0)]:
                 s0 = jnp.sum(particles[0].weights**3)
-                s111 = [s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms]
+                s111_ellm = {(ell, m): s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms}
             else:
                 rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
-                s111 = [jnp.sum(rmesh.value * get_Ylm(ell, m, reduced=True, real=False, conj=True)(*xvec)) for ell, m in ellms]
-            return s111
+                xvec = mattrs.rcoords(sparse=True)
+                s111_ellm = {(ell, m): jnp.sum(rmesh.value * get_Ylm(ell, m, reduced=True, real=False, conj=True)(*xvec)) for ell, m in ellms}
+            s111 = s111_ellm.get((0, 0), 0.)
+            if is_correlation:
+                mask = 1. / mattrs.cellsize.prod()**2 * jnp.all((bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.), axis=1)
+                s111 *= mask
+            return s111, s111_ellm
 
-        def compensate_shotnoise(s111):
+        def compensate_shotnoise():
             # NOTE: when there is no interlacing, triumvirate compensates pk with aliasing_shotnoise in the shotnoise estimation (but in bk estimation?)
             # In jaxpower, we always compensate by the standard compensate
             #if convention == 'triumvirate' and not interlacing:
-            if not interlacing:
-                return s111 * resampler.aliasing_shotnoise(1., kcirc) * (resampler.compensate(1., kcirc)**2 if compensate else 1.)
-            return s111
+            kcirc = mattrs.kcoords(kind='circular', sparse=True)
+            if interlacing:
+                return (1. if compensate else 1. / resampler.compensate(1., kcirc)**2)
+            else:
+                return resampler.aliasing_shotnoise(1., kcirc) * (resampler.compensate(1., kcirc)**2 if compensate else 1.)
 
-        def compute_S122(particles, ells, axis):  # 1 == 2
-            rmesh = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
-            rmesh -= rmesh.mean()
-            cmesh = particles[0].paint(**kwargs, out='complex')
-            cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
+        def compute_S122(particles, ells, axis=0):  # 1 == 2
+            rmeshw2 = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
+            cmeshw = particles[0].paint(**kwargs, out='complex')
 
-            @partial(jax.checkpoint, static_argnums=0)
-            def f(Ylm, carry, im):
-                im, s111 = im
-                # Second and third lines
-                s111 = compensate_shotnoise(s111)
-                los = xvec if vlos is None else vlos
-                carry += jax.lax.switch(im, Ylm, *svec) * (cmesh * (rmesh * jax.lax.switch(im, Ylm, *los)).r2c().conj() - s111).c2r()
-                return carry, im
-
-            s122 = []
-            for ell in ells:
-                Ylms = [get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)]
-                xs = (jnp.arange(len(Ylms)), jnp.array([s111[ellms.index((ell, m))] for m in range(-ell, ell + 1)]))
-                s122.append((2 * ell + 1) * bin_mesh2(jax.lax.scan(partial(f, Ylms), init=rmesh.clone(value=jnp.zeros_like(rmesh.value, dtype=mattrs.cdtype)), xs=xs)[0], axis))
-            return s122
+            if is_correlation:
+                s122 = _compute_sugiyama_correlation_S122(rmeshw2, cmeshw, s111_ellm, cmesh_s111=compensate_shotnoise(), bin=bin, ells=tuple(ells), los=los, axis=axis)
+                mask = 1. / mattrs.cellsize.prod()**2 * ((bin.edges[..., 1 - axis, 0] <= 0.) & (bin.edges[..., 1 - axis, 1] >= 0.))
+            else:
+                s122 = _compute_sugiyama_spectrum_S122(rmeshw2, cmeshw, s111_ellm, cmesh_s111=compensate_shotnoise(), bin=bin, ells=tuple(ells), los=los, axis=axis)
+                mask = 1.
+            return [s[bin._iedges[..., axis]] * mask for s in s122]
 
         def compute_S113(particles, ells):
-
-            rmesh = particles[2].paint(**kwargs, out='real')
-            rmesh -= rmesh.mean()
-            cmesh = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
-            cmesh = cmesh.clone(value=cmesh.value.at[(0,) * cmesh.ndim].set(0.))  # remove zero-mode
-
-            inter_edges = jnp.concatenate([jnp.max(bin.edges[..., 0], axis=1, keepdims=True), jnp.min(bin.edges[..., 1], axis=1, keepdims=True)], axis=-1)
-            inter_edges = jnp.where(inter_edges[..., [1]] <= inter_edges[..., [0]], 0., inter_edges)
-            snorm = jnp.sqrt(sum(ss**2 for ss in svec))
-            from .mesh import _get_bin_attrs_edges2d
-            inter_ibin, uinter_edges, M = _get_bin_attrs_edges2d(snorm, inter_edges)
-            inter_ibin = inter_ibin[0]
-            del snorm
-
-            def bin_mesh2_inter(mesh):
-                tmp = M @ _bincount(inter_ibin, getattr(mesh, 'value', mesh), length=len(uinter_edges) - 1)
-                return tmp / (bin.nmodes1d[0][bin._iedges[..., 0]] * bin.nmodes1d[1][bin._iedges[..., 1]])
-
-            @partial(jax.checkpoint, static_argnums=(0, 1))
-            def f(Ylms, carry, im):
-                los = xvec if vlos is None else vlos
-                s111, coeff, sym, im = im[-1], im[3], im[4], im[:3]
-                s111 = compensate_shotnoise(s111)
-                # Fourth line
-                tmp = coeff * ((rmesh * jax.lax.switch(im[2], Ylms[2], *los).conj()).r2c() * cmesh.conj() - s111)
-                tmp = tmp.c2r() * (jax.lax.switch(im[0], Ylms[0], *svec) * jax.lax.switch(im[1], Ylms[1], *svec)).conj()
-                tmp = bin_mesh2_inter(tmp)
-                carry += tmp + sym * tmp.conj()
-                return carry, im
-
-            s113 = []
-            for ell1, ell2, ell3 in ells:
-                Ylms = [[get_Ylm(ell, m, reduced=True, real=False) for m in range(-ell, ell + 1)] for ell in [ell1, ell2, ell3]]
-                xs = _iter_triposh(ell1, ell2, ell3, los=los)
-                if xs[0].size:
-                    # Add s111 for s, im in xs are offset by ell
-                    xs = xs + [jnp.array([s111[ellms.index((ell3, int(im3) - ell3))] for im3 in xs[2]])]
-                    sign = (-1)**(ell1 + ell2)
-                    s113.append(sign * jax.lax.scan(partial(f, Ylms), init=jnp.zeros_like(bin.xavg[..., 0], dtype=mattrs.cdtype), xs=xs)[0])
-                else:
-                    s113.append(jnp.zeros_like(bin.xavg[..., 0]))
-            return s113
+            rmeshw = particles[2].paint(**kwargs, out='real')
+            cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
+            if is_correlation:
+                inter_edges = jnp.concatenate([jnp.max(bin.edges[..., 0], axis=1, keepdims=True), jnp.min(bin.edges[..., 1], axis=1, keepdims=True)], axis=-1)
+                inter_edges = jnp.where(inter_edges[..., [1]] <= inter_edges[..., [0]], 0., inter_edges)
+                from .mesh import _get_bin_attrs_edges2d
+                inter_bin = _get_bin_attrs_edges2d(jnp.sqrt(sum(ss**2 for ss in mattrs.rcoords(sparse=True, kind='separation'))), inter_edges)
+                s113 = _compute_sugiyama_correlation_S113(rmeshw, cmeshw2, s111_ellm, cmesh_s111=compensate_shotnoise(), bin=bin, inter_bin=inter_bin, ells=tuple(ells), los=los)
+                mask = 1. / mattrs.cellsize.prod()**2
+            else:
+                s113 = _compute_sugiyama_spectrum_S113(rmeshw, cmeshw2, s111_ellm, cmesh_s111=compensate_shotnoise(), bin=bin, ells=tuple(ells), los=los)
+                mask = 1.
+            return [s * mask for s in s113]
 
         uells = sorted(sum(ells, start=tuple()))
         ellms = [(ell, m) for ell in uells for m in range(-ell, ell + 1)]
-        s111 = [0.] * len(ellms)
+        s111_ellm = {(ell, m): 0 for ell, m in ellms}
+
         if fields[0] == fields[1] == fields[2]:
-            s111 = compute_S111(particles, ellms)
+            s111, s111_ellm = compute_S111(particles, tuple(ellms))
             ell0 = (0, 0, 0)
-            mask_shotnoise = jnp.all((bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.), axis=1)
             if ell0 in ells:
-                shotnoise[ells.index(ell0)] += s111[ellms.index((0, 0))] * mask_shotnoise
+                shotnoise[ells.index(ell0)] += s111
 
         if fields[1] == fields[2]:
             def select(ell):
                 return ell[2] == ell[0] and ell[1] == 0
 
             ells1 = [ell[0] for ell in ells if select(ell)]
-            # r2 == 0
-            mask_shotnoise = (bin.edges[..., 1, 0] <= 0.) & (bin.edges[..., 1, 1] >= 0.)
-
             if ells1:
                 particles01 = particles
-                s122 = compute_S122(particles01, ells1, 0)
+                s122 = compute_S122(particles01, ells=ells1, axis=0)
 
                 for ill, ell in enumerate(ells):
                     if select(ell):
                         idx = ells1.index(ell[0])
-                        shotnoise[ill] += s122[idx][bin._iedges[..., 0]] * mask_shotnoise
+                        shotnoise[ill] += s122[idx]
 
         if fields[0] == fields[2]:
             def select(ell):
                 return ell[2] == ell[1] and ell[0] == 0
 
             ells2 = [ell[1] for ell in ells if select(ell)]
-            # r1 == 0
-            mask_shotnoise = (bin.edges[..., 0, 0] <= 0.) & (bin.edges[..., 0, 1] >= 0.)
-
             if ells2:
                 particles01 = [particles[1], particles[0]]
-                s121 = compute_S122(particles01, ells2, 1)
+                s121 = compute_S122(particles01, ells=ells2, axis=1)
                 for ill, ell in enumerate(ells):
                     if select(ell):
                         idx = ells2.index(ell[1])
-                        shotnoise[ill] += s121[idx][bin._iedges[..., 1]] * mask_shotnoise
+                        shotnoise[ill] += s121[idx]
 
         if fields[0] == fields[1]:
-            s113 = compute_S113(particles, ells)
+            s113 = compute_S113(particles, ells=ells)
             for ill, ell in enumerate(ells):
                 shotnoise[ill] += s113[ill]
 
-        shotnoise = [sn.real for sn in shotnoise]
+        shotnoise = [sn.real if is_correlation or (sum(ell[:2]) % 2 == 0) else sn.imag for ell, sn in zip(ells, shotnoise)]
 
-    return [sn / mattrs.cellsize.prod()**2 for sn in shotnoise]
+    return list(shotnoise)
 
 
 def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory ell

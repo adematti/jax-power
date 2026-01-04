@@ -2012,7 +2012,7 @@ def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sha
 def _get_bin_attrs_edges2d(coords, edges: jax.Array, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
     edges_1d = jnp.unique(edges.ravel())
     battrs = _get_bin_attrs(coords, edges_1d, weights=weights, sharding_mesh=sharding_mesh, ravel=ravel)
-    M = ((edges_1d[:-1] >= edges[:, [0]]) & (edges_1d[1:]  <= edges[:, [1]])).astype(int)  # rebinning matrix
+    M = ((edges_1d[:-1] >= edges[:, [0]]) & (edges_1d[1:] <= edges[:, [1]])).astype(int)  # rebinning matrix
     return battrs, edges_1d, M
 
 
