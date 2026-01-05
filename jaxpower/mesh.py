@@ -1448,9 +1448,10 @@ def _get_extent(*positions):
     nonempty_positions = [pos for pos in positions if pos.size]
     if backend == 'jax':
         if nonempty_positions:
+            pos_min = jnp.array([jnp.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
+            pos_max = jnp.array([jnp.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
+        else:
             raise ValueError('<= 1 particles found; cannot infer boxsize')
-        pos_min = jnp.array([jnp.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
-        pos_max = jnp.array([jnp.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
     else:
         pos_min, pos_max = None, None
         if nonempty_positions:
