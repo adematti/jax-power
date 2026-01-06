@@ -25,6 +25,7 @@ except ImportError:
 
 
 def get_sharding_mesh():
+    """Return current sharding mesh :class:`jax.sharding.Mesh`."""
     from jax._src import mesh as mesh_lib
     return mesh_lib.thread_resources.env.physical_mesh
 
@@ -86,8 +87,46 @@ def _get_ndim(*args, default=3):
     return ndim
 
 
-def create_sharding_mesh(meshsize=None, device_mesh_shape=None):
+def create_sharding_mesh(device_mesh_shape=None, meshsize=None):
+    """
+    Create a JAX sharding Mesh for device-parallel execution.
 
+    This helper builds a 2-D device mesh (axis names 'x' and 'y') suitable for use with
+    JAX sharding primitives (NamedSharding, shard_map, etc.). The returned mesh can be
+    used as a context manager (with mesh:) or passed directly to functions that accept
+    a jax.sharding.Mesh.
+
+    Parameters
+    ----------
+    device_mesh_shape : tuple[int, ...], optional
+        Explicit device mesh shape (number of devices per axis). If omitted the function
+        will inspect available JAX devices and pick a 2-D tiling that best matches the
+        device count and (optionally) `meshsize`.
+
+    meshsize : int or sequence[int], optional
+        Global array mesh size used to guide the heuristic that chooses a device tiling
+        when `device_mesh_shape` is not given. If provided as a scalar it will be treated
+        as a repeated value. Only divisibility with the chosen
+        device tiling is considered.
+
+    Returns
+    -------
+    jax.sharding.Mesh
+        A 2-D Mesh instance (axis names ('x', 'y')) ready for use with JAX sharding.
+
+    Notes
+    -----
+    - If `device_mesh_shape` results in more than two axes a NotImplementedError is raised.
+    - The function prefers device tilings whose axes divide `meshsize` when that argument
+      is supplied; otherwise it chooses divisors close to sqrt(n_devices).
+
+    Examples
+    --------
+    >>> mesh = create_sharding_mesh(meshsize=(512, 512))
+    >>> with mesh:
+    ...     # use jax sharding APIs inside the context
+    ...     ...
+    """
     if device_mesh_shape is None:
         count = len(jax.devices())
         if meshsize is None:
@@ -122,7 +161,7 @@ def create_sharding_mesh(meshsize=None, device_mesh_shape=None):
 
 
 def default_sharding_mesh(func: Callable):
-
+    """Wrapper to provide a default sharding mesh to jax-power functions."""
     @functools.wraps(func)
     def wrapper(*args, sharding_mesh=None, **kwargs):
         if sharding_mesh is None:
@@ -135,6 +174,10 @@ def default_sharding_mesh(func: Callable):
 @partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
 @default_sharding_mesh
 def create_sharded_array(func, shape, out_specs=None, sharding_mesh=None):
+    """
+    Helper function to create a sharded array using ``shard_map``, with given global shape.
+    ``func`` is called with ``shape`` argument giving the local shard shape.
+    """
     if np.ndim(shape) == 0: shape = (shape,)
     shape = tuple(shape)
     if sharding_mesh.axis_names:
@@ -159,6 +202,10 @@ def create_sharded_array(func, shape, out_specs=None, sharding_mesh=None):
 @partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
 @default_sharding_mesh
 def create_sharded_random(func, key, shape, out_specs=None, sharding_mesh=None):
+    """
+    Helper function to create a (random) sharded array using ``shard_map``, with given global shape.
+    ``func`` is called with ``key`` argument corresponding to the random seed and and ``shape`` argument giving the local shard shape.
+    """
     if np.ndim(shape) == 0: shape = (shape,)
     shape = tuple(shape)
     if sharding_mesh.axis_names:
@@ -220,15 +267,12 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
     ----------
     kind : str, default='separation'
         Either 'separation' (i.e. wavenumbers) or 'position'.
-
     sparse : bool, default=None
         If ``None``, return a tuple of 1D-arrays.
         If ``False``, return a tuple of broadcastable arrays.
         If ``True``, return a tuple of broadcastable arrays of same shape.
-
     hermitian : bool, default=False
         If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
-
     spacing : float, default=1.
         Sampling spacing, typically ``cellsize`` (real space) or ``kfun`` (Fourier space).
 
@@ -260,6 +304,7 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
 
 @default_sharding_mesh
 def mesh_shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
+    """Shape of local mesh shard for given global shape."""
     if not len(sharding_mesh.axis_names):
         return tuple(shape)
     return tuple(s // pdim for s, pdim in zip(shape, sharding_mesh.devices.shape)) + shape[sharding_mesh.devices.ndim:]
@@ -268,6 +313,9 @@ def mesh_shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=['halo_size', 'factor', 'sharding_mesh'])
 def pad_halo(value, halo_size=0, factor=2, sharding_mesh: jax.sharding.Mesh=None):
+
+    """Pad halo regions to a sharded mesh `` value``. ``factor`` gives the multiple of ``halo_size`` to pad on each side of the mesh axis; 1 when reading, 2 when painting."""
+
     pad_width = [(factor * halo_size if sharding_mesh.devices.shape[axis] > 1 else 0,) * 2 for axis in range(len(sharding_mesh.axis_names))]
     pad_width += [(0,) * 2] * len(value.shape[len(sharding_mesh.axis_names):])
 
@@ -281,6 +329,7 @@ def pad_halo(value, halo_size=0, factor=2, sharding_mesh: jax.sharding.Mesh=None
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
 def unpad_halo(value, halo_size=0, sharding_mesh=None):
+    """Unpad halo regions of a sharded mesh `` value``, summing halo regions. Typically after distributed paint."""
 
     def unpad(value):
         crop = []
@@ -306,22 +355,79 @@ def unpad_halo(value, halo_size=0, sharding_mesh=None):
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
 def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
+    """Exchange halo regions of a sharded mesh `` value``. Uses jaxdecomp.halo_exchange."""
     extents = (halo_size,) * len(sharding_mesh.axis_names)
     return jaxdecomp.halo_exchange(value, halo_extents=tuple(extents), halo_periods=(True,) * len(extents))
 
 
-
 @default_sharding_mesh
 def make_array_from_global_data(array, sharding_mesh: jax.sharding.Mesh=None):
+    """Create a sharded array from global data."""
     shape = array.shape
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
     return jax.make_array_from_callback(shape, sharding, lambda index: array[index])
 
 
+def _get_pad_constant(constant_values):
+
+    def pad(array, pad_width):
+        _constant_values = np.atleast_1d(np.asarray(constant_values, dtype=array.dtype))
+        return np.concatenate([array, np.repeat(_constant_values, pad_width[0][1], axis=0)], dtype=array.dtype, axis=0)
+
+    return pad
+
+
+def _get_pad_uniform_numpy(mattrs, seed=42):
+
+    rng = np.random.RandomState(seed=seed)
+    if isinstance(mattrs, MeshAttrs):
+        limits = [mattrs.boxcenter - mattrs.boxsize / 2., mattrs.boxcenter + mattrs.boxsize / 2.]
+    else:
+        limits = mattrs
+
+    def pad(array, pad_width):
+        return np.concatenate([array, rng.uniform(*limits, size=(pad_width[0][1],) + array.shape[1:])], dtype=array.dtype, axis=0)
+
+    return pad
+
+
+def _get_pad_uniform_jax(mattrs, seed=42):
+
+    key = jax.random.key(seed)
+    if isinstance(mattrs, MeshAttrs):
+        limits = [mattrs.boxcenter - mattrs.boxsize / 2., mattrs.boxcenter + mattrs.boxsize / 2.]
+    else:
+        limits = mattrs
+
+    def pad(array, pad_width):
+        return jnp.concatenate([array, jax.random.uniform(key, shape=(pad_width[0][1],) + array.shape[1:], minval=limits[0], maxval=limits[1])], dtype=array.dtype, axis=0)
+
+    return pad
+
 
 @default_sharding_mesh
 def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0, sharding_mesh: jax.sharding.Mesh=None):
+    """
+    Create a sharded array from per-process local data, padding to equal size if needed.
 
+    Parameters
+    ----------
+    per_host_array : array_like
+        Local data array on each process.
+    per_host_size : int, optional
+        If given, pad each process local array to this size along the first axis.
+        Else, pad to the maximum size across all processes.
+    pad : callable or str or float, default=0
+        Padding function or specification.
+        If callable, should have signature ``pad(array, pad_width)``.
+        If str, can be 'mean', 'global_mean' or 'uniform' (uniform random distribution).
+        If float, constant value to use for padding.
+
+    Returns
+    -------
+    sharded_array : jax.Array
+        Sharded array with data from all processes.
+    """
     if not len(sharding_mesh.axis_names):
         return per_host_array
 
@@ -333,18 +439,26 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
         return jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0], nlocal))
 
     if not callable(pad):
+
         if isinstance(pad, str):
             if pad == 'global_mean':
                 if sizes is None:
                     sizes = get_sizes()
                 per_host_sum = np.repeat(per_host_array.sum(axis=0, keepdims=True), nlocal, axis=0)
-                pad = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0, keepdims=True) / sizes.sum()[None, ...]
+                constant_values = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0, keepdims=True) / sizes.sum()[None, ...]
+                pad = _get_pad_constant(constant_values)
             elif pad == 'mean':
-                pad = np.mean(per_host_array, axis=0)[None, ...]
+                constant_values = np.mean(per_host_array, axis=0, keepdims=True)
+                pad = _get_pad_constant(constant_values)
+            elif pad == 'uniform':
+                limits = [jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.min(axis=0, keepdims=True), nlocal, axis=0)).min(axis=0),
+                          jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.max(axis=0, keepdims=True), nlocal, axis=0)).max(axis=0)]
+                pad = _get_pad_uniform_numpy(limits)
             else:
                 raise ValueError('mean or global_mean supported only')
-        constant_values = pad
-        pad = lambda array, pad_width: np.concatenate([array, np.repeat(np.asarray(constant_values, dtype=array.dtype), pad_width[0][1], axis=0)], dtype=array.dtype, axis=0)
+
+        else:  # constant value
+            pad = _get_pad_constant(pad)
 
     if per_host_size is None:
         if sizes is None: sizes = get_sizes()
@@ -356,8 +470,30 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
 
 
 @default_sharding_mesh
-def make_particles_from_local(positions, weights=None, sharding_mesh: jax.sharding.Mesh=None):
-    positions = make_array_from_process_local_data(positions, pad='mean', sharding_mesh=sharding_mesh)
+def make_particles_from_local(positions, weights=None, pad='uniform', sharding_mesh: jax.sharding.Mesh=None):
+    """
+    Create sharded particle positions and weights from local data, padding as needed.
+
+    Parameters
+    ----------
+    positions : array_like
+        Local particle positions array of shape (N_local, ndim).
+    weights : array_like, optional
+        Local particle weights array of shape (N_local,).
+    pad : callable or str or float, default='uniform'
+        Padding function or specification.
+        If callable, should have signature ``pad(array, pad_width)``.
+        If str, can be 'mean', 'global_mean' or 'uniform' (uniform random distribution).
+        If float, constant value to use for padding.
+
+    Returns
+    -------
+    positions : jax.Array
+        Sharded array of particle positions.
+    weights : jax.Array, optional
+        Sharded array of particle weights, if ``weights`` is given.
+    """
+    positions = make_array_from_process_local_data(positions, pad=pad, sharding_mesh=sharding_mesh)
     if weights is None:
         return positions
     weights = make_array_from_process_local_data(weights, pad=0, sharding_mesh=sharding_mesh)
@@ -365,10 +501,32 @@ def make_particles_from_local(positions, weights=None, sharding_mesh: jax.shardi
 
 
 def _identity_fn(x):
+  # To jit once
   return x
 
 
 def global_array_from_single_device_arrays(sharding, arrays, return_slices=False, pad=None):
+    """
+    Create a global array from single-device arrays, padding to equal size if needed.
+    Calls :func:`jax.make_array_from_single_device_arrays`.
+
+    Parameters
+    ----------
+    sharding : jax.sharding.Sharding
+        Sharding specification for the global array.
+    arrays : list of jax.Array
+        List of single-device arrays, one per device.
+        They must exist globally.
+    return_slices : bool, default=False
+        If True, also return the list of slices corresponding to each device data in the global array.
+
+    Returns
+    -------
+    global_array : jax.Array
+        Global sharded array.
+    slices : list of slice, optional
+        List of slices corresponding to each device data in the global array, if ``return_slices`` is ``True``.
+    """
     if pad is None:
         pad = np.nan
     if not callable(pad):
@@ -394,7 +552,7 @@ def global_array_from_single_device_arrays(sharding, arrays, return_slices=False
     return tmp
 
 
-def allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwargs):
+def _allgather_single_device_arrays(sharding, arrays, return_slices=False, **kwargs):
     tmp, slices = global_array_from_single_device_arrays(sharding, arrays, return_slices=True, **kwargs)
     # Line below fails with no attribute .with_spec for jax 0.6.2
     #tmp = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(tmp).addressable_data(0)  # replicated accross all devices
@@ -434,7 +592,7 @@ def _exchange_array_jax(array, device, pad=0, return_indices=False):
             mask_idevice = per_host_device == idevice
             per_host_chunks.append(jax.device_put(per_host_array[mask_idevice], local_device, donate=True))
             if return_indices: per_host_indices[ilocal_device].append(jax.device_put(np.flatnonzero(mask_idevice), local_device, donate=True))
-        tmp, slices[idevice] = allgather_single_device_arrays(sharding, per_host_chunks, return_slices=True)
+        tmp, slices[idevice] = _allgather_single_device_arrays(sharding, per_host_chunks, return_slices=True)
         del per_host_chunks
         if devices[idevice] in local_devices:
             per_host_final_arrays[local_devices.index(devices[idevice])] = jax.device_put(tmp, devices[idevice], donate=True)
@@ -463,7 +621,7 @@ def _exchange_inverse_jax(array, indices):
         for ilocal_device, (per_host_array, local_device) in enumerate(zip(per_host_arrays, local_devices)):
             sl = slices[devices.index(local_device)][idevice]
             per_host_chunks.append(jax.device_put(per_host_array[sl], local_device, donate=True))
-        tmp = allgather_single_device_arrays(sharding, per_host_chunks, return_slices=False)
+        tmp = _allgather_single_device_arrays(sharding, per_host_chunks, return_slices=False)
         del per_host_chunks
         if devices[idevice] in local_devices:
             ilocal_device = local_devices.index(devices[idevice])
@@ -497,7 +655,7 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
 
-    positions = _exchange_array_jax(positions, idx_out_devices, pad='mean', return_indices=return_inverse)
+    positions = _exchange_array_jax(positions, idx_out_devices, pad=_get_pad_uniform_jax(attrs), return_indices=return_inverse)
     if return_inverse:
         positions, indices = positions
 
@@ -647,16 +805,13 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = np.ravel_multi_index(tuple(np.floor(idx_out_devices).astype('i4').T), tuple(shape_devices))
-    shifts = np.meshgrid(*[np.arange(s) * attrs.boxsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
-    shifts = np.stack(shifts, axis=-1).reshape(-1, len(shifts))
-
     positions = _exchange_array_mpi(positions, idx_out_devices, return_indices=return_inverse, mpicomm=mpicomm)
 
     if return_inverse:
         positions, indices = positions
 
     if return_type == 'jax':
-        positions = make_array_from_process_local_data(positions, pad='mean', sharding_mesh=sharding_mesh)
+        positions = make_array_from_process_local_data(positions, pad=_get_pad_uniform_numpy(attrs), sharding_mesh=sharding_mesh)
 
     def exchange(values, pad=0.):
         per_host_array = _exchange_array_mpi(values, idx_out_devices, return_indices=False, mpicomm=mpicomm)
@@ -703,7 +858,31 @@ def _get_distributed_backend(array, backend='auto', **kwargs):
 
 @default_sharding_mesh
 def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None, backend='auto', **kwargs):
+    """
+    Exchange particles across processes/devices according to their positions.
 
+    Parameters
+    ----------
+    attrs : MeshAttrs
+        Mesh attributes.
+    positions : array_like
+        Particle positions array of shape (N_particles, ndim).
+    return_inverse : bool, default=False
+        If ``True``, also return the inverse exchange function.
+    backend : str, default='auto'
+        Distributed backend to use. Either 'auto', 'jax' or 'mpi'.
+    **kwargs : keyword arguments
+        If the MPI backend is used, the MPI communicator ``mpicomm``.
+
+    Returns
+    -------
+    positions : jax.Array or np.ndarray
+        Exchanged particle positions.
+    exchange : callable
+        Function to exchange other particle attributes according to the same scheme.
+    inverse : callable, optional
+        Inverse exchange function, if ``return_inverse`` is ``True``.
+    """
     if not len(sharding_mesh.axis_names):
 
         def exchange(values, pad=0.):
@@ -727,7 +906,23 @@ def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inv
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
 class MeshAttrs(object):
+    """
+    Object storing mesh attributes.
 
+    Parameters
+    ----------
+    meshsize : array_like
+        Number of mesh cells along each dimension.
+    boxsize : array_like, default=None
+        Physical size of the box along each dimension.
+        If ``None``, set to ``meshsize``.
+    boxcenter : array_like, default=0.
+        Physical coordinates of the box center along each dimension.
+    dtype : data-type, default=float
+        Data type of the mesh.
+    fft_engine : str, default='auto'
+        FFT engine to use. Either 'auto', 'jax' or 'jaxdecomp'.
+    """
     meshsize: staticarray = None
     boxsize: jax.Array = None
     boxcenter: jax.Array = 0.
@@ -749,22 +944,27 @@ class MeshAttrs(object):
 
     @property
     def rdtype(self):
+        """Real data type corresponding to :attr:`dtype`."""
         return jnp.zeros((), dtype=self.dtype).real.dtype
 
     @property
     def cdtype(self):
+        """Complex data type corresponding to :attr:`dtype`."""
         return (1j * jnp.zeros((), dtype=self.dtype)).dtype
 
     @property
     def sharding_mesh(self):
+        """Current sharding mesh."""
         return get_sharding_mesh()
 
     @property
     def is_real(self):
+        """Whether mesh is real."""
         return jnp.issubdtype(self.dtype, jnp.floating)
 
     @property
     def is_hermitian(self):
+        """Whether mesh Fourier modes have Hermitian symmetry. Not available (yet) for jaxdecomp FFTs."""
         return self.fft_engine != 'jaxdecomp' and self.is_real
 
     def tree_flatten(self):
@@ -793,10 +993,12 @@ class MeshAttrs(object):
 
     @property
     def ndim(self):
+        """Number of mesh dimensions."""
         return len(self.meshsize)
 
     @property
     def cellsize(self):
+        """Physical size of each mesh cell."""
         return self.boxsize / self.meshsize
 
     @property
@@ -1609,8 +1811,8 @@ class ParticleField(object):
         If ``True``, perform particle exchange for distributed computation.
     backend : {'auto', 'jax', 'mpi'}, default='auto'
         Backend particle exchange.
-    **kwargs
-        Additional keyword arguments for mesh or sharding setup.
+    **kwargs : keyword arguments
+        If the MPI backend is used in the particle exchange, the MPI communicator ``mpicomm``.
 
     Attributes
     ----------
@@ -1633,6 +1835,7 @@ class ParticleField(object):
     attrs: MeshAttrs | None = field(init=False, repr=False)
 
     def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, backend='auto', **kwargs):
+        if attrs is None: attrs = kwargs.pop('mattrs', None)
         if attrs is None: raise ValueError('attrs must be provided')
         if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
         sharding_mesh = attrs.sharding_mesh
@@ -1662,7 +1865,7 @@ class ParticleField(object):
                 weights = get(weights)
 
             if backend == 'jax' and input_is_not_sharded:
-                positions, weights = make_particles_from_local(positions, weights)
+                positions, weights = make_particles_from_local(positions, weights, pad='uniform')
 
             if backend == 'jax':
                 positions, weights = jax.device_put((positions, weights), sharding)
