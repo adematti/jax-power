@@ -822,14 +822,20 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     exchange.backend = 'mpi'
 
     if return_inverse:
-        positions, indices = positions
+
+        def get(array):
+            return np.concatenate([_.data for _ in array.addressable_shards], axis=0)
 
         def inverse(values):
+            input_is_sharded = (getattr(values, 'sharding', None) is not None) and (getattr(values.sharding, 'mesh', None) is not None)
+            if input_is_sharded:
+                values = get(values)
             return _exchange_inverse_mpi(values, indices, mpicomm=mpicomm)
 
         inverse.backend = 'mpi'
 
         return positions, exchange, inverse
+
     return positions, exchange
 
 
