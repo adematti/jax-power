@@ -188,7 +188,7 @@ class BinParticle2CorrelationPoles(object):
         return call(*particles)
 
 
-def convert_particles(particles: ParticleField, weights=None, **kwargs):
+def convert_particles(particles: ParticleField, weights=None, exchange_weights: bool=True, index_value: bool=None):
     """Convert :class:`ParticleField` to :class:`cucount.jax.Particles`, optionally updating weights."""
     from cucount.jax import Particles, _make_list_weights
     if isinstance(particles, FKPField):
@@ -200,7 +200,7 @@ def convert_particles(particles: ParticleField, weights=None, **kwargs):
         weights = [jnp.asarray(weight) for weight in weights]
         sharding_mesh = particles.attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
-        if with_sharding and particles.exchange_direct is not None:
+        if with_sharding and exchange_weights and particles.exchange_direct is not None:
             input_is_not_sharded = (getattr(weights[0], 'sharding', None) is not None) and (getattr(weights[0].sharding, 'mesh', None) is None)
             if particles.exchange_direct.backend == 'jax' and input_is_not_sharded:
                 from .mesh import make_array_from_process_local_data
@@ -208,7 +208,7 @@ def convert_particles(particles: ParticleField, weights=None, **kwargs):
             weights = [particles.exchange_direct(weight, pad=0) for weight in weights]
     else:
         weights = particles.weights
-    return Particles(particles.positions, weights=weights, **kwargs)
+    return Particles(particles.positions, weights=weights, positions_type='pos', index_value=index_value, exchange=False, sharding_mesh=particles.attrs.sharding_mesh)
 
 
 

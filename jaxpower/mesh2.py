@@ -707,7 +707,6 @@ def split_particles(*particles, seed=0):
             nsplits = 0
     # Reorder
     particles_to_split = particles_to_split[::-1]
-    # remove last one
     if isinstance(seed, int):
         seed = random.key(seed)
     seeds = random.split(seed, len(particles_to_split))

@@ -205,6 +205,8 @@ def create_sharded_random(func, key, shape, out_specs=None, sharding_mesh=None):
     """
     Helper function to create a (random) sharded array using ``shard_map``, with given global shape.
     ``func`` is called with ``key`` argument corresponding to the random seed and and ``shape`` argument giving the local shard shape.
+
+    WARNING: The result is *not* invariant under the number of devices.
     """
     if np.ndim(shape) == 0: shape = (shape,)
     shape = tuple(shape)
@@ -926,16 +928,16 @@ class MeshAttrs(object):
         Physical coordinates of the box center along each dimension.
     dtype : data-type, default=float
         Data type of the mesh.
-    fft_engine : str, default='auto'
+    fft_backend : str, default='auto'
         FFT engine to use. Either 'auto', 'jax' or 'jaxdecomp'.
     """
     meshsize: staticarray = None
     boxsize: jax.Array = None
     boxcenter: jax.Array = 0.
     dtype: Any = None
-    fft_engine: str = None
+    fft_backend: str = None
 
-    def __init__(self, meshsize=None, boxsize=None, boxcenter=0., dtype=float, fft_engine='auto'):
+    def __init__(self, meshsize=None, boxsize=None, boxcenter=0., dtype=float, fft_backend='auto'):
         ndim = _get_ndim(*[meshsize, boxsize, boxcenter])
         if meshsize is not None:  # meshsize may not be provided (e.g. for particles) and it is fine
             meshsize = staticarray.fill(meshsize, ndim, dtype='i4')
@@ -944,9 +946,10 @@ class MeshAttrs(object):
         self.__dict__.update(dtype=dtype)
         if boxsize is not None: boxsize = _jnp_array_fill(boxsize, ndim, dtype=self.rdtype)
         if boxcenter is not None: boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=self.rdtype)
-        if fft_engine == 'auto':
-            fft_engine = 'jaxdecomp' if ndim == 3 and jaxdecomp is not None else 'jax'
-        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter, fft_engine=fft_engine)
+        if fft_backend == 'auto':
+            fft_backend = 'jaxdecomp' if ndim == 3 and jaxdecomp is not None else 'jax'
+        assert fft_backend in ['jax', 'jaxdecomp']
+        self.__dict__.update(meshsize=meshsize, boxsize=boxsize, boxcenter=boxcenter, fft_backend=fft_backend)
 
     @property
     def rdtype(self):
@@ -971,7 +974,7 @@ class MeshAttrs(object):
     @property
     def is_hermitian(self):
         """Whether mesh Fourier modes have Hermitian symmetry. Not available (yet) for jaxdecomp FFTs."""
-        return self.fft_engine != 'jaxdecomp' and self.is_real
+        return self.fft_backend != 'jaxdecomp' and self.is_real
 
     def tree_flatten(self):
         state = asdict(self)
@@ -1076,7 +1079,7 @@ class MeshAttrs(object):
             spacing = 1
             kind = 'separation'
         axis_order = None
-        if self.fft_engine == 'jaxdecomp':
+        if self.fft_backend == 'jaxdecomp':
             axis_order = tuple(np.roll(np.arange(self.ndim), shift=2))
         return fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=self.is_hermitian, spacing=spacing, axis_order=axis_order, sharding_mesh=self.sharding_mesh, dtype=self.rdtype)
 
@@ -1106,7 +1109,7 @@ class MeshAttrs(object):
         if 'complex' in name:
             if self.is_hermitian:
                 shape = shape[:-1] + (shape[-1] // 2 + 1,)
-            if self.fft_engine == 'jaxdecomp':
+            if self.fft_backend == 'jaxdecomp':
                 shape = tuple(np.roll(shape, shift=len(self.sharding_mesh.axis_names)))
         itemsize = jnp.zeros((), dtype=self.dtype).real.dtype.itemsize
         dtype = jnp.dtype('c{:d}'.format(2 * itemsize) if 'complex' in name else 'f{:d}'.format(itemsize))
@@ -1123,7 +1126,7 @@ class MeshAttrs(object):
 
     def r2c(self, value):
         """FFT, from real to complex."""
-        if self.fft_engine == 'jaxdecomp':
+        if self.fft_backend == 'jaxdecomp':
             fft = jaxdecomp.fft.pfft3d
             if self.sharding_mesh.axis_names:
                 value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
@@ -1143,7 +1146,7 @@ class MeshAttrs(object):
 
     def c2r(self, value):
         """FFT, from complex to real."""
-        if self.fft_engine == 'jaxdecomp':
+        if self.fft_backend == 'jaxdecomp':
             fft = jaxdecomp.fft.pifft3d
             if self.sharding_mesh.axis_names:
                 value = jax.lax.with_sharding_constraint(value, jax.sharding.NamedSharding(self.sharding_mesh, spec=P(*self.sharding_mesh.axis_names)))
