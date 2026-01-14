@@ -1,8 +1,8 @@
 import os
 import operator
 import functools
-import itertools
-from functools import partial
+import math
+from functools import partial, lru_cache
 from collections.abc import Callable
 import numbers
 from typing import Any
@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 import jax
 from jax import numpy as jnp
-from jax import sharding
 from jax import shard_map
 #from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
@@ -87,14 +86,9 @@ def _get_ndim(*args, default=3):
     return ndim
 
 
-def create_sharding_mesh(device_mesh_shape=None, meshsize=None):
+def get_device_mesh_shape(device_mesh_shape=None, meshsize=None):
     """
-    Create a JAX sharding Mesh for device-parallel execution.
-
-    This helper builds a 2-D device mesh (axis names 'x' and 'y') suitable for use with
-    JAX sharding primitives (NamedSharding, shard_map, etc.). The returned mesh can be
-    used as a context manager (with mesh:) or passed directly to functions that accept
-    a jax.sharding.Mesh.
+    Return device mesh shape for sharding mesh creation.
 
     Parameters
     ----------
@@ -102,7 +96,6 @@ def create_sharding_mesh(device_mesh_shape=None, meshsize=None):
         Explicit device mesh shape (number of devices per axis). If omitted the function
         will inspect available JAX devices and pick a 2-D tiling that best matches the
         device count and (optionally) `meshsize`.
-
     meshsize : int or sequence[int], optional
         Global array mesh size used to guide the heuristic that chooses a device tiling
         when `device_mesh_shape` is not given. If provided as a scalar it will be treated
@@ -111,21 +104,7 @@ def create_sharding_mesh(device_mesh_shape=None, meshsize=None):
 
     Returns
     -------
-    jax.sharding.Mesh
-        A 2-D Mesh instance (axis names ('x', 'y')) ready for use with JAX sharding.
-
-    Notes
-    -----
-    - If `device_mesh_shape` results in more than two axes a NotImplementedError is raised.
-    - The function prefers device tilings whose axes divide `meshsize` when that argument
-      is supplied; otherwise it chooses divisors close to sqrt(n_devices).
-
-    Examples
-    --------
-    >>> mesh = create_sharding_mesh(meshsize=(512, 512))
-    >>> with mesh:
-    ...     # use jax sharding APIs inside the context
-    ...     ...
+    tuple[int, int]
     """
     if device_mesh_shape is None:
         count = len(jax.devices())
@@ -156,7 +135,49 @@ def create_sharding_mesh(device_mesh_shape=None, meshsize=None):
     device_mesh_shape = tuple(s for s in device_mesh_shape if s > 1)
     if len(device_mesh_shape) > 2:
         raise NotImplementedError('device mesh with ndim {:d} > 2 not implemented'.format(len(device_mesh_shape)))
-    device_mesh_shape = (1,) * (2 - len(device_mesh_shape)) + device_mesh_shape
+    return (1,) * (2 - len(device_mesh_shape)) + device_mesh_shape
+
+
+def create_sharding_mesh(device_mesh_shape=None, meshsize=None):
+    """
+    Create a JAX sharding Mesh for device-parallel execution.
+
+    This helper builds a 2-D device mesh (axis names 'x' and 'y') suitable for use with
+    JAX sharding primitives (NamedSharding, shard_map, etc.). The returned mesh can be
+    used as a context manager (with mesh:) or passed directly to functions that accept
+    a jax.sharding.Mesh.
+
+    Parameters
+    ----------
+    device_mesh_shape : tuple[int, ...], optional
+        Explicit device mesh shape (number of devices per axis). If omitted the function
+        will inspect available JAX devices and pick a 2-D tiling that best matches the
+        device count and (optionally) `meshsize`.
+    meshsize : int or sequence[int], optional
+        Global array mesh size used to guide the heuristic that chooses a device tiling
+        when `device_mesh_shape` is not given. If provided as a scalar it will be treated
+        as a repeated value. Only divisibility with the chosen
+        device tiling is considered.
+
+    Returns
+    -------
+    jax.sharding.Mesh
+        A 2-D Mesh instance (axis names ('x', 'y')) ready for use with JAX sharding.
+
+    Notes
+    -----
+    - If `device_mesh_shape` results in more than two axes a NotImplementedError is raised.
+    - The function prefers device tilings whose axes divide `meshsize` when that argument
+      is supplied; otherwise it chooses divisors close to sqrt(n_devices).
+
+    Examples
+    --------
+    >>> mesh = create_sharding_mesh(meshsize=(512, 512))
+    >>> with mesh:
+    ...     # use jax sharding APIs inside the context
+    ...     ...
+    """
+    device_mesh_shape = get_device_mesh_shape(device_mesh_shape=device_mesh_shape, meshsize=meshsize)
     return jax.make_mesh(device_mesh_shape, axis_names=('x', 'y'), axis_types=(jax.sharding.AxisType.Auto,) * 2)
 
 
@@ -171,63 +192,105 @@ def default_sharding_mesh(func: Callable):
     return wrapper
 
 
-@partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
+#@partial(jax.jit, static_argnames=('func', 'shape', 'in_specs', 'out_specs', 'sharding_mesh'))
 @default_sharding_mesh
-def create_sharded_array(func, shape, out_specs=None, sharding_mesh=None):
+def create_sharded_array(func, *args, shape=(), in_specs=(), out_specs=None, sharding_mesh=None):
     """
     Helper function to create a sharded array using ``shard_map``, with given global shape.
     ``func`` is called with ``shape`` argument giving the local shard shape.
     """
-    if np.ndim(shape) == 0: shape = (shape,)
+    if np.ndim(shape) == 0:
+        shape = (shape,)
     shape = tuple(shape)
     if sharding_mesh.axis_names:
         if out_specs is None:
             out_specs = P(*sharding_mesh.axis_names)
-        if not isinstance(out_specs, P):
-            axis = out_specs
-            if np.ndim(axis) == 0:
-                out_specs = P((None,) * axis + (sharding_mesh.axis_names,))
-            else:
-                assert len(axis) <= len(sharding_mesh.axis_names), 'cannot have more array axes than device mesh'
-                out_specs = [None] * np.max(axis)
-                for iax, ax in enumerate(axis): out_specs[ax] = sharding_mesh.axis_names[iax]
-                out_specs = P(*out_specs)
         shard_shape = jax.sharding.NamedSharding(sharding_mesh, spec=out_specs).shard_shape(shape)
-        f = shard_map(partial(func, shape=shard_shape), mesh=sharding_mesh, in_specs=(), out_specs=out_specs)
+        f = shard_map(partial(func, shape=shard_shape), mesh=sharding_mesh, in_specs=in_specs, out_specs=out_specs)
     else:
         f = partial(func, shape=shape)
-    return f()
+    return f(*args)
 
 
-@partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
+#@partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
 @default_sharding_mesh
-def create_sharded_random(func, key, shape, out_specs=None, sharding_mesh=None):
+def _create_sharded_random(func, key=None, ids=None, shape=(), out_specs=None, sharding_mesh=None):
     """
     Helper function to create a (random) sharded array using ``shard_map``, with given global shape.
-    ``func`` is called with ``key`` argument corresponding to the random seed and and ``shape`` argument giving the local shard shape.
+    ``func`` is called with ``key`` argument corresponding to the random seed and ``shape`` argument giving the local shard shape.
 
-    WARNING: The result is *not* invariant under the number of devices.
+    WARNING: The result is *not* invariant under the number of devices, unless ``ids`` is provided.
     """
-    if np.ndim(shape) == 0: shape = (shape,)
+    if np.ndim(shape) == 0:
+        shape = (shape,)
     shape = tuple(shape)
-    if sharding_mesh.axis_names:
-        key = jnp.array(jax.random.split(key, sharding_mesh.devices.size))
-        if out_specs is None:
-            out_specs = P(*sharding_mesh.axis_names)
-        if not isinstance(out_specs, P):
-            axis = out_specs
-            if np.ndim(axis) == 0:
-                out_specs = P((None,) * axis + tuple(sharding_mesh.axis_names))
-            else:
-                assert len(axis) <= len(sharding_mesh.axis_names), 'cannot have more array axes than device mesh'
-                out_specs = [None] * (1 + np.max(axis))
-                for iax, ax in enumerate(axis): out_specs[ax] = sharding_mesh.axis_names[iax]
-                out_specs = P(*out_specs)
-        shard_shape = jax.sharding.NamedSharding(sharding_mesh, spec=out_specs).shard_shape(shape)
-        f = shard_map(lambda key: func(key[0], shape=shard_shape), mesh=sharding_mesh, in_specs=P(sharding_mesh.axis_names,), out_specs=out_specs)
+    if out_specs is None:
+        out_specs = P(*sharding_mesh.axis_names)
+    if ids is None:
+        if sharding_mesh.axis_names:
+            key = jnp.array(jax.random.split(key, sharding_mesh.devices.size)).reshape(sharding_mesh.devices.shape)
+            _func = lambda key, shape: func(key.ravel()[0], shape=shape)
+            in_specs = (P(*sharding_mesh.axis_names),)
+        else:
+            _func = func
+            in_specs = ()
     else:
-        f = partial(func, shape=shape)
-    return f(key)
+        in_specs = out_specs
+        if key is None:
+            def _func(id, shape):
+                idshape = id.shape
+                toret = jax.vmap(lambda id: func(id, shape=()))(id.reshape(-1))
+                return toret.reshape(idshape + toret.shape[1:])
+        else:
+            base = key
+            def _func(id, shape):
+                idshape = id.shape
+                toret = jax.vmap(lambda id: func(jax.random.fold_in(base, id), shape=()))(id.reshape(-1))
+                return toret.reshape(idshape + toret.shape[1:])
+        key = ids
+    return create_sharded_array(_func, key, shape=shape, in_specs=in_specs, out_specs=out_specs, sharding_mesh=sharding_mesh)
+
+
+def _process_seed(seed):
+    if isinstance(seed, tuple):
+        key, ids = seed
+    else:
+        key, ids = seed, None
+    if isinstance(key, int):
+        key = jax.random.key(key)
+    return key, ids
+
+
+@default_sharding_mesh
+def create_sharded_random(func, seed, shape=(), out_specs=None, sharding_mesh=None):
+    """
+    Helper function to create a (random) sharded array using ``shard_map``, with given global shape.
+    ``func`` is called with ``key`` argument corresponding to the random seed and ``shape`` argument giving the local shard shape.
+
+    Parameters
+    ----------
+    func : callable
+        Function with signature ``func(key, shape)`` returning an array of given ``shape``.
+    seed : int or tuple
+        Random seed integer, or tuple ``(key, ids)`` where ``key`` is a JAX random key or integer seed or ``None``,
+        and ``ids`` a (sharded) array of integer ids, or the string 'index', in which case
+        the ids will be generated as the global index of each element in the array.
+        ``ids`` can be used to ensure reproducibility when changing the number of devices.
+        If ``key`` is ``None``, the random key passed to ``func`` is directly derived from the ``ids``.
+        Else, the random key is derived from folding in the ``ids`` into the base ``key``.
+    """
+    if np.ndim(shape) == 0:
+        shape = (shape,)
+    shape = tuple(shape)
+    if out_specs is None:
+        out_specs = P(*sharding_mesh.axis_names)
+    key, ids = _process_seed(seed)
+    if isinstance(ids, str) and ids == 'index':
+        ids = create_sharded_array(lambda start, shape: start * np.prod(shape) + jnp.arange(np.prod(shape)).reshape(shape), jnp.arange(sharding_mesh.devices.size), shape=shape,
+                                    in_specs=out_specs, out_specs=out_specs)
+    if ids is None:
+        assert key is not None, 'provide random key for random generation'
+    return _create_sharded_random(func, key=key, ids=ids, shape=shape, out_specs=out_specs, sharding_mesh=sharding_mesh)
 
 
 @partial(jax.jit, static_argnames=('sparse', 'sharding_mesh'))
@@ -322,7 +385,7 @@ def pad_halo(value, halo_size=0, factor=2, sharding_mesh: jax.sharding.Mesh=None
     pad_width += [(0,) * 2] * len(value.shape[len(sharding_mesh.axis_names):])
 
     def pad(value):
-        return jnp.pad(value, tuple(pad_width))
+        return jnp.pad(value, tuple(pad_width), mode='constant', constant_values=0.)
 
     offset = jnp.array([width[0] for width in pad_width])
     return shard_map(pad, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),), out_specs=P(*sharding_mesh.axis_names))(value), offset
@@ -1121,7 +1184,7 @@ class MeshAttrs(object):
             return kind(fill, attrs=self)
         else:
             fun = lambda shape: jnp.full(shape, fill, dtype=dtype)
-        value = create_sharded_array(fun, shape, out_specs=P(*self.sharding_mesh.axis_names), sharding_mesh=self.sharding_mesh)
+        value = create_sharded_array(fun, shape=shape, out_specs=P(*self.sharding_mesh.axis_names), sharding_mesh=self.sharding_mesh)
         return kind(value, attrs=self)
 
     def r2c(self, value):
@@ -1677,11 +1740,56 @@ def _get_extent(*positions):
     return pos_min, pos_max
 
 
+@lru_cache(maxsize=32, typed=False)
+def next_fft_size(n, primes=(2, 3, 5, 7), divisors=()):
+    """
+    Return the smallest integer m >= n such that:
+      - m has only prime factors in `primes`
+      - m is divisible by all `divisors`
+    """
+    n = int(n)
+    primes = tuple(p for p in primes if p > 1)
+    divisors = tuple(int(d) for d in divisors if d > 1)
+
+    def lcm(a, b):
+        return abs(a * b) // math.gcd(a, b)
+
+    def lcm_many(nums):
+        out = 1
+        for n in nums:
+            out = lcm(out, int(n))
+        return out
+
+    D = lcm_many(divisors) if divisors else 1
+
+    # Start from the smallest multiple of D >= n
+    k = (n + D - 1) // D
+    m = k * D
+
+    if not primes:
+        return m
+
+    while True:
+        x = m
+        for p in primes:
+            while x % p == 0:
+                x //= p
+        if x == 1:
+            return m
+        m += D
+
+
+def next_fft_shape(shape, primes=(2, 3, 5, 7)):
+    """Return the smallest FFT-friendly shape >= input shape (component-wise)."""
+    return tuple(next_fft_size(n, primes) for n in shape)
+
+
 @default_sharding_mesh
 def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                    boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
                    cellsize: np.ndarray | float=None, boxpad: np.ndarray | float=2.,
-                   check: bool=False, approximate: bool=False, dtype=None, sharding_mesh=None, **kwargs):
+                   check: bool=False, approximate: bool=False, dtype=None, primes=None,
+                   sharding_mesh=None, **kwargs):
     """
     Compute enclosing box.
     Differentiable if ``meshsize`` is provided.
@@ -1691,30 +1799,27 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
     positions : (list of) (N, 3) arrays, default=None
         If ``boxsize`` and / or ``boxcenter`` is ``None``, use this (list of) position arrays
         to determine ``boxsize`` and / or ``boxcenter``.
-
     meshsize : array, int, default=None
         Mesh size, i.e. number of mesh nodes along each axis.
         If not provided, see ``value``.
-
     boxsize : float, default=None
         Physical size of the box.
         If not provided, see ``positions``.
-
     boxcenter : array, float, default=None
         Box center.
         If not provided, see ``positions``.
-
     cellsize : array, float, default=None
         Physical size of mesh cells.
         If not ``None``, ``boxsize`` is ``None`` and mesh size ``meshsize`` is not ``None``, used to set ``boxsize`` to ``meshsize * cellsize``.
         If ``meshsize`` is ``None``, it is set to (the nearest integer(s) to) ``boxsize / cellsize`` if ``boxsize`` is provided,
         else to the nearest even integer to ``boxsize / cellsize``, and ``boxsize`` is then reset to ``meshsize * cellsize``.
-
     boxpad : float, default=2.
         When ``boxsize`` is determined from ``positions``, take ``boxpad`` times the smallest box enclosing ``positions`` as ``boxsize``.
-
     check : bool, default=False
         If ``True``, and input ``positions`` (if provided) are not contained in the box, raise a :class:`ValueError`.
+    primes : tuple, default=None
+        For more efficient FFTs, tuple of prime numbers to construct ``meshsize``.
+        Typically: (2, 3, 5, 7).
 
     Returns
     -------
@@ -1723,6 +1828,23 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         - boxcenter : array, box center
         - meshsize : array, shape of mesh.
     """
+    # First determine ndim and dtype
+    ndim = 3
+    if positions:
+        if dtype is None:
+            dtype = positions[0].dtype
+        if ndim is None:
+            ndim = positions[0].shape[-1]
+
+    rdtype = jnp.zeros((), dtype=dtype).real.dtype
+
+    if cellsize is not None and meshsize is not None:
+        if boxsize is not None:
+            raise ValueError('cannot specify boxsize, cellsize and meshsize simultaneously')
+        meshsize = _np_array_fill(meshsize, ndim, dtype='i4')
+        cellsize = _np_array_fill(cellsize, ndim, dtype=rdtype)
+        boxsize = meshsize * cellsize
+
     if boxsize is None or boxcenter is None or (positions and check):
         if not positions:
             raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
@@ -1738,28 +1860,22 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if check and (boxsize < delta).any():
             raise ValueError('boxsize {} too small to contain all data (max {})'.format(boxsize, delta))
 
-    ndim = 3
-    if positions:
-        if dtype is None:
-            dtype = positions[0].dtype
-        if ndim is None:
-            ndim = positions[0].shape[-1]
-
-    rdtype = jnp.zeros((), dtype=dtype).real.dtype
     boxsize = _jnp_array_fill(boxsize, ndim, dtype=rdtype)
     toret = dict()
     if meshsize is None:
         if cellsize is not None:
             cellsize = _np_array_fill(cellsize, ndim, dtype=rdtype)
             meshsize = np.ceil(boxsize / cellsize).astype('i4')
+            if primes is None: primes = tuple()
+            divisors = [tuple()] * ndim
             if sharding_mesh.axis_names:
                 same = np.all(meshsize == meshsize[0])
                 if same:
-                    # FIXME
-                    shape_devices = max(sharding_mesh.devices.shape)
+                    divisors = [tuple(sharding_mesh.devices.shape)] * ndim  # add all divisors
                 else:
-                    shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (ndim - sharding_mesh.devices.ndim))
-                meshsize = (meshsize + shape_devices - 1) // shape_devices * shape_devices  # to make it a multiple of devices
+                    shape_devices = sharding_mesh.devices.shape + (1,) * (ndim - sharding_mesh.devices.ndim)
+                    divisors = [(s,) for s in shape_devices]
+            meshsize = np.array([next_fft_size(msize, primes=primes, divisors=divs) for msize, divs in zip(meshsize, divisors)])
             toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
             if not positions and not bool(approximate):
@@ -1768,8 +1884,6 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         else:
             raise ValueError('meshsize (or cellsize) must be specified')
     else:
-        if cellsize is not None:
-            raise ValueError('cannot specify both meshsize and cellsize')
         meshsize = _np_array_fill(meshsize, ndim, dtype='i4')
         toret['meshsize'] = meshsize
     boxcenter = _jnp_array_fill(boxcenter, ndim, dtype=rdtype)
@@ -1964,24 +2078,6 @@ class ParticleField(object):
 
     def __rtruediv__(self, other):
         return self.concatenate([self], [1. / other])
-
-    def split(self, nsplits=1, extent=None):
-        attrs = self.attrs
-        nsplits = _np_array_fill(nsplits, attrs.ndim, dtype='i4')
-        split_boxsize = attrs.boxsize / nsplits
-        if extent is None:
-            extent = _get_extent(*self.positions)
-        extent_boxsize = (extent[1] - extent[0]) / nsplits
-        extent_offset = extent[0]
-
-        def split_particles(isplit):
-            isplit = np.array(isplit)
-            mask = jnp.all((self.positions >= isplit * extent_boxsize + extent_offset) & (self.positions <= (isplit + 1) * extent_boxsize + extent_offset), axis=-1)
-            attrs = self.attrs.clone(boxsize=split_boxsize, boxcenter=(isplit + 0.5) * extent_boxsize + extent_offset, meshsize=self.attrs.meshsize)
-            return self.clone(positions=self.positions[mask], weights=self.weights[mask], attrs=attrs)
-
-        for isplit in itertools.product(*(range(nsplit) for nsplit in nsplits)):
-            yield split_particles(isplit)
 
     def paint(self, resampler: str | Callable='cic', interlacing: int=0,
               compensate: bool=False, out: str='real', dtype=None, **kwargs):
@@ -2266,3 +2362,271 @@ def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
         count = shard_map(count, mesh=sharding_mesh, in_specs=in_specs, out_specs=P(None))
 
     return count(value, *ibin)
+
+
+@partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
+@dataclass(frozen=True, init=False)
+class FKPField(object):
+    """
+    FKP field: data minus randoms.
+
+    Parameters
+    ----------
+    data : ParticleField
+        Data particles.
+    randoms : ParticleField
+        Random particles.
+
+    References
+    ----------
+    https://arxiv.org/abs/astro-ph/9304022
+    """
+    data: ParticleField
+    randoms: ParticleField
+
+    def __init__(self, data, randoms, attrs=None):
+        """
+        Initialize FKPField.
+
+        Parameters
+        ----------
+        data : ParticleField
+            Data particles.
+        randoms : ParticleField
+            Random particles.
+        attrs : MeshAttrs, optional
+            Mesh attributes.
+        """
+        if attrs is not None:
+            data = data.clone(attrs=attrs)
+            randoms = randoms.clone(attrs=attrs)
+        self.__dict__.update(data=data, randoms=randoms)
+
+    def clone(self, **kwargs):
+        """Create a new instance, updating some attributes."""
+        state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
+        return self.__class__(**state)
+
+    def exchange(self, **kwargs):
+        """In distributed computation, exchange particles such that their distribution matches the mesh shards."""
+        return self.clone(data=self.data.clone(exchange=True, **kwargs), randoms=self.randoms.clone(exchange=True, **kwargs), attrs=self.attrs)
+
+    @property
+    def attrs(self):
+        """Mesh attributes."""
+        return self.data.attrs
+
+    def split(self, nsplits=1, extent=None):
+        """Split particles into subregions."""
+        from .mesh import _get_extent
+        if extent is None:
+            extent = _get_extent(self.data.positions, self.randoms.positions)
+        for data, randoms in zip(self.data.split(nsplits=nsplits, extent=extent), self.randoms.split(nsplits=nsplits, extent=extent)):
+            new = self.clone(data=data, randoms=randoms)
+            yield new
+
+    @property
+    def particles(self):
+        """Return the FKP field as a :class:`ParticleField`."""
+        particles = getattr(self, '_particles', None)
+        if particles is None:
+            self.__dict__['_particles'] = particles = (self.data - self.data.sum() / self.randoms.sum() * self.randoms).clone(attrs=self.data.attrs)
+        return particles
+
+    def paint(self, resampler: str | Callable='cic', interlacing: int=1,
+              compensate: bool=False, dtype=None, out: str='real', **kwargs):
+        r"""
+        Paint the FKP field onto a mesh.
+
+        Parameters
+        ----------
+        resampler : str, Callable, default='cic'
+            Resampler to read particule weights from mesh.
+            One of ['ngp', 'cic', 'tsc', 'pcs'].
+        interlacing : int, default=0
+            If 0 or 1, no interlacing correction.
+            If > 1, order of interlacing correction.
+            Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
+        compensate : bool, default=False
+            If ``True``, applies compensation to the mesh after painting.
+        dtype : default=None
+            Mesh array type.
+        out : str, default='real'
+            If 'real', return a :class:`RealMeshField`, else :class:`ComplexMeshField`
+            or :class:`ComplexMeshField` if ``dtype`` is complex.
+
+        Returns
+        -------
+        mesh : MeshField
+        """
+        return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
+
+
+def get_halo_for_new_mattrs(mattrs, **kwargs):
+    """
+    Return halo size for new :class:`MeshAttrs`.
+
+    Parameters
+    ----------
+    mattrs : MeshAttrs
+        Current mesh attributes.
+    kwargs : dict
+        New mesh attributes.
+
+    Returns
+    -------
+    halo_add : int
+        Additional halo size required.
+    mattrs : MeshAttrs
+        New mesh attributes.
+    """
+    halo_add, new_mattrs = 0, mattrs
+    if kwargs:
+        old_mattrs = dict(mattrs)
+        update_mattrs = dict(kwargs)
+        update_cellsize = 'cellsize' in update_mattrs
+        if update_cellsize:
+            old_mattrs.pop('meshsize')
+            old_mattrs.setdefault('approximate', True)
+        kw = old_mattrs | update_mattrs
+        new_mattrs = mattrs.clone(**get_mesh_attrs(**kw))
+        if np.any((new_mattrs.meshsize - mattrs.meshsize) % 2):  # we want a divisor of 2, otherwise they will be half-a-cell-shift
+            # device shape must be odd in this case (as they devide the old and new meshsize)
+            add = np.array(mattrs.sharding_mesh.devices.shape + (1,) * (mattrs.ndim - mattrs.sharding_mesh.devices.ndim))
+            new_mattrs = new_mattrs.clone(meshsize=new_mattrs.meshsize + add, boxsize=new_mattrs.cellsize * (new_mattrs.meshsize + add))
+        mattrs = new_mattrs
+        old_extent = (old_mattrs['boxcenter'] - old_mattrs['boxsize'] / 2., old_mattrs['boxcenter'] + old_mattrs['boxsize'] / 2.)
+        new_extent = (mattrs.boxcenter - mattrs.boxsize / 2., mattrs.boxcenter + mattrs.boxsize / 2.)
+        delta = np.maximum(np.abs(new_extent[0] - old_extent[0]), np.abs(new_extent[1] - old_extent[1]))
+        halo_add = int(np.ceil(np.max(delta / mattrs.cellsize)))
+    return halo_add, mattrs
+
+
+def _iter_meshes(*inputs, resampler='cic', interlacing=0, compensate=False, **kwargs) -> BaseMeshField:
+    """
+    Iterate over input fields and yield mesh representations.
+
+    Parameters
+    ----------
+    *inputs : RealMeshField or ParticleField
+        Input fields. All inputs are assumed to be compatible and to share
+        consistent spatial attributes.
+    resampler : str or Callable, default='cic'
+        Resampling scheme used when painting particle fields onto a mesh
+        (e.g. ``'cic'``, ``'tsc'``, or a custom kernel).
+    interlacing : int, default=0
+        Interlacing order used to reduce aliasing when painting particles.
+        A value of 0 disables interlacing.
+    compensate : bool, default=False
+        Whether to apply deconvolution (window-function compensation) to the
+        painted mesh.
+    **kwargs
+        Optional mesh attributes (e.g. ``boxsize``, ``boxcenter``, ``meshsize``)
+        used when constructing meshes from particle fields, if not inferred
+        from existing mesh inputs.
+
+    Yields
+    ------
+    mesh : BaseMeshField
+        Mesh fields corresponding to the inputs. Existing mesh inputs are
+        yielded directly, while particle inputs are painted and yielded as
+        meshes.
+    """
+    meshes, particles = [], []
+    attrs = dict(kwargs)
+    for name in list(attrs):
+        if attrs[name] is None: attrs.pop(name)
+    for inp in inputs:
+        if isinstance(inp, RealMeshField):
+            meshes.append(inp)
+            attrs = {name: getattr(inp, name) for name in ['boxsize', 'boxcenter', 'meshsize']}
+        else:
+            particles.append(inp)
+    halo_add = 0
+    if particles and attrs:
+        halo_add, attrs = get_halo_for_new_mattrs(particles[0].attrs, **attrs)
+        particles = [particle.clone(attrs=attrs) for particle in particles]
+    for mesh in meshes:
+        yield mesh
+    for particle in particles:
+        yield particle.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, halo_add=halo_add)
+
+
+def compute_normalization(*inputs: RealMeshField | ParticleField,
+                          resampler='cic', start=1., **kwargs) -> jax.Array:
+    """
+    Compute normalization for input fields, in volume**(1 - len(inputs)) unit.
+
+    Parameters
+    ----------
+    inputs : RealMeshField or ParticleField
+        Input fields, assumed to have same :attr:`attrs`.
+    resampler : str, Callable, default='cic'
+        Resampling method.
+    kwargs : dict
+        Additional arguments for :meth:`ParticleField.paint`.
+
+    Returns
+    -------
+    normalization : jax.Array
+
+    Warning
+    -------
+    Input particles are considered uncorrelated and share the same :attr:`attrs`.
+    """
+    normalization = start
+    for mesh in _iter_meshes(*inputs, resampler=resampler, **kwargs):
+        normalization *= mesh
+    norm = normalization.sum() * normalization.cellsize.prod()**(1 - len(inputs))
+    return norm
+
+
+def compute_box_normalization(*inputs: RealMeshField | ParticleField) -> jax.Array:
+    """Compute normalization, assuming constant density."""
+    normalization = 1.
+    mattrs = inputs[0].attrs
+    size = mattrs.meshsize.prod(dtype=mattrs.rdtype)
+    for mesh in inputs:
+        normalization *= mesh.sum() / size
+    norm = normalization * size * mattrs.cellsize.prod()**(1 - len(inputs))
+    return norm
+
+
+def split_particles(*particles, seed=0):
+    """
+    Split input particles for estimation of the normalization.
+
+    Parameters
+    ----------
+    particles : ParticleField or None
+        Input particles.
+    seed : int, optional
+        Random seed.
+
+    Returns
+    -------
+    Yield particles.
+    """
+    toret = list(particles)
+    if not isinstance(seed, list):
+        seed = [seed] * len(particles)
+    seeds = [_process_seed(seed) if seed is not None else seed for seed in seed]
+    particles_to_split, nsplits = [], 0
+    # Loop in reverse order
+    for particle, seed in zip(particles[::-1], seeds[::-1], strict=True):
+        if particle is None:
+            nsplits += 1
+        else:
+            particles_to_split.append((particle, nsplits + 1, seed))
+            nsplits = 0
+    # Reorder
+    particles_to_split = particles_to_split[::-1]
+    for i, (particle, nsplits, seed) in enumerate(particles_to_split):
+        if nsplits == 1:
+            yield particle
+        else:
+            sharding_mesh = particle.attrs.sharding_mesh
+            x = create_sharded_random(jax.random.uniform, seed, particle.size, out_specs=P(sharding_mesh.axis_names,))
+            for isplit in range(nsplits):
+                mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+                yield particle.clone(weights=particle.weights * mask)

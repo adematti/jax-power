@@ -15,7 +15,8 @@ from jax import numpy as jnp
 
 from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, ObservableLeaf, ObservableTree
 from .utils import get_legendre, get_spherical_jn, get_Ylm, real_gaunt, legendre_product, register_pytree_dataclass
-from .mesh import BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, get_mesh_attrs, create_sharded_random
+from .mesh import (BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, FKPField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges,
+                    _get_bin_attrs, _bincount, get_mesh_attrs, create_sharded_random, split_particles, compute_normalization, compute_box_normalization)
 
 
 prod = functools.partial(functools.reduce, operator.mul)
@@ -512,217 +513,16 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         return Mesh2CorrelationPoles(correlation)
 
 
-@partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])
-@dataclass(frozen=True, init=False)
-class FKPField(object):
-    """
-    FKP field: data minus randoms.
-
-    Parameters
-    ----------
-    data : ParticleField
-        Data particles.
-    randoms : ParticleField
-        Random particles.
-
-    References
-    ----------
-    https://arxiv.org/abs/astro-ph/9304022
-    """
-    data: ParticleField
-    randoms: ParticleField
-
-    def __init__(self, data, randoms, attrs=None):
-        """
-        Initialize FKPField.
-
-        Parameters
-        ----------
-        data : ParticleField
-            Data particles.
-        randoms : ParticleField
-            Random particles.
-        attrs : MeshAttrs, optional
-            Mesh attributes.
-        """
-        if attrs is not None:
-            data = data.clone(attrs=attrs)
-            randoms = randoms.clone(attrs=attrs)
-        self.__dict__.update(data=data, randoms=randoms)
-
-    def clone(self, **kwargs):
-        """Create a new instance, updating some attributes."""
-        state = {name: getattr(self, name) for name in ['data', 'randoms']} | kwargs
-        return self.__class__(**state)
-
-    def exchange(self, **kwargs):
-        """In distributed computation, exchange particles such that their distribution matches the mesh shards."""
-        return self.clone(data=self.data.clone(exchange=True, **kwargs), randoms=self.randoms.clone(exchange=True, **kwargs), attrs=self.attrs)
-
-    @property
-    def attrs(self):
-        """Mesh attributes."""
-        return self.data.attrs
-
-    def split(self, nsplits=1, extent=None):
-        """Split particles into subregions."""
-        from .mesh import _get_extent
-        if extent is None:
-            extent = _get_extent(self.data.positions, self.randoms.positions)
-        for data, randoms in zip(self.data.split(nsplits=nsplits, extent=extent), self.randoms.split(nsplits=nsplits, extent=extent)):
-            new = self.clone(data=data, randoms=randoms)
-            yield new
-
-    @property
-    def particles(self):
-        """Return the FKP field as a :class:`ParticleField`."""
-        particles = getattr(self, '_particles', None)
-        if particles is None:
-            self.__dict__['_particles'] = particles = (self.data - self.data.sum() / self.randoms.sum() * self.randoms).clone(attrs=self.data.attrs)
-        return particles
-
-    def paint(self, resampler: str | Callable='cic', interlacing: int=1,
-              compensate: bool=False, dtype=None, out: str='real', **kwargs):
-        r"""
-        Paint the FKP field onto a mesh.
-
-        Parameters
-        ----------
-        resampler : str, Callable, default='cic'
-            Resampler to read particule weights from mesh.
-            One of ['ngp', 'cic', 'tsc', 'pcs'].
-        interlacing : int, default=0
-            If 0 or 1, no interlacing correction.
-            If > 1, order of interlacing correction.
-            Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
-        compensate : bool, default=False
-            If ``True``, applies compensation to the mesh after painting.
-        dtype : default=None
-            Mesh array type.
-        out : str, default='real'
-            If 'real', return a :class:`RealMeshField`, else :class:`ComplexMeshField`
-            or :class:`ComplexMeshField` if ``dtype`` is complex.
-
-        Returns
-        -------
-        mesh : MeshField
-        """
-        return self.particles.paint(resampler=resampler, interlacing=interlacing, compensate=compensate, dtype=dtype, out=out, **kwargs)
-
-
-def compute_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, resampler='cic', **kwargs) -> jax.Array:
-    """
-    Compute normalization for input fields, in volume**(1 - len(inputs)) unit.
-
-    Parameters
-    ----------
-    inputs : RealMeshField or ParticleField
-        Input fields.
-    resampler : str, Callable, default='cic'
-        Resampling method.
-    kwargs : dict
-        Additional arguments for :meth:`ParticleField.paint`.
-
-    Returns
-    -------
-    normalization : jax.Array
-
-    Warning
-    -------
-    Input particles are considered uncorrelated.
-    """
-    meshes, particles = [], []
-    attrs = dict(kwargs)
-    for inp in inputs:
-        if isinstance(inp, RealMeshField):
-            meshes.append(inp)
-            attrs = {name: getattr(inp, name) for name in ['boxsize', 'boxcenter', 'meshsize']}
-        else:
-            particles.append(inp)
-    halo_add = 0
-    if particles:
-        cattrs = dict(particles[0].attrs)
-        update_cellsize = 'cellsize' in attrs
-        if update_cellsize:
-            cattrs.pop('meshsize')
-            cattrs.setdefault('approximate', True)
-        kw = cattrs | attrs
-        attrs = particles[0].attrs.clone(**get_mesh_attrs(**kw))
-        if update_cellsize:
-            halo_add = int(np.ceil(np.max((attrs.boxsize - cattrs['boxsize']) / 2. / attrs.cellsize)))
-        particles = [particle.clone(attrs=attrs) for particle in particles]
-    normalization = 1
-    for mesh in meshes:
-        normalization *= mesh
-    for particle in particles:
-        normalization *= particle.paint(resampler=resampler, interlacing=0, compensate=False, halo_add=halo_add)
-    norm = normalization.sum() * normalization.cellsize.prod()**(1 - len(inputs))
-    if bin is not None:
-        return [norm] * len(bin.ells)
-    return norm
-
-
-def compute_box_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None) -> jax.Array:
-    """Compute normalization, assuming constant density."""
-    normalization = 1.
-    mattrs = inputs[0].attrs
-    size = mattrs.meshsize.prod(dtype=mattrs.rdtype)
-    for mesh in inputs:
-        normalization *= mesh.sum() / size
-    norm = normalization * size * mattrs.cellsize.prod()**(1 - len(inputs))
-    if bin is not None:
-        return [norm] * len(bin.ells)
-    return norm
-
 
 def compute_box2_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None) -> jax.Array:
     """Compute normalization, assuming constant density, for the power spectrum."""
-    return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
+    norm = compute_box_normalization(*_format_meshes(*inputs)[0])
+    if bin is not None:
+        return [norm] * len(bin.ells)
+    return norm
 
 
-def split_particles(*particles, seed=0):
-    """
-    Split input particles for estimation of the bispectrum normalization.
-
-    Parameters
-    ----------
-    particles : ParticleField or None
-        Input particles.
-    seed : int, optional
-        Random seed.
-
-    Returns
-    -------
-    toret : list
-        List of split particles.
-    """
-    toret = list(particles)
-    particles_to_split, nsplits = [], 0
-    # Loop in reverse order
-    for particle in particles[::-1]:
-        if particle is None:
-            nsplits += 1
-        else:
-            particles_to_split.append((particle, nsplits + 1))
-            nsplits = 0
-    # Reorder
-    particles_to_split = particles_to_split[::-1]
-    if isinstance(seed, int):
-        seed = random.key(seed)
-    seeds = random.split(seed, len(particles_to_split))
-    toret = []
-    for i, (particle, nsplits) in enumerate(particles_to_split):
-        if nsplits == 1:
-            toret.append(particle)
-        else:
-            x = create_sharded_random(random.uniform, seeds[i], particle.size, out_specs=0)
-            for isplit in range(nsplits):
-                mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
-                toret.append(particle.clone(weights=particle.weights * mask))
-    return toret
-
-
-def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10., split=None):
+def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10., split=None, **kwargs):
     """
     Compute the FKP normalization for the power spectrum.
 
@@ -734,14 +534,15 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
         Binning operator. Only used to return a list of normalization factors for each multipole.
     cellsize : float, optional
         Cell size.
+    kwargs : dict
+        Optional arguments for :func:`compute_normalization`.
 
     Returns
     -------
     norm : float, list
     """
-    kw = dict(cellsize=cellsize)
-    for name in list(kw):
-        if kw[name] is None: kw.pop(name)
+    kwargs.update(cellsize=cellsize)
+
     if split is not None:
 
         def get_randoms(fkp):
@@ -750,9 +551,9 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
         fkps_none =  list(fkps) + [None] * (2 - len(fkps))
         fkps, autocorr = _format_meshes(*fkps)
         alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
-        randoms = split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split)
+        randoms = list(split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split))
         alpha *= prod(get_randoms(fkp).sum() / randoms.sum() for fkp, randoms in zip(fkps, randoms, strict=True))
-        norm = alpha * compute_normalization(*randoms, **kw)
+        norm = alpha * compute_normalization(*randoms, **kwargs)
     else:
         # This is the pypower normalization
         fkps, autocorr = _format_meshes(*fkps)
@@ -763,14 +564,14 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
             #randoms = [fkp.randoms[mask], fkp.randoms[~mask]]
             #randoms = [fkp.randoms[:fkp.randoms.size // 2], fkp.randoms[fkp.randoms.size // 2:]]
             alpha = fkp.data.sum() / fkp.randoms.sum()
-            norm = alpha * compute_normalization(*randoms, **kw)
+            norm = alpha * compute_normalization(*randoms, **kwargs)
         else:
             randoms = [fkps[0].data, fkps[1].randoms]  # cross to remove common noise
             alpha2 = fkps[1].data.sum() / fkps[1].randoms.sum()
-            norm = alpha2 * compute_normalization(*randoms, **kw)
+            norm = alpha2 * compute_normalization(*randoms, **kwargs)
             randoms = [fkps[1].data, fkps[0].randoms]
             alpha2 = fkps[0].data.sum() / fkps[0].randoms.sum()
-            norm += alpha2 * compute_normalization(*randoms, **kw)
+            norm += alpha2 * compute_normalization(*randoms, **kwargs)
             norm = norm / 2
     if bin is not None:
         return [norm] * len(bin.ells)

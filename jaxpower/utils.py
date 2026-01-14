@@ -668,3 +668,11 @@ def register_pytree_dataclass(cls, meta_fields=None):
     cls.tree_flatten = tree_flatten
     cls.tree_unflatten = classmethod(tree_unflatten)
     return jax.tree_util.register_pytree_node_class(cls)
+
+
+def estimate_memory(fun, *args, **kwargs):
+    lowered = fun.lower(*args, **kwargs)
+    compiled = lowered.compile()
+    memory_analysis = compiled.memory_analysis()
+    print(f"{memory_analysis}")
+    print(f"Estimated memory cost: {(memory_analysis.output_size_in_bytes + memory_analysis.temp_size_in_bytes) / 1024 ** 2:.2f} MB")

@@ -22,8 +22,26 @@ def test_static_array():
 
 
 def test_mesh_attrs():
+    from jaxpower import generate_uniform_particles
+    from jaxpower.mesh import next_fft_size
+
     attrs = get_mesh_attrs(boxsize=1000., boxcenter=0., cellsize=10.)
+    assert np.allclose(attrs.meshsize, 100)
+    assert np.allclose(attrs.cellsize, 10.)
+    attrs = get_mesh_attrs(boxsize=1000., boxcenter=0., meshsize=128)
+    assert np.allclose(attrs.meshsize, 128)
+    assert np.allclose(attrs.cellsize, 1000. / 128)
+
     attrs = MeshAttrs(meshsize=100, boxsize=100.)
+    randoms = generate_uniform_particles(attrs, size=100, seed=84)
+    attrs = get_mesh_attrs(randoms.positions, meshsize=128)
+    assert np.allclose(attrs.meshsize, 128)
+    attrs = get_mesh_attrs(randoms.positions, cellsize=12.)
+    assert np.allclose(attrs.cellsize, 12.)
+    primes = (2, 3, 5)
+    attrs = get_mesh_attrs(randoms.positions, cellsize=12., primes=primes)
+    assert np.allclose(attrs.meshsize, 18)
+    assert np.allclose(attrs.cellsize, 12.)
     dict(**attrs)
     attrs.create()
 
@@ -67,8 +85,8 @@ def test_base_mesh():
 
 
 def test_real_mesh():
-    for engine in ['jax', 'jaxdecomp']:
-        mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)), boxsize=(1000., 102., 2320.), fft_engine=engine)
+    for backend in ['jax', 'jaxdecomp']:
+        mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)), boxsize=(1000., 102., 2320.), fft_backend=backend)
         mesh2 = mesh.r2c()
         assert mesh2.shape != mesh.shape
         assert np.allclose(mesh2.c2r(), mesh)
@@ -77,9 +95,9 @@ def test_real_mesh():
             for resampler in ['ngp', 'cic', 'tsc', 'pcs']:
                 assert mesh.read(positions, resampler=resampler, compensate=compensate).shape == positions.shape[:1]
 
-        mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)) + 0. * 1j, boxsize=(1000., 102., 2320.), fft_engine=engine)
+        mesh = RealMeshField(random.uniform(random.key(42), shape=(10, 21, 13)) + 0. * 1j, boxsize=(1000., 102., 2320.), fft_backend=backend)
         mesh2 = mesh.r2c()
-        if engine == 'jax': assert mesh2.shape == mesh.shape, (mesh2.shape, mesh.shape)
+        if backend == 'jax': assert mesh2.shape == mesh.shape, (mesh2.shape, mesh.shape)
         assert np.allclose(mesh2.c2r(), mesh)
         positions = random.uniform(random.key(42), shape=(10, 3))
         for compensate in [True, False]:
@@ -107,7 +125,7 @@ def get_random_catalog(mattrs, size=10000, seed=42):
     particles = generate_uniform_particles(mattrs, size, seed=seed, exchange=False)
     def sample(key, shape):
         return jax.random.uniform(key, shape, dtype=mattrs.dtype)
-    weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=0)
+    weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=P(mattrs.sharding_mesh.axis_names,))
     return particles.clone(weights=weights)
 
 
@@ -228,7 +246,7 @@ def test_timing():
 
 def test_dtype():
     for dtype in ['f4', 'f8']:
-        attrs = MeshAttrs(boxsize=1000., meshsize=64, dtype=dtype, fft_engine='jax')
+        attrs = MeshAttrs(boxsize=1000., meshsize=64, dtype=dtype, fft_backend='jax')
         mesh = attrs.create(kind='real', fill=0.)
         assert mesh.value.dtype == mesh.dtype == attrs.dtype, (mesh.value.dtype, attrs.dtype)
         mesh = mesh.r2c()
@@ -236,6 +254,43 @@ def test_dtype():
         mesh = mesh.c2r()
         assert mesh.value.dtype == mesh.dtype == attrs.dtype, (mesh.value.dtype, attrs.dtype)
 
+
+def test_sharded_normalization():
+    from jaxpower import compute_fkp2_normalization, compute_fkp3_normalization, generate_uniform_particles, FKPField
+    from jaxpower.mesh import create_sharded_array
+
+    size = int(1e5)
+
+    with create_sharding_mesh() as sharding_mesh:
+        pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
+        data = generate_uniform_particles(pattrs, size, seed=(42, 'index'))
+        randoms = generate_uniform_particles(pattrs, size, seed=(84, 'index'))
+        index = create_sharded_array(lambda start, shape: start * np.prod(shape) + jnp.arange(np.prod(shape)).reshape(shape), jnp.arange(sharding_mesh.devices.size),
+                                    shape=(randoms.size,), in_specs=P(sharding_mesh.axis_names), out_specs=P(sharding_mesh.axis_names))
+        #assert np.allclose(data.positions.std(), 288.2335461652553)
+        fkp = FKPField(data.exchange(backend='jax'), randoms.exchange(backend='jax'))
+        index = fkp.randoms.exchange_direct(index)
+        norm = compute_fkp2_normalization(fkp, cellsize=None, split=None)
+        assert np.allclose(norm, 7.087479585302545)
+        norm = compute_fkp2_normalization(fkp, cellsize=10., split=None)
+        assert np.allclose(norm, 6.996265569638566)
+        norm = compute_fkp2_normalization(fkp, cellsize=10., split=(42, index))
+        assert np.allclose(norm, 6.932929039885748)
+
+
+def test_sharded_random():
+    from jaxpower.mesh import create_sharded_array, create_sharded_random
+
+    size = int(100)
+    with create_sharding_mesh() as sharding_mesh:
+        result = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=(size,), out_specs=P(sharding_mesh.axis_names))
+        assert np.allclose(result.sum(), -6.613044420294692)
+        assert np.allclose(result.std(), 0.9735605177416136)
+        shape = (size, 3, 4)
+        result = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=shape, out_specs=P(sharding_mesh.axis_names))
+        assert result.shape == shape
+        result = create_sharded_random(lambda key, shape: jax.random.normal(key, shape=shape + (3,)), (jax.random.key(42), 'index'), shape=shape, out_specs=P(sharding_mesh.axis_names))
+        assert result.shape == shape + (3,)
 
 
 if __name__ == '__main__':
@@ -253,3 +308,5 @@ if __name__ == '__main__':
     test_dtype()
     os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
     test_sharded_paint_read()
+    test_sharded_random()
+    test_sharded_normalization()

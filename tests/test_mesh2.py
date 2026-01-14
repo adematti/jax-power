@@ -6,6 +6,7 @@ import numpy as np
 import jax
 from jax import random
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as P
 
 from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       BinMesh2CorrelationPoles, compute_mesh2_correlation,
@@ -55,8 +56,6 @@ def test_mesh2_spectrum(plot=False):
         # remove first few bins because of binning effects
         assert np.allclose(spectrum.get(0).value()[2:], pk(spectrum.get(0).coords('k'))[2:], rtol=1e-2)
         assert tuple(spectrum.ells) == (0, 2, 4)
-
-    exit()
 
     if plot:
         from matplotlib import pyplot as plt
@@ -531,7 +530,7 @@ def test_window(plot=False):
         return toret
 
     selection = gaussian_survey(mattrs, paint=True)
-    norm = compute_normalization(selection, selection, bin=bin)
+    norm = [compute_normalization(selection, selection)] * len(bin.ells)
 
     for flag in ['smooth', 'infinite']:
         for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')]:
@@ -943,7 +942,7 @@ def test_pypower():
         particles = generate_uniform_particles(mattrs, size, seed=seed)
         def sample(key, shape):
             return jax.random.uniform(key, shape, dtype=mattrs.dtype)
-        weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=0)
+        weights = create_sharded_random(sample, seed, shape=particles.size, out_specs=P(*mattrs.sharding_mesh.axis_names))
         return particles.clone(weights=weights)
 
     def _identity_fn(x):

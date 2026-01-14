@@ -10,8 +10,9 @@ from jax import numpy as jnp
 from jax import random
 from dataclasses import dataclass
 
-from .mesh import BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random
-from .mesh2 import _get_los_vector, FKPField
+from .mesh import (BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, FKPField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random,
+compute_normalization, compute_box_normalization, split_particles)
+from .mesh2 import _get_los_vector
 from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableLeaf, ObservableTree, WindowMatrix
 from .utils import real_gaunt, get_legendre, get_spherical_jn, get_Ylm, wigner_3j, wigner_9j, register_pytree_dataclass
 
@@ -714,15 +715,15 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     return Mesh3CorrelationPoles(correlation)
 
 
-from .mesh2 import compute_normalization, compute_box_normalization, split_particles
-
-
 def compute_box3_normalization(*inputs: RealMeshField | ParticleField, bin: BinMesh3SpectrumPoles=None) -> jax.Array:
     """Compute normalization, assuming constant density, for the bispectrum."""
-    return compute_box_normalization(*_format_meshes(*inputs)[0], bin=bin)
+    norm = compute_box_normalization(*_format_meshes(*inputs)[0])
+    if bin is not None:
+        return [norm] * len(bin.ells)
+    return norm
 
 
-def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=10., split=None):
+def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=10., split=None, **kwargs):
     """
     Compute the FKP normalization for the bispectrum.
 
@@ -741,11 +742,14 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
         For instance, if 3 different fields are provided, no splitting is performed; if 2 fields are provided, one of them is split in 2.
         The each split is painted on a mesh, and the normalization is computed from the product of the 3 meshes.
         If ``None``, no splitting is performed.
+    kwargs : dict
+        Optional arguments for :func:`compute_normalization`.
 
     Returns
     -------
     norm : float, list
     """
+    kwargs.update(cellsize=cellsize)
     fkps_none =  list(fkps) + [None] * (3 - len(fkps))
     fkps, fields = _format_meshes(*fkps)
     alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
@@ -754,15 +758,12 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
         return fkp.randoms if isinstance(fkp, FKPField) else fkp
 
     if split is not None:
-        randoms = split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split)
+        randoms = list(split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split))
         alpha *= prod(get_randoms(fkp).sum() / randoms.sum() for fkp, randoms in zip(fkps, randoms, strict=True))
     else:
         fkps, fields = _format_meshes(*fkps)
         randoms = [get_randoms(fkp) for fkp in fkps]
-    kw = dict(cellsize=cellsize)
-    for name in list(kw):
-        if kw[name] is None: kw.pop(name)
-    norm = alpha * compute_normalization(*randoms, **kw)
+    norm = alpha * compute_normalization(*randoms, **kwargs)
     if bin is not None:
         return [norm] * len(bin.ells)
     return norm

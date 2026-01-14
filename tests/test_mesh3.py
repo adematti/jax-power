@@ -27,7 +27,7 @@ def test_mesh3_spectrum(plot=False):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'local']
-    mattrs = MeshAttrs(meshsize=128, boxsize=1000., fft_engine='jax')
+    mattrs = MeshAttrs(meshsize=128, boxsize=1000., fft_backend='jax')
 
     for basis in ['scoccimarro', 'sugiyama-diagonal']:
 

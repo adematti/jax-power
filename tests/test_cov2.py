@@ -159,7 +159,7 @@ def save_cutsky_mocks():
     sbin = BinMesh2CorrelationPoles(mattrs, edges={'step': 5.}, ells=(0, 2, 4))
     los = 'local'
 
-    norm = compute_normalization(selection, selection, bin=kbin)
+    norm = [compute_normalization(selection, selection)] * len(kbin.ells)
 
     @jit
     def mock(seed):

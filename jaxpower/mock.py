@@ -4,8 +4,9 @@ import numpy as np
 import jax
 from jax import random
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec as P
 
-from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random
+from .mesh import RealMeshField, ParticleField, MeshAttrs, exchange_particles, create_sharded_random, _process_seed
 from .mesh2 import _get_los_vector
 from .utils import get_legendre, get_Ylm
 from .types import ObservableTree
@@ -23,8 +24,9 @@ def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
         Mesh attributes (box size, mesh size, etc.).
     power : Callable
         Function returning the power spectrum as a function of :math:`k`-vector.
-    seed : int, optional
+    seed : int, tuple, optional
         Random seed for mesh generation.
+        Provide (seed, ids) to ensure reproducibility when changing the number of devices; see :func:`create_sharded_random` for details.
     unitary_amplitude : bool, optional
         If ``True``, normalize the amplitude to be unitary.
 
@@ -33,10 +35,7 @@ def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
     mesh : RealMeshField
         Generated mesh field with the specified power spectrum.
     """
-    if isinstance(seed, int):
-        seed = random.key(seed)
-
-    mesh = mattrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=mattrs.meshsize)).r2c()
+    mesh = mattrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=mattrs.meshsize, out_specs=P(*mattrs.sharding_mesh.axis_names))).r2c()
 
     def kernel(value, kvec):
         ker = jnp.sqrt(power(kvec) / mesh.cellsize.prod())
@@ -58,8 +57,9 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
         Mesh attributes (box size, mesh size, etc.).
     poles : dict or Mesh2SpectrumPoles or list
         Dictionary of multipole order to power spectrum function, or :class:`Mesh2SpectrumPoles`, or list of power spectra.
-    seed : int, default=42
+    seed : int, tuple, optional
         Random seed for mesh generation.
+        Provide (seed, ids) to ensure reproducibility when changing the number of devices; see :func:`create_sharded_random` for details.
     los : str, optional
         Line-of-sight specification ('x', 'y', 'z', or 'local').
     unitary_amplitude : bool, optional
@@ -82,11 +82,11 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
         poles = {ell: pole for ell, pole in zip(ells, poles)}
     ells = list(poles)
 
-    if isinstance(seed, int):
-        seed = random.key(seed)
+    key, ids = _process_seed(seed)
+    assert key is not None, 'provide random key for mesh generation'
 
-    def generate_normal(seed):
-        mesh = mattrs.create(kind='real', fill=create_sharded_random(random.normal, seed, shape=mattrs.meshsize)).r2c()
+    def generate_normal(key):
+        mesh = mattrs.create(kind='real', fill=create_sharded_random(random.normal, (key, ids), shape=mattrs.meshsize, out_specs=P(*mattrs.sharding_mesh.axis_names))).r2c()
         if unitary_amplitude:
             mesh *= jnp.sqrt(mattrs.meshsize.prod(dtype=float)) / jnp.abs(mesh.value)
         return mesh
@@ -111,7 +111,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
     if los == 'local':
 
         @jax.checkpoint
-        def get_meshs(seeds):
+        def get_meshs(keys):
 
             if is_callable:
                 p0, p2, p4 = (get_theory(ell) / mattrs.cellsize.prod() for ell in ells)
@@ -135,17 +135,17 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
                     return get_theory(pole=pole).reshape(kshape)
 
             # The mesh for ell = 0
-            normal = generate_normal(seeds[0])
+            normal = generate_normal(key[0])
             mesh = (normal * _interp(l00)).c2r()
             del l00
             mesh2 = normal * _interp(l10)
             del normal
             # The mesh for ell = 2
-            mesh2 += generate_normal(seeds[1]) * _interp(jnp.sqrt(a11 - l10**2))
+            mesh2 += generate_normal(key[1]) * _interp(jnp.sqrt(a11 - l10**2))
             del a11, l10
             return mesh, mesh2
 
-        mesh, mesh2 = get_meshs(random.split(seed))
+        mesh, mesh2 = get_meshs(random.split(key))
         xvec = mesh.coords(sparse=True)
         ell = 2
         Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
@@ -163,7 +163,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
 
     else:
         vlos = _get_los_vector(los, ndim=mattrs.ndim)
-        mesh = generate_normal(seed)
+        mesh = generate_normal(key)
 
         def kernel(value, kvec):
             mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.where(knorm == 0., 1., knorm)
@@ -177,7 +177,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
         return mesh
 
 
-def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42, exchange=False):
+def generate_uniform_particles(mattrs: MeshAttrs, size: int=None, seed: int=42, exchange=False):
     """
     Generate uniformly distributed particles in the input box.
 
@@ -187,8 +187,9 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42, excha
         Mesh attributes (box size, mesh size, etc.).
     size : int
         Number of particles to generate.
-    seed : int, optional
-        Random seed for particle generation.
+    seed : int, tuple, optional
+        Random seed for mesh generation.
+        Provide (seed, ids) to ensure reproducibility when changing the number of devices; see :func:`create_sharded_random` for details.
     exchange : bool, default=False
         If ``True``, perform particle exchange for distributed computation.
 
@@ -197,12 +198,8 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int, seed: int=42, excha
     particles : ParticleField
         Generated uniformly distributed particles.
     """
-    if isinstance(seed, int):
-        seed = random.key(seed)
-
     def sample(key, shape):
         return mattrs.boxsize * random.uniform(key, shape + (len(mattrs.boxsize),), dtype=mattrs.rdtype) - mattrs.boxsize / 2. + mattrs.boxcenter
-
-    positions = create_sharded_random(sample, seed, shape=size, out_specs=0)
+    positions = create_sharded_random(sample, seed, shape=size, out_specs=P(mattrs.sharding_mesh.axis_names,))
     #positions = exchange_particles(mattrs, positions=positions, return_inverse=False)[0]
     return ParticleField(positions, attrs=mattrs, exchange=exchange)
