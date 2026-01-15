@@ -1788,7 +1788,7 @@ def next_fft_shape(shape, primes=(2, 3, 5, 7)):
 def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                    boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
                    cellsize: np.ndarray | float=None, boxpad: np.ndarray | float=2.,
-                   check: bool=False, approximate: bool=False, dtype=None, primes=None,
+                   check: bool=False, approximate: bool=False, dtype=None, primes=None, divisors=None,
                    sharding_mesh=None, **kwargs):
     """
     Compute enclosing box.
@@ -1820,6 +1820,8 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
     primes : tuple, default=None
         For more efficient FFTs, tuple of prime numbers to construct ``meshsize``.
         Typically: (2, 3, 5, 7).
+    divisors : tuple, default=None
+        Tuple of divisors of ``meshsize``. One can provide a list of such divisors, for each dimension.
 
     Returns
     -------
@@ -1867,14 +1869,19 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
             cellsize = _np_array_fill(cellsize, ndim, dtype=rdtype)
             meshsize = np.ceil(boxsize / cellsize).astype('i4')
             if primes is None: primes = tuple()
-            divisors = [tuple()] * ndim
+            if divisors is None: divisors = tuple()
+            if not divisors or np.ndim(divisors[0]) == 0: divisors = [divisors] * ndim
+            assert len(divisors) == ndim, 'provide a list of divisors tuples, one for each dimension'
+            divisors = [tuple(divs) for divs in divisors]
+            sdivisors = [tuple()] * ndim
             if sharding_mesh.axis_names:
                 same = np.all(meshsize == meshsize[0])
                 if same:
-                    divisors = [tuple(sharding_mesh.devices.shape)] * ndim  # add all divisors
+                    sdivisors = [tuple(sharding_mesh.devices.shape)] * ndim  # add all divisors
                 else:
                     shape_devices = sharding_mesh.devices.shape + (1,) * (ndim - sharding_mesh.devices.ndim)
-                    divisors = [(s,) for s in shape_devices]
+                    sdivisors = [(s,) for s in shape_devices]
+            divisors = [divs + sdivs for divs, sdivs in zip(divisors, sdivisors)]
             meshsize = np.array([next_fft_size(msize, primes=primes, divisors=divs) for msize, divs in zip(meshsize, divisors)])
             toret['meshsize'] = meshsize
             toret['boxsize'] = meshsize * cellsize  # enforce exact cellsize
