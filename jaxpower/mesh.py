@@ -2616,8 +2616,16 @@ def split_particles(*particles, seed=0):
     """
     toret = list(particles)
     if not isinstance(seed, list):
-        seed = [seed] * len(particles)
-    seeds = [_process_seed(seed) if seed is not None else seed for seed in seed]
+        seed = [seed]
+    input_seeds = seed
+    assert len(input_seeds) == len([particle for particle in particles if particle is not None]), 'provide as many seeds as not None particles'
+    seeds, iseed = [], 0
+    for particle in particles:
+        if particle is None:
+            seeds.append(None)
+        else:
+            seeds.append(_process_seed(input_seeds[iseed]))
+            iseed += 1
     particles_to_split, nsplits = [], 0
     # Loop in reverse order
     for particle, seed in zip(particles[::-1], seeds[::-1], strict=True):
