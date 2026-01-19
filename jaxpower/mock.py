@@ -135,13 +135,13 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
                     return get_theory(pole=pole).reshape(kshape)
 
             # The mesh for ell = 0
-            normal = generate_normal(key[0])
+            normal = generate_normal(keys[0])
             mesh = (normal * _interp(l00)).c2r()
             del l00
             mesh2 = normal * _interp(l10)
             del normal
             # The mesh for ell = 2
-            mesh2 += generate_normal(key[1]) * _interp(jnp.sqrt(a11 - l10**2))
+            mesh2 += generate_normal(keys[1]) * _interp(jnp.sqrt(a11 - l10**2))
             del a11, l10
             return mesh, mesh2
 
