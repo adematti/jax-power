@@ -12,13 +12,12 @@ from dataclasses import dataclass
 
 from .mesh import (BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, FKPField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random,
 compute_normalization, compute_box_normalization, split_particles)
-from .mesh2 import _get_los_vector
+from .mesh2 import _get_los_vector, __format_meshes
 from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableLeaf, ObservableTree, WindowMatrix
 from .utils import real_gaunt, get_legendre, get_spherical_jn, get_Ylm, wigner_3j, wigner_9j, register_pytree_dataclass
 
 
-prod = functools.partial(functools.reduce, operator.mul)
-
+prod = partial(functools.reduce, operator.mul)
 
 
 def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None, buffer_size=0, mask_edges=None):
@@ -402,17 +401,7 @@ class BinMesh3CorrelationPoles(object):
 
 
 
-def _format_meshes(*meshes):
-    """Format input meshes for autocorrelation/cross-correlation: return list of 3 meshes,
-    and a list of indices corresponding to the mesh they are equal to."""
-    meshes = list(meshes)
-    meshes = meshes + [None] * (3 - len(meshes))
-    fields = [0]
-    for mesh in meshes[1:]: fields.append(fields[-1] if mesh is None else fields[-1] + 1)
-    for imesh, mesh in enumerate(meshes):
-        if mesh is None:
-            meshes[imesh] = meshes[imesh - 1]
-    return meshes, tuple(fields)
+_format_meshes = partial(__format_meshes, nmeshes=3)
 
 
 def _format_ells(ells, basis: str='sugiyama'):
@@ -723,7 +712,7 @@ def compute_box3_normalization(*inputs: RealMeshField | ParticleField, bin: BinM
     return norm
 
 
-def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=10., split=None, **kwargs):
+def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=10., split=None, fields: tuple=None, **kwargs):
     """
     Compute the FKP normalization for the bispectrum.
 
@@ -738,10 +727,12 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     split : int or None, optional
         Random seed for splitting.
         This is useful to get unbiased estimate of the normalization.
-        The input particle fields are split such that the total number of splits is 3.
-        For instance, if 3 different fields are provided, no splitting is performed; if 2 fields are provided, one of them is split in 2.
-        The each split is painted on a mesh, and the normalization is computed from the product of the 3 meshes.
+        The input particle fields are split into 3 disjoint samples.
+        Each sample is painted on a mesh, and the normalization is computed from the product of the 3 meshes.
         If ``None``, no splitting is performed.
+    fields : tuple, default=None
+        Field identifiers; pass e.g. [0, 0, 1] if the first two fields share the same positions;
+        disjoint random subsamples will be selected with ``split``.
     kwargs : dict
         Optional arguments for :func:`compute_normalization`.
 
@@ -750,15 +741,14 @@ def compute_fkp3_normalization(*fkps, bin: BinMesh3SpectrumPoles=None, cellsize=
     norm : float, list
     """
     kwargs.update(cellsize=cellsize)
-    fkps_none =  list(fkps) + [None] * (3 - len(fkps))
-    fkps, fields = _format_meshes(*fkps)
+    fkps, fields = _format_meshes(*fkps, fields=fields)
     alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
 
     def get_randoms(fkp):
         return fkp.randoms if isinstance(fkp, FKPField) else fkp
 
     if split is not None:
-        randoms = list(split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split))
+        randoms = list(split_particles(*[get_randoms(fkp) for fkp in fkps], seed=split, fields=fields))
         alpha *= prod(get_randoms(fkp).sum() / randoms.sum() for fkp, randoms in zip(fkps, randoms, strict=True))
     else:
         fkps, fields = _format_meshes(*fkps)
@@ -983,7 +973,7 @@ def _compute_sugiyama_correlation_S113(rmesh, cmesh, s111=dict(), cmesh_s111=1.,
     return s113
 
 
-def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, **kwargs):
+def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler='cic', interlacing=False, compensate=True, fields: tuple=None, **kwargs):
     r"""
     Compute the FKP shot noise for the bispectrum.
 
@@ -1007,6 +997,8 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
         Typically, 3 gives reliable power spectrum estimation up to :math:`k \sim k_\mathrm{nyq}`.
     compensate : bool, default=False
         If ``True``, applies compensation to the mesh after painting.
+    fields : tuple, list, optional
+        Field identifiers; pass e.g. [0, 0, 1] if the first two fields share the same positions.
     kwargs : dict
         Additional arguments for :meth:`ParticleField.paint`.
 
@@ -1015,7 +1007,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
     shotnoise : list
         Shot noise for each multipole.
     """
-    fkps, fields = _format_meshes(*fkps)
+    fkps, fields = _format_meshes(*fkps, fields=fields)
     mattrs = fkps[0].attrs
     if 'sugiyama' in bin.basis:
         mattrs = mattrs.clone(dtype=mattrs.cdtype)
@@ -1053,11 +1045,11 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
         # Eq. 58 of https://arxiv.org/pdf/1506.02729, 1 => 3
         if not (fields[0] == fields[1] == fields[2]):
             raise NotImplementedError
-        cmeshw = particles[0].paint(**kwargs, out='complex')
+        cmeshw = particles[2].paint(**kwargs, out='complex')
         cmeshw = cmeshw.clone(value=cmeshw.value.at[(0,) * cmeshw.ndim].set(0.))  # remove zero-mode
-        cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
+        cmeshw2 = particles[0].clone(weights=particles[0].weights * particles[1].weights).paint(**kwargs, out='complex')
         cmeshw2 = cmeshw2.clone(value=cmeshw2.value.at[(0,) * cmeshw2.ndim].set(0.))  # remove zero-mode
-        sumw3 = jnp.sum(particles[0].weights**3)
+        sumw3 = jnp.sum(particles[0].weights * particles[1].weights * particles[2].weights)
         del particles
 
         shotnoise = _compute_scoccimarro_S(cmeshw, cmeshw2, sumw3, bin=bin, los=los)
@@ -1068,7 +1060,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
         def compute_S111(particles, ellms):
             ellms = list(ellms)
             if ellms == [(0, 0)]:
-                s0 = jnp.sum(particles[0].weights**3)
+                s0 = jnp.sum(particles[0].weights * particles[1].weights * particles[2].weights)
                 s111_ellm = {(ell, m): s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms}
             else:
                 rmesh = particles[0].clone(weights=particles[0].weights**3).paint(**kwargs, out='real')
@@ -1091,7 +1083,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
                 return resampler.aliasing_shotnoise(1., kcirc) * (resampler.compensate(1., kcirc)**2 if compensate else 1.)
 
         def compute_S122(particles, ells, axis=0):  # 1 == 2
-            rmeshw2 = particles[1].clone(weights=particles[1].weights**2).paint(**kwargs, out='real')
+            rmeshw2 = particles[1].clone(weights=particles[1].weights * particles[2].weights).paint(**kwargs, out='real')
             cmeshw = particles[0].paint(**kwargs, out='complex')
 
             if is_correlation:
@@ -1104,7 +1096,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
 
         def compute_S113(particles, ells):
             rmeshw = particles[2].paint(**kwargs, out='real')
-            cmeshw2 = particles[0].clone(weights=particles[0].weights**2).paint(**kwargs, out='complex')
+            cmeshw2 = particles[0].clone(weights=particles[0].weights * particles[1].weights).paint(**kwargs, out='complex')
             if is_correlation:
                 inter_edges = jnp.concatenate([jnp.max(bin.edges[..., 0], axis=1, keepdims=True), jnp.min(bin.edges[..., 1], axis=1, keepdims=True)], axis=-1)
                 inter_edges = jnp.where(inter_edges[..., [1]] <= inter_edges[..., [0]], 0., inter_edges)
@@ -1147,7 +1139,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
 
             ells2 = [ell[1] for ell in ells if select(ell)]
             if ells2:
-                particles01 = [particles[1], particles[0]]
+                particles01 = [particles[1], particles[0], particles[2]]
                 s121 = compute_S122(particles01, ells=ells2, axis=1)
                 for ill, ell in enumerate(ells):
                     if select(ell):

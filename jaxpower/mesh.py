@@ -2014,10 +2014,18 @@ class ParticleField(object):
 
         self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, exchange_direct=exchange_direct, attrs=attrs)
 
+    def __repr__(self):
+        return f'{self.__class__.__name__}(size={self.size})'
+
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
+        keep = {}
+        if not kwargs.get('exchange', True) and 'positions' not in kwargs:
+            keep.update(exchange_inverse=self.exchange_inverse, exchange_direct=self.exchange_direct)
         state = asdict(self) | kwargs
-        return self.__class__(**state)
+        new = self.__class__(**state)
+        new.__dict__.update(keep)  # add back exchange functions if not changed
+        return new
 
     def exchange(self, **kwargs):
         return self.clone(exchange=True, **kwargs)
@@ -2599,7 +2607,34 @@ def compute_box_normalization(*inputs: RealMeshField | ParticleField) -> jax.Arr
     return norm
 
 
-def split_particles(*particles, seed=0):
+def _make_input_tuple(*inputs):
+    if len(inputs) == 1 and isinstance(inputs[0], (tuple, list)):  # tuple of meshes
+        inputs = inputs[0]
+    return tuple(inputs)
+
+
+def __format_meshes(*meshes, fields=None, nmeshes=None):
+    """Format input meshes for autocorrelation/cross-correlation: return list of two meshes, and boolean if they are equal."""
+    meshes = _make_input_tuple(*meshes)
+    meshes = list(meshes)
+    assert len(meshes) >= 1
+    if nmeshes is not None:
+        assert len(meshes) <= nmeshes
+        meshes = meshes + [None] * (nmeshes - len(meshes))
+    if fields is None:
+        fields = [0]
+    else:
+        fields = list(fields)
+    for mesh in meshes[len(fields):]:
+        fields.append(fields[-1] if mesh is None else fields[-1] + 1)
+    for imesh, (mesh, field) in enumerate(zip(meshes, fields)):
+        if mesh is None:
+            meshes[imesh] = meshes[fields.index(field)]
+        assert meshes[imesh] is not None, f'first mesh of field {field} must not be None'
+    return meshes, tuple(fields)
+
+
+def split_particles(*particles, seed=0, fields: tuple=None):
     """
     Split input particles for estimation of the normalization.
 
@@ -2609,39 +2644,31 @@ def split_particles(*particles, seed=0):
         Input particles.
     seed : int, optional
         Random seed.
+    fields : tuple, default=None
+        Field identifiers; pass e.g. [0, 0] if two fields sharing the same positions are given as input;
+        disjoint random subsamples will be selected.
 
     Returns
     -------
-    Yield particles.
+    particles : list of particles
+        Disjoint samples of particles.
     """
-    toret = list(particles)
+    particles, fields = __format_meshes(particles, fields=fields, nmeshes=None)
+    unique_fields = []
+    for field in fields:
+        if field not in unique_fields:
+            unique_fields.append(field)
     if not isinstance(seed, list):
         seed = [seed]
-    input_seeds = seed
-    assert len(input_seeds) == len([particle for particle in particles if particle is not None]), 'provide as many seeds as not None particles'
-    seeds, iseed = [], 0
-    for particle in particles:
-        if particle is None:
-            seeds.append(None)
-        else:
-            seeds.append(_process_seed(input_seeds[iseed]))
-            iseed += 1
-    particles_to_split, nsplits = [], 0
-    # Loop in reverse order
-    for particle, seed in zip(particles[::-1], seeds[::-1], strict=True):
-        if particle is None:
-            nsplits += 1
-        else:
-            particles_to_split.append((particle, nsplits + 1, seed))
-            nsplits = 0
-    # Reorder
-    particles_to_split = particles_to_split[::-1]
-    for i, (particle, nsplits, seed) in enumerate(particles_to_split):
-        if nsplits == 1:
-            yield particle
-        else:
-            sharding_mesh = particle.attrs.sharding_mesh
-            x = create_sharded_random(jax.random.uniform, seed, particle.size, out_specs=P(sharding_mesh.axis_names,))
-            for isplit in range(nsplits):
-                mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
-                yield particle.clone(weights=particle.weights * mask)
+    seeds = seed
+    assert len(seeds) == len(unique_fields), 'provide as many seeds as unique fields'
+    toret = list(particles)
+    for unique_field, seed in zip(unique_fields, seeds):
+        field_indices = [ifield for ifield, field in enumerate(fields) if field == unique_field]
+        sharding_mesh = particles[field_indices[0]].attrs.sharding_mesh
+        x = create_sharded_random(jax.random.uniform, _process_seed(seed), particles[field_indices[0]].size, out_specs=P(sharding_mesh.axis_names,))
+        nsplits = len(field_indices)
+        for isplit, field_index in enumerate(field_indices):
+            mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+            toret[field_index] = particles[field_index].clone(weights=particles[field_index].weights * mask)
+    return toret

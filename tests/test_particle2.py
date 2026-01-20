@@ -264,6 +264,19 @@ def test_particle2(plot=False):
     spectrum = compute_particle2(data, bin=bin)
 
 
+def test_particle2_shotnoise():
+    mattrs = MeshAttrs(boxsize=1000., meshsize=128)
+    size = int(1e5)
+    data = generate_uniform_particles(mattrs, size, seed=32)
+    data1 = data.clone(weights=create_sharded_random(jax.random.uniform, shape=(size,), seed=42))
+    data2 = data.clone(weights=create_sharded_random(jax.random.uniform, shape=(size,), seed=84))
+    bin = BinParticle2SpectrumPoles(mattrs, edges={'step': 0.01, 'max': 0.2})
+    num_shotnoise = compute_particle2_shotnoise([data1, data2], bin=bin)
+    assert np.allclose(num_shotnoise[0], 0.)
+    num_shotnoise = compute_particle2_shotnoise([data1, data2], bin=bin, fields=[0, 0])
+    assert np.allclose(num_shotnoise[0], jnp.sum(data1.weights * data2.weights))
+
+
 def test():
     from jax.experimental.shard_map import shard_map
     from jax.sharding import Mesh, PartitionSpec as P
@@ -290,5 +303,6 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
 
     test_particle2(plot=True)
+    test_particle2_shotnoise()
     #jax.distributed.initialize()
     #jax.distributed.shutdown()

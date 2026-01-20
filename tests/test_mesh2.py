@@ -13,7 +13,7 @@ from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
                       MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
                       compute_fkp2_normalization, compute_fkp2_shotnoise, compute_normalization,
-                      Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils)
+                      Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils, create_sharded_random)
 
 
 dirname = Path('_tests')
@@ -67,6 +67,25 @@ def test_mesh2_spectrum(plot=False):
             ax.plot(k, k * pk(k))
             ax.set_title(los)
             plt.show()
+
+
+def test_fkp2_shotnoise():
+
+    mattrs = MeshAttrs(boxsize=1000., meshsize=128)
+    size = int(1e5)
+    data = generate_uniform_particles(mattrs, size, seed=32)
+    data1 = data.clone(weights=create_sharded_random(jax.random.uniform, shape=(size,), seed=42))
+    data2 = data.clone(weights=create_sharded_random(jax.random.uniform, shape=(size,), seed=84))
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.005}, ells=(0, 2))
+    #num_shotnoise = compute_fkp2_shotnoise(data1, bin=bin)
+    #assert np.allclose(num_shotnoise[0], jnp.sum(data1.weights**2))
+    num_shotnoise = compute_fkp2_shotnoise([data1, data2], bin=bin)
+    assert np.allclose(num_shotnoise[0], 0.)
+    num_shotnoise = compute_fkp2_shotnoise([data1, data2], bin=bin, fields=[0, 0])
+    assert np.allclose(num_shotnoise[0], jnp.sum(data1.weights * data2.weights))
+    fkp = FKPField(data1, data2)
+    num_shotnoise = compute_fkp2_shotnoise(fkp, bin=bin)
+    assert np.allclose(num_shotnoise[0], jnp.sum(fkp.particles.weights**2))
 
 
 def test_mesh2_correlation(plot=False):
@@ -937,7 +956,6 @@ def test_sharding():
 def test_pypower():
 
     def get_random_catalog(mattrs, size=int(1e6), seed=42):
-        from jaxpower import create_sharded_random
         seed = jax.random.key(seed)
         particles = generate_uniform_particles(mattrs, size, seed=seed)
         def sample(key, shape):
@@ -1018,6 +1036,7 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
 
     test_mesh2_spectrum(plot=False)
+    test_fkp2_shotnoise()
     test_mesh2_correlation(plot=False)
     test_fkp2_spectrum(plot=False)
     test_mesh2_spectrum_mean(plot=False)

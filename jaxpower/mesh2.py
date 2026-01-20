@@ -16,7 +16,7 @@ from jax import numpy as jnp
 from .types import WindowMatrix, Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, ObservableLeaf, ObservableTree
 from .utils import get_legendre, get_spherical_jn, get_Ylm, real_gaunt, legendre_product, register_pytree_dataclass
 from .mesh import (BaseMeshField, RealMeshField, ComplexMeshField, ParticleField, FKPField, staticarray, MeshAttrs, _get_hermitian_weights, _find_unique_edges,
-                    _get_bin_attrs, _bincount, get_mesh_attrs, create_sharded_random, split_particles, compute_normalization, compute_box_normalization)
+                    _get_bin_attrs, _bincount, __format_meshes, get_mesh_attrs, create_sharded_random, split_particles, compute_normalization, compute_box_normalization)
 
 
 prod = functools.partial(functools.reduce, operator.mul)
@@ -203,17 +203,7 @@ def _get_los_vector(los: str | np.ndarray, ndim=3):
     return staticarray(vlos)
 
 
-def _format_meshes(*meshes):
-    """Format input meshes for autocorrelation/cross-correlation: return list of two meshes, and boolean if they are equal."""
-    meshes = list(meshes)
-    assert 1 <= len(meshes) <= 2
-    meshes = meshes + [None] * (2 - len(meshes))
-    fields = [0]
-    for mesh in meshes[1:]: fields.append(fields[-1] if mesh is None else fields[-1] + 1)
-    for imesh, mesh in enumerate(meshes):
-        if mesh is None:
-            meshes[imesh] = meshes[imesh - 1]
-    return meshes, fields[1] == fields[0]
+_format_meshes = partial(__format_meshes, nmeshes=2)
 
 
 def _format_ells(ells):
@@ -281,7 +271,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     result : Mesh2SpectrumPoles
     """
 
-    meshes, autocorr = _format_meshes(*meshes)
+    meshes, fields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
@@ -306,13 +296,13 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         if swap: meshes = meshes[::-1]
 
         rmesh1 = meshes[0]
-        A0 = _2c(rmesh1 if autocorr else meshes[1])
+        A0 = _2c(rmesh1 if fields[1] == fields[0] else meshes[1])
         #print('jax', rmesh1.value.std(), A0.value.std())
         del meshes
 
         num = []
         if 0 in ells:
-            if autocorr:
+            if fields[1] == fields[0]:
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
                 Aell = _2c(rmesh1) * A0.conj()
@@ -355,9 +345,9 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
     else:  # fixed line-of-sight
 
-        for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+        for imesh, mesh in enumerate(meshes[:1 if fields[1] == fields[0] else 2]):
             meshes[imesh] = _2c(mesh)
-        if autocorr:
+        if fields[1] == fields[0]:
             Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
         else:
             Aell = meshes[0] * meshes[1].conj()
@@ -404,7 +394,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     -------
     result : Mesh2CorrelationPoles
     """
-    meshes, autocorr = _format_meshes(*meshes)
+    meshes, fields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
@@ -429,12 +419,12 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         if swap: meshes = meshes[::-1]
 
         rmesh1 = meshes[0]
-        A0 = _2c(rmesh1 if autocorr else meshes[1])
+        A0 = _2c(rmesh1 if fields[1] == fields[0] else meshes[1])
         del meshes
 
         num = []
         if 0 in ells:
-            if autocorr:
+            if fields[1] == fields[0]:
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
                 Aell = _2c(rmesh1) * A0.conj()
@@ -479,9 +469,9 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
 
     else:  # fixed line-of-sight
 
-        for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+        for imesh, mesh in enumerate(meshes[:1 if fields[1] == fields[0] else 2]):
             meshes[imesh] = _2c(mesh)
-        if autocorr:
+        if fields[1] == fields[0]:
             Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
         else:
             Aell = meshes[0] * meshes[1].conj()
@@ -522,7 +512,7 @@ def compute_box2_normalization(*inputs: RealMeshField | ParticleField, bin: BinM
     return norm
 
 
-def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10., split=None, **kwargs):
+def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, cellsize: float=10., split=None, fields: tuple=None, **kwargs):
     """
     Compute the FKP normalization for the power spectrum.
 
@@ -534,6 +524,12 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
         Binning operator. Only used to return a list of normalization factors for each multipole.
     cellsize : float, optional
         Cell size.
+    fields : tuple, list, optional
+        Field identifiers; pass e.g. [0, 0] if two fields sharing the same positions are given as input.
+        Disjoint random subsamples will be selected, if ``split`` is provided.
+    fields : tuple, default=None
+        Field identifiers; pass e.g. [0, 0, 1] if the first two fields share the same positions;
+        disjoint random subsamples will be selected with ``split``.
     kwargs : dict
         Optional arguments for :func:`compute_normalization`.
 
@@ -548,16 +544,15 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
         def get_randoms(fkp):
             return fkp.randoms if isinstance(fkp, FKPField) else fkp
 
-        fkps_none =  list(fkps) + [None] * (2 - len(fkps))
-        fkps, autocorr = _format_meshes(*fkps)
+        fkps, fields = _format_meshes(*fkps, fields=fields)
         alpha = prod(map(lambda fkp: fkp.data.sum() / fkp.randoms.sum() if isinstance(fkp, FKPField) else 1., fkps))
-        randoms = list(split_particles(*[get_randoms(fkp) for fkp in fkps_none], seed=split))
+        randoms = list(split_particles(*[get_randoms(fkp) for fkp in fkps], seed=split, fields=fields))
         alpha *= prod(get_randoms(fkp).sum() / randoms.sum() for fkp, randoms in zip(fkps, randoms, strict=True))
         norm = alpha * compute_normalization(*randoms, **kwargs)
     else:
         # This is the pypower normalization
-        fkps, autocorr = _format_meshes(*fkps)
-        if autocorr:
+        fkps, fields = _format_meshes(*fkps)  # fields not provided on purpose
+        if fields[1] == fields[0]:
             fkp = fkps[0]
             randoms = [fkp.data, fkp.randoms]  # cross to remove common noise
             #mask = random.uniform(random.key(42), shape=fkp.randoms.size) < 0.5
@@ -578,7 +573,7 @@ def compute_fkp2_normalization(*fkps: FKPField, bin: BinMesh2SpectrumPoles | Bin
     return norm
 
 
-def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None):
+def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2SpectrumPoles | BinMesh2CorrelationPoles=None, fields: tuple=None):
     """
     Compute the FKP shot noise for the power spectrum and correlation function.
 
@@ -588,18 +583,23 @@ def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2Spectru
         FKP or particle fields.
     bin : BinMesh2SpectrumPoles or BinMesh2CorrelationPoles, optional
         Binning operator. Only used to return a list of shotnoise estimates for each multipole.
+    fields : tuple, list, optional
+        Field identifiers; pass e.g. [0, 0] if two fields sharing the same positions are given as input.
 
     Returns
     -------
     shotnoise : float, list
     """
-    # This is the pypower normalization - move to new one?
-    fkps, autocorr = _format_meshes(*fkps)
-    if autocorr:
-        particles = fkp = fkps[0]
+    fkps, fields = _format_meshes(*fkps, fields=fields)
+
+    def get_particles(fkp):
         if isinstance(fkp, FKPField):
-            particles = fkp.particles
-        shotnoise = jnp.sum(particles.weights**2)
+            return fkp.particles
+        return fkp
+
+    if fields[1] == fields[0]:  # same positions
+        particles = [get_particles(fkp) for fkp in fkps]
+        shotnoise = jnp.sum(particles[0].weights * particles[1].weights)
         scale = 1.
         klimit = getattr(bin, 'klimit', None)
         if klimit is not None:  # count number of modes
@@ -952,10 +952,10 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
     from .utils import BesselIntegral
 
-    meshes, autocorr = _format_meshes(*meshes)
+    meshes, fields = _format_meshes(*meshes)
     periodic = isinstance(meshes[0], MeshAttrs)
     if periodic:
-        assert autocorr
+        assert fields[1] == fields[0]
         mattrs = meshes[0]
     else:
         mattrs = meshes[0].attrs
@@ -1008,9 +1008,9 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
 
         if not periodic:
 
-            for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+            for imesh, mesh in enumerate(meshes[:1 if fields[1] == fields[0] else 2]):
                 meshes[imesh] = _2c(mesh)
-            if autocorr:
+            if fields[1] == fields[0]:
                 meshes[1] = meshes[0]
 
             Q = _2r(meshes[0] * meshes[1].conj()) / mattrs.meshsize.prod(dtype=rdtype)
@@ -1136,8 +1136,8 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
             meshes = [mattrs.create(kind='real', fill=1.)]
 
         rmesh1 = _2r(meshes[0])
-        rmesh2 = rmesh1 if autocorr else _2r(meshes[1])
-        A0 = _2c(meshes[0] if autocorr else meshes[1])
+        rmesh2 = rmesh1 if fields[1] == fields[0] else _2r(meshes[1])
+        A0 = _2c(meshes[0] if fields[1] == fields[0] else meshes[1])
         del meshes
 
         # The real-space grid
@@ -1493,10 +1493,10 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
     -------
     spectrum : Mesh2SpectrumPoles
     """
-    meshes, autocorr = _format_meshes(*meshes)
+    meshes, fields = _format_meshes(*meshes)
     periodic = isinstance(meshes[0], MeshAttrs)
     if periodic:
-        assert autocorr
+        assert fields[1] == fields[0]
         rdtype = float
         mattrs = meshes[0]
     else:
@@ -1555,9 +1555,9 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
         if not periodic:
 
-            for imesh, mesh in enumerate(meshes[:1 if autocorr else 2]):
+            for imesh, mesh in enumerate(meshes[:1 if fields[1] == fields[0] else 2]):
                 meshes[imesh] = _2c(mesh)
-            if autocorr:
+            if fields[1] == fields[0]:
                 meshes[1] = meshes[0]
 
             Q = _2r(meshes[0] * meshes[1].conj())
@@ -1600,8 +1600,8 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
             meshes = [mattrs.create(kind='real', fill=1.)]
 
         rmesh1 = _2r(meshes[0])
-        rmesh2 = rmesh1 if autocorr else _2r(meshes[1])
-        A0 = _2c(meshes[0] if autocorr else meshes[1])
+        rmesh2 = rmesh1 if fields[1] == fields[0] else _2r(meshes[1])
+        A0 = _2c(meshes[0] if fields[1] == fields[0] else meshes[1])
         del meshes
 
         # The real-space grid

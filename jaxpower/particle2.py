@@ -8,8 +8,8 @@ from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
-from .mesh import MeshAttrs, staticarray, ParticleField, get_sharding_mesh
-from .mesh2 import FKPField, _format_ells
+from .mesh import MeshAttrs, staticarray, ParticleField, get_sharding_mesh, _make_input_tuple
+from .mesh2 import FKPField, _format_ells, _format_meshes
 from .utils import get_legendre, get_spherical_jn, set_env, register_pytree_dataclass
 from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Mesh2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
 
@@ -98,9 +98,9 @@ class BinParticle2SpectrumPoles(object):
         """
         from cucount.jax import Particles, count2, BinAttrs, setup_logging
         sharding_mesh = get_sharding_mesh()
+        particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
-
-        if len(particles) == 1: particles = particles * 2
+        particles = _format_meshes(*particles)
 
         def call(*particles):
             #setup_logging('error')
@@ -175,9 +175,9 @@ class BinParticle2CorrelationPoles(object):
         """
         from cucount.jax import Particles, count2, BinAttrs, setup_logging
         sharding_mesh = get_sharding_mesh()
+        particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
-
-        if len(particles) == 1: particles = particles * 2
+        particles = _format_meshes(*particles)
 
         def call(*particles):
             #setup_logging('error')
@@ -247,7 +247,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
         return Particle2SpectrumPoles(spectrum)
 
 
-def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2SpectrumPoles | BinParticle2CorrelationPoles=None):
+def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2SpectrumPoles | BinParticle2CorrelationPoles=None, fields: tuple=None):
     """
     Compute the shot noise for the particle-based power spectrum and correlation function multipoles.
 
@@ -257,19 +257,21 @@ def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2Spec
         Particles.
     bin : BinParticle2SpectrumPoles or BinParticle2CorrelationPoles, optional
         Binning operator.
+    fields : tuple, list, optional
+        Field identifiers; pass e.g. [0, 0] if two fields sharing the same positions are given as input.
 
     Returns
     -------
     shotnoise : float, list
     """
-    autocorr = len(particles) == 1
+    from cucount.jax import Particles
+    particles = _make_input_tuple(*particles)
+    particles = [convert_particles(particles) if not isinstance(particles, Particles) else particles for particles in particles]
+    particles = _format_meshes(*particles, fields=fields)
 
-    if autocorr:
+    if fields[1] == fields[0]:
         wattrs = bin.wattrs
-        from cucount.jax import Particles
-        particles = [convert_particles(particles[0]) if not isinstance(particles[0], Particles) else particles[0]] * 2
         num_shotnoise = jnp.sum(wattrs(*particles))
-
     else:
         num_shotnoise = 0.
 

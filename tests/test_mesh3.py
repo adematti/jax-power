@@ -71,19 +71,22 @@ def test_fkp3_shotnoise():
     #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
     kw = dict(resampler='tsc', interlacing=2, compensate=True)
 
+    def test_shotnoise(ref):
+        num_shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
+        assert np.allclose([np.mean(sn) for sn in num_shotnoise], ref)
+        num_shotnoise = compute_fkp3_shotnoise([data, data, data], bin=bin, fields=[0, 0, 0], **kw)
+        assert np.allclose([np.mean(sn) for sn in num_shotnoise], ref)
+
     edges = [np.arange(0.01, knyq / 2., 0.01) for knyq in mattrs.knyq]
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='scoccimarro', ells=[0, 2])
-    shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
-    assert np.allclose([np.mean(sn) for sn in shotnoise], [10013.975399104605, -104.97685444849071])
+    test_shotnoise([10013.975399104605, -104.97685444849071])
 
     bin = BinMesh3SpectrumPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0), (2, 0, 2)])
-    shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
-    assert np.allclose([np.mean(sn) for sn in shotnoise], [10139.357378112192, 380.2427505962978])
+    test_shotnoise([10139.357378112192, 380.2427505962978])
 
     edges = [np.arange(0., 100, 20.) for knyq in mattrs.knyq]
     bin = BinMesh3CorrelationPoles(mattrs, edges=edges, basis='sugiyama', ells=[(0, 0, 0), (2, 0, 2)])
-    shotnoise = compute_fkp3_shotnoise(data, bin=bin, **kw)
-    assert np.allclose([np.mean(sn) for sn in shotnoise], [0.0010000712178773513, 3.766614752457692e-07])
+    test_shotnoise([0.0010000712178773513, 3.766614752457692e-07])
 
 
 

@@ -77,8 +77,8 @@ def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fiel
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
         Else, a 3-vector.
-    fields : list of str, optional
-        List of field names (default: [0, 1, 2, ...]).
+    fields : list of int or str, optional
+        List of field identifiers (default: [0, 1, 2, ...]).
     kwargs : dict
         Additional arguments for mesh painting, see :meth:`ParticleField.paint`.
 
@@ -212,7 +212,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
 
 
 def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
-    """
+    r"""
     Compute the covariance matrix for the 2-point power spectrum, given window matrices and poles.
 
     Parameters
@@ -507,7 +507,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
 
 
 def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
-    """
+    r"""
     Compute the covariance matrix for the 2-point power spectrum, given window matrices and poles.
 
     Parameters
