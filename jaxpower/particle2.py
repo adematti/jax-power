@@ -100,7 +100,7 @@ class BinParticle2SpectrumPoles(object):
         sharding_mesh = get_sharding_mesh()
         particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
-        particles = _format_meshes(*particles)
+        particles = _format_meshes(*particles)[0]
 
         def call(*particles):
             #setup_logging('error')
@@ -177,7 +177,7 @@ class BinParticle2CorrelationPoles(object):
         sharding_mesh = get_sharding_mesh()
         particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
-        particles = _format_meshes(*particles)
+        particles = _format_meshes(*particles)[0]
 
         def call(*particles):
             #setup_logging('error')
@@ -231,8 +231,6 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
         Resulting spectrum or correlation function object.
     """
     ells = bin.ells
-    particles = list(particles)
-
     num = bin(*particles, los=los)
 
     if isinstance(bin, BinParticle2CorrelationPoles):
@@ -267,7 +265,7 @@ def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2Spec
     from cucount.jax import Particles
     particles = _make_input_tuple(*particles)
     particles = [convert_particles(particles) if not isinstance(particles, Particles) else particles for particles in particles]
-    particles = _format_meshes(*particles, fields=fields)
+    particles, fields = _format_meshes(*particles, fields=fields)
 
     if fields[1] == fields[0]:
         wattrs = bin.wattrs
