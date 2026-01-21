@@ -31,42 +31,44 @@ def test_mesh2_spectrum(plot=False):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'endpoint']
-    mattrs = MeshAttrs(meshsize=128, boxsize=1000.)
-    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
-    @partial(jax.jit, static_argnames=['los'])
-    def mock(mattrs, bin, seed, los='x'):
-        mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
-        return compute_mesh2_spectrum(mesh, los=los, bin=bin)
+    for meshsize in [128, (128, 124, 122)]:
+        mattrs = MeshAttrs(meshsize=meshsize, boxsize=1000.)
+        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
 
-    for los in list_los:
-
-        nmock = 5
-        t0 = time.time()
-        spectrum = mock(mattrs, bin, random.key(43), los=los)
-        #print(spectrum)
-        jax.block_until_ready(spectrum)
-        print(f'time for jit {time.time() - t0:.2f}')
-        t0 = time.time()
-        for i in range(nmock):
-            spectrum = mock(mattrs, bin, random.key(i + 42), los=los)
-            jax.block_until_ready(spectrum)
-        print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
-        spectrum.write(get_fn(los))
-        # remove first few bins because of binning effects
-        assert np.allclose(spectrum.get(0).value()[2:], pk(spectrum.get(0).coords('k'))[2:], rtol=1e-2)
-        assert tuple(spectrum.ells) == (0, 2, 4)
-
-    if plot:
-        from matplotlib import pyplot as plt
+        @partial(jax.jit, static_argnames=['los'])
+        def mock(mattrs, bin, seed, los='x'):
+            mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
+            return compute_mesh2_spectrum(mesh, los=los, bin=bin)
 
         for los in list_los:
-            power = read(get_fn(los=los))
-            ax = power.plot().axes[0]
-            k = power.get(0).coords('k')
-            ax.plot(k, k * pk(k))
-            ax.set_title(los)
-            plt.show()
+
+            nmock = 5
+            t0 = time.time()
+            spectrum = mock(mattrs, bin, random.key(43), los=los)
+            #print(spectrum)
+            jax.block_until_ready(spectrum)
+            print(f'time for jit {time.time() - t0:.2f}')
+            t0 = time.time()
+            for i in range(nmock):
+                spectrum = mock(mattrs, bin, random.key(i + 42), los=los)
+                jax.block_until_ready(spectrum)
+            print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
+            spectrum.write(get_fn(los))
+            # remove first few bins because of binning effects
+            assert np.allclose(spectrum.get(0).value()[2:], pk(spectrum.get(0).coords('k'))[2:], rtol=1e-2)
+            assert tuple(spectrum.ells) == (0, 2, 4)
+
+        if plot:
+            from matplotlib import pyplot as plt
+
+            for los in list_los:
+                power = read(get_fn(los=los))
+                ax = power.plot().axes[0]
+                k = power.get(0).coords('k')
+                ax.plot(k, k * pk(k))
+                ax.set_title(los)
+                plt.show()
 
 
 def test_fkp2_shotnoise():

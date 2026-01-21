@@ -334,8 +334,8 @@ def fftfreq(shape: tuple, kind: str='separation', sparse: bool | None=None,
         Either 'separation' (i.e. wavenumbers) or 'position'.
     sparse : bool, default=None
         If ``None``, return a tuple of 1D-arrays.
-        If ``False``, return a tuple of broadcastable arrays.
-        If ``True``, return a tuple of broadcastable arrays of same shape.
+        If ``True``, return a tuple of broadcastable arrays.
+        If ``False``, return a tuple of broadcastable arrays of same shape.
     hermitian : bool, default=False
         If ``True``, last axis is of size ``shape[-1] // 2 + 1``.
     spacing : float, default=1.
@@ -1094,8 +1094,8 @@ class MeshAttrs(object):
 
         sparse : bool, default=None
             If ``None``, return a tuple of 1D-arrays.
-            If ``False``, return a tuple of broadcastable arrays.
-            If ``True``, return a tuple of broadcastable arrays of same shape, :attr:`shape`.
+            If ``True``, return a tuple of broadcastable arrays.
+            If ``False``, return a tuple of broadcastable arrays of same shape, :attr:`shape`.
 
         Returns
         -------
@@ -1125,8 +1125,8 @@ class MeshAttrs(object):
 
         sparse : bool, default=None
             If ``None``, return a tuple of 1D-arrays.
-            If ``False``, return a tuple of broadcastable arrays.
-            If ``True``, return a tuple of broadcastable arrays of same shape.
+            If ``True``, return a tuple of broadcastable arrays.
+            If ``False``, return a tuple of broadcastable arrays of same shape.
 
         Returns
         -------
@@ -1173,7 +1173,7 @@ class MeshAttrs(object):
             if self.is_hermitian:
                 shape = shape[:-1] + (shape[-1] // 2 + 1,)
             if self.fft_backend == 'jaxdecomp':
-                shape = tuple(np.roll(shape, shift=len(self.sharding_mesh.axis_names)))
+                shape = tuple(np.roll(shape, shift=2))
         itemsize = jnp.zeros((), dtype=self.dtype).real.dtype.itemsize
         dtype = jnp.dtype('c{:d}'.format(2 * itemsize) if 'complex' in name else 'f{:d}'.format(itemsize))
         if callable(fill):
@@ -1490,8 +1490,8 @@ class RealMeshField(BaseMeshField):
 
         sparse : bool, default=None
             If ``None``, return a tuple of 1D-arrays.
-            If ``False``, return a tuple of broadcastable arrays.
-            If ``True``, return a tuple of broadcastable arrays of same shape, :attr:`shape`.
+            If ``True``, return a tuple of broadcastable arrays.
+            If ``False``, return a tuple of broadcastable arrays of same shape, :attr:`shape`.
 
         Returns
         -------
@@ -1664,8 +1664,8 @@ class ComplexMeshField(BaseMeshField):
 
         sparse : bool, default=None
             If ``None``, return a tuple of 1D-arrays.
-            If ``False``, return a tuple of broadcastable arrays.
-            If ``True``, return a tuple of broadcastable arrays of same shape.
+            If ``True``, return a tuple of broadcastable arrays.
+            If ``False``, return a tuple of broadcastable arrays of same shape.
 
         Returns
         -------
@@ -2211,7 +2211,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
                 kvec = sum(kvec)
                 return value * jnp.exp(shift * 1j * kvec) / interlacing
 
-            carry += paint(positions + shift, weights).r2c().apply(kernel_shift, kind='circular')
+            carry += paint(positions + shift, weights).r2c().apply(kernel_shift, kind='circular', sparse=True)
             return carry, shift
 
         toret = jax.lax.scan(paint_with_interlacing, init=attrs.create(kind='complex', fill=0.), xs=interlacing_shifts)[0]
@@ -2220,6 +2220,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         if kernel_compensate is not None:
             toret = toret.apply(kernel_compensate)
         if out == 'real': toret = toret.c2r()
+
     return toret
 
 

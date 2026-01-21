@@ -155,37 +155,38 @@ def allgather_particles(particles):
 
 def test_sharded_paint_read():
 
-    mattrs = MeshAttrs(boxsize=1000., boxcenter=0., meshsize=64)
-    pattrs = mattrs.clone(boxsize=800.)
+    for meshsize in [64, (128, 64, 32)]:
+        mattrs = MeshAttrs(boxsize=1000., boxcenter=0., meshsize=meshsize)
+        pattrs = mattrs.clone(boxsize=800.)
 
-    def f(data, positions, exchange=False):
-        mesh = data.paint(resampler=resampler, compensate=False, interlacing=0)
-        #print(mesh.std())
-        return mesh.read(positions, resampler=resampler, compensate=False, exchange=exchange)
+        def f(data, positions, exchange=False):
+            mesh = data.paint(resampler=resampler, compensate=False, interlacing=0)
+            #print(mesh.std())
+            return mesh.read(positions, resampler=resampler, compensate=False, exchange=exchange)
 
-    for resampler in ['ngp', 'cic', 'tsc', 'pcs']:
-        with create_sharding_mesh():
-            data = get_random_catalog(pattrs, seed=42).clone(attrs=mattrs).exchange(backend='jax')
-            randoms = get_random_catalog(pattrs, size=12000, seed=43).clone(attrs=mattrs)
-            ref_data = allgather_particles(data)
-            ref_randoms = allgather_particles(randoms)
-            rweights = randoms.weights
-            randoms = randoms.exchange(backend='jax', return_inverse=True)
-            #print(jnp.argmin(diff), diff.min())
-            weights = allgather(randoms.exchange_inverse(f(data, randoms.positions)))
-            #diff = jnp.abs(randoms.exchange_inverse(randoms.weights) - rweights)
-            rweights = allgather(randoms.exchange_inverse(randoms.weights))
+        for resampler in ['ngp', 'cic', 'tsc', 'pcs']:
+            with create_sharding_mesh():
+                data = get_random_catalog(pattrs, seed=42).clone(attrs=mattrs).exchange(backend='jax')
+                randoms = get_random_catalog(pattrs, size=12000, seed=43).clone(attrs=mattrs)
+                ref_data = allgather_particles(data)
+                ref_randoms = allgather_particles(randoms)
+                rweights = randoms.weights
+                randoms = randoms.exchange(backend='jax', return_inverse=True)
+                #print(jnp.argmin(diff), diff.min())
+                weights = allgather(randoms.exchange_inverse(f(data, randoms.positions)))
+                #diff = jnp.abs(randoms.exchange_inverse(randoms.weights) - rweights)
+                rweights = allgather(randoms.exchange_inverse(randoms.weights))
 
-        ref_data = ParticleField(ref_data.positions, ref_data.weights, attrs=mattrs, exchange=False)
-        ref_weights = f(ref_data, ref_randoms.positions)
-        assert np.allclose(ref_randoms.weights, rweights)
-        assert np.allclose(weights, ref_weights)
+            ref_data = ParticleField(ref_data.positions, ref_data.weights, attrs=mattrs, exchange=False)
+            ref_weights = f(ref_data, ref_randoms.positions)
+            assert np.allclose(ref_randoms.weights, rweights)
+            assert np.allclose(weights, ref_weights)
 
 
 def test_paint_jit():
 
     from jaxpower.resamplers import tsc
-    mesh = jnp.zeros((256,) * 3)
+    mesh = jnp.zeros((256, 128, 64))
     positions = random.uniform(random.key(64), shape=(1000000, 3))
     t0 = time.time()
     paint = jax.jit(tsc.paint)
@@ -207,6 +208,7 @@ def test_paint_jit():
     nmock = 10
     for i in range(nmock):
         mesh = positions.paint(resampler='tsc', interlacing=3, compensate=True)
+        assert np.allclose(mesh.std(), 0.6890684579054714)
         jax.block_until_ready(mesh)
     print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
 

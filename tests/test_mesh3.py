@@ -27,40 +27,42 @@ def test_mesh3_spectrum(plot=False):
         return dirname / 'tmp_{}.h5'.format(los)
 
     list_los = ['x', 'local']
-    mattrs = MeshAttrs(meshsize=128, boxsize=1000., fft_backend='jax')
 
-    for basis in ['scoccimarro', 'sugiyama-diagonal']:
+    for meshsize in [128, (128, 124, 122)]:
+        mattrs = MeshAttrs(meshsize=meshsize, boxsize=1000., fft_backend='jax')
 
-        ells = [0, 2] if 'scoccimarro' in basis else [(0, 0, 0), (2, 0, 2)]
-        bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.1}, basis=basis, ells=ells)
+        for basis in ['scoccimarro', 'sugiyama-diagonal']:
 
-        @partial(jax.jit, static_argnames=['los'])
-        def mock(mattrs, bin, seed, los='x'):
-            mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
-            return compute_mesh3_spectrum(mesh, los=los, bin=bin)
+            ells = [0, 2] if 'scoccimarro' in basis else [(0, 0, 0), (2, 0, 2)]
+            bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.1}, basis=basis, ells=ells)
 
-        for los in list_los:
-            nmock = 2
-            t0 = time.time()
-            spectrum = mock(mattrs, bin, random.key(43), los=los)
-            jax.block_until_ready(spectrum)
-            print(f'time for jit {time.time() - t0:.2f}')
-            t0 = time.time()
-            for i in range(nmock):
-                spectrum = mock(mattrs, bin, random.key(i + 42), los=los)
-                jax.block_until_ready(spectrum)
-            print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
-            #for pole in spectrum: pole.basis
-            spectrum.write(get_fn(los))
-
-        if plot:
-            from matplotlib import pyplot as plt
+            @partial(jax.jit, static_argnames=['los'])
+            def mock(mattrs, bin, seed, los='x'):
+                mesh = generate_gaussian_mesh(mattrs, pkvec, seed=seed, unitary_amplitude=True)
+                return compute_mesh3_spectrum(mesh, los=los, bin=bin)
 
             for los in list_los:
-                spectrum = read(get_fn(los=los))
-                ax = spectrum.plot().axes[0]
-                ax.set_title(los)
-                plt.show()
+                nmock = 2
+                t0 = time.time()
+                spectrum = mock(mattrs, bin, random.key(43), los=los)
+                jax.block_until_ready(spectrum)
+                print(f'time for jit {time.time() - t0:.2f}')
+                t0 = time.time()
+                for i in range(nmock):
+                    spectrum = mock(mattrs, bin, random.key(i + 42), los=los)
+                    jax.block_until_ready(spectrum)
+                print(f'time per iteration {(time.time() - t0) / nmock:.2f}')
+                #for pole in spectrum: pole.basis
+                spectrum.write(get_fn(los))
+
+            if plot:
+                from matplotlib import pyplot as plt
+
+                for los in list_los:
+                    spectrum = read(get_fn(los=los))
+                    ax = spectrum.plot().axes[0]
+                    ax.set_title(los)
+                    plt.show()
 
 
 def test_fkp3_shotnoise():
