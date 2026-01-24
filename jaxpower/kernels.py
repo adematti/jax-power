@@ -41,32 +41,6 @@ def gradient(axis: int | tuple | list=0, order: str | None=None):
     return fn
 
 
-def invlaplace(order: str | None=None):
-    """
-    Return the inverse Laplace kernel.
-
-    cf. [Feng+2016](https://arxiv.org/pdf/1603.00476)
-
-    Parameters
-    ----------
-    order : str
-        'finite_difference' for finite difference kernel.
-
-    Returns
-    -------
-    fn : callable
-        Kernel callable to be applied to mesh: ``mesh.apply(fn)``.
-    """
-    def fn(value, kvec):
-        if order == 'finite_difference':
-            kk = sum((ki * jnp.sinc(ki / (2 * jnp.pi)))**2 for ki in kvec)
-        else:
-            kk = sum(ki**2 for ki in kvec)
-        return jnp.where(kk == 0, 0, - value / kk)
-    fn.kind = 'circular'
-    return fn
-
-
 def gaussian(radius: float=0.):
     r"""
     Return Gaussian smoothing kernel, :math:`e^{-(k * r)^2 / 2}`.

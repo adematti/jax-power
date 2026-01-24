@@ -429,8 +429,10 @@ def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
 def make_array_from_global_data(array, sharding_mesh: jax.sharding.Mesh=None):
     """Create a sharded array from global data."""
     shape = array.shape
-    sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
-    return jax.make_array_from_callback(shape, sharding, lambda index: array[index])
+    if sharding_mesh.axis_names:
+        sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+        return jax.make_array_from_callback(shape, sharding, lambda index: array[index])
+    return jnp.asarray(array)
 
 
 def _get_pad_constant(constant_values):
@@ -904,26 +906,27 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     return positions, exchange
 
 
-def _get_distributed_backend(array, backend='auto', **kwargs):
+def _get_mpicomm():
+    mpicomm = None
+    try: from mpi4py import MPI
+    except: MPI = None
+    if MPI is not None:
+        mpicomm = MPI.COMM_WORLD
+    return mpicomm
 
-    def get_mpicomm():
-        mpicomm = None
-        try: from mpi4py import MPI
-        except: MPI = None
-        if MPI is not None:
-            mpicomm = MPI.COMM_WORLD
-        return mpicomm
+
+def _get_distributed_backend(array, backend='auto', **kwargs):
 
     if backend == 'auto' and isinstance(array, np.ndarray):
         if jax.distributed.is_initialized():
-            mpicomm = get_mpicomm()
+            mpicomm = _get_mpicomm()
             if mpicomm is not None and mpicomm.size == len(jax.devices()):
                 backend = 'mpi'
                 kwargs.setdefault('mpicomm', mpicomm)
     if backend == 'auto':
         backend = 'jax'
     if backend == 'mpi':
-        kwargs.setdefault('mpicomm', get_mpicomm())
+        kwargs.setdefault('mpicomm', _get_mpicomm())
     return backend, kwargs
 
 
@@ -1038,6 +1041,17 @@ class MeshAttrs(object):
     def is_hermitian(self):
         """Whether mesh Fourier modes have Hermitian symmetry. Not available (yet) for jaxdecomp FFTs."""
         return self.fft_backend != 'jaxdecomp' and self.is_real
+
+    def __getstate__(self):
+        state = asdict(self)
+        for name in ['meshsize', 'boxsize', 'boxcenter']:
+            state[name] = tuple(np.array(state[name]).tolist())
+        state['dtype'] = state['dtype'].str
+        return state
+
+    @classmethod
+    def from_state(cls, state):
+        return cls(**state)
 
     def tree_flatten(self):
         state = asdict(self)
@@ -1230,6 +1244,32 @@ class MeshAttrs(object):
         return value
 
 
+def _reconstruct_local_block(array: jax.Array):
+    shards = array.addressable_shards
+    assert len(shards) > 0
+    # Each index is a tuple of slices
+    indices = [shard.index for shard in shards]
+    # Compute bounding box in global coordinates
+    ndim = len(indices[0])
+    starts = [min(idx[d].start for idx in indices) for d in range(ndim)]
+    stops  = [max(idx[d].stop  for idx in indices) for d in range(ndim)]
+    global_shape = tuple(stops[d] - starts[d] for d in range(ndim))
+
+    # Allocate local array (on host)
+    out = None
+    # Fill it
+    for shard in shards:
+        idx = shard.index
+        # Compute local coordinates
+        local_slices = tuple(slice(idx[d].start - starts[d], idx[d].stop - starts[d]) for d in range(ndim))
+        local_data = np.array(shard.data)
+        if out is None:
+            out = np.empty(global_shape, dtype=local_data.dtype)
+        out[local_slices] = local_data
+
+    return out, tuple(slice(starts[d], stops[d]) for d in range(ndim))
+
+
 # Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
 @jax.tree_util.register_pytree_node_class
 @dataclass(init=False, frozen=True)
@@ -1291,19 +1331,79 @@ class BaseMeshField(object):
         # for numpy
         return np.array(self.value)
 
-    def save(self, fn):
+    def save(self, fn, mpicomm=None, **kwargs):
         """Save mesh to file."""
         fn = str(fn)
         utils.mkdir(os.path.dirname(fn))
-        np.savez(fn, **{name: getattr(self, name) for name in ['value', 'attrs']})
+        state = {name: getattr(self, name) for name in ['value', 'attrs']}
+        state['attrs'] = state['attrs'].__getstate__()
+        if fn.endswith('.npz'):
+            state['value'] = np.asarray(jax.device_get(state['value']))
+            np.savez(fn, **state)
+        elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
+            group = 'value'
+            import h5py
+            if h5py.get_config().mpi:
+                if mpicomm is None:
+                    mpicomm = _get_mpicomm()
+                with h5py.File(fn, 'w', driver='mpio', comm=mpicomm, **kwargs) as file:
+                    dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
+                    # Each rank writes its slab
+                    for shard in state['value'].addressable_shards:
+                        index = shard.index
+                        dset[tuple(slice(idx.start, idx.stop) for idx in index)] = np.asarray(shard.data)
+                    dset.attrs.update(state['attrs'])
+            else:
+                state['value'] = np.asarray(jax.device_get(state['value']))
+                with h5py.File(fn, 'w', **kwargs) as file:
+                    dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
+                    dset[...] = state['value']
+                    dset.attrs.update(state['attrs'])
+        else:
+            raise ValueError('extension not known')
 
     @classmethod
-    def load(cls, fn):
+    @default_sharding_mesh
+    def load(cls, fn, sharding_mesh=None, **kwargs):
         """Load mesh from file."""
         fn = str(fn)
-        state = dict(np.load(fn, allow_pickle=True))
         new = cls.__new__(cls)
-        state['attrs'] = state['attrs'][()]
+        state = {}
+        if fn.endswith('.npz'):
+            state = dict(np.load(fn, allow_pickle=True))
+            state['attrs'] = MeshAttrs.from_state(state['attrs'][()])
+            state['value'] = make_array_from_global_data(state['value'], sharding_mesh=sharding_mesh)
+            new.__dict__.update(**state)
+        elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
+            group = 'value'
+            import h5py
+            with h5py.File(fn, 'r', **kwargs) as file:
+                dset = file[group]
+                state['attrs'] = dict(dset.attrs)
+                shape = dset.shape
+
+            mattrs = state['attrs'] = MeshAttrs.from_state(state['attrs'])
+            sharding_mesh = mattrs.sharding_mesh
+            sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+
+            def callback(index):
+                kw = {}
+                if h5py.get_config().mpi:
+                    if mpicomm is None:
+                        mpicomm = _get_mpicomm()
+                    kw.update(driver='mpio', comm=mpicomm)
+
+                with h5py.File(fn, 'r', **kw, **kwargs) as file:
+                    dset = file['value']
+                    return np.asarray(dset[index])
+
+            if sharding_mesh.axis_names:
+                state['value'] = jax.make_array_from_callback(shape, sharding, callback)
+            else:
+                state['value'] = callback(Ellipsis)
+        else:
+            raise ValueError('extension not known')
+
         new.__dict__.update(**state)
         return new
 
@@ -2171,8 +2271,6 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
             return positions - shard_shifts[idevice[0]]
 
         positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
-
-        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))  # check_rep=False otherwise error in jvp
 
     def paint(positions, weights=None):
         mesh = attrs.create(kind='real', fill=0.)

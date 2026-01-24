@@ -77,11 +77,11 @@ def test_base_mesh():
     mesh = mesh.at[1, 2].set(100.)
     assert isinstance(mesh, BaseMeshField) and np.allclose(mesh[1, 2], 100)
 
-    fn = dirname / 'mesh.npz'
-    mesh.save(fn)
-    mesh2 = RealMeshField.load(fn)
-    mesh2.attrs.boxsize
-    assert np.allclose(mesh2.value, mesh.value)
+    for fn in [dirname / 'mesh.npz', dirname / 'mesh.h5']:
+        mesh.save(fn)
+        mesh2 = RealMeshField.load(fn)
+        mesh2.attrs.boxsize
+        assert np.allclose(mesh2.value, mesh.value)
 
     mesh2.r2c().apply(kernels.gaussian(radius=10.))
 

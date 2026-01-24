@@ -12,7 +12,7 @@ from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       BinMesh2CorrelationPoles, compute_mesh2_correlation,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
                       MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
-                      compute_fkp2_normalization, compute_fkp2_shotnoise, compute_normalization,
+                      compute_fkp2_normalization, compute_fkp2_shotnoise, compute_normalization, create_sharding_mesh, get_mesh_attrs,
                       Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils, create_sharded_random)
 
 
@@ -819,140 +819,33 @@ def test_sympy():
         point(ell)
 
 
-def test_mem():
 
-    from jaxpower import MeshAttrs, create_sharded_random, create_sharding_mesh
-    with create_sharding_mesh() as sharding_mesh:
-        mattrs = MeshAttrs(meshsize=1600, boxsize=1000.)
-        #mattrs = MeshAttrs(meshsize=850, boxsize=1000.)
-        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.001}, ells=(0, 2, 4))
-        mesh = mattrs.create(kind='real', fill=create_sharded_random(jax.random.normal, jax.random.key(42), shape=mattrs.meshsize))
-        compute = partial(compute_mesh2_spectrum, bin=bin, los='firstpoint')
-        compute = jax.jit(compute)
-        t0 = time.time()
-        mesh_power = compute(mesh)
-        jax.block_until_ready(mesh_power)
-        print(time.time() - t0)
+def test_sharded_spectrum():
+    size = int(1e5)
+    pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
+    mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=2000., boxcenter=1500.)
 
-
-def test_split():
-    from pathlib import Path
-
-    import numpy as np
-    from jax import numpy as jnp
-    from jax import random
-    from matplotlib import pyplot as plt
-
-    from cosmoprimo.fiducial import DESI
-    from jaxpower import (compute_mesh2_spectrum, Mesh2SpectrumPoles, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField,
-                          WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_fkp2_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random)
-
-    mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1000., boxcenter=1200.)
-    size = int(1e-4 * mattrs.boxsize.prod())
-    data = generate_uniform_particles(mattrs, size + 1, seed=42)
-    randoms = generate_uniform_particles(mattrs, 4 * size + 1, seed=43)
-
-    cosmo = DESI()
-    pk = cosmo.get_fourier().pk_interpolator().to_1d(z=1.)
-
-    f, b = 0.8, 1.5
-    beta = f / b
-    edgesin = np.linspace(0.001, 0.7, 100)
-    edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
-    kin = np.mean(edgesin, axis=-1)
-    ellsin = (0, 2, 4)
-    theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk,
-                        (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
-                        8. / 35 * beta ** 2 * pk]
-
-    poles = []
-    for ell, value in zip(ellsin, theory):
-        poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, ell=ell))
-    theory = Mesh2SpectrumPoles(poles)
-
-    mesh = generate_anisotropic_gaussian_mesh(mattrs, theory, seed=random.key(42), los='local', unitary_amplitude=True)
-    data = data.clone(weights=1. + mesh.read(data.positions))
-
-    fkp = FKPField(data, randoms, attrs=mattrs.clone(boxsize=2. * mattrs.boxsize))  # x2 padding
-    from jaxpower.mesh import _paint
-    for split_fkp in fkp.split(nsplits=2):
-        t0 = time.time()
-        mesh = split_fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
-        jax.block_until_ready(mesh)
-        print(f'cache {_paint._cache_size()} {time.time() - t0:.2f}')
-
-
-def test_sharding():
-
-    # Initialize JAX distributed environment
-    #jax.distributed.initialize()
-
-    # Let's simulate distributed calculation
-        # Let's create some mesh mock!
-    import jax
-    from jax import numpy as jnp
-    from jaxpower import MeshAttrs, Mesh2SpectrumPoles, generate_anisotropic_gaussian_mesh
-
-    meshsize = 64
-
-
-    def get_theory(kmax=0.3, dk=0.001):
-        # Return theory power spectrum
-        from cosmoprimo.fiducial import DESI
-        cosmo = DESI(engine='eisenstein_hu')
-        z = 1.
-        pk1d = cosmo.get_fourier().pk_interpolator().to_1d(z=z)
-        ellsin = (0, 2, 4)
-        edgesin = jnp.arange(0., kmax, dk)
-        edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
-        kin = np.mean(edgesin, axis=-1)
-        f, b = cosmo.growth_rate(z), 1.5
-        beta = f / b
-        shotnoise = (1e-3)**(-1)
-        pk = pk1d(kin)
-        theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
-                    (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
-                    8. / 35 * beta ** 2 * pk]
-
-        poles = []
-        for ell, value in zip(ellsin, theory):
-            poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, num_shotnoise=shotnoise * np.ones_like(kin) * (ell == 0), ell=ell))
-        return Mesh2SpectrumPoles(poles)
-
-    attrs = MeshAttrs(boxsize=1000., meshsize=meshsize)
-    poles = get_theory(4 * attrs.knyq.max())
-
-    from jaxpower import create_sharding_mesh, exchange_particles, ParticleField, compute_fkp2_shotnoise, compute_mesh2, get_mesh_attrs
-
-    with create_sharding_mesh() as sharding_mesh:  # specify how to spatially distribute particles / mesh
-        print('Sharding mesh {}.'.format(sharding_mesh))
-        # Generate a Gaussian mock --- everything is already distributed
-        attrs = MeshAttrs(boxsize=1000., meshsize=meshsize, boxcenter=700.)
-        pattrs = attrs.clone(boxsize=800.)
-        size = int(1e6)
-        data = generate_uniform_particles(pattrs, size, seed=42)
-        mmesh = generate_anisotropic_gaussian_mesh(attrs, poles, los='local', seed=68, order=1, unitary_amplitude=True)
-        pattrs = attrs.clone(boxsize=800.)
-        size = int(1e6)
-        data = generate_uniform_particles(pattrs, size, seed=42)
-        data = data.clone(weights=1. + mmesh.read(data.positions, resampler='cic', compensate=True))
-        randoms = generate_uniform_particles(pattrs, 2 * size, seed=43)
-        # Now, pick MeshAttrs
-        attrs = get_mesh_attrs(data.positions, randoms.positions, boxpad=2., meshsize=128)
-        # Create ParticleField, exchanging particles
-        data = ParticleField(data.positions, attrs=attrs, exchange=True)  # or data.clone(exchange=True)
-        randoms = ParticleField(randoms.positions, attrs=attrs, exchange=True)
-        # Now data and randoms are exchanged given MeshAttrs attrs, we can proceed as normal
-        fkp = FKPField(data, randoms, attrs=attrs)
-        norm, num_shotnoise = compute_fkp2_normalization(fkp), compute_fkp2_shotnoise(fkp)
+    def compute_spectrum():
+        data = generate_uniform_particles(pattrs, size, seed=(42, 'index'))
+        randoms = generate_uniform_particles(pattrs, size, seed=(84, 'index'))
+        data = ParticleField(data.positions, attrs=mattrs, exchange=True)
+        randoms = ParticleField(randoms.positions, attrs=mattrs, exchange=True)
+        fkp = FKPField(data, randoms)
+        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
+        norm, num_shotnoise = compute_fkp2_normalization(fkp, bin=bin), compute_fkp2_shotnoise(fkp, bin=bin)
         mesh = fkp.paint(resampler='tsc', interlacing=3, compensate=True, out='real')
         del fkp
-        bin = BinMesh2SpectrumPoles(attrs, edges={'step': 0.01}, ells=(0, 2, 4))
-        pk = compute_mesh2(mesh, bin=bin, los='firstpoint')
-        pk = pk.clone(norm=norm, num_shotnoise=num_shotnoise)
+        spectrum = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
+        return spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
 
-    # Close JAX distributed environment
-    #jax.distributed.shutdown()
+    import os
+    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=1"
+    ref = compute_spectrum()
+    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
+    with create_sharding_mesh() as sharding_mesh:
+        test = compute_spectrum()
+        assert np.allclose(test.value(), ref.value())
+    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=1"
 
 
 def test_pypower():
@@ -1036,6 +929,9 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+
+    test_sharded_spectrum()
+    exit()
 
     test_mesh2_spectrum(plot=False)
     test_fkp2_shotnoise()
