@@ -96,8 +96,7 @@ class BinParticle2SpectrumPoles(object):
         spectrum : ndarray
             Power spectrum multipoles for each bin.
         """
-        from cucount.jax import Particles, count2, BinAttrs, setup_logging
-        sharding_mesh = get_sharding_mesh()
+        from cucount.jax import Particles, count2, BinAttrs
         particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
         particles = _format_meshes(*particles)[0]
@@ -173,8 +172,7 @@ class BinParticle2CorrelationPoles(object):
         correlation : ndarray
             Correlation function multipoles for each bin.
         """
-        from cucount.jax import Particles, count2, BinAttrs, setup_logging
-        sharding_mesh = get_sharding_mesh()
+        from cucount.jax import Particles, count2, BinAttrs
         particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
         particles = _format_meshes(*particles)[0]

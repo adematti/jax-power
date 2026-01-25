@@ -2765,7 +2765,7 @@ def split_particles(*particles, seed=0, fields: tuple=None):
     particles : list of particles
         Disjoint samples of particles.
     """
-    particles, fields = __format_meshes(particles, fields=fields, nmeshes=None)
+    particles, fields = __format_meshes(*particles, fields=fields, nmeshes=None)
     unique_fields = []
     for field in fields:
         if field not in unique_fields:
