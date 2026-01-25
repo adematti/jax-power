@@ -821,14 +821,40 @@ def test_sympy():
 
 
 def test_sharded_spectrum():
-    size = int(1e5)
-    pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
-    mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=2000., boxcenter=1500.)
+
+    def get_theory(kmax=0.3, dk=0.005):
+        # Return theory power spectrum
+        from cosmoprimo.fiducial import DESI
+        cosmo = DESI(engine='eisenstein_hu')
+        z = 1.
+        pk1d = cosmo.get_fourier().pk_interpolator().to_1d(z=z)
+        ellsin = (0, 2, 4)
+        edgesin = jnp.arange(0., kmax, dk)
+        edgesin = jnp.column_stack([edgesin[:-1], edgesin[1:]])
+        kin = np.mean(edgesin, axis=-1)
+        f, b = cosmo.growth_rate(z), 1.5
+        beta = f / b
+        shotnoise = (1e-3)**(-1)
+        pk = pk1d(kin)
+        theory = [(1. + 2. / 3. * beta + 1. / 5. * beta ** 2) * pk + shotnoise,
+                    (4. / 3. * beta + 4. / 7. * beta ** 2) * pk,
+                    8. / 35 * beta ** 2 * pk]
+
+        poles = []
+        for ell, value in zip(ellsin, theory):
+            poles.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=value, num_shotnoise=shotnoise * np.ones_like(kin) * (ell == 0), ell=ell))
+        return Mesh2SpectrumPoles(poles)
 
     def compute_spectrum():
+        theory = get_theory()
+        mesh = generate_anisotropic_gaussian_mesh(mattrs, poles=theory, los='z', seed=(43, 'index'), unitary_amplitude=True)
+        #fill = jnp.sin(sum(xx**2 for xx in mattrs.xcoords(kind='position')))
+        #mesh = mattrs.create(kind='real', fill=fill)
+        print(mesh.std())
         data = generate_uniform_particles(pattrs, size, seed=(42, 'index'))
         randoms = generate_uniform_particles(pattrs, size, seed=(84, 'index'))
         data = ParticleField(data.positions, attrs=mattrs, exchange=True)
+        data = data.clone(weights=(1. + mesh.read(data.positions, resampler='cic', compensate=False, exchange=False)) * data.weights)
         randoms = ParticleField(randoms.positions, attrs=mattrs, exchange=True)
         fkp = FKPField(data, randoms)
         bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 0.01}, ells=(0, 2, 4))
@@ -839,13 +865,18 @@ def test_sharded_spectrum():
         return spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
 
     import os
-    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=1"
-    ref = compute_spectrum()
     os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
+    size = int(1e5)
+    pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
+    mattrs = MeshAttrs(meshsize=(64,) * 3, boxsize=2000., boxcenter=1500.)
+    ref_fn = dirname / 'ref_spectrum2.h5'
+
     with create_sharding_mesh() as sharding_mesh:
+        print(sharding_mesh)
         test = compute_spectrum()
-        assert np.allclose(test.value(), ref.value())
-    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=1"
+        test.write(ref_fn)
+        print(test.value())
+        assert np.allclose(test.value(), read(ref_fn).value())
 
 
 def test_pypower():

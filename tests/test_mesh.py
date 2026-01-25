@@ -161,11 +161,11 @@ def test_sharded_paint_read():
 
         def f(data, positions, exchange=False):
             mesh = data.paint(resampler=resampler, compensate=False, interlacing=0)
-            #print(mesh.std())
             return mesh.read(positions, resampler=resampler, compensate=False, exchange=exchange)
 
         for resampler in ['ngp', 'cic', 'tsc', 'pcs']:
-            with create_sharding_mesh():
+            with create_sharding_mesh() as sharding_mesh:
+                print(sharding_mesh)
                 data = get_random_catalog(pattrs, seed=42).clone(attrs=mattrs).exchange(backend='jax')
                 randoms = get_random_catalog(pattrs, size=12000, seed=43).clone(attrs=mattrs)
                 ref_data = allgather_particles(data)
@@ -266,6 +266,7 @@ def test_sharded_normalization():
     size = int(1e5)
 
     with create_sharding_mesh() as sharding_mesh:
+        print(sharding_mesh)
         pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
         data = generate_uniform_particles(pattrs, size, seed=(42, 'index'))
         randoms = generate_uniform_particles(pattrs, size, seed=(84, 'index'))
@@ -287,6 +288,7 @@ def test_sharded_random():
 
     size = int(100)
     with create_sharding_mesh() as sharding_mesh:
+        print(sharding_mesh)
         result = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=(size,), out_specs=P(sharding_mesh.axis_names))
         assert np.allclose(result.sum(), -6.613044420294692)
         assert np.allclose(result.std(), 0.9735605177416136)
@@ -301,6 +303,12 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+
+    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
+    test_sharded_random()
+    test_sharded_paint_read()
+    test_sharded_normalization()
+    exit()
 
     test_real_mesh()
     test_base_mesh()

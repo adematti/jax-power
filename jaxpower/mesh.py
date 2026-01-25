@@ -286,8 +286,19 @@ def create_sharded_random(func, seed, shape=(), out_specs=None, sharding_mesh=No
         out_specs = P(*sharding_mesh.axis_names)
     key, ids = _process_seed(seed)
     if isinstance(ids, str) and ids == 'index':
-        ids = create_sharded_array(lambda start, shape: start * np.prod(shape) + jnp.arange(np.prod(shape)).reshape(shape), jnp.arange(sharding_mesh.devices.size), shape=shape,
-                                    in_specs=out_specs, out_specs=out_specs)
+        #starts = jnp.arange(sharding_mesh.devices.size).reshape(out_specs.shape)
+        #ids = create_sharded_array(lambda start, shape: start * np.prod(shape) + jnp.arange(np.prod(shape)).reshape(shape), starts, shape=shape,
+        #                            in_specs=out_specs, out_specs=out_specs)
+        def callback(index):
+            indices = []
+            for axis, idx in enumerate(index):
+                start, stop = idx.start, idx.stop
+                if start is None:
+                    start, stop = 0, shape[axis]
+                indices.append(np.arange(start, stop))
+            return jnp.ravel_multi_index(np.meshgrid(*indices, indexing='ij'), dims=shape)
+
+        ids = jax.make_array_from_callback(shape, jax.sharding.NamedSharding(sharding_mesh, out_specs), callback)
     if ids is None:
         assert key is not None, 'provide random key for random generation'
     return _create_sharded_random(func, key=key, ids=ids, shape=shape, out_specs=out_specs, sharding_mesh=sharding_mesh)
@@ -702,6 +713,24 @@ def _exchange_inverse_jax(array, indices):
 
 
 @default_sharding_mesh
+def _get_device_origin(shape, sharding_mesh=None):
+    sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
+    mapping = sharding.devices_indices_map(shape)
+    ordered_devices = list(sharding_mesh.devices.flat)
+    # Extract device origins from mapping
+    return np.array([tuple(s.start if s.start is not None else 0 for s in mapping[d]) for d in ordered_devices])
+
+
+@default_sharding_mesh
+def _check_device_layout(shape, sharding_mesh=None):
+    device_origins = _get_device_origin(shape, sharding_mesh=sharding_mesh)
+    shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (len(shape) - sharding_mesh.devices.ndim))
+    expected_tile_indices = device_origins // (np.array(shape) // shape_devices)
+    unraveled = np.stack(np.unravel_index(np.arange(len(device_origins)), shape_devices), axis=-1)
+    assert np.all(expected_tile_indices == unraveled), 'device layout is not as expected: file a github issue!'
+
+
+@default_sharding_mesh
 def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None):
 
     if not len(sharding_mesh.axis_names):
@@ -716,9 +745,9 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
             return positions, exchange, inverse
         return positions, exchange
 
+    _check_device_layout(attrs.meshsize, sharding_mesh=sharding_mesh)
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     #size_devices = shape_devices.prod(dtype='i4')
-
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
 
@@ -869,6 +898,7 @@ def _exchange_inverse_mpi(array, indices, mpicomm=None):
 @default_sharding_mesh
 def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None, return_type='nparray', mpicomm=None):
 
+    _check_device_layout(attrs.meshsize, sharding_mesh=sharding_mesh)
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
     idx_out_devices = np.ravel_multi_index(tuple(np.floor(idx_out_devices).astype('i4').T), tuple(shape_devices))
@@ -906,7 +936,7 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     return positions, exchange
 
 
-def _get_mpicomm():
+def _get_default_mpicomm():
     mpicomm = None
     try: from mpi4py import MPI
     except: MPI = None
@@ -919,14 +949,14 @@ def _get_distributed_backend(array, backend='auto', **kwargs):
 
     if backend == 'auto' and isinstance(array, np.ndarray):
         if jax.distributed.is_initialized():
-            mpicomm = _get_mpicomm()
+            mpicomm = _get_default_mpicomm()
             if mpicomm is not None and mpicomm.size == len(jax.devices()):
                 backend = 'mpi'
                 kwargs.setdefault('mpicomm', mpicomm)
     if backend == 'auto':
         backend = 'jax'
     if backend == 'mpi':
-        kwargs.setdefault('mpicomm', _get_mpicomm())
+        kwargs.setdefault('mpicomm', _get_default_mpicomm())
     return backend, kwargs
 
 
@@ -1345,13 +1375,12 @@ class BaseMeshField(object):
             import h5py
             if h5py.get_config().mpi:
                 if mpicomm is None:
-                    mpicomm = _get_mpicomm()
+                    mpicomm = _get_default_mpicomm()
                 with h5py.File(fn, 'w', driver='mpio', comm=mpicomm, **kwargs) as file:
                     dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
                     # Each rank writes its slab
                     for shard in state['value'].addressable_shards:
-                        index = shard.index
-                        dset[tuple(slice(idx.start, idx.stop) for idx in index)] = np.asarray(shard.data)
+                        dset[shard.index] = np.asarray(shard.data)
                     dset.attrs.update(state['attrs'])
             else:
                 state['value'] = np.asarray(jax.device_get(state['value']))
@@ -1390,7 +1419,7 @@ class BaseMeshField(object):
                 kw = {}
                 if h5py.get_config().mpi:
                     if mpicomm is None:
-                        mpicomm = _get_mpicomm()
+                        mpicomm = _get_default_mpicomm()
                     kw.update(driver='mpio', comm=mpicomm)
 
                 with h5py.File(fn, 'r', **kw, **kwargs) as file:
@@ -1704,18 +1733,12 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
     #ishifts = np.array(list(product(ishifts, ishifts, ishifts)), dtype=int)
 
     if with_sharding:
-        shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
-        size_devices = shape_devices.prod(dtype='i4')
-        shard_shifts = jnp.meshgrid(*[np.arange(s) * attrs.meshsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
-        shard_shifts = jnp.stack(shard_shifts, axis=-1).reshape(-1, len(shard_shifts))
+        shard_shifts = jnp.array(_get_device_origin(attrs.meshsize, sharding_mesh=sharding_mesh))
 
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
 
-        #idx = jnp.round(positions[12]).astype(int)
-        #print('1', positions[12], idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
-        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
-        #print('2', positions[12])
+        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(sharding_mesh.devices.size))
 
         kw_sharding = dict(halo_size=halo_add + resampler.order, sharding_mesh=sharding_mesh)
         value, offset = pad_halo(value, **kw_sharding, factor=1)
@@ -2262,15 +2285,14 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
 
     _paint = resampler.paint
     if with_sharding:
-        shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
-        size_devices = shape_devices.prod(dtype='i4')
-        shard_shifts = jnp.meshgrid(*[np.arange(s) * attrs.meshsize[i] / s for i, s in enumerate(shape_devices)], indexing='ij', sparse=False)
-        shard_shifts = jnp.stack(shard_shifts, axis=-1).reshape(-1, len(shard_shifts))
+        shard_shifts = jnp.array(_get_device_origin(attrs.meshsize, sharding_mesh=sharding_mesh))
 
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
 
-        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(size_devices))
+        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(sharding_mesh.devices.size))
+
+        _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))  # check_rep=False otherwise error in jvp
 
     def paint(positions, weights=None):
         mesh = attrs.create(kind='real', fill=0.)
@@ -2529,15 +2551,6 @@ class FKPField(object):
     def attrs(self):
         """Mesh attributes."""
         return self.data.attrs
-
-    def split(self, nsplits=1, extent=None):
-        """Split particles into subregions."""
-        from .mesh import _get_extent
-        if extent is None:
-            extent = _get_extent(self.data.positions, self.randoms.positions)
-        for data, randoms in zip(self.data.split(nsplits=nsplits, extent=extent), self.randoms.split(nsplits=nsplits, extent=extent)):
-            new = self.clone(data=data, randoms=randoms)
-            yield new
 
     @property
     def particles(self):
