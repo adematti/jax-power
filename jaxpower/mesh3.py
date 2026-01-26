@@ -1260,7 +1260,7 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: boo
     return ellw
 
 
-def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None, flags: tuple=None) -> WindowMatrix:
+def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None, flags: tuple=None, batch_size: int=None) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 
@@ -1274,6 +1274,8 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         Input multipole orders. Optional when ``edgesin`` is provided.
     bin : BinMesh2SpectrumPoles
         Output binning.
+    batch_size : int, optional
+        Size of the batch for each step to execute in parallel.
 
     Returns
     -------
@@ -1403,7 +1405,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                         spectrum *= compute_I(ell2, kout.T) * (-1)**ell2 / compute_I(0, kout.T)
                         return spectrum
 
-                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
+                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
                 wmat_tmp[ellin, wain].append(tmp)
 
@@ -1428,7 +1430,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                 if wcoeffs:
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, minfolds=0)
-                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
+                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
                 sym_ell1 = tuple(ellin[1::-1]) + ellin[2:]
                 # Takes care of symmetry
@@ -1437,7 +1439,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     if wcoeffs:
                         Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                         to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sym_ell1, minfolds=0)
-                        tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
+                        tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
                 wmat_tmp[ellin, wain].append(tmp)
 
