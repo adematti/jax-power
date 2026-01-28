@@ -12,7 +12,7 @@ from .utils import get_legendre, get_Ylm
 from .types import ObservableTree
 
 
-def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable, seed: int=42,
+def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable=lambda kvec: 1., seed: int=42,
                            unitary_amplitude: bool=False):
 
     r"""

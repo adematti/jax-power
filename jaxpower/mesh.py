@@ -298,7 +298,10 @@ def create_sharded_random(func, seed, shape=(), out_specs=None, sharding_mesh=No
                 indices.append(np.arange(start, stop))
             return jnp.ravel_multi_index(np.meshgrid(*indices, indexing='ij'), dims=shape)
 
-        ids = jax.make_array_from_callback(shape, jax.sharding.NamedSharding(sharding_mesh, out_specs), callback)
+        if sharding_mesh.axis_names:
+            ids = jax.make_array_from_callback(shape, jax.sharding.NamedSharding(sharding_mesh, out_specs), callback)
+        else:
+            ids = callback([slice(None)] * len(shape))
     if ids is None:
         assert key is not None, 'provide random key for random generation'
     return _create_sharded_random(func, key=key, ids=ids, shape=shape, out_specs=out_specs, sharding_mesh=sharding_mesh)
@@ -1147,12 +1150,14 @@ class MeshAttrs(object):
         """
         offset = None
         spacing = self.cellsize
+        dtype = self.rdtype
         if kind == 'position':
             offset = self.boxcenter - self.boxsize / 2.
         if kind == 'index':
             spacing = 1
             kind = 'position'
-        toret = fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=False, spacing=spacing, sharding_mesh=self.sharding_mesh, dtype=self.rdtype)
+            dtype = jnp.int32
+        toret = fftfreq(self.meshsize, kind=kind, sparse=sparse, hermitian=False, spacing=spacing, sharding_mesh=self.sharding_mesh, dtype=dtype)
         if offset is not None:
             toret = tuple(tmp + off for off, tmp in zip(offset, toret))
         return toret
@@ -1411,9 +1416,8 @@ class BaseMeshField(object):
                 state['attrs'] = dict(dset.attrs)
                 shape = dset.shape
 
-            mattrs = state['attrs'] = MeshAttrs.from_state(state['attrs'])
-            sharding_mesh = mattrs.sharding_mesh
-            sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+            state['attrs'] = MeshAttrs.from_state(state['attrs'])
+            sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
 
             def callback(index):
                 kw = {}

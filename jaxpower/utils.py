@@ -675,4 +675,4 @@ def estimate_memory(fun, *args, **kwargs):
     compiled = lowered.compile()
     memory_analysis = compiled.memory_analysis()
     print(f"{memory_analysis}")
-    print(f"Estimated memory cost: {(memory_analysis.output_size_in_bytes + memory_analysis.temp_size_in_bytes) / 1024 ** 2:.2f} MB")
+    print(f"Estimated memory cost: {(memory_analysis.temp_size_in_bytes + memory_analysis.argument_size_in_bytes + memory_analysis.output_size_in_bytes - memory_analysis.alias_size_in_bytes) / 1024 ** 2:.2f} MB")

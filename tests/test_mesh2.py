@@ -961,9 +961,6 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_sharded_spectrum()
-    exit()
-
     test_mesh2_spectrum(plot=False)
     test_fkp2_shotnoise()
     test_mesh2_correlation(plot=False)
@@ -972,4 +969,5 @@ if __name__ == '__main__':
     test_window_box(plot=False)
     test_window(plot=False)
     test_smooth_window(plot=False)
+    #test_sharded_spectrum()
     test_pypower()

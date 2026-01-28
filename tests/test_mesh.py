@@ -304,12 +304,6 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
-    test_sharded_random()
-    test_sharded_paint_read()
-    test_sharded_normalization()
-    exit()
-
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
