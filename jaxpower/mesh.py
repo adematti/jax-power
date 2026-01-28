@@ -1372,8 +1372,16 @@ class BaseMeshField(object):
         utils.mkdir(os.path.dirname(fn))
         state = {name: getattr(self, name) for name in ['value', 'attrs']}
         state['attrs'] = state['attrs'].__getstate__()
+
+        sharding_mesh = self.attrs.sharding_mesh
+
+        def get(value):
+            if sharding_mesh.axis_names:
+                return  jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding_mesh, spec=P(None)))(value).addressable_data(0)
+            return value.addressable_data(0)
+
         if fn.endswith('.npz'):
-            state['value'] = np.asarray(jax.device_get(state['value']))
+            state['value'] = np.asarray(get(state['value']))
             np.savez(fn, **state)
         elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
             group = 'value'
@@ -1388,11 +1396,12 @@ class BaseMeshField(object):
                         dset[shard.index] = np.asarray(shard.data)
                     dset.attrs.update(state['attrs'])
             else:
-                state['value'] = np.asarray(jax.device_get(state['value']))
-                with h5py.File(fn, 'w', **kwargs) as file:
-                    dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
-                    dset[...] = state['value']
-                    dset.attrs.update(state['attrs'])
+                state['value'] = np.asarray(get(state['value']))
+                if jax.process_index() == 0:
+                    with h5py.File(fn, 'w', **kwargs) as file:
+                        dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
+                        dset[...] = state['value']
+                        dset.attrs.update(state['attrs'])
         else:
             raise ValueError('extension not known')
 
