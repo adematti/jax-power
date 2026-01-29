@@ -299,11 +299,51 @@ def test_sharded_random():
         assert result.shape == shape + (3,)
 
 
+def test_sharded_io():
+    import jax
+    from jaxpower.mesh import create_sharded_array, create_sharded_random
+    jax.distributed.initialize()
+
+    with create_sharding_mesh() as sharding_mesh:
+        mattrs = MeshAttrs(boxsize=1000., meshsize=64)
+        print(sharding_mesh)
+        mesh = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=mattrs.meshsize, out_specs=P(*sharding_mesh.axis_names))
+        mesh = mattrs.create(kind='real', fill=mesh)
+
+        def allclose(array1, array2):
+            return all(np.allclose(shard1.data, shard2.data) for shard1, shard2 in zip(array1.addressable_shards, array2.addressable_shards))
+
+        for fn in [dirname / 'mesh.npz', dirname / 'mesh.h5']:
+            mesh.save(fn)
+            import jax.experimental.multihost_utils
+            jax.experimental.multihost_utils.sync_global_devices('save')
+            mesh2 = RealMeshField.load(fn)
+            #jax.debug.inspect_array_sharding(mesh.value, callback=print)
+            #jax.debug.inspect_array_sharding(mesh2.value, callback=print)
+            assert allclose(mesh2.value, mesh.value)
+
+        from jaxpower.mock import generate_uniform_particles
+        particles = generate_uniform_particles(mattrs, size=1000, seed=(42, 'index'))
+
+        for fn in [dirname / 'particles.npz', dirname / 'particles.h5']:
+            particles.save(fn)
+            import jax.experimental.multihost_utils
+            jax.experimental.multihost_utils.sync_global_devices('save')
+            particles2 = ParticleField.load(fn)
+            #jax.debug.inspect_array_sharding(particles.weights, callback=print)
+            #jax.debug.inspect_array_sharding(particles2.weights, callback=print)
+            assert allclose(particles2.positions, particles.positions)
+            assert allclose(particles2.weights, particles.weights)
+
+    jax.distributed.shutdown()
+
+
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
 
+    #test_sharded_io()
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()

@@ -440,11 +440,11 @@ def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
 
 
 @default_sharding_mesh
-def make_array_from_global_data(array, sharding_mesh: jax.sharding.Mesh=None):
+def make_array_from_global_data(array, sharding_mesh: jax.sharding.Mesh=None, spec: jax.sharding.PartitionSpec=None):
     """Create a sharded array from global data."""
     shape = array.shape
     if sharding_mesh.axis_names:
-        sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
+        sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P(sharding_mesh.axis_names,) if spec is None else spec)
         return jax.make_array_from_callback(shape, sharding, lambda index: array[index])
     return jnp.asarray(array)
 
@@ -835,7 +835,7 @@ def _all_to_all_mpi(data, counts=None, mpicomm=None, return_recvcounts=False):
     else:
         fail = dtype == 'O'
     if fail:
-        raise ValueError('"object" data type not supported in scatter; please specify specific data type')
+        raise ValueError('"object" data type not supported in all_to_all; please specify specific data type')
 
     # setup the custom dtype
     duplicity = np.prod(shape[1:], dtype='intp')
@@ -856,6 +856,113 @@ def _all_to_all_mpi(data, counts=None, mpicomm=None, return_recvcounts=False):
 
     if return_recvcounts:
         return recvbuffer, recvcounts
+    return recvbuffer
+
+
+def _gather_mpi(data, mpiroot=0, mpicomm=None):
+    """
+    Taken from https://github.com/bccp/nbodykit/blob/master/nbodykit/utils.py.
+    Gather the input data array from all ranks to the specified ``mpiroot``.
+    This uses ``Gatherv``, which avoids mpi4py pickling, and also
+    avoids the 2 GB mpi4py limit for bytes using a custom datatype.
+
+    Parameters
+    ----------
+    data : array_like
+        The data on each rank to gather.
+    mpiroot : int, Ellipsis, default=0
+        The rank number to gather the data to. If mpiroot is Ellipsis or None,
+        broadcast the result to all ranks.
+    mpicomm : MPI communicator, default=None
+        The MPI communicator.
+
+    Returns
+    -------
+    recvbuffer : array_like, None
+        The gathered data on mpiroot, and `None` otherwise.
+    """
+    from mpi4py import MPI
+    if mpiroot is None: mpiroot = Ellipsis
+
+    if all(mpicomm.allgather(np.isscalar(data))):
+        if mpiroot is Ellipsis:
+            return np.array(mpicomm.allgather(data))
+        gathered = mpicomm.gather(data, root=mpiroot)
+        if mpicomm.rank == mpiroot:
+            return np.array(gathered)
+        return None
+
+    # Need C-contiguous order
+    data = np.asarray(data)
+    shape, dtype = data.shape, data.dtype
+    data = np.ascontiguousarray(data)
+
+    local_length = data.shape[0]
+
+    # check dtypes and shapes
+    shapes = mpicomm.allgather(data.shape)
+    dtypes = mpicomm.allgather(data.dtype)
+
+    # object dtype is not supported
+    fail = False
+    if dtypes[0].char == 'V':
+        fail = any(dtype[name] == 'O' for name in dtype.names)
+    else:
+        fail = dtypes[0] == 'O'
+    if fail:
+        raise ValueError('"object" data type not supported in all_to_all; please specify specific data type')
+
+    # check for bad dtypes and bad shapes
+    if mpiroot is Ellipsis or mpicomm.rank == mpiroot:
+        bad_shape = any(s[1:] != shapes[0][1:] for s in shapes[1:])
+        bad_dtype = any(dt != dtypes[0] for dt in dtypes[1:])
+    else:
+        bad_shape, bad_dtype = None, None
+
+    if mpiroot is not Ellipsis:
+        bad_shape, bad_dtype = mpicomm.bcast((bad_shape, bad_dtype), root=mpiroot)
+
+    if bad_shape:
+        raise ValueError('mismatch between shape[1:] across ranks in gather')
+    if bad_dtype:
+        raise ValueError('mismatch between dtypes across ranks in gather')
+
+    shape = data.shape
+    dtype = data.dtype
+
+    # setup the custom dtype
+    duplicity = np.prod(shape[1:], dtype='intp')
+    itemsize = duplicity * dtype.itemsize
+    dt = MPI.BYTE.Create_contiguous(itemsize)
+    dt.Commit()
+
+    # compute the new shape for each rank
+    newlength = mpicomm.allreduce(local_length)
+    newshape = list(shape)
+    newshape[0] = newlength
+
+    # the return array
+    if mpiroot is Ellipsis or mpicomm.rank == mpiroot:
+        recvbuffer = np.empty(newshape, dtype=dtype, order='C')
+    else:
+        recvbuffer = None
+
+    # the recv counts
+    counts = mpicomm.allgather(local_length)
+    counts = np.array(counts, order='C')
+
+    # the recv offsets
+    offsets = np.zeros_like(counts, order='C')
+    offsets[1:] = counts.cumsum()[:-1]
+
+    # gather to mpiroot
+    if mpiroot is Ellipsis:
+        mpicomm.Allgatherv([data, dt], [recvbuffer, (counts, offsets), dt])
+    else:
+        mpicomm.Gatherv([data, dt], [recvbuffer, (counts, offsets), dt], root=mpiroot)
+
+    dt.Free()
+
     return recvbuffer
 
 
@@ -1008,6 +1115,115 @@ def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inv
         return _exchange_particles_jax(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
     return _exchange_particles_mpi(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
 
+
+@default_sharding_mesh
+def gather_array(array, sharding_mesh=None):
+    """
+    Gather (possibly distributed) array.
+    Return the tuple (exists_on_process, gathered_array).
+    """
+    if sharding_mesh.axis_names:
+        mpicomm = _get_default_mpicomm()
+        #print(mpicomm, mpicomm.size, len(jax.devices()))
+        if mpicomm is not None:
+            # Use MPI to gather all shards
+            tmp = _gather_mpi(np.array([shard.data for shard in array.addressable_shards]), mpiroot=0, mpicomm=mpicomm)
+            # Now reshaping
+            indices = mpicomm.allreduce([shard.index for shard in array.addressable_shards])
+            gathered = None
+            if mpicomm.rank == 0:
+                gathered = np.empty(array.shape, dtype=array.dtype)
+                for i, index in enumerate(indices):
+                    gathered[index] = tmp[i]
+            return mpicomm.rank == 0, gathered
+        else:
+            gathered = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding_mesh, spec=P(None)))(array).addressable_data(0)
+            return jax.process_index() == 0, gathered
+    return jax.process_index() == 0, array.addressable_data(0)
+
+
+@default_sharding_mesh
+def _save(fn, state, attrs=None, sharding_mesh=None, mpicomm=None, **kwargs):
+    fn = str(fn)
+    utils.mkdir(os.path.dirname(fn))
+    names = list(state)
+    attrs = dict(attrs or {})
+
+    if fn.endswith('.npz'):
+        for name in names:
+            exists, state[name] = gather_array(state[name], sharding_mesh=sharding_mesh)
+        state['attrs'] = attrs
+        if exists:
+            np.savez(fn, **state)
+
+    elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
+        import h5py
+        if h5py.get_config().mpi:
+            if mpicomm is None:
+                mpicomm = _get_default_mpicomm()
+            with h5py.File(fn, 'w', driver='mpio', comm=mpicomm, **kwargs) as file:
+                for name in names:
+                    dset = file.create_dataset(name, shape=tuple(state[name].shape), dtype=state[name].dtype)
+                    # Each rank writes its slab
+                    for shard in state[name].addressable_shards:
+                        dset[shard.index] = np.asarray(shard.data)
+                file.attrs.update(attrs)
+        else:
+            for name in names:
+                exists, state[name] = gather_array(state[name], sharding_mesh=sharding_mesh)
+            if exists:
+                with h5py.File(fn, 'w', **kwargs) as file:
+                    for name in names:
+                        dset = file.create_dataset(name, shape=tuple(state[name].shape), dtype=state[name].dtype)
+                        dset[...] = state[name]
+                    if attrs is not None:
+                        file.attrs.update(attrs)
+    else:
+        raise ValueError('extension not known')
+
+@default_sharding_mesh
+def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
+    fn = str(fn)
+    state = {}
+    specs = names
+    if not isinstance(names, dict):
+        specs = {name: P(None) for name in names}
+
+    if fn.endswith('.npz'):
+        state = dict(np.load(fn, allow_pickle=True))
+        state['attrs'] = state['attrs'][()]
+        for name in specs:
+            state[name] = make_array_from_global_data(state[name], sharding_mesh=sharding_mesh, spec=specs[name])
+
+    elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
+        shapes = {}
+        import h5py
+        with h5py.File(fn, 'r', **kwargs) as file:
+            state['attrs'] = dict(file.attrs)
+            for name in specs:
+                shapes[name] = file[name].shape
+
+        def callback(name, index, mpicomm=mpicomm):
+            kw = {}
+            if h5py.get_config().mpi:
+                if mpicomm is None:
+                    mpicomm = _get_default_mpicomm()
+                kw.update(driver='mpio', comm=mpicomm)
+
+            with h5py.File(fn, 'r', **kw, **kwargs) as file:
+                dset = file[name]
+                return np.asarray(dset[index])
+
+        if sharding_mesh.axis_names:
+            for name in specs:
+                sharding = jax.sharding.NamedSharding(sharding_mesh, spec=specs[name])
+                state[name] = jax.make_array_from_callback(shapes[name], sharding, partial(callback, name))
+        else:
+            for name in specs:
+                state[name] = callback(name, Ellipsis)
+    else:
+        raise ValueError('extension not known')
+    return state
 
 
 @jax.tree_util.register_pytree_node_class
@@ -1279,31 +1495,6 @@ class MeshAttrs(object):
         return value
 
 
-def _reconstruct_local_block(array: jax.Array):
-    shards = array.addressable_shards
-    assert len(shards) > 0
-    # Each index is a tuple of slices
-    indices = [shard.index for shard in shards]
-    # Compute bounding box in global coordinates
-    ndim = len(indices[0])
-    starts = [min(idx[d].start for idx in indices) for d in range(ndim)]
-    stops  = [max(idx[d].stop  for idx in indices) for d in range(ndim)]
-    global_shape = tuple(stops[d] - starts[d] for d in range(ndim))
-
-    # Allocate local array (on host)
-    out = None
-    # Fill it
-    for shard in shards:
-        idx = shard.index
-        # Compute local coordinates
-        local_slices = tuple(slice(idx[d].start - starts[d], idx[d].stop - starts[d]) for d in range(ndim))
-        local_data = np.array(shard.data)
-        if out is None:
-            out = np.empty(global_shape, dtype=local_data.dtype)
-        out[local_slices] = local_data
-
-    return out, tuple(slice(starts[d], stops[d]) for d in range(ndim))
-
 
 # Note: I couldn't make it work properly with jax dataclass registration as tree_unflatten would pass all fields to __init__, which I don't want
 @jax.tree_util.register_pytree_node_class
@@ -1366,86 +1557,18 @@ class BaseMeshField(object):
         # for numpy
         return np.array(self.value)
 
-    def save(self, fn, mpicomm=None, **kwargs):
+    def save(self, fn, **kwargs):
         """Save mesh to file."""
-        fn = str(fn)
-        utils.mkdir(os.path.dirname(fn))
-        state = {name: getattr(self, name) for name in ['value', 'attrs']}
-        state['attrs'] = state['attrs'].__getstate__()
-
-        sharding_mesh = self.attrs.sharding_mesh
-
-        def get(value):
-            if sharding_mesh.axis_names:
-                return  jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding_mesh, spec=P(None)))(value).addressable_data(0)
-            return value.addressable_data(0)
-
-        if fn.endswith('.npz'):
-            state['value'] = np.asarray(get(state['value']))
-            np.savez(fn, **state)
-        elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
-            group = 'value'
-            import h5py
-            if h5py.get_config().mpi:
-                if mpicomm is None:
-                    mpicomm = _get_default_mpicomm()
-                with h5py.File(fn, 'w', driver='mpio', comm=mpicomm, **kwargs) as file:
-                    dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
-                    # Each rank writes its slab
-                    for shard in state['value'].addressable_shards:
-                        dset[shard.index] = np.asarray(shard.data)
-                    dset.attrs.update(state['attrs'])
-            else:
-                state['value'] = np.asarray(get(state['value']))
-                if jax.process_index() == 0:
-                    with h5py.File(fn, 'w', **kwargs) as file:
-                        dset = file.create_dataset(group, shape=tuple(self.shape), dtype=self.dtype)
-                        dset[...] = state['value']
-                        dset.attrs.update(state['attrs'])
-        else:
-            raise ValueError('extension not known')
+        state = {name: getattr(self, name) for name in ['value']}
+        _save(fn, state, attrs=self.attrs.__getstate__(), sharding_mesh=self.attrs.sharding_mesh, **kwargs)
 
     @classmethod
     @default_sharding_mesh
     def load(cls, fn, sharding_mesh=None, **kwargs):
         """Load mesh from file."""
-        fn = str(fn)
+        state = _load(fn, names={name: P(*sharding_mesh.axis_names) for name in ['value']}, sharding_mesh=sharding_mesh, **kwargs)
+        state['attrs'] = MeshAttrs.from_state(state['attrs'])
         new = cls.__new__(cls)
-        state = {}
-        if fn.endswith('.npz'):
-            state = dict(np.load(fn, allow_pickle=True))
-            state['attrs'] = MeshAttrs.from_state(state['attrs'][()])
-            state['value'] = make_array_from_global_data(state['value'], sharding_mesh=sharding_mesh)
-            new.__dict__.update(**state)
-        elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
-            group = 'value'
-            import h5py
-            with h5py.File(fn, 'r', **kwargs) as file:
-                dset = file[group]
-                state['attrs'] = dict(dset.attrs)
-                shape = dset.shape
-
-            state['attrs'] = MeshAttrs.from_state(state['attrs'])
-            sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
-
-            def callback(index):
-                kw = {}
-                if h5py.get_config().mpi:
-                    if mpicomm is None:
-                        mpicomm = _get_default_mpicomm()
-                    kw.update(driver='mpio', comm=mpicomm)
-
-                with h5py.File(fn, 'r', **kw, **kwargs) as file:
-                    dset = file['value']
-                    return np.asarray(dset[index])
-
-            if sharding_mesh.axis_names:
-                state['value'] = jax.make_array_from_callback(shape, sharding, callback)
-            else:
-                state['value'] = callback(Ellipsis)
-        else:
-            raise ValueError('extension not known')
-
         new.__dict__.update(**state)
         return new
 
@@ -2111,7 +2234,7 @@ class ParticleField(object):
             sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names))
         positions = jnp.asarray(positions)
         if weights is None:
-            weights = jnp.ones_like(positions, shape=positions.shape[:-1])
+            weights = jnp.ones_like(positions[..., 0])  # do not provide shape to preserve sharding
         else:
             weights = jnp.asarray(weights)
 
@@ -2271,6 +2394,21 @@ class ParticleField(object):
         #return jpaint(attrs, positions, weights, resampler=resampler, interlacing=interlacing, compensate=compensate, out=out, **kwargs)
         #jax.block_until_ready(toret)
         #print(f'exchange {t1 - t0:.2f} painting {time.time() - t1:.2f}', positions.shape[0] / size, _paint._cache_size())
+
+    def save(self, fn, **kwargs):
+        """Save particles to file."""
+        state = {name: getattr(self, name) for name in ['positions', 'weights']}
+        _save(fn, state, attrs=self.attrs.__getstate__(), sharding_mesh=self.attrs.sharding_mesh, **kwargs)
+
+    @classmethod
+    @default_sharding_mesh
+    def load(cls, fn, sharding_mesh=None, **kwargs):
+        """Load particles from file."""
+        state = _load(fn, names={name: P(sharding_mesh.axis_names) for name in ['positions', 'weights']}, sharding_mesh=sharding_mesh, **kwargs)
+        state['attrs'] = MeshAttrs.from_state(state['attrs'])
+        new = cls.__new__(cls)
+        new.__dict__.update(**state)
+        return new
 
 
 @partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out', 'halo_add'])
