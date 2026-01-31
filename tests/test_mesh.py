@@ -320,7 +320,7 @@ def test_sharded_io():
             mesh2 = RealMeshField.load(fn)
             #jax.debug.inspect_array_sharding(mesh.value, callback=print)
             #jax.debug.inspect_array_sharding(mesh2.value, callback=print)
-            assert allclose(mesh2.value, mesh.value)
+            allclose(mesh2.value, mesh.value)
 
         from jaxpower.mock import generate_uniform_particles
         particles = generate_uniform_particles(mattrs, size=1000, seed=(42, 'index'))

@@ -439,16 +439,6 @@ def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
     return jaxdecomp.halo_exchange(value, halo_extents=tuple(extents), halo_periods=(True,) * len(extents))
 
 
-@default_sharding_mesh
-def make_array_from_global_data(array, sharding_mesh: jax.sharding.Mesh=None, spec: jax.sharding.PartitionSpec=None):
-    """Create a sharded array from global data."""
-    shape = array.shape
-    if sharding_mesh.axis_names:
-        sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P(sharding_mesh.axis_names,) if spec is None else spec)
-        return jax.make_array_from_callback(shape, sharding, lambda index: array[index])
-    return jnp.asarray(array)
-
-
 def _get_pad_constant(constant_values):
 
     def pad(array, pad_width):
@@ -966,6 +956,39 @@ def _gather_mpi(data, mpiroot=0, mpicomm=None):
     return recvbuffer
 
 
+def _scatter_mpi(data, local_slice, mpiroot=0, mpicomm=None):
+    # Use MPI to gather all shards
+    # Broadcast slice definitions
+    from mpi4py import MPI
+    slices = mpicomm.gather(local_slice, root=mpiroot)
+    dtype, shape = mpicomm.bcast((data.dtype, data.shape) if mpicomm.rank == mpiroot else None, root=mpiroot)
+
+    # Setup the custom dtype
+    duplicity = np.prod(shape[len(local_slice):], dtype='intp')
+    itemsize = duplicity * dtype.itemsize
+    dt = MPI.BYTE.Create_contiguous(itemsize)
+    dt.Commit()
+
+    # Allocate receive buffer
+    recv_shape = []
+    for axis, sl in enumerate(local_slice):
+        size = sl.stop - sl.start if sl.start is not None else shape[axis]
+        recv_shape.append(size)
+    recv_shape = tuple(recv_shape) + tuple(shape[len(recv_shape):])
+    recv = np.empty(recv_shape, dtype=dtype, order='C')
+    # Rank mpiroot sends, others receive
+    if mpicomm.rank == mpiroot:
+        for rank in range(mpicomm.size):
+            buf = np.ascontiguousarray(data[slices[rank]])
+            if rank == mpiroot:
+                recv[...] = buf
+            else:
+                mpicomm.Send([buf, dt], dest=rank, tag=rank)
+    else:
+        mpicomm.Recv([recv, dt], source=mpiroot, tag=mpicomm.rank)
+    return recv
+
+
 def _exchange_array_mpi(array, process, return_indices=False, mpicomm=None):
     # Exchange array along the first (0) axis
     # TODO: generalize to any axis
@@ -1046,7 +1069,7 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     return positions, exchange
 
 
-def _get_default_mpicomm():
+def get_mpicomm():
     mpicomm = None
     try: from mpi4py import MPI
     except: MPI = None
@@ -1055,18 +1078,28 @@ def _get_default_mpicomm():
     return mpicomm
 
 
-def _get_distributed_backend(array, backend='auto', **kwargs):
+def default_mpicomm(func: Callable):
+    """Wrapper to provide a default MPI communicator to jax-power functions."""
+    @functools.wraps(func)
+    def wrapper(*args, mpicomm=None, **kwargs):
+        if mpicomm is None:
+            mpicomm = get_mpicomm()
+        return func(*args, mpicomm=mpicomm, **kwargs)
+
+    return wrapper
+
+
+@default_mpicomm
+def _get_distributed_backend(array, backend='auto', mpicomm=None, **kwargs):
 
     if backend == 'auto' and isinstance(array, np.ndarray):
         if jax.distributed.is_initialized():
-            mpicomm = _get_default_mpicomm()
-            if mpicomm is not None and mpicomm.size == len(jax.devices()):
+            if mpicomm is not None and all(mpicomm.allgather(len(jax.local_devices()) == 1)):
                 backend = 'mpi'
-                kwargs.setdefault('mpicomm', mpicomm)
     if backend == 'auto':
         backend = 'jax'
     if backend == 'mpi':
-        kwargs.setdefault('mpicomm', _get_default_mpicomm())
+        kwargs.setdefault('mpicomm', mpicomm)
     return backend, kwargs
 
 
@@ -1116,14 +1149,14 @@ def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inv
     return _exchange_particles_mpi(attrs, positions, return_inverse=return_inverse, sharding_mesh=sharding_mesh, **kwargs)
 
 
+@default_mpicomm
 @default_sharding_mesh
-def gather_array(array, sharding_mesh=None):
+def gather_array(array, sharding_mesh=None, mpiroot=0, mpicomm=None):
     """
     Gather (possibly distributed) array.
     Return the tuple (exists_on_process, gathered_array).
     """
     if sharding_mesh.axis_names:
-        mpicomm = _get_default_mpicomm()
         #print(mpicomm, mpicomm.size, len(jax.devices()))
         if mpicomm is not None:
             # Use MPI to gather all shards
@@ -1142,6 +1175,30 @@ def gather_array(array, sharding_mesh=None):
     return jax.process_index() == 0, array.addressable_data(0)
 
 
+@default_mpicomm
+@default_sharding_mesh
+def scatter_array(array, sharding_mesh=None, spec=None, mpiroot=0, mpicomm=None):
+    """
+    Gather (possibly distributed) array.
+    Return the tuple (exists_on_process, gathered_array).
+    """
+    if sharding_mesh.axis_names:
+        sharding = jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names) if spec is None else spec)
+        if mpicomm is not None:
+            local_devices = jax.local_devices()
+            assert all(mpicomm.allgather(len(local_devices) == 1)), f'each process must have one local device'
+            # Use MPI to gather all shards
+            # Broadcast slice definitions
+            shape = mpicomm.bcast(array.shape if mpicomm.rank == mpiroot else None, root=mpiroot)
+            slices = sharding.devices_indices_map(shape)
+            per_host_array = _scatter_mpi(array, slices[local_devices[0]], mpiroot=mpiroot, mpicomm=mpicomm)
+            return jax.make_array_from_process_local_data(sharding, per_host_array)
+        else:
+            raise NotImplementedError('mpi4py is necessary to scatter the array')
+    return jnp.asarray(array)
+
+
+@default_mpicomm
 @default_sharding_mesh
 def _save(fn, state, attrs=None, sharding_mesh=None, mpicomm=None, **kwargs):
     fn = str(fn)
@@ -1159,8 +1216,6 @@ def _save(fn, state, attrs=None, sharding_mesh=None, mpicomm=None, **kwargs):
     elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
         import h5py
         if h5py.get_config().mpi:
-            if mpicomm is None:
-                mpicomm = _get_default_mpicomm()
             with h5py.File(fn, 'w', driver='mpio', comm=mpicomm, **kwargs) as file:
                 for name in names:
                     dset = file.create_dataset(name, shape=tuple(state[name].shape), dtype=state[name].dtype)
@@ -1181,6 +1236,8 @@ def _save(fn, state, attrs=None, sharding_mesh=None, mpicomm=None, **kwargs):
     else:
         raise ValueError('extension not known')
 
+
+@default_mpicomm
 @default_sharding_mesh
 def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
     fn = str(fn)
@@ -1190,10 +1247,16 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
         specs = {name: P(None) for name in names}
 
     if fn.endswith('.npz'):
-        state = dict(np.load(fn, allow_pickle=True))
-        state['attrs'] = state['attrs'][()]
+        file = np.load(fn, allow_pickle=True)
+        state = {}
+        state['attrs'] = file['attrs'][()]
         for name in specs:
-            state[name] = make_array_from_global_data(state[name], sharding_mesh=sharding_mesh, spec=specs[name])
+            if mpicomm is not None:
+                array = scatter_array(file[name] if mpicomm.rank == 0 else None, sharding_mesh=sharding_mesh, spec=specs[name], mpiroot=0, mpicomm=mpicomm)
+            else:
+                sharding = jax.NamedSharding(sharding_mesh, spec=specs[name])
+                array = jax.make_array_from_callback(file[name].shape, sharding, lambda index: file[name][index])
+            state[name] = array
 
     elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
         shapes = {}
@@ -1206,8 +1269,6 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
         def callback(name, index, mpicomm=mpicomm):
             kw = {}
             if h5py.get_config().mpi:
-                if mpicomm is None:
-                    mpicomm = _get_default_mpicomm()
                 kw.update(driver='mpio', comm=mpicomm)
 
             with h5py.File(fn, 'r', **kw, **kwargs) as file:
