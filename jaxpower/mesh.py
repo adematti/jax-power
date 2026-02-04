@@ -415,13 +415,10 @@ def unpad_halo(value, halo_size=0, sharding_mesh=None):
         for axis in range(len(sharding_mesh.axis_names)):
             if sharding_mesh.devices.shape[axis] > 1:
                 slices = [slice(None) for i in range(value.ndim)]
-                slices[axis] = slice(2 * halo_size, 3 * halo_size)
                 slices_add = list(slices)
-                slices_add[axis] = slice(0, halo_size)
+                slices[axis], slices_add[axis] = slice(2 * halo_size, 3 * halo_size), slice(0, halo_size)
                 value = value.at[tuple(slices)].add(value[tuple(slices_add)])
-                slices[axis] = slice(value.shape[axis] - 3 * halo_size, value.shape[axis] - 2 * halo_size)
-                slices_add = list(slices)
-                slices_add[axis] = slice(value.shape[axis] - halo_size, value.shape[axis])
+                slices[axis], slices_add[axis] = slice(value.shape[axis] - 3 * halo_size, value.shape[axis] - 2 * halo_size), slice(value.shape[axis] - halo_size, value.shape[axis])
                 value = value.at[tuple(slices)].add(value[tuple(slices_add)])
                 crop.append(slice(2 * halo_size, value.shape[axis] - 2 * halo_size))
             else:
@@ -742,7 +739,9 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     #size_devices = shape_devices.prod(dtype='i4')
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
-    idx_out_devices = jnp.ravel_multi_index(jnp.unstack(jnp.floor(idx_out_devices).astype('i4'), axis=-1), tuple(shape_devices))
+    idx_out_devices = np.floor(idx_out_devices).astype('i4')
+    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    idx_out_devices = jnp.ravel_multi_index(jnp.unstack(idx_out_devices, axis=-1), tuple(shape_devices))
 
     positions = _exchange_array_jax(positions, idx_out_devices, pad=_get_pad_uniform_jax(attrs), return_indices=return_inverse)
     if return_inverse:
@@ -1028,13 +1027,36 @@ def _exchange_inverse_mpi(array, indices, mpicomm=None):
     return final
 
 
+def get_mpicomm():
+    mpicomm = None
+    try: from mpi4py import MPI
+    except: MPI = None
+    if MPI is not None:
+        mpicomm = MPI.COMM_WORLD
+    return mpicomm
+
+
+def default_mpicomm(func: Callable):
+    """Wrapper to provide a default MPI communicator to jax-power functions."""
+    @functools.wraps(func)
+    def wrapper(*args, mpicomm=None, **kwargs):
+        if mpicomm is None:
+            mpicomm = get_mpicomm()
+        return func(*args, mpicomm=mpicomm, **kwargs)
+
+    return wrapper
+
+
+@default_mpicomm
 @default_sharding_mesh
 def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, return_inverse=False, sharding_mesh=None, return_type='nparray', mpicomm=None):
 
     _check_device_layout(attrs.meshsize, sharding_mesh=sharding_mesh)
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
-    idx_out_devices = np.ravel_multi_index(tuple(np.floor(idx_out_devices).astype('i4').T), tuple(shape_devices))
+    idx_out_devices = np.floor(idx_out_devices).astype('i4')
+    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    idx_out_devices = np.ravel_multi_index(tuple(idx_out_devices.T), tuple(shape_devices))
     positions = _exchange_array_mpi(positions, idx_out_devices, return_indices=return_inverse, mpicomm=mpicomm)
 
     if return_inverse:
@@ -1067,26 +1089,6 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
         return positions, exchange, inverse
 
     return positions, exchange
-
-
-def get_mpicomm():
-    mpicomm = None
-    try: from mpi4py import MPI
-    except: MPI = None
-    if MPI is not None:
-        mpicomm = MPI.COMM_WORLD
-    return mpicomm
-
-
-def default_mpicomm(func: Callable):
-    """Wrapper to provide a default MPI communicator to jax-power functions."""
-    @functools.wraps(func)
-    def wrapper(*args, mpicomm=None, **kwargs):
-        if mpicomm is None:
-            mpicomm = get_mpicomm()
-        return func(*args, mpicomm=mpicomm, **kwargs)
-
-    return wrapper
 
 
 @default_mpicomm
@@ -2243,9 +2245,10 @@ class ParticleField(object):
 
     Warning
     -------
-    When particles are exchanged (`exchange=True`), positions (and weights) array may be reordered and resized such that their shards are of the same size
-    (per JAX design). To resize positions and weights, positions are filled with the mean position, and weights by 0.
-    Therefore, whenever particles are exchanged, please use the column :attr:`weights` (even if no input weights were given / all input weights were 1).
+    When particles are exchanged (`exchange=True`), positions (and weights) array may be reordered and resized such that their shards are of the same size (per JAX design). To resize positions and weights, positions are filled with the mean position, and weights by 0.
+    Therefore, whenever particles are exchanged, please use the column :attr:`weights` (even if no input weights were given / all input weights were 1). To exchange particles they must sit within the box extent.
+    Also *never ever* apply periodic wrapping to sharded positions, as they will not match their spatial shard anymore. Periodic wrapping is already enforced in the :meth:`paint` operation anyway.
+    If you really have to do periodic wrapping, then you have to re-exchange particles, ``particles.exchange``.
 
     Parameters
     ----------
@@ -2295,7 +2298,9 @@ class ParticleField(object):
             sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names))
         positions = jnp.asarray(positions)
         if weights is None:
-            weights = jnp.ones_like(positions[..., 0])  # do not provide shape to preserve sharding
+            # do not pass shape, as sharding is lost
+            # do not take positions[..., 0], as int64 => int32 cast if not jax_enable_x64 (jax 0.9.0)
+            weights = jnp.ones_like(jnp.unstack(positions, axis=-1)[0])
         else:
             weights = jnp.asarray(weights)
 
