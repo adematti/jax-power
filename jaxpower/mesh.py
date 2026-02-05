@@ -390,7 +390,7 @@ def mesh_shard_shape(shape: tuple, sharding_mesh: jax.sharding.Mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=['halo_size', 'factor', 'sharding_mesh'])
+#@partial(jax.jit, static_argnames=['halo_size', 'factor', 'sharding_mesh'])
 def pad_halo(value, halo_size=0, factor=2, sharding_mesh: jax.sharding.Mesh=None):
 
     """Pad halo regions to a sharded mesh `` value``. ``factor`` gives the multiple of ``halo_size`` to pad on each side of the mesh axis; 1 when reading, 2 when painting."""
@@ -401,12 +401,12 @@ def pad_halo(value, halo_size=0, factor=2, sharding_mesh: jax.sharding.Mesh=None
     def pad(value):
         return jnp.pad(value, tuple(pad_width), mode='constant', constant_values=0.)
 
-    offset = jnp.array([width[0] for width in pad_width])
+    offset = np.array([int(width[0]) for width in pad_width])
     return shard_map(pad, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names),), out_specs=P(*sharding_mesh.axis_names))(value), offset
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
+#@partial(jax.jit, static_argnames=['halo_size', 'sharding_mesh'])
 def unpad_halo(value, halo_size=0, sharding_mesh=None):
     """Unpad halo regions of a sharded mesh `` value``, summing halo regions. Typically after distributed paint."""
 
@@ -2427,7 +2427,7 @@ class ParticleField(object):
         Parameters
         ----------
         resampler : str, Callable
-            Resampler to read particule weights from mesh.
+            Resampler to paint particule weights from mesh.
             One of ['ngp', 'cic', 'tsc', 'pcs'].
         interlacing : int, default=0
             If 0 or 1, no interlacing correction.
