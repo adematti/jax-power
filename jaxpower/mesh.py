@@ -1283,7 +1283,7 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
                 state[name] = jax.make_array_from_callback(shapes[name], sharding, partial(callback, name))
         else:
             for name in specs:
-                state[name] = callback(name, Ellipsis)
+                state[name] = jnp.asarray(callback(name, Ellipsis))
     else:
         raise ValueError('extension not known')
     return state
