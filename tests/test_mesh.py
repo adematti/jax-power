@@ -338,6 +338,29 @@ def test_sharded_io():
     jax.distributed.shutdown()
 
 
+def test_sharded_halo():
+    from jaxpower.mesh import create_sharded_array, create_sharded_random
+    from jaxpower import compute_fkp2_normalization, compute_fkp3_normalization, generate_uniform_particles, FKPField
+    from jaxpower.mesh import create_sharded_array
+
+    size = int(32000)
+    with create_sharding_mesh() as sharding_mesh:
+        print(sharding_mesh)
+        pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
+        randoms = generate_uniform_particles(pattrs, size, seed=(84, 'index'))
+        r = create_sharded_random(jax.random.uniform, (jax.random.key(42), 'index'), shape=randoms.positions.shape, out_specs=P(sharding_mesh.axis_names))
+        mattrs = pattrs#.clone(boxsize=2000.)
+        randoms = randoms.clone(attrs=mattrs, exchange=True)
+        r = randoms.exchange_direct(r)
+        positions = randoms.positions + 6 * mattrs.cellsize * (r - 0.5)
+        offset = mattrs.boxcenter - mattrs.boxsize / 2.
+        #positions = (positions - offset) % mattrs.boxsize + offset
+        test = randoms.clone(positions=positions).paint(resampler='cic', halo_add=12)
+        positions = (positions - offset) % mattrs.boxsize + offset
+        ref = randoms.clone(positions=positions, exchange=True).paint(resampler='cic')
+        assert jnp.allclose(test.value, ref.value)
+
+
 if __name__ == '__main__':
 
     from jax import config
