@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from functools import partial
@@ -864,8 +865,7 @@ def test_sharded_spectrum():
         spectrum = compute_mesh2_spectrum(mesh, bin=bin, los='firstpoint')
         return spectrum.clone(norm=norm, num_shotnoise=num_shotnoise)
 
-    import os
-    os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
+    #os.environ["XLA_FLAGS"] = " --xla_force_host_platform_device_count=4"
     size = int(1e5)
     pattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=1121., boxcenter=1500.)
     mattrs = MeshAttrs(meshsize=(64,) * 3, boxsize=2000., boxcenter=1500.)
@@ -874,7 +874,8 @@ def test_sharded_spectrum():
     with create_sharding_mesh() as sharding_mesh:
         print(sharding_mesh)
         test = compute_spectrum()
-        test.write(ref_fn)
+        if False and jax.process_index() == 0:
+            test.write(ref_fn)
         print(test.value())
         assert np.allclose(test.value(), read(ref_fn).value())
 
@@ -960,6 +961,11 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+
+    #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
+    #jax.distributed.initialize()
+    #test_sharded_spectrum()
+    #jax.distributed.shutdown()
 
     test_mesh2_spectrum(plot=False)
     test_fkp2_shotnoise()

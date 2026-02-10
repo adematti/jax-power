@@ -739,7 +739,7 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     #size_devices = shape_devices.prod(dtype='i4')
     idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
-    idx_out_devices = np.floor(idx_out_devices).astype('i4')
+    idx_out_devices = jnp.floor(idx_out_devices).astype('i4')
     assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(idx_out_devices, axis=-1), tuple(shape_devices))
 
