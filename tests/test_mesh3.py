@@ -180,7 +180,28 @@ def test_buffer():
 
     from jaxpower.mesh import create_sharded_random
 
-    mattrs = MeshAttrs(meshsize=256, boxsize=1000.)
+    mattrs = MeshAttrs(meshsize=64, boxsize=250.)
+    edges = [np.linspace(0.0, 250., 60) for kmax in mattrs.knyq]
+    for basis in ['sugiyama']:
+        kw = dict(edges=edges, basis=basis, ells=[0] if 'scoccimarro' in basis else [(0, 0, 0)], mask_edges='')
+        bin_buffer = BinMesh3CorrelationPoles(mattrs, **kw, buffer_size=20)
+        print(2 * (edges[0].size - 1)**2, bin_buffer._buffer_iedges[1].size)
+
+    mattrs = MeshAttrs(meshsize=128, boxsize=500.)
+    edges = [np.arange(0.01, 0.21 + 0.001, 0.02) for kmax in mattrs.knyq]
+    for basis in ['sugiyama']:
+        kw = dict(edges=edges, basis=basis, ells=[0] if 'scoccimarro' in basis else [(0, 0, 0)], mask_edges='')
+        bin = BinMesh3SpectrumPoles(mattrs, **kw)
+        bin_buffer = BinMesh3SpectrumPoles(mattrs, **kw, buffer_size=5)
+        #print(bin_buffer._buffer_iedges[1])
+        #print('buffer', edges[0].size - 1, bin_buffer._buffer_iedges[1].shape, bin_buffer._buffer_iedges[1].size)
+        cmeshs = [mattrs.create(kind='real', fill=create_sharded_random(random.normal, random.key(42), shape=mattrs.meshsize)).r2c() for axis in range(3)]
+        if 'sugiyama' in bin.basis:
+            cmeshs[-1] = cmeshs[-1].c2r()
+        bk1 = bin(*cmeshs)
+        bk2 = bin_buffer(*cmeshs)
+        assert np.allclose(bk2, bk1)
+
     edges = [np.arange(0.01, 0.2, 0.05) for kmax in mattrs.knyq]
     for basis in ['scoccimarro', 'sugiyama-diagonal']:
         kw = dict(edges=edges, basis=basis, ells=[0] if 'scoccimarro' in basis else [(0, 0, 0)])
@@ -189,7 +210,6 @@ def test_buffer():
         cmeshs = [mattrs.create(kind='real', fill=create_sharded_random(random.normal, random.key(42), shape=mattrs.meshsize)).r2c() for axis in range(3)]
         if 'sugiyama' in bin.basis:
             cmeshs[-1] = cmeshs[-1].c2r()
-
         bk1 = bin(*cmeshs)
         bk2 = bin_buffer(*cmeshs)
         assert np.allclose(bk2, bk1)
@@ -1075,6 +1095,20 @@ def test_basis():
             print(value, np.unique(value).size, value.size)
 
 
+def test_misc():
+    from jaxpower import get_smooth3_window_bin_attrs
+    from jaxpower.mesh3 import _iter_triposh
+    ells = [(0, 0, 0), (2, 0, 2)]
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=2, return_ellsin=True)
+    nterms = 0
+    for ell in kw['ells']:
+        #if any(el > 2 for el in ell): continue
+        xs = _iter_triposh(*ell, los='local')[0]
+        print(ell, xs)
+        nterms += len(xs)
+    print(nterms)
+
+
 if __name__ == '__main__':
 
     #import os
@@ -1084,8 +1118,10 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
+    test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
+    exit()
     test_mesh3_spectrum()
     test_fkp3_shotnoise()
     test_polybin3d()

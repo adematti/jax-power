@@ -107,7 +107,7 @@ def get_device_mesh_shape(device_mesh_shape=None, meshsize=None):
     tuple[int, int]
     """
     if device_mesh_shape is None:
-        count = len(jax.devices())
+        count = jax.device_count()
         if meshsize is None:
             meshsize = 0
         ndim = _get_ndim(meshsize, default=2)

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
+import lsstypes as types
 from jaxpower import Mesh2SpectrumPole, Mesh2SpectrumPoles, CovarianceMatrix, WindowMatrix, WindowRotationSpectrum2, setup_logging
 
 
@@ -36,14 +37,19 @@ def test_rotation_spectrum2(plot=False):
         #fig = window.plot_slice(indices=10)
         #window.plot_slice(indices=10, fig=fig, show=True)
 
+    fn = dirname / 'tmp.h5'
+
     rotation = WindowRotationSpectrum2(window=window, covariance=covariance)
     rotation.setup()
     rotation.fit()
+    assert np.allclose(rotation._mmatrix['M'].sum(), 60.0002087159116)
 
-    fn = dirname / 'tmp.npy'
-    rotation.save(fn)
+    rotation.set_prior(data=observable, theory=theory)
+    pmatrix = rotation.prior()
+    assert pmatrix.shape == (observable.size, len(ells))
 
-    rotation = WindowRotationSpectrum2.load(fn)
+    rotation.write(fn)
+    rotation = types.read(fn)
     if plot:
         rotation.plot_compactness(show=True)
         rotation.plot_window_slice(indices=10, show=True)
