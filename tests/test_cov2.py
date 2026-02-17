@@ -595,16 +595,15 @@ def test_fkp2_covariance(plot=False):
 
 def test_multitracer_covariance(plot=False):
     boxcenter = np.array([0., 0., 1200])
-    boxcenter2 = np.array([0., 0., 2000])
-    mattrs = MeshAttrs(boxsize=2000., boxcenter=boxcenter, meshsize=128)
-    pattrs = mattrs.clone(boxsize=1000., meshsize=64)
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=boxcenter, meshsize=64)
+    pattrs = mattrs.clone(boxsize=500.)
 
     theory = get_theory(kmax=mattrs.knyq.max(), dk=0.04)
     size = int(1e-4 * pattrs.boxsize.prod())
 
     ialpha = 5
     randoms1 = generate_uniform_particles(pattrs, size * ialpha, seed=32).clone(attrs=mattrs)
-    randoms2 = generate_uniform_particles(pattrs.clone(boxcenter=boxcenter2), size * ialpha, seed=32).clone(attrs=mattrs.clone(boxcenter=boxcenter2))
+    randoms2 = generate_uniform_particles(pattrs, size * ialpha, seed=42).clone(attrs=mattrs)
     #edges = {'step': attrs.cellsize.min()}
     edges = None
 
@@ -617,14 +616,14 @@ def test_multitracer_covariance(plot=False):
         ObservableTree(windows, types=['WW', 'WS', 'SS']).write(window_fn)
 
     windows = list(windows)
-    for i, window in enumerate(windows):
-        windows[i] = ObservableTree([next(iter(window))] * len(window.fields), fields=window.fields)
+    #for i, window in enumerate(windows):
+    #    windows[i] = ObservableTree([next(iter(window))] * len(window.fields), fields=window.fields)
 
     #theory = ObservableTree([theory] * 4, fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())], fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     covs = compute_spectrum2_covariance(windows, theory)
 
-    for name, cov in zip(['WW', 'WS', 'SS'], covs):
+    for name, cov in zip(['WW', 'SS', 'WS'], covs):
         cov = cov.value()
         assert np.allclose(cov, cov.T), name
 
@@ -816,7 +815,7 @@ if __name__ == '__main__':
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
-    #test_cutsky2_spectrum_covariance(plot=True)
+    test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
     #test_pre_post_covariance()
     test_multitracer_covariance()
