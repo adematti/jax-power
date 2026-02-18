@@ -1583,6 +1583,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
             if odd: leg += get_legendre(ell)(-mu)
             num.append((2 * ell + 1) / (1 + odd) * bin(Aell * leg))
 
+        num = [num.real if ell % 2 == 0 else num.imag for ell, num in zip(ells, num)]
         spectrum = []
         for ill, ell in enumerate(ells):
             spectrum.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], nmodes=bin.nmodes, norm=jnp.ones_like(bin.xavg) * norm,
@@ -1653,6 +1654,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
 
         # jax-mesh convention is F(k) = \sum_{r} e^{-ikr} F(r); let us correct it here
         if swap: num = list(map(jnp.conj, num))
+        num = [num.real if ell % 2 == 0 else num.imag for ell, num in zip(ells, num)]
         # Format the spectrum results into :class:`Mesh2SpectrumPoles` instance
         spectrum = []
         for ill, ell in enumerate(ells):
