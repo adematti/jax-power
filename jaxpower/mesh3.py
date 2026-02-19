@@ -589,22 +589,30 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
 
         meshes = [_2c(mesh) for mesh in meshes[:2]] + [_2r(meshes[2])]
 
-        @partial(jax.checkpoint, static_argnums=0)
-        def f(Ylm, carry, im):
-            coeff, sym, im = im[3], im[4], im[:3]
-            tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
-            los = xvec if vlos is None else vlos
-            tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp) #, remove_zero=True)
-            carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
-            return carry, im
+        def get_f(ells):
+            Ylms = [[get_Ylm(ell, m, reduced=True, real=False, conj=True) for m in range(-ell, ell + 1)] for ell in ells]
+            xs = _iter_triposh(*ells, los=los)
+            branches = []
+            for row in zip(*xs):
+                def branch(kvec, los, row=row):
+                    coeff, sym, im = row[3], row[4], row[:3]
+                    tmp = tuple(meshes[i] * Ylms[i][im[i]](*kvec) for i in range(2))
+                    tmp += (Ylms[2][im[2]](*los) * meshes[2],)
+                    tmp = coeff.astype(mattrs.rdtype) * bin(*tmp)  # remove_zero=True)
+                    return tmp + sym.astype(mattrs.rdtype) * tmp.conj()
+                branches.append(branch)
+
+            def f(carry, idx):
+                los = xvec if vlos is None else vlos
+                carry += jax.lax.switch(idx, branches, kvec, los)
+                return carry, idx
+
+            return f, np.arange(len(branches))
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
-            Ylms = [[get_Ylm(ell, m, reduced=True, real=False, conj=True) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
-            xs = _iter_triposh(ell1, ell2, ell3, los=los)
-            if xs[0].size:
-                num_ = jax.lax.scan(partial(f, Ylms), init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0] / bin.nmodes[ill]
-                #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
+            f, xs = get_f((ell1, ell2, ell3))
+            if xs.size:
+                num_ = jax.lax.scan(f, init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0] / bin.nmodes[ill]
             else:
                 num_ = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
             num.append(num_.real if (ell1 + ell2) % 2 == 0 else num_.imag)
@@ -678,25 +686,34 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
 
         meshes = [_2c(mesh) for mesh in meshes[:2]] + [_2r(meshes[2])]
 
-        @partial(jax.checkpoint, static_argnums=(0, 1))
-        def f(Ylm, ell, carry, im):
-            coeff, sym, im = im[3], im[4], im[:3]
-            tmp = tuple(meshes[i] * jax.lax.switch(im[i], Ylm[i], *kvec) for i in range(2))
-            los = xvec if vlos is None else vlos
-            tmp += (jax.lax.switch(im[2], Ylm[2], *los) * meshes[2],)
-            tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, ell=ell) # remove_zero=True)
-            carry += tmp + sym.astype(mattrs.rdtype) * tmp.conj()
-            return carry, im
+        def get_f(ells):
+            Ylms = [[get_Ylm(ell, m, reduced=True, real=False, conj=True) for m in range(-ell, ell + 1)] for ell in ells]
+            xs = _iter_triposh(*ells, los=los)
+            branches = []
+            for row in zip(*xs):
+                def branch(kvec, los, row=row):
+                    coeff, sym, im = row[3], row[4], row[:3]
+                    tmp = tuple(meshes[i] * Ylms[i][im[i]](*kvec) for i in range(2))
+                    tmp += (Ylms[2][im[2]](*los) * meshes[2],)
+                    tmp = coeff.astype(mattrs.rdtype) * bin(*tmp, ell=ells) # remove_zero=True)
+                    return tmp + sym.astype(mattrs.rdtype) * tmp.conj()
+                branches.append(branch)
 
-        for ill, (ell1, ell2, ell3) in enumerate(ells):
-            Ylms = [[get_Ylm(ell, m, reduced=True, real=False, conj=True) for m in range(-ell, ell + 1)] for ell in (ell1, ell2, ell3)]
-            xs = _iter_triposh(ell1, ell2, ell3, los=los)
-            if xs[0].size:
-                num_ = jax.lax.scan(partial(f, Ylms, (ell1, ell2, ell3)), init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0]
-                #num.append(bin(*meshes, remove_zero=True) / bin.nmodes[ill])
+            def f(carry, idx):
+                los = xvec if vlos is None else vlos
+                carry += jax.lax.switch(idx, branches, kvec, los)
+                return carry, idx
+
+            return f, np.arange(len(branches))
+
+        for (ell1, ell2, ell3) in ells:
+            f, xs = get_f((ell1, ell2, ell3))
+            if xs.size:
+                num_ = jax.lax.scan(f, init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0]
             else:
                 num_ = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
             num.append(num_.real)
+
 
     correlation = []
     for ill, ell in enumerate(ells):

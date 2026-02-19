@@ -1109,6 +1109,43 @@ def test_misc():
     print(nterms)
 
 
+def test_memory():
+    from jaxpower.utils import estimate_memory
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
+
+    mesh = generate_gaussian_mesh(mattrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e4)
+    data = generate_uniform_particles(mattrs, size, seed=32)
+    # Triumvirate doesn't take weights for box statistics...
+    #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+
+    kw = dict(resampler='cic', interlacing=False, compensate=True)
+    mesh = data.paint(**kw)
+    mean = mesh.mean()
+    #mean = 1.
+    mesh = mesh - mean
+    edges = np.linspace(0.1, mattrs.boxsize.min() / 3., 3)
+    #ell = (0, 0, 0)
+    #ell = (2, 0, 2)
+    #ell = (2, 2, 2)
+    ell = (4, 4, 4)
+    los = 'local'
+
+    bin = BinMesh3CorrelationPoles(mattrs, edges=edges, basis='sugiyama', ells=[ell])
+    #correlation = compute_mesh3_correlation(mesh, los=los, bin=bin)
+    #print(correlation.value())
+
+    jitted_compute_mesh3_correlation = jax.jit(compute_mesh3_correlation, static_argnames=['los'])
+    estimate_memory(jitted_compute_mesh3_correlation, mesh, los=los, bin=bin)
+
+
 if __name__ == '__main__':
 
     #import os
