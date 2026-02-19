@@ -1121,7 +1121,6 @@ if __name__ == '__main__':
     test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
-    exit()
     test_mesh3_spectrum()
     test_fkp3_shotnoise()
     test_polybin3d()

@@ -551,8 +551,7 @@ def test_fkp2_covariance(plot=False):
     theory = get_theory(kmax=mattrs.knyq.max())
     size = int(1e-4 * pattrs.boxsize.prod())
 
-    ialpha = 5
-    randoms = generate_uniform_particles(pattrs, size * ialpha, seed=32).clone(attrs=mattrs)
+    randoms = generate_uniform_particles(pattrs, size, seed=32).clone(attrs=mattrs)
     #edges = {'step': attrs.cellsize.min()}
     edges = None
 
@@ -561,8 +560,8 @@ def test_fkp2_covariance(plot=False):
     if window_fn.exists():
         windows = list(read(window_fn))
     else:
-        windows = compute_fkp2_covariance_window(randoms, edges=edges, interlacing=2, resampler='tsc', los='local', alpha=1. / ialpha)
-        ObservableTree(windows, types=['WW', 'WS', 'SS']).write(window_fn)
+        windows = compute_fkp2_covariance_window(randoms, edges=edges, interlacing=2, resampler='tsc', los='local')
+        windows.write(window_fn)
 
     covs = compute_spectrum2_covariance(windows, theory, delta=0.2)
     for cov in covs:
@@ -609,21 +608,21 @@ def test_multitracer_covariance(plot=False):
 
     window_fn = dirname / 'window_fkp_multitracer.h5'
 
-    if window_fn.exists():
-        windows = list(read(window_fn))
+    if False: #window_fn.exists():
+        windows = read(window_fn)
     else:
-        windows = compute_fkp2_covariance_window([randoms1, randoms2], edges=edges, interlacing=2, resampler='tsc', los='local', alpha=1. / ialpha, fields=['a', 'b'])
-        ObservableTree(windows, types=['WW', 'WS', 'SS']).write(window_fn)
+        windows = compute_fkp2_covariance_window([randoms1, randoms2], edges=edges, interlacing=2, resampler='tsc', los='local', fields=['a', 'b'])
+        windows.write(window_fn)
 
-    windows = list(windows)
+    #windows = list(windows)
     #for i, window in enumerate(windows):
     #    windows[i] = ObservableTree([next(iter(window))] * len(window.fields), fields=window.fields)
 
     #theory = ObservableTree([theory] * 4, fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())], fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
-    covs = compute_spectrum2_covariance(windows, theory)
+    covs = compute_spectrum2_covariance(windows, theory, return_type='list')
 
-    for name, cov in zip(['WW', 'SS', 'WS'], covs):
+    for name, cov in zip(['WW', 'WS', 'SS'], covs):
         cov = cov.value()
         assert np.allclose(cov, cov.T), name
 
@@ -818,7 +817,7 @@ if __name__ == '__main__':
     test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
     #test_pre_post_covariance()
-    test_multitracer_covariance()
+    #test_multitracer_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)

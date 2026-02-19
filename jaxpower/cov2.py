@@ -59,7 +59,7 @@ class Correlation2Spectrum(object):
         return self.k, self._postfactor * fun
 
 
-def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fields=None, **kwargs):
+def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, **kwargs):
     """
     Compute the window matrices (WW, WS, SS) for the FKP 2-point covariance.
 
@@ -69,10 +69,6 @@ def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fiel
         (List of) FKPField or ParticleField.
     bin : BinMesh2CorrelationPoles, optional
         Binning operator.
-    alpha : float, optional
-        Normalization factor for the randoms: sum(data_weights) / sum(randoms_weights).
-        If ``None``, measured from input FKP particules.
-        Used to compute shotnoise terms.
     los : str, optional
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
         Else, may be 'x', 'y' or 'z', for one of the Cartesian axes.
@@ -120,12 +116,13 @@ def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fiel
 
     if fields is None: fields = list(range(len(fkps)))
     fkps = {field: fkp for field, fkp in zip(fields, fkps, strict=True)}
-
-    ipairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each inner P(k)
-    for iW in itertools.product(ipairs, ipairs):  # then choose two pairs of fields
-        iW = iW[0] + iW[1]
-        if iW not in WW:
-            W = ws = [get_W(iW[0]) * get_W(iW[1]), get_W(iW[2]) * get_W(iW[3])]
+    windows = {name: {} for name in ['WW', 'WS', 'SW', 'SS']}
+    pairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each inner P(k)
+    compute_mesh2_window = jax.jit(compute_mesh2, static_argnames=['los'])
+    for pair in itertools.product(pairs, pairs):
+        wfield = sum(pair, start=tuple())
+        if wfield not in windows['WW']:
+            W = ws = [get_W(wfield[0]) * get_W(wfield[1]), get_W(wfield[2]) * get_W(wfield[3])]
             # mattrs = W[0].attrs
             # norm is sum(cellsize * W^2) * sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2) / cellsize^2, so correct norm by cellsize^2
@@ -133,20 +130,18 @@ def compute_fkp2_covariance_window(fkps, bin=None, alpha=None, los='local', fiel
             # We could have used the normalization from the power spectrum estimation,
             # but this is anyway degenerate with the approximation we're making that W * W ~ W^2
             update = dict(norm=[ws[0].sum() * ws[1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
-            WW[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
-            if iW[3] == iW[2]:
-                ws = [W[0], get_S(iW[2], iW[3])]
-                WS[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
-            if iW[1] == iW[0]:
-                ws = [get_S(iW[0], iW[1]), W[1]]
-                WS[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
-            if iW[1] == iW[0] and iW[3] == iW[2]:
-                ws = [get_S(iW[0], iW[1]), get_S(iW[2], iW[3])]
-                SS[iW] = compute_mesh2(*ws, bin=bin, los=los).clone(**update)
-    WW = ObservableTree(list(WW.values()), fields=[tuple(iW) for iW in WW])
-    WS = ObservableTree(list(WS.values()), fields=[tuple(iW) for iW in WS])
-    SS = ObservableTree(list(SS.values()), fields=[tuple(iW) for iW in SS])
-    return WW, WS, SS
+            windows['WW'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+            if wfield[3] == wfield[2]:
+                ws = [W[0], get_S(wfield[2], wfield[3])]
+                windows['WS'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+            if wfield[1] == wfield[0]:
+                ws = [get_S(wfield[0], wfield[1]), W[1]]
+                windows['SW'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+            if wfield[1] == wfield[0] and wfield[3] == wfield[2]:
+                ws = [get_S(wfield[0], wfield[1]), get_S(wfield[2], wfield[3])]
+                windows['SS'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+    return ObservableTree([ObservableTree(list(windows[name].values()), fields=[tuple(wfield) for wfield in windows[name]]) for name in windows], types=list(windows))
+
 
 
 def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, **kwargs):
@@ -178,8 +173,6 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
             mesh = mesh.c2r()
         return mesh
 
-    meshes = [_2r(mesh) for mesh in meshes]
-    WW = {}
     if bin is None:
         mattrs = meshes[0].attrs
         kw = {'edges': None, 'ells': tuple(range(0, 9, 2)), 'basis': None, 'klimit': None, 'batch_size': None}
@@ -194,25 +187,29 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
         mesh = meshes[field]
         return mesh / mesh.cellsize.prod()
 
+    meshes = [_2r(mesh) for mesh in meshes]
     if fields is None: fields = list(range(len(meshes)))
     meshes = {field: mesh for field, mesh in zip(fields, meshes, strict=True)}
-    ipairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each P(k)
-    for iW in itertools.product(ipairs, ipairs):  # then choose two pairs of fields
-        iW = iW[0] + iW[1]
-        if iW not in WW:
-            W = [get_W(iW[0]) * get_W(iW[1])]
-            if iW[2:] != iW[:2]:
-                W.append(get_W(iW[2]) * get_W(iW[3]))
-            mattrs = W[0].attrs
+
+    pairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each P(k)
+    window = {}
+    compute_mesh2_window = jax.jit(compute_mesh2, static_argnames=['los'])
+    for pair in itertools.product(pairs, pairs):  # then choose two pairs of fields
+        wfield = sum(pair, start=tuple())
+        if wfield not in window:
+            ws = [get_W(wfield[0]) * get_W(wfield[1])]
+            if wfield[2:] != wfield[:2]:
+                ws.append(get_W(wfield[2]) * get_W(wfield[3]))
+            #mattrs = W[0].attrs
             #norm = W[0].sum() * W[-1].sum() * mattrs.cellsize.prod()**2  # sum(cellsize * W^2) *  sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2 * W^2) / cellsize^2, so correct norm:
             #norm = norm / mattrs.cellsize.prod()**2
-            WW[iW] = compute_mesh2(*W, bin=bin, los=los).clone(norm=[W[0].sum() * W[-1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
-    WW = ObservableTree(list(WW.values()), fields=[tuple(iW) for iW in WW])
-    return WW
+            norm = [ws[0].sum() * ws[-1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells)
+            window[wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(norm=norm)
+    return ObservableTree(list(window.values()), fields=[tuple(wfield) for wfield in window])
 
 
-def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
+def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, flags=('smooth',)):
     r"""
     Compute the covariance matrix for the 2-point power spectrum, given window matrices and poles.
 
@@ -236,10 +233,14 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
     and interpolate with :func:`interpolate_window_function`.
     Else, use fine :math:`s`-binning (smaller than the :math:`pi / k_\mathrm{max}`, where :math:`k_\mathrm{max}` is the maximum wavenumber of the covariance matrix).
 
+    Reference
+    ---------
+    https://arxiv.org/pdf/1811.0571
+
     Returns
     -------
-    cov : CovarianceMatrix or tuple of CovarianceMatrix
-        Covariance matrix (or tuple of matrices: PP, PS and SS if WS and SS are input).
+    cov : CovarianceMatrix
+        Covariance matrix.
     """
     # TODO: check for multiple fields
     single_field = False
@@ -319,304 +320,12 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
 
     else:
         assert 'smooth' in flags, 'only "smooth" approximation is implemented'
-        has_shotnoise = not isinstance(window2, ObservableTree)
+        has_shotnoise = 'types' in window2.labels(return_type='keys')
         if has_shotnoise:
-            WW, WS, SS = window2
+            WW, WS, SW, SS = [window2.get(name) for name in ['WW', 'WS', 'SW', 'SS']]
         else:
             WW = window2
-        fields = []
-        for field in WW.fields:
-            field = field[::2]
-            if field not in fields:
-                fields.append(field)
 
-        if not with_fields(poles):
-            single_field = True
-            assert len(WW.fields) == 1, 'single poles can be provided if only one window (field)'
-            field = WW.fields[0]
-            poles = ObservableTree([poles], fields=[field[::2]])
-        for field in fields:
-            assert field in poles.fields, f'input pole {field} is required'
-
-        def get_wj(ww, k1, k2, q1, q2):
-            shape = k1.shape + k2.shape
-            w = sum(legendre_product(q1, q2, q) *  ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
-            if w.size <= 1:
-                return np.zeros(shape)
-            tmpw = next(iter(ww))
-            s = tmpw.coords('s')
-
-            def interp2d(x, y, xp, yp, fp, left=0., right=0.):
-                # fp shape: (len(xp), len(yp))
-                interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
-                return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
-
-            if 'fftlog' in flags:
-                s = tmpw.coords('s')
-                fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
-                tmp = fftlog(w)[1]
-                #from scipy.interpolate import RectBivariateSpline
-                #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
-                #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
-                toret = interp2d(k1, k2, fftlog.k, fftlog.k, tmp, left=0., right=0.)
-                #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
-                #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
-                return toret
-
-            else:
-                k1, k2 = np.meshgrid(k1, k2, indexing='ij', sparse=False)
-                k1, k2 = k1.ravel(), k2.ravel()
-                kmask = Ellipsis
-                if delta is not None:
-                    kmask = np.abs(k2 - k1) <= delta
-                    k1, k2 = k1[kmask], k2[kmask]
-
-                if 'volume' in tmpw.values():
-                    vol = tmpw.values('volume')
-                    #vol = 4. / 3. * np.pi * np.diff(ww.edges(projs=q1)**3, axis=-1)[..., 0]
-                    w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
-                    w *= vol
-
-                def f(k12):
-                    k1, k2 = k12
-                    return jnp.sum(w * get_spherical_jn(q1)(k1 * s) * get_spherical_jn(q2)(k2 * s))
-
-                batch_size = int(min(max(1e7 / (k1.size * s.size), 1), k1.size))
-                tmp = jax.lax.map(f, (k1, k2), batch_size=batch_size)
-                toret = np.zeros(shape)
-                toret.flat[kmask] = tmp
-                return toret
-
-        def get_window_field(window, fields, test=False):
-            def sort(field):
-                return tuple(sorted(field[:2])) + tuple(sorted(field[2:]))
-            wfields = [sort(field) for field in window.fields]
-            fields = sort(fields)
-            if fields in wfields:
-                if test: return True
-                return window.get(window.fields[wfields.index(fields)])
-            if test: return False
-            raise ValueError(f'{fields} not found in {window}')
-
-        cov_WW, cov_WS, cov_SS = {}, {}, {}
-        for field in itertools.combinations_with_replacement(fields, 2):
-            field = sum(field, start=tuple())
-            cross_fields = [(field[0], field[2]), (field[1], field[3])]
-            cross_fields_swap = [(field[0], field[3]), (field[1], field[2])]
-            pole1, pole2 = poles.get(cross_fields[0]), poles.get(cross_fields[1])
-            assert pole1.ells == pole2.ells
-            ells = pole1.ells
-            ills = list(range(len(ells)))
-
-            def init():
-                return [[np.zeros((len(pole1.get(ell).coords('k')), len(pole2.get(ell).coords('k')))) for ell in ells] for ell in ells]
-
-            cov_WW[field] = init()
-            if has_shotnoise: cov_WS[field], cov_SS[field] = init(), init()
-
-            if field[1] != field[0] or field[3] != field[2]:
-                cross_fields = [(1, False, cross_fields), (1, True, cross_fields_swap)]
-            else:
-                cross_fields = [(2, False, cross_fields)]
-
-            for factor, swap, cross_fields in cross_fields:
-                window_fields = sum(cross_fields, start=tuple())
-                window_fields_swap = sum(cross_fields[::-1], start=tuple())
-
-                cache_WW, cache_WS1, cache_WS2 = {}, {}, {}
-                center = 'mid_if_edges_and_nan'
-                for ill1, ill2 in itertools.product(ills, ills):
-                    ell1, ell2 = ells[ill1], ells[ill2]
-                    k1 = pole1.get(ell1).coords('k', center=center)
-                    k2 = pole2.get(ell2).coords('k', center=center)
-                    for p1, p2 in itertools.product(ells, ells):
-                        q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
-                        q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
-                        # WW
-                        for q1, q2 in itertools.product(q1, q2):
-                            coeff1 = legendre_product(ell1, p1, q1) * legendre_product(ell2, p2, q2)
-                            if coeff1 == 0.: continue
-                            if (q1, q2) in cache_WW:
-                                tmp = cache_WW[q1, q2]
-                            else:
-                                tmp = (-1)**((q1 - q2) // 2) * (2 * q1 + 1) * (2 * q2 + 1) * get_wj(get_window_field(WW, window_fields), k1, k2, q1, q2)
-                                cache_WW[q1, q2] = tmp
-                            if swap:
-                                pk12 = pole1.get(p1).value()[..., None] * pole2.get(p2).value()
-                                pk12 = (pk12 + (-1)**((p1 % 2) + (p2 % 2)) * pk12.T) / 2. * (-1)**(q2 % 2)  # +k2 in window
-                            else:
-                                pk12 = pole1.get(p1).value()[..., None] * (-1)**(p2 % 2) * pole2.get(p2).value()
-                                pk12 = (pk12 + pk12.T) / 2.
-                            cov_WW[field][ill1][ill2] += factor * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pk12
-                    if not has_shotnoise: continue
-                    if get_window_field(WS, window_fields, test=True):
-                        # WS
-                        for p1 in ells:
-                            q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
-                            for q1 in q1:
-                                q2 = q1
-                                coeff1 = legendre_product(ell1, p1, q1)
-                                if coeff1 == 0.: continue
-                                if (q1, ell2) in cache_WS1:
-                                    tmp = cache_WS1[q1, ell2]
-                                else:
-                                    tmp = (-1)**((q1 - ell2) // 2) * (2 * q1 + 1) * get_wj(get_window_field(WS, window_fields), k1, k2, q1, ell2)
-                                    cache_WS1[q1, ell2] = tmp
-                                if swap:
-                                    pk1 = pole1.get(p1).value()[:, None]
-                                    pk1 = (pk1 + (-1)**(p1 % 2) * pk1.T) / 2. * (-1)**(ell2 % 2)  # +k2 in window
-                                else:
-                                    pk1 = pole1.get(p1).value()[:, None]
-                                    pk1 = (pk1 + pk1.T) / 2.
-                                cov_WS[field][ill1][ill2] += factor * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * tmp * pk1
-
-                        # WS swap
-                        for p2 in ells:
-                            q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
-                            for q2 in q2:
-                                q1 = q2
-                                coeff1 = legendre_product(ell2, p2, q2)
-                                if coeff1 == 0.: continue
-                                if (q2, ell1) in cache_WS2:
-                                    tmp = cache_WS2[q2, ell1]
-                                else:
-                                    tmp = (-1)**((q2 - ell1) // 2) * (2 * q2 + 1) * get_wj(get_window_field(WS, window_fields_swap), k1, k2, ell1, q2)
-                                    cache_WS2[q2, ell1] = tmp
-                                if swap:
-                                    pk2 = pole2.get(p2).value()[:, None]
-                                    pk2 = ((-1)**(p2 % 2) * pk2 + pk2.T) / 2. * (-1)**(q2 % 2)  # +k2 in window
-                                else:
-                                    pk2 = (-1)**(p2 % 2) * pole2.get(p2).value()[:, None]
-                                    pk2 = (pk2 + pk2.T) / 2.
-                                # window conjugate
-                                cov_WS[field][ill1][ill2] += factor * (2 * ell1 + 1) * (2 * ell2 + 1) * coeff1 * (-1)**((ell1 % 2) + (q2 % 2)) * tmp * pk2
-                    if get_window_field(SS, window_fields, test=True):
-                        # SS
-                        if swap:
-                            sign = (-1)**(ell2 % 2)  # +k2 in window
-                        else:
-                            sign = 1
-                        cov_SS[field][ill1][ill2] += factor * (2 * ell1 + 1) * (2 * ell2 + 1) * (-1)**((ell1 - ell2) // 2) * get_wj(get_window_field(SS, window_fields), k1, k2, ell1, ell2) * sign
-
-        if has_shotnoise:
-            covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
-        else:
-            covs = finalize(cov_WW)
-        return covs
-
-
-def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
-    r"""
-    Compute the covariance matrix for the 2-point power spectrum, given window matrices and poles.
-
-    Parameters
-    ----------
-    window2 : Obser or MeshAttrs
-        Window matrices (WW, WS, SS).
-        A :class:`MeshAttrs` instance can be directly provided instead, in case the selection function is trivial (constant).
-    poles : ObservableTree or Mesh2SpectrumPoles
-        Dictionary of Mesh2SpectrumPoles objects for each observable, or a single :class:`Mesh2SpectrumPoles` instance.
-    delta : float, optional
-        Maximum :math:`|k_i - k_j|` (in :math:`k`-bin units) for which to compute the covariance.
-    flags : tuple, optional
-        Flags controlling the computation:
-        - 'smooth' (default for non-trivial selection function): no binning effects
-        - 'fftlog': same as 'smooth', but using 2D fftlog instead of naive spherical Bessel integration.
-
-    Notes
-    -----
-    If 'fftlog' in ``flags``, compute windows (:func:`compute_fkp2_covariance_window`) with arguments ``basis='bessel'``,
-    and interpolate with :func:`interpolate_window_function`.
-    Else, use fine :math:`s`-binning (smaller than the :math:`pi / k_\mathrm{max}`, where :math:`k_\mathrm{max}` is the maximum wavenumber of the covariance matrix).
-
-    Returns
-    -------
-    cov : CovarianceMatrix or tuple of CovarianceMatrix
-        Covariance matrix (or tuple of matrices: PP, PS and SS if WS and SS are input).
-    """
-    # TODO: check for multiple fields
-    single_field = False
-
-    def with_fields(poles):
-        return 'fields' in poles.labels(return_type='keys')
-
-    def finalize(cov):
-        nfields = len(fields)
-        value = [[None for i in range(nfields)] for i in range(nfields)]
-        for ifield1, ifield2 in itertools.combinations_with_replacement(range(nfields), 2):
-            field = fields[ifield1] + fields[ifield2]
-            value[ifield1][ifield2] = np.block(cov[field])
-            if ifield2 > ifield1:
-                value[ifield2][ifield1] = value[ifield1][ifield2].T
-        value = np.block(value)
-        if single_field:
-            observable = next(iter(poles))
-        else:
-            observable = ObservableTree([poles.get(field) for field in fields], fields=fields)
-        return CovarianceMatrix(observable=observable, value=value)
-
-    if isinstance(window2, MeshAttrs):
-        mattrs = window2
-        if not with_fields(poles):
-            single_field = True
-            poles = ObservableTree([poles], fields=[(0, 0)])
-        fields = []
-        for field1 in poles.fields:
-            for field2 in poles.fields:
-                field = (field1[0], field2[0])
-                if field not in fields:
-                    fields.append(field)
-
-        cov = {}
-        for field in itertools.combinations_with_replacement(fields, 2):
-            field = sum(field, start=tuple())
-            cross_fields = [(field[0], field[2]), (field[1], field[3])]
-            cross_fields_swap = [(field[0], field[3]), (field[1], field[2])]
-            pole1, pole2 = poles.get(cross_fields[0]), poles.get(cross_fields[1])
-            assert pole1.ells == pole2.ells
-            ells = pole1.ells
-            ills = list(range(len(ells)))
-
-            def init():
-                return [[np.zeros((len(pole1.get(ell).coords('k')),) * 2) for ell in ells] for ell in ells]
-
-            cov[field] = init()
-
-            from scipy import special
-            if 'smooth' not in flags:
-                bin = BinMesh2SpectrumPoles(mattrs, edges=next(iter(pole1)).edges('k'), ells=(0,))
-                kvec = mattrs.kcoords(sparse=True)
-                vlos = (0, 0, 1)  # doesn't matter
-                mu = sum(kk * ll for kk, ll in zip(kvec, vlos)) / jnp.sqrt(sum(kk**2 for kk in kvec)).at[(0,) * mattrs.ndim].set(1.)
-
-            for ill1, ill2 in itertools.product(ills, ills):
-                ell1, ell2 = ells[ill1], ells[ill2]
-                for p1, p2 in itertools.product(ells, ells):
-                    pk12 = pole1.get(p1).value() * (-1)**(p2 % 2) * pole2.get(p2).value()
-                    if field[1] != field[0] or field[3] != field[2]:
-                        pk12 += poles.get(cross_fields_swap[0]).get(p1).value() * (-1)**(p2 % 2) * poles.get(cross_fields_swap[1]).get(p2).value()
-                    else:
-                        pk12 *= 2
-                    pk12 *= 1. / mattrs.boxsize.prod() * (2 * ell1 + 1) * (2 * ell2 + 1)
-                    if 'smooth' in flags:
-                        coeff = sum((2 * q + 1) * legendre_product(ell1, p1, q) * legendre_product(ell2, p2, q) for q in range(abs(ell1 - p1), ell1 + p1 + 1))
-                        vol = 4. / 3. * np.pi * np.diff(pole1.get(ell1).edges('k')**3, axis=-1)[..., 0]
-                    else:
-                        poly = 1.
-                        for ell in [ell1, ell2, p1, p2]: poly *= special.legendre(ell)
-                        coeff = bin(poly(mu))
-                        vol = bin.nmodes * mattrs.kfun.prod()
-                    cov[field][ill1][ill2] += np.diag((2. * np.pi)**3 / vol * coeff * pk12)
-
-        return finalize(cov)
-
-    else:
-        assert 'smooth' in flags, 'only "smooth" approximation is implemented'
-        has_shotnoise = not isinstance(window2, ObservableTree)
-        if has_shotnoise:
-            WW, WS, SS = window2
-        else:
-            WW = window2
         fields = []
         for field in WW.fields:
             field = field[::2]
@@ -763,8 +472,8 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                                 else:
                                     wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, q1, ell2)
                                     if window_fields_swap != window_fields:
-                                        # conjugate *
-                                        wj2 = (-1)**((q1 % 2) + (ell2 % 2)) * get_wj(get_window_field(WS, window_fields_swap), k1, k2, q1, ell2)
+                                        # conjugate * in ref paper: actually SW
+                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, q1, ell2)
                                     wj = (wj1, wj2)
                                     cache_WS1[q1, ell2] = wj
                                 if swap:
@@ -790,8 +499,8 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
                                 else:
                                     wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, ell1, q2)
                                     if window_fields_swap != window_fields:
-                                        # conjugate *
-                                        wj2 = (-1)**((ell1 % 2) + (q2 % 2)) * get_wj(get_window_field(WS, window_fields_swap), k1, k2, ell1, q2)
+                                        # conjugate * in ref paper: actually SW
+                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, ell1, q2)
                                     wj = (wj1, wj2)
                                     cache_WS2[ell1, q2] = wj
                                 if swap:
@@ -815,6 +524,9 @@ def compute_spectrum2_covariance(window2, poles, delta=None, flags=('smooth',)):
 
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
+            if return_type != 'list':
+                covs = sum(covs)
+            return covs
         else:
             covs = finalize(cov_WW)
         return covs
