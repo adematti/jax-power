@@ -9,7 +9,7 @@ from jax import shard_map
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
+from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, create_sharded_array, create_sharded_random, exchange_particles)
 
 
 dirname = Path('_tests')
@@ -86,7 +86,7 @@ def test_exchange_array():
     def allgather(array):
         return jax.jit(_identity_fn, out_shardings=array.sharding.with_spec(P(None)))(array).addressable_data(0)
 
-    test = 1
+    test = 0
     if test == 0:
         device_mesh_shape = (4,)
         devices = mesh_utils.create_device_mesh(device_mesh_shape)
@@ -129,20 +129,12 @@ def test_exchange_array():
         array = rng.uniform(size=int(1e5))
         device = np.clip(np.floor(array * mpicomm.size).astype('i4'), 0, mpicomm.size - 1)
         device = np.clip(device, 0, mpicomm.size - 2)
-        exchanged, *indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
+        exchanged, indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
         array_gathered = np.concatenate(mpicomm.allgather(array))
         device_gathered = np.concatenate(mpicomm.allgather(device))
         assert all(mpicomm.allgather(np.allclose(exchanged, array_gathered[device_gathered == mpicomm.rank])))
-        array2 = _exchange_inverse_mpi(exchanged, *indices, mpicomm=mpicomm)
+        array2 = _exchange_inverse_mpi(exchanged, indices, mpicomm=mpicomm)
         assert np.allclose(array2, array)
-
-    if test == 2:
-        device_mesh_shape = (4,)
-        devices = mesh_utils.create_device_mesh(device_mesh_shape)
-        with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
-            positions = jax.random.uniform(random.key(42), shape=(18, 3))
-            positions = make_particles_from_local(positions)
-            print(positions.shape)
 
 
 def test_halo():
@@ -418,6 +410,7 @@ if __name__ == '__main__':
     config.update('jax_enable_x64', True)
     import warnings
     warnings.simplefilter("error")
+    test_exchange_array()
     #save_reference_mock()
     # Setting up distributed jax
     #jax.distributed.initialize()

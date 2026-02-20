@@ -32,15 +32,6 @@ def select_region(ra, dec, region=None):
         return mask_ngc & mask_s
     if region == 'SSGC':
         return (~mask_ngc) & mask_s
-    if footprint is None: load_footprint()
-    north, south, des = footprint.get_imaging_surveys()
-    mask_des = des[hp.ang2pix(nside, ra, dec, nest=True, lonlat=True)]
-    if region == 'DES':
-        return mask_des
-    if region == 'SnoDES':
-        return mask_s & (~mask_des)
-    if region == 'SSGCnoDES':
-        return (~mask_ngc) & mask_s & (~mask_des)
     raise ValueError('unknown region {}'.format(region))
 
 
@@ -113,7 +104,7 @@ def get_measurement_fn(kind='mesh2_spectrum_poles', tracer='LRG', region='NGC', 
 
 
 def compute_jaxpower_mesh2_spectrum(fn, get_data, get_randoms, cut=None, ells=(0, 2, 4), los='firstpoint', **attrs):
-    from jaxpower import (ParticleField, FKPField, compute_fkp2_normalization, compute_fkp2_shotnoise, create_sharding_mesh, make_particles_from_local, exchange_particles, BinMesh2SpectrumPoles, BinParticle2CorrelationPoles, BinParticle2SpectrumPoles, compute_particle2, get_mesh_attrs)
+    from jaxpower import (ParticleField, FKPField, compute_fkp2_normalization, compute_fkp2_shotnoise, BinMesh2SpectrumPoles, BinParticle2CorrelationPoles, BinParticle2SpectrumPoles, compute_particle2, get_mesh_attrs)
     t0 = time.time()
     data = get_data()
     randoms = get_randoms()
@@ -294,7 +285,7 @@ if __name__ == '__main__':
             output_fn = get_measurement_fn(imock=imock, **catalog_args, kind=f'mesh3_spectrum_poles_{bispectrum_args["basis"]}_triumvirate')
             compute_triumvirate_mesh3_spectrum(output_fn, get_data, get_randoms, **bispectrum_args)
 
-    
+
     print('Elapsed time: {:.2f}'.format(time.time() - t0))
 
     if with_jax: jax.distributed.shutdown()

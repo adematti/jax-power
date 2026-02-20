@@ -8,7 +8,7 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, compute_mesh3_correlation, BinMesh3CorrelationPoles, Mesh3CorrelationPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles,
+from jaxpower import (compute_mesh3, compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, compute_mesh3_correlation, BinMesh3CorrelationPoles, Mesh3CorrelationPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles,
                       FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils, ParticleField, compute_smooth3_spectrum_window)
 
 
@@ -1146,6 +1146,49 @@ def test_memory():
     estimate_memory(jitted_compute_mesh3_correlation, mesh, los=los, bin=bin)
 
 
+def test_ref():
+    from jaxpower.utils import estimate_memory
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
+    mesh = generate_gaussian_mesh(mattrs, pkvec, seed=(42, 'index'), unitary_amplitude=True)
+    size = int(1e4)
+    data = generate_uniform_particles(mattrs, size, seed=(32, 'index'), exchange=True)
+    randoms = generate_uniform_particles(mattrs, 2 * size, seed=(64, 'index'), exchange=True)
+    fkp = FKPField(data, randoms)
+    kw = dict(resampler='cic', interlacing=3, compensate=True)
+    mesh = fkp.paint(**kw)
+
+    def run(bin, los):
+        compute = jax.jit(compute_mesh3, static_argnames=['los'])
+        estimate_memory(compute, mesh, los=los, bin=bin)
+        return compute(mesh, los=los, bin=bin)
+
+    ref = {('z', 'scoccimarro'): 424.78682826098094, ('local', 'scoccimarro'): 414.7191334479663,
+    ('z', 'sugiyama'): 431.36652062570494, ('local', 'sugiyama'): 423.8844698657364,
+    ('z', 'sugiyama-diagonal'): 451.4928633144716, ('local', 'sugiyama-diagonal'): 430.14525522553345}
+    result = {}
+    for basis, ells in zip(['scoccimarro', 'sugiyama', 'sugiyama-diagonal'], [(0, 2), [(0, 0, 0), (2, 0, 2)], [(0, 0, 0), (2, 0, 2)]]):
+        bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 10 * mattrs.kfun.min()}, basis=basis, ells=ells)
+        for los in ['z', 'local']:
+            result[los, basis] = run(bin, los).value().std()
+            assert np.allclose(result[los, basis], ref[los, basis])
+
+    ref = {'x': 4.247522247532211e-06, 'firstpoint': 4.131427316273581e-06, 'endpoint': 4.131427316273581e-06}
+    result = {}
+    for basis, ells in zip(['sugiyama', 'sugiyama-diagonal'], [[(0, 0, 0), (2, 0, 2)], [(0, 0, 0), (2, 0, 2)]]):
+        bin = BinMesh3CorrelationPoles(mattrs, edges={'step': 10 * mattrs.cellsize.min()}, basis=basis, ells=ells)
+        for los in ['x', 'local']:
+            result[los, basis] = run(bin, los).value().std()
+            #assert np.allclose(result[los, basis], ref[los])
+    print({key: float(result[key]) for key in result})
+
+
 if __name__ == '__main__':
 
     #import os
@@ -1155,7 +1198,8 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_misc()
+    test_ref()
+    #test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
     test_mesh3_spectrum()
