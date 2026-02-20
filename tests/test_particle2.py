@@ -1,9 +1,11 @@
+import time
+
 import numpy as np
 import jax
 from jax import numpy as jnp
 from scipy import special
 
-from jaxpower import MeshAttrs, generate_uniform_particles, compute_particle2, BinParticle2SpectrumPoles, BinParticle2CorrelationPoles, Mesh2SpectrumPoles, Mesh2CorrelationPoles, utils
+from jaxpower import MeshAttrs, create_sharding_mesh, generate_uniform_particles, compute_particle2, BinParticle2SpectrumPoles, BinParticle2CorrelationPoles, Mesh2SpectrumPoles, Mesh2CorrelationPoles, utils
 
 
 @np.vectorize
@@ -265,6 +267,7 @@ def test_particle2(plot=False):
 
 
 def test_particle2_shotnoise():
+    from jaxpower import create_sharded_random, compute_particle2_shotnoise
     mattrs = MeshAttrs(boxsize=1000., meshsize=128)
     size = int(1e5)
     data = generate_uniform_particles(mattrs, size, seed=32)
@@ -277,24 +280,36 @@ def test_particle2_shotnoise():
     assert np.allclose(num_shotnoise[0], jnp.sum(data1.weights * data2.weights))
 
 
-def test():
-    from jax.experimental.shard_map import shard_map
-    from jax.sharding import Mesh, PartitionSpec as P
+def test_ref():
 
-    sharding_mesh = jax.make_mesh((2,), ('x',))
+    from jaxpower.utils import estimate_memory
 
-    def custom(x, y):
-        x, y = np.array(x), np.array(y)
-        return np.sum(x + y)
+    with create_sharding_mesh() as sharding_mesh:
+        mattrs = MeshAttrs(meshsize=(128,) * 3, boxsize=100., boxcenter=1200.)
+        size = 128 * 1024
+        backend = 'jax'
+        data = generate_uniform_particles(mattrs, size, seed=(42, 'index')).exchange(backend=backend)
+        ells = (0, 2, 4)
+        kw = dict(ells=ells, sattrs={'theta': (0., 0.1)})
 
-    def s(x):
-        out_type = jax.ShapeDtypeStruct((), float)
-        return jax.lax.psum(jax.pure_callback(custom, out_type, x['x'], x['y']), sharding_mesh.axis_names)
+        def run(bin, los):
+            return compute_particle2(data, los=los, bin=bin)
 
-    s = shard_map(s, mesh=sharding_mesh, in_specs=P(*sharding_mesh.axis_names), out_specs=P(None))
-    x = jnp.ones(10)
-    x = jax.device_put(x, jax.sharding.NamedSharding(sharding_mesh, spec=P(*sharding_mesh.axis_names)))
-    print(s({'x': x, 'y': x}))
+        ref = {'x': 11649024.215370646, 'firstpoint': 22368010.819297045, 'midpoint': 22368134.22839946, 'endpoint': 22368010.819297027}
+        bin = BinParticle2CorrelationPoles(mattrs, edges={'step': 10., 'max': 100.}, **kw)
+        result = {}
+        for los in ['x', 'firstpoint', 'midpoint', 'endpoint']:
+            result[los] = run(bin, los).value().std()
+            assert np.allclose(result[los], ref[los]), los
+        #print({key: float(result[key]) for key in result})
+
+        ref = {'x': 17488296.67618633, 'firstpoint': 27293178.097055845, 'midpoint': 27293228.561646573, 'endpoint': 27293178.09705584}
+        bin = BinParticle2SpectrumPoles(mattrs, edges={'step': 0.01, 'max': 0.2}, **kw)
+        result = {}
+        for los in ['x', 'firstpoint', 'midpoint', 'endpoint']:
+            result[los] = run(bin, los).value().std()
+            assert np.allclose(result[los], ref[los]), los
+        #print({key: float(result[key]) for key in result})
 
 
 if __name__ == '__main__':
@@ -302,7 +317,10 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    test_particle2(plot=True)
-    test_particle2_shotnoise()
+    jax.distributed.initialize()
+    test_ref()
+
+    #test_particle2(plot=True)
+    #test_particle2_shotnoise()
     #jax.distributed.initialize()
     #jax.distributed.shutdown()

@@ -9,7 +9,7 @@ from jax import shard_map
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, make_particles_from_local, create_sharded_array, create_sharded_random, exchange_particles)
+from jaxpower import (compute_mesh2_spectrum, generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, RealMeshField, ParticleField, FKPField, Mesh2SpectrumPole, Mesh2SpectrumPoles, read, WindowMatrix, MeshAttrs, BinMesh2SpectrumPoles, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_normalization, utils, create_sharding_mesh, create_sharded_array, create_sharded_random, exchange_particles)
 
 
 dirname = Path('_tests')
@@ -79,70 +79,66 @@ def test_exchange_array():
     from jax.sharding import PartitionSpec as P
     from jaxpower.mesh import _exchange_array_jax, _exchange_inverse_jax, _exchange_array_mpi, _exchange_inverse_mpi
 
-
     def _identity_fn(x):
         return x
 
+    def allclose(array1, array2):
+        return all(np.allclose(shard1.data, shard2.data) for shard1, shard2 in zip(array1.addressable_shards, array2.addressable_shards))
+
     def allgather(array):
-        return jax.jit(_identity_fn, out_shardings=array.sharding.with_spec(P(None)))(array).addressable_data(0)
+        return jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(array.sharding.mesh, P()))(array).addressable_data(0)
 
-    test = 1
-    if test == 0:
-        device_mesh_shape = (4,)
-        devices = mesh_utils.create_device_mesh(device_mesh_shape)
-        with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
 
-            nprocs = sharding_mesh.devices.size
+    #device_mesh_shape = (4,)
+    #devices = mesh_utils.create_device_mesh(device_mesh_shape)
+    #with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
+    print(len(jax.devices()))
 
-            if False:
-                array = create_sharded_random(jax.random.uniform, jax.random.key(42), shape=(1024,))
-                device = jnp.floor(array * nprocs).astype('i4')
-                exchanged, *indices = _exchange_array_jax(array, device, pad=jnp.nan, return_indices=True)
-                #tmp = [_.data[~np.isnan(_.data)] for _ in exchanged.addressable_shards]
-                #print(jax.process_index(), [(tt.min(), tt.max()) for tt in tmp])
-                array2 = _exchange_inverse_jax(exchanged, *indices)
-                assert np.allclose(allgather(array2), allgather(array))
+    with create_sharding_mesh() as sharding_mesh:
+        print(sharding_mesh)
+        ndevices = sharding_mesh.devices.size
 
-            if False:
-                from mpi4py import MPI
-                mpicomm = MPI.COMM_WORLD
-                array = np.random.uniform(size=int(1e5))
-                device = np.clip(np.floor(array * nprocs).astype('i4'), 0, mpicomm.size - 1)
-                print(device.min(), device.max())
-                exchanged, *indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
-                array2 = _exchange_inverse_mpi(exchanged, *indices, mpicomm=mpicomm)
-                assert np.allclose(array2, array)
+        if False:
+            array = create_sharded_random(jax.random.uniform, jax.random.key(42), shape=(1024,), out_specs=P(sharding_mesh.axis_names))
+            device = jnp.floor(array * ndevices).astype('i4')
+            print(device.min(), device.max())
+            exchanged, indices = _exchange_array_jax(array, device, pad=jnp.nan, return_indices=True)
+            #tmp = [_.data[~np.isnan(_.data)] for _ in exchanged.addressable_shards]
+            #print(jax.process_index(), [(tt.min(), tt.max()) for tt in tmp])
+            array2 = _exchange_inverse_jax(exchanged, indices)
+            assert allclose(array2, array)
+            #jax.debug.inspect_array_sharding(array, callback=print)
+            #jax.debug.inspect_array_sharding(array2, callback=print)
+            assert np.allclose(allgather(array2), allgather(array))
+            #assert np.allclose(allgather(array2), allgather(array))
 
-            if True:
-                positions = np.random.uniform(size=(int(1e4) + jax.process_index(), 3))
-                weights = np.random.uniform(size=positions.shape[0])
-                mattrs = MeshAttrs(boxsize=1., boxcenter=0.5, meshsize=4)
-                for backend in ['mpi', 'jax']:
-                    positions, exchange, inverse = exchange_particles(mattrs, positions, backend=backend, return_type='jax', return_inverse=True)
-                    weights2 = inverse(exchange(weights))
-                    assert np.allclose(weights2, weights)
+        if False:
+            from mpi4py import MPI
+            mpicomm = MPI.COMM_WORLD
+            rng = np.random.RandomState(seed=42 + jax.process_index())
+            array = rng.uniform(size=100 + jax.process_index())
+            device = np.clip(np.floor(array * ndevices).astype('i4'), 0, mpicomm.size - 1)
+            exchanged, indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
+            array2 = _exchange_inverse_mpi(exchanged, indices, mpicomm=mpicomm)
+            assert np.allclose(array2, array)
 
-    if test == 1:
-        from mpi4py import MPI
-        mpicomm = MPI.COMM_WORLD
-        rng = np.random.RandomState(seed=42 + mpicomm.rank)
-        array = rng.uniform(size=int(1e5))
-        device = np.clip(np.floor(array * mpicomm.size).astype('i4'), 0, mpicomm.size - 1)
-        device = np.clip(device, 0, mpicomm.size - 2)
-        exchanged, *indices = _exchange_array_mpi(array, device, return_indices=True, mpicomm=mpicomm)
-        array_gathered = np.concatenate(mpicomm.allgather(array))
-        device_gathered = np.concatenate(mpicomm.allgather(device))
-        assert all(mpicomm.allgather(np.allclose(exchanged, array_gathered[device_gathered == mpicomm.rank])))
-        array2 = _exchange_inverse_mpi(exchanged, *indices, mpicomm=mpicomm)
-        assert np.allclose(array2, array)
-
-    if test == 2:
-        device_mesh_shape = (4,)
-        devices = mesh_utils.create_device_mesh(device_mesh_shape)
-        with jax.sharding.Mesh(devices, axis_names=('x',)) as sharding_mesh:
-            positions = jax.random.uniform(random.key(42), shape=(18, 3))
-            positions = make_particles_from_local(positions)
-            print(positions.shape)
+        if True:
+            rng = np.random.RandomState(seed=42 + jax.process_index())
+            positions = rng.uniform(size=(1000 + jax.process_index(), 3))
+            weights = 1. + rng.uniform(size=positions.shape[0])
+            mattrs = MeshAttrs(boxsize=100., boxcenter=40., meshsize=32)
+            for backend in ['mpi', 'jax']:
+                epositions, exchange, inverse = exchange_particles(mattrs, positions, backend=backend, return_type='jax', return_inverse=True)
+                eweights = exchange(weights)
+                eidx = (epositions - mattrs.boxcenter + mattrs.boxsize / 2.) / mattrs.boxsize
+                sharding = epositions.sharding
+                mapping = sharding.devices_indices_map(tuple(mattrs.meshsize))
+                for device, eidx, eweight in zip(jax.local_devices(), eidx.addressable_shards, eweights.addressable_shards):
+                    slices = mapping[device]
+                    limits = np.array([(sl.start, sl.stop) if sl.start is not None else (0, mattrs.meshsize[axis]) for axis, sl in enumerate(slices)]).T
+                    assert np.all((eweight.data == 0.)[:, None] | ((eidx.data >= limits[0]) & (eidx.data <= limits[-1])))
+                weights2 = inverse(exchange(weights))
+                assert np.allclose(weights2, weights)
 
 
 def test_halo():
@@ -414,13 +410,17 @@ def test_sharding_routines():
 
 
 if __name__ == '__main__':
+    
     from jax import config
     config.update('jax_enable_x64', True)
+    config.update('jax_num_cpu_devices', 16)
+    #config.update('jax_platform_name', 'cpu')
     import warnings
     warnings.simplefilter("error")
+
     #save_reference_mock()
     # Setting up distributed jax
-    #jax.distributed.initialize()
+    jax.distributed.initialize()
     #test_sharding_routines()
     #test_halo()
     #test_exchange_array()

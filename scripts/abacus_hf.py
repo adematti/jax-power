@@ -26,15 +26,6 @@ def select_region(ra, dec, region=None):
         return mask_ngc & mask_s
     if region == 'SSGC':
         return (~mask_ngc) & mask_s
-    if footprint is None: load_footprint()
-    north, south, des = footprint.get_imaging_surveys()
-    mask_des = des[hp.ang2pix(nside, ra, dec, nest=True, lonlat=True)]
-    if region == 'DES':
-        return mask_des
-    if region == 'SnoDES':
-        return mask_s & (~mask_des)
-    if region == 'SSGCnoDES':
-        return (~mask_ngc) & mask_s & (~mask_des)
     raise ValueError('unknown region {}'.format(region))
 
 

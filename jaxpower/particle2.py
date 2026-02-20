@@ -39,10 +39,10 @@ def _make_edges2(kind, mattrs, edges: staticarray | dict | None=None, xavg: stat
         sattrs = SelectionAttrs(**(sattrs or {}))
     if not isinstance(wattrs, WeightAttrs):
         wattrs = WeightAttrs(**(wattrs or {}))
-    return dict(edges=edges, xavg=xavg, sattrs=sattrs, wattrs=wattrs, ells=ells)
+    return dict(edges=staticarray(edges), xavg=staticarray(xavg), sattrs=sattrs, wattrs=wattrs, ells=ells)
 
 
-@partial(register_pytree_dataclass, meta_fields=['ells'])
+@partial(register_pytree_dataclass, meta_fields=['edges', 'xavg', 'sattrs', 'wattrs', 'ells'])
 @dataclass(init=False, frozen=True)
 class BinParticle2SpectrumPoles(object):
     """
@@ -72,7 +72,8 @@ class BinParticle2SpectrumPoles(object):
     ells : tuple
         Multipole orders.
     """
-    edges: jax.Array = None
+    edges: staticarray = None
+    xavg: staticarray = None
     sattrs: dict = None
     wattrs: dict = None
 
@@ -117,7 +118,7 @@ class BinParticle2SpectrumPoles(object):
         return call(*particles)
 
 
-@partial(register_pytree_dataclass, meta_fields=['ells'])
+@partial(register_pytree_dataclass, meta_fields=['edges', 'xavg', 'sattrs', 'wattrs', 'ells'])
 @dataclass(init=False, frozen=True)
 class BinParticle2CorrelationPoles(object):
     """
@@ -147,10 +148,10 @@ class BinParticle2CorrelationPoles(object):
     ells : ndarray
         Multipole orders.
     """
-    edges: jax.Array = None
-    xavg: jax.Array = None
-    boxsize: jax.Array = None
-    selection: dict = None
+    edges: staticarray = None
+    xavg: staticarray = None
+    sattrs: dict = None
+    wattrs: dict = None
 
     def __init__(self, mattrs=None, edges: staticarray | dict | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=0):
         kw = _make_edges2('real', mattrs, edges=edges, sattrs=sattrs, wattrs=wattrs, ells=ells)
@@ -199,10 +200,6 @@ def convert_particles(particles: ParticleField, weights=None, exchange_weights: 
         sharding_mesh = particles.attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding and exchange_weights and particles.exchange_direct is not None:
-            input_is_not_sharded = (getattr(weights[0], 'sharding', None) is not None) and (getattr(weights[0].sharding, 'mesh', None) is None)
-            if particles.exchange_direct.backend == 'jax' and input_is_not_sharded:
-                from .mesh import make_array_from_process_local_data
-                weights = [make_array_from_process_local_data(weight, pad=0) for weight in weights]
             weights = [particles.exchange_direct(weight, pad=0) for weight in weights]
     else:
         weights = particles.weights

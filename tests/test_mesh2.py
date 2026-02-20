@@ -12,7 +12,7 @@ from jax.sharding import PartitionSpec as P
 from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       BinMesh2CorrelationPoles, compute_mesh2_correlation,
                       generate_gaussian_mesh, generate_anisotropic_gaussian_mesh, generate_uniform_particles, ParticleField, FKPField,
-                      MeshAttrs, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
+                      MeshAttrs, compute_mesh2, compute_mesh2_spectrum_mean, compute_mesh2_spectrum_window, compute_smooth2_spectrum_window,
                       compute_fkp2_normalization, compute_fkp2_shotnoise, compute_normalization, create_sharding_mesh, get_mesh_attrs,
                       Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils, create_sharded_random)
 
@@ -957,10 +957,95 @@ def test_pypower():
             assert np.allclose(pk_jax.get(ells=ell).value(), pk_py(ell=ell, complex=False), equal_nan=True, atol=1e-5, rtol=1e-5)
 
 
+def test_memory():
+    from jaxpower.utils import estimate_memory
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
+
+    mesh = generate_gaussian_mesh(mattrs, pkvec, seed=42, unitary_amplitude=True)
+    size = int(1e4)
+    data = generate_uniform_particles(mattrs, size, seed=32)
+    # Triumvirate doesn't take weights for box statistics...
+    #data = data.clone(weights=1. + mesh.read(data.positions, resampler='cic', compensate=True))
+
+    kw = dict(resampler='cic', interlacing=False, compensate=True)
+    mesh = data.paint(**kw)
+    mean = mesh.mean()
+    #mean = 1.
+    mesh = mesh - mean
+
+    los = 'firstpoint'
+
+    ells = [0, 2, 4, 6, 8]
+    bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 4 * mattrs.kfun.min()}, ells=ells)
+    compute = jax.jit(compute_mesh2_spectrum, static_argnames=['los'])
+    estimate_memory(compute, mesh, los=los, bin=bin)
+
+    bin = BinMesh2CorrelationPoles(mattrs, edges={'step': 4 * mattrs.cellsize.min()}, ells=ells)
+    compute = jax.jit(compute_mesh2_correlation, static_argnames=['los'])
+    estimate_memory(compute, mesh, los=los, bin=bin)
+
+
+def test_ref():
+    from jaxpower.utils import estimate_memory
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    with create_sharding_mesh() as sharding_mesh:
+        mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
+        mesh = generate_gaussian_mesh(mattrs, pkvec, seed=(42, 'index'), unitary_amplitude=True)
+        size = 128 * 1024
+        backend = 'jax'
+        data = generate_uniform_particles(mattrs, size, seed=(32, 'index')).exchange(backend=backend)
+        randoms = generate_uniform_particles(mattrs, 2 * size, seed=(64, 'index')).exchange(backend=backend)
+
+        fkp = FKPField(data, randoms)
+        kw = dict(resampler='cic', interlacing=3, compensate=True)
+        mesh = fkp.paint(**kw)
+    
+        def run(bin, los):
+            compute = jax.jit(compute_mesh2, static_argnames=['los'])
+            estimate_memory(compute, mesh, los=los, bin=bin)
+            return compute(mesh, los=los, bin=bin)
+    
+        ells = (0, 2, 4)
+        ref = {'x': 21.734526818678155, 'firstpoint': 21.38052302043614, 'endpoint': 21.38052302043614}
+        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 4 * mattrs.kfun.min()}, ells=ells)
+        result = {}
+        for los in ['x', 'firstpoint', 'endpoint']:
+            result[los] = run(bin, los).value().std()
+            assert np.allclose(result[los], ref[los])
+
+        ref = {('x', None): 5.7245424391892524e-05, ('firstpoint', None): 5.5868671570865e-05, ('endpoint', None): 5.5868671570865e-05,
+        ('x', 'bessel'): 5.7245424391892524e-05, ('firstpoint', 'bessel'): 5.5868671570865e-05, ('endpoint', 'bessel'): 5.5868671570865e-05}
+        result = {}
+        for basis in [None, 'bessel']:
+            bin = BinMesh2CorrelationPoles(mattrs, edges={'step': 4 * mattrs.cellsize.min()}, ells=ells)
+            for los in ['x', 'firstpoint', 'endpoint']:
+                result[los, basis] = run(bin, los).value().std()
+                assert np.allclose(result[los, basis], ref[los, basis])
+
+
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+    config.update('jax_num_cpu_devices', 16)
+    config.update('jax_platform_name', 'cpu')
+
+    jax.distributed.initialize()
+    test_ref()
+    exit()
 
     #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
     #jax.distributed.initialize()

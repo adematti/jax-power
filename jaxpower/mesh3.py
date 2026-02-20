@@ -607,14 +607,15 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
                 carry += jax.lax.switch(idx, branches, kvec, los)
                 return carry, idx
 
-            return f, np.arange(len(branches))
+            init = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
+            return f, init, np.arange(len(branches))
 
         for ill, (ell1, ell2, ell3) in enumerate(ells):
-            f, xs = get_f((ell1, ell2, ell3))
+            f, init, xs = get_f((ell1, ell2, ell3))
             if xs.size:
-                num_ = jax.lax.scan(f, init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0] / bin.nmodes[ill]
+                num_ = jax.lax.scan(f, init=init, xs=xs)[0] / bin.nmodes[ill]
             else:
-                num_ = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
+                num_ = init
             num.append(num_.real if (ell1 + ell2) % 2 == 0 else num_.imag)
 
     spectrum = []
@@ -704,14 +705,15 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
                 carry += jax.lax.switch(idx, branches, kvec, los)
                 return carry, idx
 
-            return f, np.arange(len(branches))
+            init = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
+            return f, init, np.arange(len(branches))
 
         for (ell1, ell2, ell3) in ells:
-            f, xs = get_f((ell1, ell2, ell3))
+            f, init, xs = get_f((ell1, ell2, ell3))
             if xs.size:
-                num_ = jax.lax.scan(f, init=jnp.zeros(len(bin.edges), dtype=mattrs.cdtype), xs=xs)[0]
+                num_ = jax.lax.scan(f, init=init, xs=xs)[0]
             else:
-                num_ = jnp.zeros(len(bin.edges), dtype=mattrs.cdtype)
+                num_ = init
             num.append(num_.real)
 
 

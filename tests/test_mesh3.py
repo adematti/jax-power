@@ -8,8 +8,8 @@ import jax
 from jax import random
 from jax import numpy as jnp
 
-from jaxpower import (compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, compute_mesh3_correlation, BinMesh3CorrelationPoles, Mesh3CorrelationPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles,
-                      FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils, ParticleField, compute_smooth3_spectrum_window)
+from jaxpower import (compute_mesh3, compute_mesh3_spectrum, BinMesh3SpectrumPoles, Mesh3SpectrumPoles, compute_mesh3_correlation, BinMesh3CorrelationPoles, Mesh3CorrelationPoles, MeshAttrs, generate_gaussian_mesh, generate_uniform_particles,
+                      FKPField, compute_normalization, compute_fkp3_normalization, compute_fkp3_shotnoise, read, utils, ParticleField, compute_smooth3_spectrum_window, create_sharding_mesh)
 
 
 dirname = Path('_tests')
@@ -605,8 +605,9 @@ def test_normalization():
     print('norm split', norm_split)
 
 
-def survey_selection(size=int(1e7), seed=random.key(42), scale=0.25, paint=True):
+def survey_selection(size=int(1e7), seed=42, scale=0.25, paint=True):
     from jaxpower import ParticleField
+    seed = random.key(seed)
     mattrs = MeshAttrs(boxsize=1000., boxcenter=[0., 0., 1000], meshsize=64)
     xvec = mattrs.xcoords(kind='position', sparse=False)
     limits = mattrs.boxcenter - mattrs.boxsize / 4., mattrs.boxcenter + mattrs.boxsize / 4.
@@ -716,7 +717,6 @@ def test_fftlog2(plot=False):
                 ax.loglog(k[0], bk[ill, :, idx], linestyle='--', color=color)
                 ax.loglog(k2[0][ill], bk2[ill, :, idx], linestyle='-', color=color)
             plt.show()
-
 
 
 def test_interp2d():
@@ -1146,6 +1146,53 @@ def test_memory():
     estimate_memory(jitted_compute_mesh3_correlation, mesh, los=los, bin=bin)
 
 
+def test_ref():
+    from jaxpower.utils import estimate_memory
+
+    def pk(k):
+        kp = 0.03
+        return 1e4 * (k / kp)**3 * jnp.exp(-k / kp)
+
+    pkvec = lambda kvec: pk(jnp.sqrt(sum(kk**2 for kk in kvec)))
+
+    with create_sharding_mesh() as sharding_mesh:
+        mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
+        mesh = generate_gaussian_mesh(mattrs, pkvec, seed=(42, 'index'), unitary_amplitude=True)
+        size = 128 * 1024
+        backend = 'mpi'
+        data = generate_uniform_particles(mattrs, size, seed=(32, 'index')).exchange(backend=backend)
+        randoms = generate_uniform_particles(mattrs, 2 * size, seed=(64, 'index')).exchange(backend=backend)
+        fkp = FKPField(data, randoms)
+        kw = dict(resampler='cic', interlacing=3, compensate=True)
+        mesh = fkp.paint(**kw)
+        
+        def run(bin, los):
+            compute = jax.jit(compute_mesh3, static_argnames=['los'])
+            estimate_memory(compute, mesh, los=los, bin=bin)
+            return compute(mesh, los=los, bin=bin)
+        
+        ref = {('z', 'scoccimarro'): 6212.744915936817, ('local', 'scoccimarro'): 6351.9885052476775,
+        ('z', 'sugiyama'): 7101.520143303501, ('local', 'sugiyama'): 8570.76518969239,
+        ('z', 'sugiyama-diagonal'): 8369.637841532976, ('local', 'sugiyama-diagonal'): 8301.255177548157}
+        result = {}
+        for basis, ells in zip(['scoccimarro', 'sugiyama', 'sugiyama-diagonal'], [(0, 2), [(0, 0, 0), (2, 0, 2)], [(0, 0, 0), (2, 0, 2)]]):
+            bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 10 * mattrs.kfun.min()}, basis=basis, ells=ells)
+            for los in ['z', 'local']:
+                result[los, basis] = run(bin, los).value().std()
+                assert np.allclose(result[los, basis], ref[los, basis])
+        #print({key: float(result[key]) for key in result})
+        
+        ref = {('x', 'sugiyama'): 2.364754570056707e-08, ('local', 'sugiyama'): 1.7060700924698467e-08,
+        ('x', 'sugiyama-diagonal'): 3.574483788256436e-08, ('local', 'sugiyama-diagonal'): 1.9908754918383136e-08}
+        result = {}
+        for basis, ells in zip(['sugiyama', 'sugiyama-diagonal'], [[(0, 0, 0), (2, 0, 2)], [(0, 0, 0), (2, 0, 2)]]):
+            bin = BinMesh3CorrelationPoles(mattrs, edges={'step': 10 * mattrs.cellsize.min()}, basis=basis, ells=ells)
+            for los in ['x', 'local']:
+                result[los, basis] = run(bin, los).value().std()
+                assert np.allclose(result[los, basis], ref[los, basis])
+        #print({key: float(result[key]) for key in result})
+
+
 if __name__ == '__main__':
 
     #import os
@@ -1154,8 +1201,13 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
+    config.update('jax_num_cpu_devices', 4)
+    config.update('jax_platform_name', 'cpu')
 
-    test_misc()
+    jax.distributed.initialize()
+    test_ref()
+    exit()
+    #test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
     test_mesh3_spectrum()

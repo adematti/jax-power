@@ -305,7 +305,7 @@ def test_sharded_io():
     jax.distributed.initialize()
 
     with create_sharding_mesh() as sharding_mesh:
-        mattrs = MeshAttrs(boxsize=1000., meshsize=64)
+        mattrs = MeshAttrs(boxsize=1000., meshsize=128)
         print(sharding_mesh)
         mesh = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=mattrs.meshsize, out_specs=P(*sharding_mesh.axis_names))
         mesh = mattrs.create(kind='real', fill=mesh)
@@ -323,7 +323,7 @@ def test_sharded_io():
             allclose(mesh2.value, mesh.value)
 
         from jaxpower.mock import generate_uniform_particles
-        particles = generate_uniform_particles(mattrs, size=1000, seed=(42, 'index'))
+        particles = generate_uniform_particles(mattrs, size=126 * 256, seed=(42, 'index'))
 
         for fn in [dirname / 'particles.npz', dirname / 'particles.h5']:
             particles.save(fn)
@@ -366,7 +366,10 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
 
-    #test_sharded_io()
+    config.update('jax_num_cpu_devices', 16)
+    config.update('jax_platform_name', 'cpu')
+    test_sharded_io()
+    exit()
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
