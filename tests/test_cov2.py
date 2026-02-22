@@ -621,10 +621,14 @@ def test_multitracer_covariance(plot=False):
     #theory = ObservableTree([theory] * 4, fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())], fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     covs = compute_spectrum2_covariance(windows, theory, return_type='list')
-
+    scov = 0.
     for name, cov in zip(['WW', 'WS', 'SS'], covs):
         cov = cov.value()
         assert np.allclose(cov, cov.T), name
+        scov += cov
+
+    cov = compute_spectrum2_covariance(windows, theory)
+    assert np.allclose(cov, scov)
 
 
 def test_fftlog2():
@@ -814,10 +818,10 @@ if __name__ == '__main__':
     #save_box_mocks()
     #test_box2_covariance(plot=True)
     #save_cutsky_mocks()
-    test_cutsky2_spectrum_covariance(plot=True)
+    #test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
     #test_pre_post_covariance()
-    #test_multitracer_covariance()
+    test_multitracer_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)

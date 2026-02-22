@@ -525,7 +525,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
             if return_type != 'list':
-                covs = sum(covs)
+                covs = covs[0].clone(value=sum(cov.value() for cov in covs))
             return covs
         else:
             covs = finalize(cov_WW)
