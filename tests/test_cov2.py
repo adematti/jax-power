@@ -621,6 +621,7 @@ def test_multitracer_covariance(plot=False):
     #theory = ObservableTree([theory] * 4, fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())], fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
     covs = compute_spectrum2_covariance(windows, theory, return_type='list')
+    assert covs[0].observable.fields == [('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')]
     scov = 0.
     for name, cov in zip(['WW', 'WS', 'SS'], covs):
         cov = cov.value()
