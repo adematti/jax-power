@@ -395,7 +395,6 @@ if __name__ == '__main__':
     config.update('jax_num_cpu_devices', 4)
     config.update('jax_platform_name', 'cpu')
     #test_sharded_io()
-
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
