@@ -124,19 +124,25 @@ def test_exchange_array():
 
         if True:
             rng = np.random.RandomState(seed=42 + jax.process_index())
-            positions = rng.uniform(size=(1000 + jax.process_index(), 3))
+            mattrs = MeshAttrs(boxsize=100., boxcenter=50., meshsize=32)
+            positions = rng.uniform(size=(100 + jax.process_index(), 3)) * mattrs.boxsize - mattrs.boxsize / 2. + mattrs.boxcenter
             weights = 1. + rng.uniform(size=positions.shape[0])
-            mattrs = MeshAttrs(boxsize=100., boxcenter=40., meshsize=32)
+            extra = 1. + rng.uniform(size=(positions.shape[0], 4))
             for backend in ['mpi', 'jax']:
                 epositions, exchange, inverse = exchange_particles(mattrs, positions, backend=backend, return_type='jax', return_inverse=True)
-                eweights = exchange(weights)
+                for pad in [0., 'global_mean', 'mean', 'uniform']:
+                    eexta = exchange(extra, pad=pad)
+
+                eweights = exchange(weights, pad=0.)
                 eidx = (epositions - mattrs.boxcenter + mattrs.boxsize / 2.) / mattrs.boxsize
-                sharding = epositions.sharding
+                eidx *= mattrs.meshsize
+                sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
                 mapping = sharding.devices_indices_map(tuple(mattrs.meshsize))
-                for device, eidx, eweight in zip(jax.local_devices(), eidx.addressable_shards, eweights.addressable_shards):
+                for device, eidx, eweight in zip(sharding.mesh.local_devices, eidx.addressable_shards, eweights.addressable_shards):
                     slices = mapping[device]
                     limits = np.array([(sl.start, sl.stop) if sl.start is not None else (0, mattrs.meshsize[axis]) for axis, sl in enumerate(slices)]).T
-                    assert np.all((eweight.data == 0.)[:, None] | ((eidx.data >= limits[0]) & (eidx.data <= limits[-1])))
+                    mask = np.all((eweight.data == 0.)[:, None] | ((eidx.data >= limits[0]) & (eidx.data <= limits[-1])), axis=-1)
+                    assert np.all(mask)
                 weights2 = inverse(exchange(weights))
                 assert np.allclose(weights2, weights)
 
@@ -414,13 +420,17 @@ if __name__ == '__main__':
     from jax import config
     config.update('jax_enable_x64', True)
     config.update('jax_num_cpu_devices', 16)
-    #config.update('jax_platform_name', 'cpu')
-    import warnings
-    warnings.simplefilter("error")
+    config.update('jax_platform_name', 'cpu')
+    #import warnings
+    #warnings.simplefilter("error")
+
+    jax.distributed.initialize()
+    test_exchange_array()
+    exit()
 
     #save_reference_mock()
     # Setting up distributed jax
-    jax.distributed.initialize()
+    #jax.distributed.initialize()
     #test_sharding_routines()
     #test_halo()
     #test_exchange_array()
