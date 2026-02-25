@@ -2482,7 +2482,7 @@ class ParticleField(object):
     def concatenate(cls, others, weights=None, local=True, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
-            weights = [1] * len(weights)
+            weights = [1] * len(others)
         else:
             assert len(weights) == len(others)
         gather = {name: [] for name in ['positions', 'weights']}
