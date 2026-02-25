@@ -2336,12 +2336,14 @@ class ParticleField(object):
     ----------
     positions : jax.Array
         Array of particle positions, shape (N, ndim).
-        Important: in case of parellel computation, assumed scattered (sharded) over the different processes.
+        Important: in case of parallel computation, assumed scattered (sharded) over the different processes.
     weights : jax.Array, optional
         Array of particle weights, shape (N,). If None, defaults to 1 for all particles.
-        Important: in case of parellel computation, assumed scattered (sharded) over the different processes.
+        Important: in case of parallel computation, assumed scattered (sharded) over the different processes.
     attrs : MeshAttrs or dict, optional
         Mesh attributes.
+    extra : dict, optional
+        Dictionary of extra fields to attach to the instance. Each field should be a jax.Array of shape (N, ...).
     exchange : bool, default=False
         If ``True``, perform particle exchange for distributed computation.
     backend : {'auto', 'jax', 'mpi'}, default='auto'
@@ -2357,6 +2359,10 @@ class ParticleField(object):
         Particle weights.
     attrs : MeshAttrs
         Mesh attributes.
+    extra_fields : list of str
+        List of extra field names provided in the ``extra`` dictionary.
+    _ : jax.Array
+        Any extra fields provided in the ``extra`` dictionary are added as attributes to the instance, and their names are stored in the ``extra_fields`` list.
 
     Examples
     --------
@@ -2368,11 +2374,22 @@ class ParticleField(object):
     positions: jax.Array = field(repr=False)
     weights: jax.Array = field(repr=False)
     attrs: MeshAttrs | None = field(init=False, repr=False)
+    extra_fields: list[str] = field(repr=True)
 
-    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, backend='auto', **kwargs):
+    def __init__(
+        self,
+        positions: jax.Array,
+        weights: jax.Array | None = None,
+        attrs=None,
+        extra: dict | None = None,
+        exchange=False,
+        backend="auto",
+        **kwargs,
+    ):
         if attrs is None: attrs = kwargs.pop('mattrs', None)
         if attrs is None: raise ValueError('attrs must be provided')
         if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
+        extra = extra or {}
         sharding_mesh = attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding:
@@ -2389,13 +2406,22 @@ class ParticleField(object):
         if with_sharding and exchange:
             positions, exchange_direct, *_exchange_inverse = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
             weights = exchange_direct(weights)
+            extra = {k: exchange_direct(v) for k, v in extra.items()}
             if _exchange_inverse:
                 exchange_inverse = _exchange_inverse[0]
 
-        self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, exchange_direct=exchange_direct, attrs=attrs)
+        self.__dict__.update(
+            positions=positions,
+            weights=weights,
+            exchange_inverse=exchange_inverse,
+            exchange_direct=exchange_direct,
+            attrs=attrs,
+            extra_fields=list(extra.keys()),
+            **extra,
+        )
 
     def __repr__(self):
-        return f'{self.__class__.__name__}(size={self.size})'
+        return f"{self.__class__.__name__}(size={self.size}, extra_fields={self.extra_fields})"
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -2411,17 +2437,38 @@ class ParticleField(object):
         return self.clone(exchange=True, **kwargs)
 
     def tree_flatten(self):
-        return tuple(getattr(self, name) for name in ['positions', 'weights', 'attrs']), {}
+        basic_values = tuple(
+            getattr(self, name) for name in ["positions", "weights", "attrs"]
+        )
+        extra_values = tuple(getattr(self, name) for name in self.extra_fields)
+        return basic_values + extra_values, {"extra_fields": self.extra_fields}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update({name: value for name, value in zip(['positions', 'weights', 'attrs'], children)})
+        extra_fields = aux_data["extra_fields"]
+        new.__dict__.update(
+            {
+                name: value
+                for name, value in zip(
+                    ["positions", "weights", "attrs"] + extra_fields,
+                    children,
+                )
+            }
+        )
+        new.__dict__["extra_fields"] = extra_fields
         return new
 
     def __getitem__(self, name):
         """Array-like slicing."""
-        return self.clone(positions=self.positions[name], weights=self.weights[name])
+        return self.clone(
+            positions=self.positions[name],
+            weights=self.weights[name],
+            **{
+                name: getattr(self, field_name)[name]
+                for field_name in self.extra_fields
+            },
+        )
 
     @property
     def size(self):
