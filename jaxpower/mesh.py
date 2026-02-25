@@ -2613,7 +2613,7 @@ class ParticleField(object):
                 sharding_mesh=sharding_mesh,
                 **kwargs,
             )
-            state.update(extra_state)
+            state = extra_state | state
         new = cls.__new__(cls)
         new.__dict__.update(**state)
         return new
