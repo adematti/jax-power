@@ -2388,8 +2388,8 @@ class ParticleField(object):
     ):
         if attrs is None: attrs = kwargs.pop('mattrs', None)
         if attrs is None: raise ValueError('attrs must be provided')
-        if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
-        extra = extra or {}
+        if not isinstance(attrs, MeshAttrs):
+            attrs = MeshAttrs(**attrs)
         sharding_mesh = attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding:
@@ -2401,6 +2401,10 @@ class ParticleField(object):
             weights = jnp.ones_like(jnp.unstack(positions, axis=-1)[0])
         else:
             weights = jnp.asarray(weights)
+        if extra is None:
+            extra = {}
+        else:
+            extra = {k: jnp.array(v) for k, v in extra.items()}
 
         exchange_direct, exchange_inverse = None, None
         if with_sharding and exchange:
