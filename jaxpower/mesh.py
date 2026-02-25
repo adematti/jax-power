@@ -2587,15 +2587,33 @@ class ParticleField(object):
 
     def save(self, fn, **kwargs):
         """Save particles to file."""
-        state = {name: getattr(self, name) for name in ['positions', 'weights']}
-        _save(fn, state, attrs=self.attrs.__getstate__(), sharding_mesh=self.attrs.sharding_mesh, **kwargs)
+        state = {
+            name: getattr(self, name)
+            for name in ["positions", "weights", *self.extra_fields]
+        }
+        _save(
+            fn,
+            state,
+            attrs=self.attrs.__getstate__() | {"extra_fields": self.extra_fields},
+            sharding_mesh=self.attrs.sharding_mesh,
+            **kwargs,
+        )
 
     @classmethod
     @default_sharding_mesh
     def load(cls, fn, sharding_mesh=None, **kwargs):
         """Load particles from file."""
         state = _load(fn, names={name: P(sharding_mesh.axis_names) for name in ['positions', 'weights']}, sharding_mesh=sharding_mesh, **kwargs)
+        state["extra_fields"] = extra_fields = state["attrs"].pop("extra_fields", [])
         state['attrs'] = MeshAttrs.from_state(state['attrs'])
+        if extra_fields:
+            extra_state = _load(
+                fn,
+                names={name: P(sharding_mesh.axis_names) for name in extra_fields},
+                sharding_mesh=sharding_mesh,
+                **kwargs,
+            )
+            state.update(extra_state)
         new = cls.__new__(cls)
         new.__dict__.update(**state)
         return new
