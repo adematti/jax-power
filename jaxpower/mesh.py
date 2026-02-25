@@ -1370,13 +1370,22 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
     fn = str(fn)
     state = {}
     specs = names
-    if not isinstance(names, dict):
+    if isinstance(names, str):  # single string
+        names = [names]
+    if isinstance(names, (tuple, list)):  # list of strings
         specs = {name: P(None) for name in names}
+    if isinstance(names, dict):  # dict of name -> sharding spec
+        names = list(names)
+    if isinstance(names, P):
+        names = None
 
     if fn.endswith('.npz'):
         file = np.load(fn, allow_pickle=True)
         state = {}
         state['attrs'] = file['attrs'][()]
+        if names is None:
+            names = [name for name in file.files if name != 'attrs']
+            specs = {name: specs for name in names}
         for name in specs:
             if mpicomm is not None:
                 array = scatter_array(file[name] if mpicomm.rank == 0 else None, sharding_mesh=sharding_mesh, spec=specs[name], mpiroot=0, mpicomm=mpicomm)
@@ -1390,6 +1399,9 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
         import h5py
         with h5py.File(fn, 'r', **kwargs) as file:
             state['attrs'] = dict(file.attrs)
+            if names is None:
+                names = [name for name in file.keys()]
+                specs = {name: specs for name in names}
             for name in specs:
                 shapes[name] = file[name].shape
 
@@ -2386,7 +2398,7 @@ class ParticleField(object):
     attrs : MeshAttrs or dict, optional
         Mesh attributes.
     extra : dict, optional
-        Dictionary of extra fields to attach to the instance. Each field should be a jax.Array of shape (N, ...).
+        Dictionary of extra name: value. Each value should be a jax.Array of shape (N, ...).
     exchange : bool, default=False
         If ``True``, perform particle exchange for distributed computation.
     backend : {'auto', 'jax', 'mpi'}, default='auto'
@@ -2402,10 +2414,8 @@ class ParticleField(object):
         Particle weights.
     attrs : MeshAttrs
         Mesh attributes.
-    extra_fields : list of str
-        List of extra field names provided in the ``extra`` dictionary.
-    _ : jax.Array
-        Any extra fields provided in the ``extra`` dictionary are added as attributes to the instance, and their names are stored in the ``extra_fields`` list.
+    extra : dict
+        Dictionary of extra fields attached to the instance.
 
     Examples
     --------
@@ -2416,8 +2426,8 @@ class ParticleField(object):
     """
     positions: jax.Array = field(repr=False)
     weights: jax.Array = field(repr=False)
+    extra: dict = field(repr=False)
     attrs: MeshAttrs | None = field(init=False, repr=False)
-    extra_fields: list[str] = field(repr=True)
 
     def __init__(
         self,
@@ -2444,10 +2454,8 @@ class ParticleField(object):
             weights = jnp.ones_like(jnp.unstack(positions, axis=-1)[0])
         else:
             weights = jnp.asarray(weights)
-        if extra is None:
-            extra = {}
-        else:
-            extra = {k: jnp.array(v) for k, v in extra.items()}
+        extra = extra or {}
+        extra = {k: jnp.asarray(v) for k, v in extra.items()}
 
         exchange_direct, exchange_inverse = None, None
         if with_sharding and exchange:
@@ -2463,12 +2471,11 @@ class ParticleField(object):
             exchange_inverse=exchange_inverse,
             exchange_direct=exchange_direct,
             attrs=attrs,
-            extra_fields=list(extra.keys()),
-            **extra,
+            extra=extra,
         )
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(size={self.size}, extra_fields={self.extra_fields})"
+        return f"{self.__class__.__name__}(size={self.size}, extra={list(self.extra)})"
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -2484,83 +2491,67 @@ class ParticleField(object):
         return self.clone(exchange=True, **kwargs)
 
     def tree_flatten(self):
-        basic_values = tuple(
-            getattr(self, name) for name in ["positions", "weights", "attrs"]
-        )
-        extra_values = tuple(getattr(self, name) for name in self.extra_fields)
-        return basic_values + extra_values, {"extra_fields": self.extra_fields}
+        base_values = tuple(getattr(self, name) for name in ['positions', 'weights', 'attrs'])
+        extra_values = tuple(self.extra.values())
+        return base_values + extra_values, {'extra_names': list(self.extra.keys())}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        extra_fields = aux_data["extra_fields"]
-        new.__dict__.update(
-            {
-                name: value
-                for name, value in zip(
-                    ["positions", "weights", "attrs"] + extra_fields,
-                    children,
-                )
-            }
-        )
-        new.__dict__["extra_fields"] = extra_fields
+        extra_names = aux_data['extra_names']
+        new.__dict__.update({name: value for name, value in zip(['positions', 'weights', 'attrs'], children)})
+        new.__dict__.update(extra={name: value for name, value in zip(extra_names, children[3:])})
         return new
 
     def __getitem__(self, name):
         """Array-like slicing."""
-        return self.clone(
-            positions=self.positions[name],
-            weights=self.weights[name],
-            **{
-                name: getattr(self, field_name)[name]
-                for field_name in self.extra_fields
-            },
-        )
+        return self.clone(positions=self.positions[name], weights=self.weights[name],
+                          extra={name: value[name] for name, value in self.extra.items()})
 
     @property
     def size(self):
-        return self.weights.size
+        return self.positions.shape[0]
 
     def sum(self, *args, **kwargs):
         """Sum of :attr:`weights`."""
         return self.weights.sum(*args, **kwargs)
 
     @classmethod
-    def concatenate(
-        cls, others, weights=None, local=True, extra_to_weigh=None, **kwargs
-    ):
+    def concatenate(cls, others, weights=None, local=True, extra_weights=None, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
             weights = [1] * len(others)
         else:
             assert len(weights) == len(others)
-        extra_to_weigh = extra_to_weigh or []
-        extra_fields = set(others[0].extra_fields).intersection(
-            *[set(o.extra_fields) for o in others[1:]]
-        )  # keep only common extra fields
-        names = ["positions", "weights", *extra_fields]
+        extra_names = [name for name in others[0].extra if all(name in other.extra for other in others[1:])]
+        names = ['positions', 'weights']
         gather = {name: [] for name in names}
+        extra_gather = {name: [] for name in extra_names}
+        extra_weights = extra_weights or {}
+        if not isinstance(extra_weights, dict):
+            # Assume same weights for all extra fields
+            extra_weights = {name: extra_weights for name in extra_names}
         for other, factor in zip(others, weights):
             if not isinstance(other, ParticleField):
                 raise RuntimeError("Type of `other` not understood.")
             gather['positions'].append(other.positions)
             gather['weights'].append(factor * other.weights)
-            for name in extra_fields:
-                if name in extra_to_weigh:
-                    gather[name].append(factor * getattr(other, name))
+            for name in extra_names:
+                if name in extra_weights:
+                    extra_gather[name].append(extra_weights[name] * other.extra[name])
                 else:
-                    gather[name].append(getattr(other, name))
-        for name, value in gather.items():
-            if local: value = _local_concatenate(value, axis=0)
-            else: value = jnp.concatenate(value, axis=0)
-            gather[name] = value
-        return cls(
-            positions=gather["positions"],
-            weights=gather["weights"],
-            attrs=others[0].attrs,
-            extra={name: gather[name] for name in extra_fields},
-            **kwargs,
-        )
+                    extra_gather[name].append(other.extra[name])
+
+        def _concatenate(gather):
+            for name, value in gather.items():
+                if local: value = _local_concatenate(value, axis=0)
+                else: value = jnp.concatenate(value, axis=0)
+                gather[name] = value
+            return gather
+
+        gather = _concatenate(gather)
+        extra_gather = _concatenate(extra_gather)
+        return cls(positions=gather['positions'], weights=gather['weights'], attrs=others[0].attrs, extra=extra_gather, **kwargs)
 
     def __add__(self, other):
         if isinstance(other, ParticleField):
@@ -2630,33 +2621,26 @@ class ParticleField(object):
 
     def save(self, fn, **kwargs):
         """Save particles to file."""
-        state = {
-            name: getattr(self, name)
-            for name in ["positions", "weights", *self.extra_fields]
-        }
-        _save(
-            fn,
-            state,
-            attrs=self.attrs.__getstate__() | {"extra_fields": self.extra_fields},
-            sharding_mesh=self.attrs.sharding_mesh,
-            **kwargs,
-        )
+        state = {name: getattr(self, name) for name in ['positions', 'weights']}
+        for name in self.extra:
+            if name in state:
+                raise ValueError(f'extra field name {name} conflicts with reserved field names')
+            state[name] = self.extra[name]
+        attrs = self.attrs.__getstate__()
+        if self.extra:
+            attrs['extra'] = list(self.extra.keys())
+        _save(fn, state, attrs=attrs,
+              sharding_mesh=self.attrs.sharding_mesh,
+              **kwargs)
 
     @classmethod
     @default_sharding_mesh
     def load(cls, fn, sharding_mesh=None, **kwargs):
         """Load particles from file."""
-        state = _load(fn, names={name: P(sharding_mesh.axis_names) for name in ['positions', 'weights']}, sharding_mesh=sharding_mesh, **kwargs)
-        state["extra_fields"] = extra_fields = state["attrs"].pop("extra_fields", [])
+        state = _load(fn, names=P(sharding_mesh.axis_names), sharding_mesh=sharding_mesh, **kwargs)
+        extra_names = state['attrs'].pop('extra', [])
+        state['extra'] = {name: state.pop(name) for name in extra_names}
         state['attrs'] = MeshAttrs.from_state(state['attrs'])
-        if extra_fields:
-            extra_state = _load(
-                fn,
-                names={name: P(sharding_mesh.axis_names) for name in extra_fields},
-                sharding_mesh=sharding_mesh,
-                **kwargs,
-            )
-            state = extra_state | state
         new = cls.__new__(cls)
         new.__dict__.update(**state)
         return new
