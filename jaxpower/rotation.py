@@ -586,9 +586,11 @@ class WindowRotationSpectrum2(BaseWindowRotation):
         if isinstance(window, WindowMatrix):
             wobservable = window.observable
             windex = wobservable.at.hook(lambda new, transform: transform)(**at).match(self.observable)
-            assert np.ndim(windex) == 1, "input covariance must have the same binning"
+            assert np.ndim(windex) == 1, "input window must have the same binning"
             window_rotated = window.value().copy()
             window_rotated[windex, :] = _rotate_window(window.value()[windex, :])
+            if return_type is None:
+                window_rotated = window.clone(value=window_rotated)
         else:
             window_rotated = _rotate_window(window)
             if return_type is None:

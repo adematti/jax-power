@@ -436,11 +436,20 @@ def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
     return jaxdecomp.halo_exchange(value, halo_extents=tuple(extents), halo_periods=(True,) * len(extents))
 
 
-def _get_pad_constant(constant_values):
+def _get_pad_constant_numpy(constant_values):
 
     def pad(array, pad_width):
-        _constant_values = np.atleast_1d(np.asarray(constant_values, dtype=array.dtype))
-        return np.concatenate([array, np.repeat(_constant_values, pad_width[0][1], axis=0)], dtype=array.dtype, axis=0)
+        pad = np.zeros((1,) + array.shape[1:], dtype=array.dtype) + constant_values
+        return np.append(array, np.repeat(pad, pad_width[0][1], axis=0), axis=0)
+
+    return pad
+
+
+def _get_pad_constant_jax(constant_values):
+
+    def pad(array, pad_width):
+        pad = jnp.zeros((1,) + array.shape[1:], dtype=array.dtype) + constant_values
+        return jnp.append(array, jnp.repeat(jax.device_get(pad), pad_width[0][1], axis=0), axis=0)
 
     return pad
 
@@ -454,7 +463,8 @@ def _get_pad_uniform_numpy(mattrs, seed=42):
         limits = mattrs
 
     def pad(array, pad_width):
-        return np.concatenate([array, rng.uniform(*limits, size=(pad_width[0][1],) + array.shape[1:])], dtype=array.dtype, axis=0)
+        ran = rng.uniform(*limits, size=(pad_width[0][1],) + array.shape[1:])
+        return np.append(array, ran, axis=0)
 
     return pad
 
@@ -468,9 +478,22 @@ def _get_pad_uniform_jax(mattrs, seed=42):
         limits = mattrs
 
     def pad(array, pad_width):
-        return jnp.concatenate([array, jax.random.uniform(key, shape=(pad_width[0][1],) + array.shape[1:], minval=limits[0], maxval=limits[1])], dtype=array.dtype, axis=0)
+        ran = jax.random.uniform(key, shape=(pad_width[0][1],) + array.shape[1:], minval=limits[0], maxval=limits[1])
+        return jnp.append(array, jax.device_get(ran), axis=0)
 
     return pad
+
+
+def _safe_min(array, default=np.inf):
+    if array.size:
+        return array.min(axis=0)
+    return np.full(array.shape[1:], default, dtype=array.dtype)
+
+
+def _safe_max(array, default=-np.inf):
+    if array.size:
+        return array.max(axis=0)
+    return np.full(array.shape[1:], default, dtype=array.dtype)
 
 
 @default_sharding_mesh
@@ -509,7 +532,7 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
     local_devices = sharding.mesh.local_devices
     nlocal = len(local_devices)
-    sizes = jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0], nlocal))
+    all_size = jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0], nlocal))
     sl = slice(0, per_host_array.shape[0])
 
     if not callable(pad):
@@ -517,24 +540,24 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
         if isinstance(pad, str):
             if pad == 'global_mean':
                 per_host_sum = np.repeat(np.sum(per_host_array, axis=0)[None, ...], nlocal, axis=0)
-                constant_values = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0, keepdims=True) / sizes.sum()[None, ...]
-                pad = _get_pad_constant(constant_values)
+                constant_values = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0) / all_size.sum()
+                pad = _get_pad_constant_numpy(constant_values)
             elif pad == 'mean':
-                constant_values = np.mean(per_host_array, axis=0, keepdims=True)
-                pad = _get_pad_constant(constant_values)
+                constant_values = np.mean(per_host_array, axis=0)
+                pad = _get_pad_constant_numpy(constant_values)
             elif pad == 'uniform':
-                limits = [jax.make_array_from_process_local_data(sharding, np.repeat(np.min(per_host_array, axis=0)[None, ...], nlocal, axis=0)).min(axis=0),
-                          jax.make_array_from_process_local_data(sharding, np.repeat(np.max(per_host_array, axis=0)[None, ...], nlocal, axis=0)).max(axis=0)]
+                limits = [jax.make_array_from_process_local_data(sharding, np.repeat(_safe_min(per_host_array)[None, ...], nlocal, axis=0)).min(axis=0),
+                          jax.make_array_from_process_local_data(sharding, np.repeat(_safe_max(per_host_array)[None, ...], nlocal, axis=0)).max(axis=0)]
                 pad = _get_pad_uniform_numpy(limits)
             else:
                 raise ValueError('mean or global_mean supported only')
 
         else:  # constant value
-            pad = _get_pad_constant(pad)
+            pad = _get_pad_constant_numpy(pad)
 
     if per_host_size is None:
         # can be process-specific
-        per_host_size = (sizes.max().item() + nlocal - 1) // nlocal * nlocal
+        per_host_size = (all_size.max().item() + nlocal - 1) // nlocal * nlocal
     pad_width = [(0, per_host_size - per_host_array.shape[0])] + [(0, 0)] * (per_host_array.ndim - 1)
     per_host_array = pad(per_host_array, pad_width=pad_width)
     total_size = jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0] // nlocal, nlocal)).sum()
@@ -577,29 +600,55 @@ def make_array_from_single_device_arrays(sharding, per_device_arrays, return_sli
     slices : list of slice, optional
         List of slices corresponding to each device data in the global array, if ``return_slices`` is ``True``.
     """
+    local_devices = sharding.mesh.local_devices
+    nlocal = len(local_devices)
+    ndevices = sharding.mesh.devices.size
+    assert len(per_device_arrays) == nlocal
+
+    ndim = per_device_arrays[0].ndim
+
+    def _make_array(per_device_arrays):
+        global_shape = (ndevices * per_device_arrays[0].shape[0],) + per_device_arrays[0].shape[1:]
+        per_device_arrays = [jax.device_put(per_device_array, local_device, donate=True) for local_device, per_device_array in zip(local_devices, per_device_arrays)]
+        return jax.make_array_from_single_device_arrays(global_shape, sharding, per_device_arrays)
+
+    per_device_sizes = [jnp.asarray(per_device_chunk.shape[:1]) for per_device_chunk in per_device_arrays]
+    all_size =  _make_array(per_device_sizes)
+
+    def _allgather(array):
+        return jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding.mesh, P()))(array).addressable_data(0)
+
+    #all_size = _allgather(all_size)
+    all_size = all_size.ravel()
+
     if pad is None:
         pad = np.nan
     if not callable(pad):
-        constant_values = pad
-        pad = lambda array, pad_width: jnp.pad(array, pad_width, mode='constant', constant_values=constant_values)
-    local_devices = sharding.mesh.local_devices
-    nlocal = len(local_devices)
-    assert len(per_device_arrays) == nlocal
-    ndim = per_device_arrays[0].ndim
-    per_host_size = jnp.array([per_device_chunk.shape[0] for per_device_chunk in per_device_arrays])
-    all_size = jax.make_array_from_process_local_data(sharding, per_host_size)
-    # Line below fails with no attribute .with_spec for jax 0.6.2
-    #all_size = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(all_size).addressable_data(0)
-    all_size = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding.mesh, P()))(all_size).addressable_data(0)
-    all_size = all_size.ravel()
+        if isinstance(pad, str):
+            if pad == 'global_mean':
+                per_device_sums = [per_device_array.sum(axis=0)[None, ...] for per_device_array in per_device_arrays]
+                constant_values = _make_array(per_device_sums)
+                constant_values = constant_values.sum(axis=0) / all_size.sum()
+                pad = _get_pad_constant_jax(constant_values)
+            elif pad == 'mean':
+                constant_values = np.array([per_device_array.sum(axis=0) for per_device_array in per_device_arrays]).sum(axis=0) / np.sum([per_device_array.shape[0] for per_device_array in per_device_arrays])
+                pad = _get_pad_constant_jax(constant_values)
+            elif pad == 'uniform':
+                limits = [_make_array([_safe_min(per_device_array)[None, ...] for per_device_array in per_device_arrays]).min(axis=0),
+                          _make_array([_safe_max(per_device_array)[None, ...] for per_device_array in per_device_arrays]).min(axis=0)]
+                pad = _get_pad_uniform_jax(limits)
+            else:
+                raise ValueError('mean or global_mean supported only')
+
+        else:  # constant value
+            pad = _get_pad_constant_jax(pad)
+
     max_size = all_size.max().item()
     if not np.all(all_size == max_size):
         per_device_arrays = [pad(per_device_chunk, [(0, max_size - per_device_chunk.shape[0])] + [(0, 0)] * (ndim - 1)) for per_device_chunk in per_device_arrays]
-    global_shape = (max_size * len(all_size),) + per_device_arrays[0].shape[1:]
-    per_device_arrays = [jax.device_put(per_device_array, local_device, donate=True) for local_device, per_device_array in zip(local_devices, per_device_arrays)]
-    array = jax.make_array_from_single_device_arrays(global_shape, sharding, per_device_arrays)
+    array = _make_array(per_device_arrays)
     del per_device_arrays
-    slices = [slice(j * max_size, j * max_size + all_size[j].item()) for j in range(len(all_size))]
+    slices = [slice(j * max_size, j * max_size + all_size[j].item()) for j in range(ndevices)]
     if return_slices:
         return array, slices
     return array
@@ -630,13 +679,6 @@ def _exchange_array_jax(array, device, pad=0, return_indices=False):
     per_device_final_arrays = [None] * len(local_devices)
     per_host_indices = [[] for i in range(len(local_devices))]
     slices = [None] * ndevices
-
-    if isinstance(pad, str):
-        if pad == 'mean':
-            mean = array.mean(axis=0)
-            pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, ...], pad_width[0][1], axis=0), axis=0)
-        else:
-            raise ValueError('mean supported only')
 
     for idevice in range(ndevices):
         # single-device arrays
@@ -728,12 +770,13 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     _check_device_layout(attrs.meshsize, sharding_mesh=sharding_mesh)
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     #size_devices = shape_devices.prod(dtype='i4')
-    idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
+    idx_out_devices = (positions + attrs.boxsize / 2. - attrs.boxcenter) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.floor(idx_out_devices).astype('i4')
-    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(idx_out_devices, axis=-1), tuple(shape_devices))
 
     positions = _exchange_array_jax(positions, idx_out_devices, pad=_get_pad_uniform_jax(attrs), return_indices=return_inverse)
+    #positions = _exchange_array_jax(positions, idx_out_devices, pad=0., return_indices=return_inverse)
     if return_inverse:
         positions, indices = positions
 
@@ -1130,9 +1173,9 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
 
     positions = get(positions)
-    idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
+    idx_out_devices = (positions + attrs.boxsize / 2. - attrs.boxcenter) / (attrs.boxsize / shape_devices)
     idx_out_devices = np.floor(idx_out_devices).astype('i4')
-    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = np.ravel_multi_index(tuple(idx_out_devices.T), tuple(shape_devices))
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
     devices = sharding.mesh.devices.ravel().tolist()
