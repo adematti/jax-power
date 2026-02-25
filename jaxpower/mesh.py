@@ -2479,23 +2479,41 @@ class ParticleField(object):
         return self.weights.sum(*args, **kwargs)
 
     @classmethod
-    def concatenate(cls, others, weights=None, local=True, **kwargs):
+    def concatenate(
+        cls, others, weights=None, local=True, extra_to_weigh=None, **kwargs
+    ):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
             weights = [1] * len(others)
         else:
             assert len(weights) == len(others)
-        gather = {name: [] for name in ['positions', 'weights']}
+        extra_to_weigh = extra_to_weigh or []
+        extra_fields = set(others[0].extra_fields).intersection(
+            *[set(o.extra_fields) for o in others[1:]]
+        )  # keep only common extra fields
+        names = ["positions", "weights", *extra_fields]
+        gather = {name: [] for name in names}
         for other, factor in zip(others, weights):
             if not isinstance(other, ParticleField):
                 raise RuntimeError("Type of `other` not understood.")
             gather['positions'].append(other.positions)
             gather['weights'].append(factor * other.weights)
+            for name in extra_fields:
+                if name in extra_to_weigh:
+                    gather[name].append(factor * getattr(other, name))
+                else:
+                    gather[name].append(getattr(other, name))
         for name, value in gather.items():
             if local: value = _local_concatenate(value, axis=0)
             else: value = jnp.concatenate(value, axis=0)
             gather[name] = value
-        return cls(**gather, attrs=others[0].attrs)
+        return cls(
+            positions=gather["positions"],
+            weights=gather["weights"],
+            attrs=others[0].attrs,
+            extra={name: gather[name] for name in extra_fields},
+            **kwargs,
+        )
 
     def __add__(self, other):
         if isinstance(other, ParticleField):
