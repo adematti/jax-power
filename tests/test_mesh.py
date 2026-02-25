@@ -361,15 +361,41 @@ def test_sharded_halo():
         assert jnp.allclose(test.value, ref.value)
 
 
+def test_particle_field_extra():
+    with create_sharding_mesh() as sharding_mesh:
+        boxsize = 100.
+        size = 20
+        positions = boxsize * random.uniform(random.key(42), shape=(size, 3))
+        weights = 1. + random.uniform(random.key(42), shape=(size,))
+        extra = {'velocity': random.uniform(random.key(84), shape=(size, 3)), 'z': random.uniform(random.key(128), shape=(size,))}
+        attrs = get_mesh_attrs(positions, cellsize=10)
+        particle = ParticleField(positions, weights=weights, extra=extra, attrs=attrs, exchange=True, backend='mpi')
+        particle2 = particle + particle
+        assert np.allclose(particle2.cellsize, 10.)
+        assert particle2.positions.shape[0] == particle.positions.shape[0] * 2
+        assert particle2.extra['velocity'].shape == particle2.positions.shape
+        velocity = particle2.extra['velocity']
+        particle2 = particle2.clone(extra={'velocity': particle2.extra['velocity'] * 2})
+        assert np.allclose(particle2.extra['velocity'], velocity * 2)
+        for basename in ['particles.npz', 'particles.h5']:
+            fn = dirname / basename
+            particle.save(fn)
+            particle2 = ParticleField.load(fn)
+            assert np.allclose(particle2.positions, particle.positions)
+            assert np.allclose(particle2.weights, particle.weights)
+            assert np.allclose(particle2.extra['velocity'], particle.extra['velocity'])
+            assert np.allclose(particle2.extra['z'], particle.extra['z'])
+
+
 if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
 
-    config.update('jax_num_cpu_devices', 16)
+    config.update('jax_num_cpu_devices', 4)
     config.update('jax_platform_name', 'cpu')
-    test_sharded_io()
-    exit()
+    #test_sharded_io()
+
     test_real_mesh()
     test_base_mesh()
     test_mesh_attrs()
@@ -382,3 +408,4 @@ if __name__ == '__main__':
     test_sharded_paint_read()
     test_sharded_random()
     test_sharded_normalization()
+    test_particle_field_extra()

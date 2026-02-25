@@ -138,36 +138,36 @@ def test_mesh2_correlation(plot=False):
         return compute_mesh2_correlation(mesh, los=los, bin=bin)
 
     for los in list_los:
-        corr = mock(mattrs, bin, random.key(43), los=los)
-        corr = corr.select(s=(30., 140.))
-        corr.write(get_fn(los))
+        correlation = mock(mattrs, bin, random.key(43), los=los)
+        correlation = correlation.select(s=(30., 140.))
+        correlation.write(get_fn(los))
 
     if plot:
         from matplotlib import pyplot as plt
 
         for los in list_los:
-            corr = read(get_fn(los=los))
-            corr = corr.select(s=(30., 140.))
-            ax = corr.plot().axes[0]
-            s = corr.get(ells=0).s
+            correlation = read(get_fn(los=los))
+            correlation = correlation.select(s=(30., 140.))
+            ax = correlation.plot().axes[0]
+            s = correlation.get(ells=0).s
             xi = get_xi(s, pk)
-            for ill, ell in enumerate(corr.ells):
+            for ill, ell in enumerate(correlation.ells):
                 ax.plot(s, s**2 * xi[ill], color='C{:d}'.format(ill), linestyle='--')
             ax.set_title(los)
             plt.show()
 
     for los in list_los:
         seed = random.key(43)
-        corr = mock(mattrs, bin, seed, los=los)
-        corr2 = mock(mattrs, bin2, seed, los=los)
+        correlation = mock(mattrs, bin, seed, los=los)
+        correlation2 = mock(mattrs, bin2, seed, los=los)
         if plot:
             from matplotlib import pyplot as plt
             ax = plt.gca()
-            for ill, ell in enumerate(corr.ells):
+            for ill, ell in enumerate(correlation.ells):
                 color = 'C{:d}'.format(ill)
-                pole = corr.get(ell)
+                pole = correlation.get(ell)
                 ax.plot(pole.coords('s'), pole.coords('s')**2 * pole.value(), color=color, linestyle='-')
-                pole = corr2.get(ell)
+                pole = correlation2.get(ell)
                 ax.plot(pole.coords('s'), pole.coords('s')**2 * pole.value(), color=color, linestyle='--')
             ax.set_title(los)
             plt.show()
@@ -1005,19 +1005,19 @@ def test_ref():
         mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
         mesh = generate_gaussian_mesh(mattrs, pkvec, seed=(42, 'index'), unitary_amplitude=True)
         size = 128 * 1024
-        backend = 'jax'
+        backend = 'mpi'
         data = generate_uniform_particles(mattrs, size, seed=(32, 'index')).exchange(backend=backend)
         randoms = generate_uniform_particles(mattrs, 2 * size, seed=(64, 'index')).exchange(backend=backend)
 
         fkp = FKPField(data, randoms)
         kw = dict(resampler='cic', interlacing=3, compensate=True)
         mesh = fkp.paint(**kw)
-    
+
         def run(bin, los):
             compute = jax.jit(compute_mesh2, static_argnames=['los'])
             estimate_memory(compute, mesh, los=los, bin=bin)
             return compute(mesh, los=los, bin=bin)
-    
+
         ells = (0, 2, 4)
         ref = {'x': 21.734526818678155, 'firstpoint': 21.38052302043614, 'endpoint': 21.38052302043614}
         bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 4 * mattrs.kfun.min()}, ells=ells)
@@ -1040,16 +1040,13 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-    config.update('jax_num_cpu_devices', 16)
+    config.update('jax_num_cpu_devices', 4)
     config.update('jax_platform_name', 'cpu')
 
-    jax.distributed.initialize()
-    test_ref()
-    exit()
-
-    #os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
     #jax.distributed.initialize()
     #test_sharded_spectrum()
+    #test_ref()
     #jax.distributed.shutdown()
 
     test_mesh2_spectrum(plot=False)

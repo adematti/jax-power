@@ -436,11 +436,20 @@ def exchange_halo(value, halo_size=0, sharding_mesh: jax.sharding.Mesh=None):
     return jaxdecomp.halo_exchange(value, halo_extents=tuple(extents), halo_periods=(True,) * len(extents))
 
 
-def _get_pad_constant(constant_values):
+def _get_pad_constant_numpy(constant_values):
 
     def pad(array, pad_width):
-        _constant_values = np.atleast_1d(np.asarray(constant_values, dtype=array.dtype))
-        return np.concatenate([array, np.repeat(_constant_values, pad_width[0][1], axis=0)], dtype=array.dtype, axis=0)
+        pad = np.zeros((1,) + array.shape[1:], dtype=array.dtype) + constant_values
+        return np.append(array, np.repeat(pad, pad_width[0][1], axis=0), axis=0)
+
+    return pad
+
+
+def _get_pad_constant_jax(constant_values):
+
+    def pad(array, pad_width):
+        pad = jnp.zeros((1,) + array.shape[1:], dtype=array.dtype) + constant_values
+        return jnp.append(array, jnp.repeat(jax.device_get(pad), pad_width[0][1], axis=0), axis=0)
 
     return pad
 
@@ -454,7 +463,8 @@ def _get_pad_uniform_numpy(mattrs, seed=42):
         limits = mattrs
 
     def pad(array, pad_width):
-        return np.concatenate([array, rng.uniform(*limits, size=(pad_width[0][1],) + array.shape[1:])], dtype=array.dtype, axis=0)
+        ran = rng.uniform(*limits, size=(pad_width[0][1],) + array.shape[1:])
+        return np.append(array, ran, axis=0)
 
     return pad
 
@@ -468,9 +478,22 @@ def _get_pad_uniform_jax(mattrs, seed=42):
         limits = mattrs
 
     def pad(array, pad_width):
-        return jnp.concatenate([array, jax.random.uniform(key, shape=(pad_width[0][1],) + array.shape[1:], minval=limits[0], maxval=limits[1])], dtype=array.dtype, axis=0)
+        ran = jax.random.uniform(key, shape=(pad_width[0][1],) + array.shape[1:], minval=limits[0], maxval=limits[1])
+        return jnp.append(array, jax.device_get(ran), axis=0)
 
     return pad
+
+
+def _safe_min(array, default=np.inf):
+    if array.size:
+        return array.min(axis=0)
+    return np.full(array.shape[1:], default, dtype=array.dtype)
+
+
+def _safe_max(array, default=-np.inf):
+    if array.size:
+        return array.max(axis=0)
+    return np.full(array.shape[1:], default, dtype=array.dtype)
 
 
 @default_sharding_mesh
@@ -509,7 +532,7 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
     local_devices = sharding.mesh.local_devices
     nlocal = len(local_devices)
-    sizes = jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0], nlocal))
+    all_size = jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0], nlocal))
     sl = slice(0, per_host_array.shape[0])
 
     if not callable(pad):
@@ -517,24 +540,24 @@ def make_array_from_process_local_data(per_host_array, per_host_size=None, pad=0
         if isinstance(pad, str):
             if pad == 'global_mean':
                 per_host_sum = np.repeat(np.sum(per_host_array, axis=0)[None, ...], nlocal, axis=0)
-                constant_values = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0, keepdims=True) / sizes.sum()[None, ...]
-                pad = _get_pad_constant(constant_values)
+                constant_values = jax.make_array_from_process_local_data(sharding, per_host_sum).sum(axis=0) / all_size.sum()
+                pad = _get_pad_constant_numpy(constant_values)
             elif pad == 'mean':
-                constant_values = np.mean(per_host_array, axis=0, keepdims=True)
-                pad = _get_pad_constant(constant_values)
+                constant_values = np.mean(per_host_array, axis=0)
+                pad = _get_pad_constant_numpy(constant_values)
             elif pad == 'uniform':
-                limits = [jax.make_array_from_process_local_data(sharding, np.repeat(np.min(per_host_array, axis=0)[None, ...], nlocal, axis=0)).min(axis=0),
-                          jax.make_array_from_process_local_data(sharding, np.repeat(np.max(per_host_array, axis=0)[None, ...], nlocal, axis=0)).max(axis=0)]
+                limits = [jax.make_array_from_process_local_data(sharding, np.repeat(_safe_min(per_host_array)[None, ...], nlocal, axis=0)).min(axis=0),
+                          jax.make_array_from_process_local_data(sharding, np.repeat(_safe_max(per_host_array)[None, ...], nlocal, axis=0)).max(axis=0)]
                 pad = _get_pad_uniform_numpy(limits)
             else:
                 raise ValueError('mean or global_mean supported only')
 
         else:  # constant value
-            pad = _get_pad_constant(pad)
+            pad = _get_pad_constant_numpy(pad)
 
     if per_host_size is None:
         # can be process-specific
-        per_host_size = (sizes.max().item() + nlocal - 1) // nlocal * nlocal
+        per_host_size = (all_size.max().item() + nlocal - 1) // nlocal * nlocal
     pad_width = [(0, per_host_size - per_host_array.shape[0])] + [(0, 0)] * (per_host_array.ndim - 1)
     per_host_array = pad(per_host_array, pad_width=pad_width)
     total_size = jax.make_array_from_process_local_data(sharding, np.repeat(per_host_array.shape[0] // nlocal, nlocal)).sum()
@@ -577,29 +600,55 @@ def make_array_from_single_device_arrays(sharding, per_device_arrays, return_sli
     slices : list of slice, optional
         List of slices corresponding to each device data in the global array, if ``return_slices`` is ``True``.
     """
+    local_devices = sharding.mesh.local_devices
+    nlocal = len(local_devices)
+    ndevices = sharding.mesh.devices.size
+    assert len(per_device_arrays) == nlocal
+
+    ndim = per_device_arrays[0].ndim
+
+    def _make_array(per_device_arrays):
+        global_shape = (ndevices * per_device_arrays[0].shape[0],) + per_device_arrays[0].shape[1:]
+        per_device_arrays = [jax.device_put(per_device_array, local_device, donate=True) for local_device, per_device_array in zip(local_devices, per_device_arrays)]
+        return jax.make_array_from_single_device_arrays(global_shape, sharding, per_device_arrays)
+
+    per_device_sizes = [jnp.asarray(per_device_chunk.shape[:1]) for per_device_chunk in per_device_arrays]
+    all_size =  _make_array(per_device_sizes)
+
+    def _allgather(array):
+        return jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding.mesh, P()))(array).addressable_data(0)
+
+    #all_size = _allgather(all_size)
+    all_size = all_size.ravel()
+
     if pad is None:
         pad = np.nan
     if not callable(pad):
-        constant_values = pad
-        pad = lambda array, pad_width: jnp.pad(array, pad_width, mode='constant', constant_values=constant_values)
-    local_devices = sharding.mesh.local_devices
-    nlocal = len(local_devices)
-    assert len(per_device_arrays) == nlocal
-    ndim = per_device_arrays[0].ndim
-    per_host_size = jnp.array([per_device_chunk.shape[0] for per_device_chunk in per_device_arrays])
-    all_size = jax.make_array_from_process_local_data(sharding, per_host_size)
-    # Line below fails with no attribute .with_spec for jax 0.6.2
-    #all_size = jax.jit(_identity_fn, out_shardings=sharding.with_spec(P()))(all_size).addressable_data(0)
-    all_size = jax.jit(_identity_fn, out_shardings=jax.sharding.NamedSharding(sharding.mesh, P()))(all_size).addressable_data(0)
-    all_size = all_size.ravel()
+        if isinstance(pad, str):
+            if pad == 'global_mean':
+                per_device_sums = [per_device_array.sum(axis=0)[None, ...] for per_device_array in per_device_arrays]
+                constant_values = _make_array(per_device_sums)
+                constant_values = constant_values.sum(axis=0) / all_size.sum()
+                pad = _get_pad_constant_jax(constant_values)
+            elif pad == 'mean':
+                constant_values = np.array([per_device_array.sum(axis=0) for per_device_array in per_device_arrays]).sum(axis=0) / np.sum([per_device_array.shape[0] for per_device_array in per_device_arrays])
+                pad = _get_pad_constant_jax(constant_values)
+            elif pad == 'uniform':
+                limits = [_make_array([_safe_min(per_device_array)[None, ...] for per_device_array in per_device_arrays]).min(axis=0),
+                          _make_array([_safe_max(per_device_array)[None, ...] for per_device_array in per_device_arrays]).min(axis=0)]
+                pad = _get_pad_uniform_jax(limits)
+            else:
+                raise ValueError('mean or global_mean supported only')
+
+        else:  # constant value
+            pad = _get_pad_constant_jax(pad)
+
     max_size = all_size.max().item()
     if not np.all(all_size == max_size):
         per_device_arrays = [pad(per_device_chunk, [(0, max_size - per_device_chunk.shape[0])] + [(0, 0)] * (ndim - 1)) for per_device_chunk in per_device_arrays]
-    global_shape = (max_size * len(all_size),) + per_device_arrays[0].shape[1:]
-    per_device_arrays = [jax.device_put(per_device_array, local_device, donate=True) for local_device, per_device_array in zip(local_devices, per_device_arrays)]
-    array = jax.make_array_from_single_device_arrays(global_shape, sharding, per_device_arrays)
+    array = _make_array(per_device_arrays)
     del per_device_arrays
-    slices = [slice(j * max_size, j * max_size + all_size[j].item()) for j in range(len(all_size))]
+    slices = [slice(j * max_size, j * max_size + all_size[j].item()) for j in range(ndevices)]
     if return_slices:
         return array, slices
     return array
@@ -630,13 +679,6 @@ def _exchange_array_jax(array, device, pad=0, return_indices=False):
     per_device_final_arrays = [None] * len(local_devices)
     per_host_indices = [[] for i in range(len(local_devices))]
     slices = [None] * ndevices
-
-    if isinstance(pad, str):
-        if pad == 'mean':
-            mean = array.mean(axis=0)
-            pad = lambda array, pad_width: jnp.append(array, jnp.repeat(jax.device_get(mean)[None, ...], pad_width[0][1], axis=0), axis=0)
-        else:
-            raise ValueError('mean supported only')
 
     for idevice in range(ndevices):
         # single-device arrays
@@ -728,12 +770,13 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     _check_device_layout(attrs.meshsize, sharding_mesh=sharding_mesh)
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
     #size_devices = shape_devices.prod(dtype='i4')
-    idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
+    idx_out_devices = (positions + attrs.boxsize / 2. - attrs.boxcenter) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.floor(idx_out_devices).astype('i4')
-    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(idx_out_devices, axis=-1), tuple(shape_devices))
 
     positions = _exchange_array_jax(positions, idx_out_devices, pad=_get_pad_uniform_jax(attrs), return_indices=return_inverse)
+    #positions = _exchange_array_jax(positions, idx_out_devices, pad=0., return_indices=return_inverse)
     if return_inverse:
         positions, indices = positions
 
@@ -1130,9 +1173,9 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     shape_devices = np.array(sharding_mesh.devices.shape + (1,) * (attrs.ndim - sharding_mesh.devices.ndim))
 
     positions = get(positions)
-    idx_out_devices = ((positions + attrs.boxsize / 2. - attrs.boxcenter) % attrs.boxsize) / (attrs.boxsize / shape_devices)
+    idx_out_devices = (positions + attrs.boxsize / 2. - attrs.boxcenter) / (attrs.boxsize / shape_devices)
     idx_out_devices = np.floor(idx_out_devices).astype('i4')
-    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out-of-the-box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = np.ravel_multi_index(tuple(idx_out_devices.T), tuple(shape_devices))
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
     devices = sharding.mesh.devices.ravel().tolist()
@@ -1327,13 +1370,22 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
     fn = str(fn)
     state = {}
     specs = names
-    if not isinstance(names, dict):
+    if isinstance(names, str):  # single string
+        names = [names]
+    if isinstance(names, (tuple, list)):  # list of strings
         specs = {name: P(None) for name in names}
+    if isinstance(names, dict):  # dict of name -> sharding spec
+        names = list(names)
+    if isinstance(names, P):
+        names = None
 
     if fn.endswith('.npz'):
         file = np.load(fn, allow_pickle=True)
         state = {}
         state['attrs'] = file['attrs'][()]
+        if names is None:
+            names = [name for name in file.files if name != 'attrs']
+            specs = {name: specs for name in names}
         for name in specs:
             if mpicomm is not None:
                 array = scatter_array(file[name] if mpicomm.rank == 0 else None, sharding_mesh=sharding_mesh, spec=specs[name], mpiroot=0, mpicomm=mpicomm)
@@ -1347,6 +1399,9 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
         import h5py
         with h5py.File(fn, 'r', **kwargs) as file:
             state['attrs'] = dict(file.attrs)
+            if names is None:
+                names = [name for name in file.keys()]
+                specs = {name: specs for name in names}
             for name in specs:
                 shapes[name] = file[name].shape
 
@@ -2336,12 +2391,14 @@ class ParticleField(object):
     ----------
     positions : jax.Array
         Array of particle positions, shape (N, ndim).
-        Important: in case of parellel computation, assumed scattered (sharded) over the different processes.
+        Important: in case of parallel computation, assumed scattered (sharded) over the different processes.
     weights : jax.Array, optional
         Array of particle weights, shape (N,). If None, defaults to 1 for all particles.
-        Important: in case of parellel computation, assumed scattered (sharded) over the different processes.
+        Important: in case of parallel computation, assumed scattered (sharded) over the different processes.
     attrs : MeshAttrs or dict, optional
         Mesh attributes.
+    extra : dict, optional
+        Dictionary of extra name: value. Each value should be a jax.Array of shape (N, ...).
     exchange : bool, default=False
         If ``True``, perform particle exchange for distributed computation.
     backend : {'auto', 'jax', 'mpi'}, default='auto'
@@ -2357,6 +2414,8 @@ class ParticleField(object):
         Particle weights.
     attrs : MeshAttrs
         Mesh attributes.
+    extra : dict
+        Dictionary of extra fields attached to the instance.
 
     Examples
     --------
@@ -2367,12 +2426,23 @@ class ParticleField(object):
     """
     positions: jax.Array = field(repr=False)
     weights: jax.Array = field(repr=False)
+    extra: dict = field(repr=False)
     attrs: MeshAttrs | None = field(init=False, repr=False)
 
-    def __init__(self, positions: jax.Array, weights: jax.Array | None=None, attrs=None, exchange=False, backend='auto', **kwargs):
+    def __init__(
+        self,
+        positions: jax.Array,
+        weights: jax.Array | None = None,
+        attrs=None,
+        extra: dict | None = None,
+        exchange=False,
+        backend="auto",
+        **kwargs,
+    ):
         if attrs is None: attrs = kwargs.pop('mattrs', None)
         if attrs is None: raise ValueError('attrs must be provided')
-        if not isinstance(attrs, MeshAttrs): attrs = MeshAttrs(**attrs)
+        if not isinstance(attrs, MeshAttrs):
+            attrs = MeshAttrs(**attrs)
         sharding_mesh = attrs.sharding_mesh
         with_sharding = bool(sharding_mesh.axis_names)
         if with_sharding:
@@ -2384,18 +2454,28 @@ class ParticleField(object):
             weights = jnp.ones_like(jnp.unstack(positions, axis=-1)[0])
         else:
             weights = jnp.asarray(weights)
+        extra = extra or {}
+        extra = {k: jnp.asarray(v) for k, v in extra.items()}
 
         exchange_direct, exchange_inverse = None, None
         if with_sharding and exchange:
             positions, exchange_direct, *_exchange_inverse = exchange_particles(attrs, positions, return_type='jax', backend=backend, **kwargs)
             weights = exchange_direct(weights)
+            extra = {k: exchange_direct(v) for k, v in extra.items()}
             if _exchange_inverse:
                 exchange_inverse = _exchange_inverse[0]
 
-        self.__dict__.update(positions=positions, weights=weights, exchange_inverse=exchange_inverse, exchange_direct=exchange_direct, attrs=attrs)
+        self.__dict__.update(
+            positions=positions,
+            weights=weights,
+            exchange_inverse=exchange_inverse,
+            exchange_direct=exchange_direct,
+            attrs=attrs,
+            extra=extra,
+        )
 
     def __repr__(self):
-        return f'{self.__class__.__name__}(size={self.size})'
+        return f"{self.__class__.__name__}(size={self.size}, extra={list(self.extra)})"
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
@@ -2411,44 +2491,67 @@ class ParticleField(object):
         return self.clone(exchange=True, **kwargs)
 
     def tree_flatten(self):
-        return tuple(getattr(self, name) for name in ['positions', 'weights', 'attrs']), {}
+        base_values = tuple(getattr(self, name) for name in ['positions', 'weights', 'attrs'])
+        extra_values = tuple(self.extra.values())
+        return base_values + extra_values, {'extra_names': list(self.extra.keys())}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
+        extra_names = aux_data['extra_names']
         new.__dict__.update({name: value for name, value in zip(['positions', 'weights', 'attrs'], children)})
+        new.__dict__.update(extra={name: value for name, value in zip(extra_names, children[3:])})
         return new
 
     def __getitem__(self, name):
         """Array-like slicing."""
-        return self.clone(positions=self.positions[name], weights=self.weights[name])
+        return self.clone(positions=self.positions[name], weights=self.weights[name],
+                          extra={name: value[name] for name, value in self.extra.items()})
 
     @property
     def size(self):
-        return self.weights.size
+        return self.positions.shape[0]
 
     def sum(self, *args, **kwargs):
         """Sum of :attr:`weights`."""
         return self.weights.sum(*args, **kwargs)
 
     @classmethod
-    def concatenate(cls, others, weights=None, local=True, **kwargs):
+    def concatenate(cls, others, weights=None, local=True, extra_weights=None, **kwargs):
         """Sum multiple :class:`ParticleField`, with input weights."""
         if weights is None:
-            weights = [1] * len(weights)
+            weights = [1] * len(others)
         else:
             assert len(weights) == len(others)
-        gather = {name: [] for name in ['positions', 'weights']}
+        extra_names = [name for name in others[0].extra if all(name in other.extra for other in others[1:])]
+        names = ['positions', 'weights']
+        gather = {name: [] for name in names}
+        extra_gather = {name: [] for name in extra_names}
+        extra_weights = extra_weights or {}
+        if not isinstance(extra_weights, dict):
+            # Assume same weights for all extra fields
+            extra_weights = {name: extra_weights for name in extra_names}
         for other, factor in zip(others, weights):
             if not isinstance(other, ParticleField):
                 raise RuntimeError("Type of `other` not understood.")
             gather['positions'].append(other.positions)
             gather['weights'].append(factor * other.weights)
-        for name, value in gather.items():
-            if local: value = _local_concatenate(value, axis=0)
-            else: value = jnp.concatenate(value, axis=0)
-            gather[name] = value
-        return cls(**gather, attrs=others[0].attrs)
+            for name in extra_names:
+                if name in extra_weights:
+                    extra_gather[name].append(extra_weights[name] * other.extra[name])
+                else:
+                    extra_gather[name].append(other.extra[name])
+
+        def _concatenate(gather):
+            for name, value in gather.items():
+                if local: value = _local_concatenate(value, axis=0)
+                else: value = jnp.concatenate(value, axis=0)
+                gather[name] = value
+            return gather
+
+        gather = _concatenate(gather)
+        extra_gather = _concatenate(extra_gather)
+        return cls(positions=gather['positions'], weights=gather['weights'], attrs=others[0].attrs, extra=extra_gather, **kwargs)
 
     def __add__(self, other):
         if isinstance(other, ParticleField):
@@ -2519,13 +2622,24 @@ class ParticleField(object):
     def save(self, fn, **kwargs):
         """Save particles to file."""
         state = {name: getattr(self, name) for name in ['positions', 'weights']}
-        _save(fn, state, attrs=self.attrs.__getstate__(), sharding_mesh=self.attrs.sharding_mesh, **kwargs)
+        for name in self.extra:
+            if name in state:
+                raise ValueError(f'extra field name {name} conflicts with reserved field names')
+            state[name] = self.extra[name]
+        attrs = self.attrs.__getstate__()
+        if self.extra:
+            attrs['extra'] = list(self.extra.keys())
+        _save(fn, state, attrs=attrs,
+              sharding_mesh=self.attrs.sharding_mesh,
+              **kwargs)
 
     @classmethod
     @default_sharding_mesh
     def load(cls, fn, sharding_mesh=None, **kwargs):
         """Load particles from file."""
-        state = _load(fn, names={name: P(sharding_mesh.axis_names) for name in ['positions', 'weights']}, sharding_mesh=sharding_mesh, **kwargs)
+        state = _load(fn, names=P(sharding_mesh.axis_names), sharding_mesh=sharding_mesh, **kwargs)
+        extra_names = state['attrs'].pop('extra', [])
+        state['extra'] = {name: state.pop(name) for name in extra_names}
         state['attrs'] = MeshAttrs.from_state(state['attrs'])
         new = cls.__new__(cls)
         new.__dict__.update(**state)
