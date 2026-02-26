@@ -177,7 +177,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
         return mesh
 
 
-def generate_uniform_particles(mattrs: MeshAttrs, size: int=None, seed: int=42, exchange=False):
+def generate_uniform_particles(mattrs: MeshAttrs, size: int=None, seed: int=42, exchange=False, **kwargs):
     """
     Generate uniformly distributed particles in the input box.
 
@@ -192,6 +192,8 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int=None, seed: int=42, 
         Provide (seed, ids) to ensure reproducibility when changing the number of devices; see :func:`create_sharded_random` for details.
     exchange : bool, default=False
         If ``True``, perform particle exchange for distributed computation.
+    kwargs : dict
+        Other arguments for :class:`ParticleField`.
 
     Returns
     -------
@@ -202,4 +204,4 @@ def generate_uniform_particles(mattrs: MeshAttrs, size: int=None, seed: int=42, 
         return mattrs.boxsize * random.uniform(key, shape + (len(mattrs.boxsize),), dtype=mattrs.rdtype) - mattrs.boxsize / 2. + mattrs.boxcenter
     positions = create_sharded_random(sample, seed, shape=size, out_specs=P(mattrs.sharding_mesh.axis_names,))
     #positions = exchange_particles(mattrs, positions=positions, return_inverse=False)[0]
-    return ParticleField(positions, attrs=mattrs, exchange=exchange)
+    return ParticleField(positions, attrs=mattrs, exchange=exchange, **kwargs)
