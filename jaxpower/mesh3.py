@@ -715,7 +715,7 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
             else:
                 num_ = init
             num.append(num_.real)
-
+        #num.append(bin(*meshes, ell=ells[0]).real)
 
     correlation = []
     for ill, ell in enumerate(ells):
@@ -1474,7 +1474,8 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     theory = []
     kin, edgesin = jnp.mean(edgesin, axis=-1), edgesin
     for ill, ell in enumerate(ellsin):
-        theory.append(ObservableLeaf(k=kin, k_edges=edgesin, value=jnp.zeros_like(kin[..., 0]), coords=['k']))
+        #theory.append(ObservableLeaf(k=kin, k_edges=edgesin, value=jnp.zeros_like(kin[..., 0]), coords=['k']))
+        theory.append(Mesh3SpectrumPole(k=kin, k_edges=edgesin, num_raw=jnp.zeros_like(kin[..., 0]), basis='sugiyama'))
     #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
     kw = dict(ells=[ell[0] for ell in ellsin], wa_orders=[ell[1] for ell in ellsin])
     theory = ObservableTree(theory, **kw)
