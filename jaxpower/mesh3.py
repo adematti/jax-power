@@ -98,6 +98,7 @@ def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None
     edges1d = edges1d + [edges1d[-1]] * (ndim - len(edges1d))
     ibin1d = ibin1d + [ibin1d[-1]] * (ndim - len(ibin1d))
     nmodes1d = nmodes1d + [nmodes1d[-1]] * (ndim - len(nmodes1d))
+    iedges1d = [jnp.arange(len(xx)) for xx in nmodes1d]
     xavg1d = xavg1d + [xavg1d[-1]] * (ndim - len(xavg1d))
 
     def _cproduct(array):
@@ -120,7 +121,7 @@ def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None
     edges = edges[mask]
     xavg = _product(xavg1d)[mask]
     nmodes = jnp.prod(_product(nmodes1d)[mask], axis=-1)
-    iedges = _product([jnp.arange(len(xx)) for xx in nmodes1d])[mask]
+    iedges = _product(iedges1d)[mask]
     nmodes = [nmodes] * len(ells)
 
     if 'diagonal' in basis:
@@ -136,10 +137,10 @@ def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None
         split_iedges = []
 
         for axis in range(ndim):
-            axis_iedges = jnp.arange(len(edges1d[axis]))
             # Number of batches
-            nsplits = (len(axis_iedges) + buffer_size - 1) // buffer_size
-            split_iedges.append(jnp.array_split(axis_iedges, nsplits, axis=0))
+            iedges1d_axis = iedges1d[axis][np.isin(iedges1d[axis], iedges[..., axis])]
+            nsplits = (len(iedges1d_axis) + buffer_size - 1) // buffer_size
+            split_iedges.append(jnp.array_split(iedges1d_axis, nsplits, axis=0))
         _buffer_global_iedges, _buffer_iedges, _buffer_iedges1d = [], [], []
         size_max, usize_max = 0, 0
 
