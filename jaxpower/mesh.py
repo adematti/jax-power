@@ -2506,7 +2506,7 @@ class ParticleField(object):
     def __getitem__(self, name):
         """Array-like slicing."""
         return self.clone(positions=self.positions[name], weights=self.weights[name],
-                          extra={name: value[name] for name, value in self.extra.items()})
+                          extra={key: value[name] for key, value in self.extra.items()})
 
     @property
     def size(self):
