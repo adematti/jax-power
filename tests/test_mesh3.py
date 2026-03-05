@@ -1165,12 +1165,12 @@ def test_ref():
         fkp = FKPField(data, randoms)
         kw = dict(resampler='cic', interlacing=3, compensate=True)
         mesh = fkp.paint(**kw)
-        
+
         def run(bin, los):
             compute = jax.jit(compute_mesh3, static_argnames=['los'])
             estimate_memory(compute, mesh, los=los, bin=bin)
             return compute(mesh, los=los, bin=bin)
-        
+
         ref = {('z', 'scoccimarro'): 6212.744915936817, ('local', 'scoccimarro'): 6351.9885052476775,
         ('z', 'sugiyama'): 7101.520143303501, ('local', 'sugiyama'): 8570.76518969239,
         ('z', 'sugiyama-diagonal'): 8369.637841532976, ('local', 'sugiyama-diagonal'): 8301.255177548157}
@@ -1181,7 +1181,7 @@ def test_ref():
                 result[los, basis] = run(bin, los).value().std()
                 assert np.allclose(result[los, basis], ref[los, basis])
         #print({key: float(result[key]) for key in result})
-        
+
         ref = {('x', 'sugiyama'): 2.364754570056707e-08, ('local', 'sugiyama'): 1.7060700924698467e-08,
         ('x', 'sugiyama-diagonal'): 3.574483788256436e-08, ('local', 'sugiyama-diagonal'): 1.9908754918383136e-08}
         result = {}
@@ -1206,7 +1206,6 @@ if __name__ == '__main__':
 
     jax.distributed.initialize()
     test_ref()
-    exit()
     #test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()

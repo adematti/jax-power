@@ -1321,12 +1321,16 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             grid_edgesin.append(edge)
         grid_kin = tuple(jnp.mean(edge, axis=-1) for edge in grid_edgesin)
 
-        def _cproduct(array):
-            grid = jnp.meshgrid(*array, sparse=False, indexing='ij')
+        def _cproduct(arrays, swap=False):
+            if swap: arrays = arrays[::-1]
+            grid = jnp.meshgrid(*arrays, sparse=False, indexing='ij')
             return jnp.column_stack([tmp.ravel() for tmp in grid])
 
         # of shape (nbins, ndim, 2)
-        edgesin = jnp.concatenate([_cproduct([edge[..., 0] for edge in grid_edgesin])[..., None], _cproduct([edge[..., 1] for edge in grid_edgesin])[..., None]], axis=-1)
+        def _get_edgesin(grid_edgesin, swap=False):
+            return jnp.concatenate([_cproduct([edge[..., 0] for edge in grid_edgesin], swap=swap)[..., None],
+                                    _cproduct([edge[..., 1] for edge in grid_edgesin], swap=swap)[..., None]], axis=-1)
+        edgesin, edgesin_swap = (_get_edgesin(grid_edgesin, swap=swap) for swap in [False, True])
         kin = _cproduct(grid_kin)
         if 'soccimarro' in bin.basis:
             mask = (kin[:, 2] >= jnp.abs(kin[:, 0] - kin[:, 1])) & (kin[:, 2] <= jnp.abs(kin[:, 0] + kin[:, 1]))
@@ -1436,8 +1440,8 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             wmat_tmp[ellin, wain] = []
             for ill, ell in enumerate(ells):
 
-                def convolve(idx):
-                    spectrum = tophat(to_spectrum.k, edgesin[idx], 1.)
+                def convolve(idx, swap=False):
+                    spectrum = tophat(to_spectrum.k, (edgesin_swap if swap else edgesin)[idx], 1.)
                     correlation = to_correlation(spectrum)[1]
                     correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
                     return read(kout.T, to_spectrum.k, to_spectrum(correlation)[1])
@@ -1452,14 +1456,14 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, minfolds=0)
                     tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
-                sym_ell1 = tuple(ellin[1::-1]) + ellin[2:]
+                ellin_swap = tuple(ellin[1::-1]) + ellin[2:]
                 # Takes care of symmetry
-                if ellin[1] != ellin[0] and (sym_ell1, wain) not in ellsin:
-                    wcoeffs = get_sugiyama_window_convolution_coeffs(ell, sym_ell1)
+                if ellin[1] != ellin[0] and (ellin_swap, wain) not in ellsin:
+                    wcoeffs = get_sugiyama_window_convolution_coeffs(ell, ellin_swap)
                     if wcoeffs:
                         Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
-                        to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sym_ell1, minfolds=0)
-                        tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
+                        to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin_swap, minfolds=0)
+                        tmp += jax.lax.map(partial(convolve, swap=True), jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
                 wmat_tmp[ellin, wain].append(tmp)
 
