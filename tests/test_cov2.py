@@ -664,29 +664,8 @@ def test_fftlog2():
     from jaxpower.fftlog import SpectrumToCorrelation, CorrelationToSpectrum
 
     fftlog = SpectrumToCorrelation(k, ell=0, lowring=lowring, minfolds=False).fftlog
-    tmp2 = fftlog(pk)[1]
-    tmp3 = P2xi(k, l=0, N=len(k), lowring=lowring)(pk)[1]
 
     H0 = jax.jacfwd(lambda fun: fftlog(fun, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-
-
-    class Correlation2SpectrumK(object):
-
-        def __init__(self, k, ells):
-            from jaxpower.fftlog import SpectrumToCorrelation
-            fftlog = SpectrumToCorrelation(k, ell=ells[0], lowring=False, minfolds=False).fftlog
-            self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(k))
-            self._fftlog = SpectrumToCorrelation(k, ell=ells[1], lowring=False, minfolds=False).fftlog
-            dlnk = jnp.diff(jnp.log(k)).mean()
-            self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
-            self.k = k
-            self.s = fftlog.y
-
-        def __call__(self, fun):
-            fun = self._H * fun
-            _, fun = self._fftlog(fun, extrap=False, ignore_prepostfactor=True)
-            return self.k, self._postfactor * fun
-
 
     class Correlation2Spectrum(object):
 

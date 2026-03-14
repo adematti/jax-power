@@ -305,7 +305,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
             if fields[1] == fields[0]:
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
-                Aell = _2c(rmesh1) * A0.conj()
+                Aell = _2c(rmesh1).conj() * A0
             num.append(bin(Aell))
             del Aell
 
@@ -350,7 +350,7 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         if fields[1] == fields[0]:
             Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
         else:
-            Aell = meshes[0] * meshes[1].conj()
+            Aell = meshes[0].conj() * meshes[1]
         del meshes
 
         nonzeroells = ells
@@ -423,11 +423,12 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         del meshes
 
         num = []
+
         if 0 in ells:
             if fields[1] == fields[0]:
                 Aell = A0.clone(value=A0.real**2 + A0.imag**2)  # saves a bit of memory
             else:
-                Aell = _2c(rmesh1) * A0.conj()
+                Aell = _2c(rmesh1).conj() * A0
             if bin.basis != 'bessel': Aell = Aell.c2r()  # convert to real space
             num.append(bin(Aell, ell=0))
             del Aell
@@ -474,7 +475,7 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         if fields[1] == fields[0]:
             Aell = meshes[0].clone(value=meshes[0].real**2 + meshes[0].imag**2)  # saves a bit of memory
         else:
-            Aell = meshes[0] * meshes[1].conj()
+            Aell = meshes[0].conj() * meshes[1]
         if bin.basis != 'bessel': Aell = Aell.c2r()  # convert to real space
         del meshes
 

@@ -968,7 +968,6 @@ def test_memory():
 
     mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
 
-    mesh = generate_gaussian_mesh(mattrs, pkvec, seed=42, unitary_amplitude=True)
     size = int(1e4)
     data = generate_uniform_particles(mattrs, size, seed=32)
     # Triumvirate doesn't take weights for box statistics...
@@ -983,6 +982,7 @@ def test_memory():
     los = 'firstpoint'
 
     ells = [0, 2, 4, 6, 8]
+
     bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 4 * mattrs.kfun.min()}, ells=ells)
     compute = jax.jit(compute_mesh2_spectrum, static_argnames=['los'])
     estimate_memory(compute, mesh, los=los, bin=bin)
@@ -990,6 +990,15 @@ def test_memory():
     bin = BinMesh2CorrelationPoles(mattrs, edges={'step': 4 * mattrs.cellsize.min()}, ells=ells)
     compute = jax.jit(compute_mesh2_correlation, static_argnames=['los'])
     estimate_memory(compute, mesh, los=los, bin=bin)
+
+    result = compute(mesh, bin=bin, los=los)
+    jax.block_until_ready(result)
+    n = 10
+    t0 = time.time()
+    for i in range(10):
+        result = compute(mesh, bin=bin, los=los)
+        jax.block_until_ready(result)
+    print(f'Elapsed time {(time.time() - t0) / n:3f}')
 
 
 def test_ref():
@@ -1003,7 +1012,7 @@ def test_ref():
 
     with create_sharding_mesh() as sharding_mesh:
         mattrs = MeshAttrs(boxsize=1000., boxcenter=500., meshsize=128)
-        mesh = generate_gaussian_mesh(mattrs, pkvec, seed=(42, 'index'), unitary_amplitude=True)
+        #mesh = generate_gaussian_mesh(mattrs, pkvec, seed=(42, 'index'), unitary_amplitude=True)
         size = 128 * 1024
         backend = 'mpi'
         data = generate_uniform_particles(mattrs, size, seed=(32, 'index')).exchange(backend=backend)
