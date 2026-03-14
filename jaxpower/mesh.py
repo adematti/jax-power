@@ -3132,24 +3132,27 @@ def __format_meshes(*meshes, fields=None, nmeshes=None):
     return meshes, tuple(fields)
 
 
-def split_particles(*particles, seed=0, fields: tuple=None):
+def split_particles(*particles, seed=0, fields: tuple=None, return_masks=False):
     """
     Split input particles for estimation of the normalization.
 
     Parameters
     ----------
     particles : ParticleField or None
-        Input particles.
+        Input particles. One can pass ``None`` if the particles are the same as the previous one,
+        e.g. ``[particle1, None, None]`` would be considered as ``particle1`` to be split into 3 disjoint sets.
     seed : int, optional
         Random seed.
     fields : tuple, default=None
         Field identifiers; pass e.g. [0, 0] if two fields sharing the same positions are given as input;
         disjoint random subsamples will be selected.
+    return_masks : bool, default=False
+        If ``True``, return list of masks to apply to the different particles instead.
 
     Returns
     -------
     particles : list of particles
-        Disjoint samples of particles.
+        Disjoint samples of particles (or list of masks if ``return_masks``).
     """
     particles, fields = __format_meshes(*particles, fields=fields, nmeshes=None)
     unique_fields = []
@@ -3160,7 +3163,10 @@ def split_particles(*particles, seed=0, fields: tuple=None):
         seed = [seed]
     seeds = seed
     assert len(seeds) == len(unique_fields), 'provide as many seeds as unique fields'
-    toret = list(particles)
+    if return_masks:
+        toret = [None] * len(particles)
+    else:
+        toret = list(particles)
     for unique_field, seed in zip(unique_fields, seeds):
         field_indices = [ifield for ifield, field in enumerate(fields) if field == unique_field]
         sharding_mesh = particles[field_indices[0]].attrs.sharding_mesh
@@ -3168,5 +3174,8 @@ def split_particles(*particles, seed=0, fields: tuple=None):
         nsplits = len(field_indices)
         for isplit, field_index in enumerate(field_indices):
             mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
-            toret[field_index] = particles[field_index].clone(weights=particles[field_index].weights * mask)
+            if return_masks:
+                toret[field_index] = mask
+            else:
+                toret[field_index] = particles[field_index].clone(weights=particles[field_index].weights * mask)
     return toret

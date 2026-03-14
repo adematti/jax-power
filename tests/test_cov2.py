@@ -9,6 +9,7 @@ from matplotlib import pyplot as plt
 from jaxpower import (MeshAttrs, compute_mesh2_covariance_window, compute_fkp2_covariance_window, compute_spectrum2_covariance,
                       generate_anisotropic_gaussian_mesh, generate_uniform_particles, BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, Mesh2SpectrumPole, Mesh2SpectrumPoles,
                       read, compute_mesh2_spectrum, compute_mesh2_correlation, interpolate_window_function, Mesh2CorrelationPole, Mesh2CorrelationPoles)
+from jaxpower.cov2 import matrix_spline_interp, matrix_rebin
 from jaxpower.types import ObservableTree
 
 
@@ -775,39 +776,77 @@ def test_fftlog2():
 
 
 def test_bspline():
-    import numpy as np
-    from scipy.interpolate import make_interp_spline, BSpline
-
-    def matrix_spline_interp(x, xeval, k=3):
-        from scipy.interpolate import make_interp_spline, BSpline
-        from scipy import sparse
-        # Build interpolating spline
-        bspl = make_interp_spline(x, np.ones_like(x), k=k)
-        # Extract its knot vector
-        t = bspl.t   # knot positions
-        c = bspl.c   # coefficients (same length as x for interpolating spline)
-        # Build the design matrix:
-        D = BSpline.design_matrix(x, t, k)
-        A = BSpline.design_matrix(xeval, t, k)
-        return sparse.linalg.spsolve(D.T, A.T).T.toarray()
 
     def f(x):
         return np.sin(x)
 
     k = 3
-    x = np.linspace(0., 2. * np.pi, 10)
-    xeval = np.linspace(0., 2. * np.pi, 50)
-    y = f(x)
+    xt = np.linspace(0., 2. * np.pi, 10)
+    xo = np.linspace(0., 2. * np.pi, 50)
+    y = f(xt)
 
-    matrix = matrix_spline_interp(x, xeval, k=k)
+    matrix = matrix_spline_interp(xt, xo, k=k)
     yinterp = matrix.dot(y)
     bspl = make_interp_spline(x, y, k=k)
 
     ax = plt.gca()
     ax.plot(x, y, color='k', linestyle='--')
-    ax.plot(xeval, yinterp, color='k', linestyle='-')
-    ax.plot(xeval, bspl(xeval), color='k', linestyle=':')
+    ax.plot(xo, yinterp, color='k', linestyle='-')
+    ax.plot(xo, bspl(xo), color='k', linestyle=':')
     plt.show()
+
+
+def test_matrix_spline_integral_polynomial(degree=3):
+    xt = np.linspace(0.0, 1.0, 9)
+    xo = np.array([0.0, 0.2, 0.5, 0.8, 1.0])
+
+    yt = xt**degree
+
+    # Exact antiderivative of x**degree, with constant chosen to be 0 at x=0
+    expected = xo**(degree + 1) / (degree + 1)
+
+    mat = matrix_spline_interp(xt, xo, deriv=-1, interp_order=3)
+    got = mat @ yt
+
+    assert np.allclose(got, expected, rtol=1e-11, atol=1e-11)
+
+
+def test_rebin2d():
+    x = np.linspace(0.1, 0.9, 5)   # output bin centers
+    y = np.linspace(0.2, 1.8, 6)   # output bin centers
+
+    xp = np.linspace(0.0, 1.0, 9)   # input sample points
+    yp = np.linspace(0.0, 2.0, 11)  # input sample points
+
+    fx = xp**2
+    gy = 1.0 + yp
+    fp = np.outer(fx, gy)  # f(x, y) = x^2 (1 + y), shape (len(xp), len(yp))
+
+    def _edges_from_centers(x):
+        x = np.asarray(x)
+        edges = np.empty(len(x) + 1, dtype=x.dtype)
+        edges[1:-1] = 0.5 * (x[:-1] + x[1:])
+        edges[0] = x[0] - 0.5 * (x[1] - x[0])
+        edges[-1] = x[-1] + 0.5 * (x[-1] - x[-2])
+        return edges
+
+    xe = _edges_from_centers(x)
+    ye = _edges_from_centers(y)
+
+    Mx = matrix_rebin(xe, xp, wt=xp**2, interp_order=3)
+    My = matrix_rebin(ye, yp, wt=yp**2, interp_order=3)
+
+    got = Mx @ fp @ My.T
+
+    # Expected result using the same convention as matrix_rebin:
+    # numerator = integral of spline-interpolated sampled product
+    # denominator = integral of spline-interpolated sampled weight
+
+    expected_x = Mx @ fx
+    expected_y = My @ gy
+    expected = np.outer(expected_x, expected_y)
+
+    assert np.allclose(got, expected, rtol=1e-11, atol=1e-11)
 
 
 
@@ -822,8 +861,10 @@ if __name__ == '__main__':
     #test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
     #test_pre_post_covariance()
-    test_multitracer_covariance()
+    #test_multitracer_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)
     #test_bspline()
+    test_matrix_spline_integral_polynomial(degree=3)
+    test_rebin2d()

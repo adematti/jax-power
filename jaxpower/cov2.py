@@ -4,7 +4,7 @@ import numpy as np
 import jax
 from jax import numpy as jnp
 
-from .mesh import MeshAttrs, RealMeshField
+from .mesh import MeshAttrs, RealMeshField, split_particles, compute_normalization
 from .mesh2 import BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, compute_mesh2, FKPField, prod
 from .types import CovarianceMatrix, Mesh2SpectrumPoles, ObservableTree
 from .utils import legendre_product, get_spherical_jn
@@ -59,9 +59,15 @@ class Correlation2Spectrum(object):
         return self.k, self._postfactor * fun
 
 
-def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, **kwargs):
-    """
+def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, split=None, **kwargs):
+    r"""
     Compute the window matrices (WW, WS, SS) for the FKP 2-point covariance.
+
+    Reference
+    ---------
+    https://arxiv.org/pdf/1811.05714
+    Windows are already divided by :math:`\mathcal{W}_0^2`, such that the limit of WW(s->0) is the 1 / Veff
+    with Veff the volume of the survey, and the limit of SS(s->0) is 1 / (Veff * density^2).
 
     Parameters
     ----------
@@ -95,26 +101,41 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, **k
         for name in kw: kw[name] = kwargs.pop(name, kw[name])
         edges = kw.pop('edges', None)
         if edges is None: edges = {}
-        if isinstance(edges, dict):
-            edges.setdefault('max', np.sqrt(np.sum((mattrs.boxsize / 2)**2)))
         bin = BinMesh2CorrelationPoles(mattrs, edges=edges, **kw)
 
-    def get_W(field):
-        fkp = fkps[field]
-        randoms = fkp.randoms if isinstance(fkp, FKPField) else fkp
-        alpha = fkp.data.weights.sum() / fkp.randoms.weights.sum() if isinstance(fkp, FKPField) else 1.
+    def get_randoms(fkp):
+        return fkp.randoms if isinstance(fkp, FKPField) else fkp
+
+    def get_W(fkp, mask):
+        randoms = get_randoms(fkp)
+        if mask is not None: randoms = randoms.clone(weights=randoms.weights * mask)
+        alpha = fkp.data.weights.sum() / randoms.weights.sum() if isinstance(fkp, FKPField) else 1.
         mesh = randoms.paint(**kwargs, out='real')
         return alpha * mesh / mesh.cellsize.prod()
 
-    def get_S(*fields):
-        all_randoms = [fkps[field].randoms if isinstance(fkps[field], FKPField) else fkps[field] for field in fields]
+    def get_S(fkps, mask):
+        randoms = [get_randoms(fkp) for fkp in fkps]
+        if mask is not None:
+            randoms = [randoms.clone(weights=randoms.weights * mask) for randoms in randoms]
         alpha = 1.
-        if isinstance(fkps[fields[0]], FKPField):
-            alpha *= prod(fkps[field].data.weights for field in fields).sum() / prod(fkps[field].randoms.weights for field in fields).sum()
-        mesh = alpha * all_randoms[0].clone(weights=all_randoms[0].weights * all_randoms[1].weights).paint(**kwargs, out='real')
-        return mesh / mesh.cellsize.prod()
+        if isinstance(fkps[0], FKPField):
+            alpha *= prod(fkp.data.weights for fkp in fkps).sum() / prod(randoms.weights for randoms in randoms).sum()
+        mesh = randoms[0].clone(weights=randoms[0].weights * randoms[1].weights).paint(**kwargs, out='real')
+        return alpha * mesh / mesh.cellsize.prod()
 
-    if fields is None: fields = list(range(len(fkps)))
+    def split_masks(fkps, split, fields):
+        unique_fields = []
+        for field in fields:
+            if field not in unique_fields:
+                unique_fields.append(field)
+        seed = [split[fields.index(ufield)] for ufield in unique_fields]
+        return split_particles(*[get_randoms(fkp) for fkp in fkps], seed=seed, fields=fields, return_masks=True)
+
+    if fields is None:
+        fields = list(range(len(fkps)))
+    if split is not None and not isinstance(split, list):
+        assert len(split) == len(fields), 'provide as many seeds as fields'
+        split = [split]
     fkps = {field: fkp for field, fkp in zip(fields, fkps, strict=True)}
     windows = {name: {} for name in ['WW', 'WS', 'SW', 'SS']}
     pairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each inner P(k)
@@ -122,7 +143,12 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, **k
     for pair in itertools.product(pairs, pairs):
         wfield = sum(pair, start=tuple())
         if wfield not in windows['WW']:
-            W = ws = [get_W(wfield[0]) * get_W(wfield[1]), get_W(wfield[2]) * get_W(wfield[3])]
+            _fkps = [fkps[field] for field in wfield]
+            masks = [None] * len(_fkps)
+            if split is not None:
+                masks = split_masks(_fkps, split=split, fields=list(wfield))
+            W = ws = [get_W(_fkps[0], mask=masks[0]) * get_W(_fkps[1], mask=masks[1]),
+                      get_W(_fkps[2], mask=masks[2]) * get_W(_fkps[3], mask=masks[3])]
             # mattrs = W[0].attrs
             # norm is sum(cellsize * W^2) * sum(cellsize * W^2)
             # compute_mesh2 computes ~ sum(cellsize * W^2) / cellsize^2, so correct norm by cellsize^2
@@ -132,16 +158,15 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, **k
             update = dict(norm=[ws[0].sum() * ws[1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
             windows['WW'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
             if wfield[3] == wfield[2]:
-                ws = [W[0], get_S(wfield[2], wfield[3])]
+                ws = [W[0], get_S(_fkps[2:], masks[2])]
                 windows['WS'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
             if wfield[1] == wfield[0]:
-                ws = [get_S(wfield[0], wfield[1]), W[1]]
+                ws = [get_S(_fkps[:2], masks[0]), W[1]]
                 windows['SW'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
             if wfield[1] == wfield[0] and wfield[3] == wfield[2]:
-                ws = [get_S(wfield[0], wfield[1]), get_S(wfield[2], wfield[3])]
+                ws = [get_S(_fkps[:2], mask=masks[0]), get_S(_fkps[2:], mask=masks[2])]
                 windows['SS'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
     return ObservableTree([ObservableTree(list(windows[name].values()), fields=[tuple(wfield) for wfield in windows[name]]) for name in windows], types=list(windows))
-
 
 
 def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, **kwargs):
@@ -340,7 +365,19 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
         for field in fields:
             assert field in poles.fields, f'input pole {field} is required'
 
-        def get_wj(ww, k1, k2, q1, q2):
+        cache_rebin = []
+        def _edges_from_centers(x):
+            """Return bin edges from bin centers."""
+            x = np.asarray(x)
+            if x.ndim != 1 or np.any(x[1:] <= x[:-1]):
+                raise ValueError("x must be 1D and strictly increasing")
+            edges = np.empty(len(x) + 1, dtype=x.dtype)
+            edges[1:-1] = 0.5 * (x[:-1] + x[1:])
+            edges[0] = np.maximum(x[0] - 0.5 * (x[1] - x[0]), 0)
+            edges[-1] = x[-1] + 0.5 * (x[-1] - x[-2])
+            return edges
+
+        def get_wj(ww, k1, k2, k1edges, k2edges, q1, q2):
             shape = k1.shape + k2.shape
             w = sum(legendre_product(q1, q2, q) *  ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
             if w.size <= 1:
@@ -348,10 +385,12 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
             tmpw = next(iter(ww))
             s = tmpw.coords('s')
 
-            def interp2d(x, y, xp, yp, fp, left=0., right=0.):
-                # fp shape: (len(xp), len(yp))
-                interp_x = jax.vmap(lambda f: jnp.interp(x, xp, f, left=left, right=right), in_axes=1, out_axes=1)(fp)
-                return jax.vmap(lambda f: jnp.interp(y, yp, f, left=left, right=right), in_axes=0, out_axes=0)(interp_x)
+            def rebin2d(xedges, yedges, xp, yp, fp, cache=cache_rebin):
+                """Rebin fp sampled on (xp, yp) to bins centered on (x, y)."""
+                interp_order = 3
+                Mx = matrix_rebin(xedges, xp, wt=xp**2, interp_order=interp_order, cache=cache)
+                My = matrix_rebin(yedges, yp, wt=yp**2, interp_order=interp_order, cache=cache)
+                return Mx @ fp @ My.T
 
             if 'fftlog' in flags:
                 s = tmpw.coords('s')
@@ -360,7 +399,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                 #from scipy.interpolate import RectBivariateSpline
                 #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
                 #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
-                toret = interp2d(k1, k2, fftlog.k, fftlog.k, tmp, left=0., right=0.)
+                toret = rebin2d(k1edges, k2edges, fftlog.k, fftlog.k, tmp)
                 #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
                 #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
                 return toret
@@ -375,7 +414,8 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
 
                 if 'volume' in tmpw.values():
                     vol = tmpw.values('volume')
-                    #vol = 4. / 3. * np.pi * np.diff(ww.edges(projs=q1)**3, axis=-1)[..., 0]
+                    #vol = 4. / 3. * np.pi * np.diff(tmpw.edges('s')**3, axis=-1)[..., 0]
+                    #print(vol / vol2)
                     w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
                     w *= vol
 
@@ -432,7 +472,9 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                 for ill1, ill2 in itertools.product(ills, ills):
                     ell1, ell2 = ells[ill1], ells[ill2]
                     k1 = pole1.get(ell1).coords('k', center=center)
+                    k1edges = pole1.get(ell1).edges('k', default=_edges_from_centers(k1))
                     k2 = pole2.get(ell2).coords('k', center=center)
+                    k2edges = pole1.get(ell1).edges('k', default=_edges_from_centers(k2))
                     for p1, p2 in itertools.product(ells, ells):
                         q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
                         q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
@@ -444,7 +486,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                             if (q1, q2) in cache_WW:
                                 wj = cache_WW[q1, q2]
                             else:
-                                wj = get_wj(get_window_field(WW, window_fields), k1, k2, q1, q2)
+                                wj = get_wj(get_window_field(WW, window_fields), k1, k2, k1edges, k2edges, q1, q2)
                                 cache_WW[q1, q2] = wj
                             if swap:
                                 pk12 = pole1.get(p1).value()[:, None] * pole2.get(p2).value() * wj
@@ -470,10 +512,10 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                                 if (q1, ell2) in cache_WS1:
                                     wj = cache_WS1[q1, ell2]
                                 else:
-                                    wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, q1, ell2)
+                                    wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, k1edges, k2edges, q1, ell2)
                                     if window_fields_swap != window_fields:
                                         # conjugate * in ref paper: actually SW
-                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, q1, ell2)
+                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, k1edges, k2edges, q1, ell2)
                                     wj = (wj1, wj2)
                                     cache_WS1[q1, ell2] = wj
                                 if swap:
@@ -497,10 +539,10 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                                 if (ell1, q2) in cache_WS2:
                                     wj = cache_WS2[ell1, q2]
                                 else:
-                                    wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, ell1, q2)
+                                    wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, k1edges, k2edges, ell1, q2)
                                     if window_fields_swap != window_fields:
                                         # conjugate * in ref paper: actually SW
-                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, ell1, q2)
+                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, k1edges, k2edges, ell1, q2)
                                     wj = (wj1, wj2)
                                     cache_WS2[ell1, q2] = wj
                                 if swap:
@@ -520,7 +562,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                             coeff *= (-1)**((ell1 + ell2) // 2)  #-k2 -> +k2 in window
                         else:
                             coeff *= (-1)**((ell1 - ell2) // 2)
-                        cov_SS[field][ill1][ill2] += coeff * get_wj(get_window_field(SS, window_fields), k1, k2, ell1, ell2)
+                        cov_SS[field][ill1][ill2] += coeff * get_wj(get_window_field(SS, window_fields), k1, k2, k1edges, k2edges, ell1, ell2)
 
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
@@ -532,29 +574,125 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
         return covs
 
 
-def matrix_spline_interp(x, xeval, interp_order=3):
-    from scipy.interpolate import make_interp_spline, BSpline
-    from scipy import sparse
-    # Build interpolating spline
-    bspl = make_interp_spline(x, np.ones_like(x), k=interp_order)
-    # Extract its knot vector
-    t = bspl.t   # knot positions
-    # Build the design matrix:
-    D = BSpline.design_matrix(x, t, interp_order)
-    A = BSpline.design_matrix(xeval, t, interp_order)
-    return sparse.linalg.spsolve(D.T, A.T).T.toarray()
+def matrix_spline_interp(xt, xo, deriv=0, interp_order=3):
+    r"""
+    Matrix for spline interpolation from samples on `xt` to evaluations at `xo`.
+
+    Returns matrix A such that, for a 1D array y sampled on `xt`,
+        y_interp = A @ y
+    approximates y evaluated at `xo`.
+    """
+    from scipy.interpolate import make_interp_spline
+
+    xt = np.asarray(xt)
+    xo = np.asarray(xo)
+
+    if xt.ndim != 1 or np.any(xt[1:] <= xt[:-1]):
+        raise ValueError("xt must be 1D and strictly increasing")
+    if xo.ndim != 1:
+        raise ValueError("xo must be 1D")
+
+    I = np.eye(len(xt), dtype=float)
+    spl = make_interp_spline(xt, I, k=interp_order, axis=0)
+    if deriv == -1:
+        spl = spl.antiderivative()
+    elif deriv == 1:
+        spl = spl.derivative()
+    elif deriv != 0:
+        raise NotImplementedError(f"deriv={deriv} not implemented")
+
+    return jnp.asarray(spl(xo))
 
 
-def project_to_spectrum(edges, theory, interp_order=3):
+def matrix_rebin(xedges, xt, wt=None, interp_order=3, cache=None):
+    r"""
+    Rebin samples on `xt` into bins `xedges`.
+
+    Parameters
+    ----------
+    xedges : array_like
+        Either:
+          - 1D array of shape (nedges,), defining consecutive bins
+          - 2D array of shape (nbins, 2), where each row is [xmin, xmax]
+    xt : array_like, shape (nt,)
+        Sample positions.
+    wt : array_like, shape (nt,), optional
+        Weights associated with samples on `xt`.
+        If None, uses ones.
+    interp_order : int, optional
+        Spline order.
+    cache : list, optional
+        Cache list storing previously computed matrices.
+
+    Returns
+    -------
+    M : jax array, shape (nbins, nt)
+        Matrix such that for sampled values `ft`,
+            rebinned = M @ ft
+        gives the weighted bin average.
+    """
+    cache = [] if cache is None else cache
+
+    xt = np.asarray(xt, dtype=float)
+    xedges = np.asarray(xedges, dtype=float)
+
+    if xt.ndim != 1 or np.any(xt[1:] <= xt[:-1]):
+        raise ValueError("xt must be 1D and strictly increasing")
+
+    if wt is None:
+        wt = np.ones_like(xt, dtype=float)
+    else:
+        wt = np.asarray(wt, dtype=float)
+        if wt.shape != xt.shape:
+            raise ValueError("wt must have same shape as xt")
+
+    # Normalize xedges to a (nbins, 2) array
+    if xedges.ndim == 1:
+        if len(xedges) < 2:
+            raise ValueError("1D xedges must have at least 2 entries")
+        bins = np.column_stack([xedges[:-1], xedges[1:]])
+    elif xedges.ndim == 2 and xedges.shape[1] == 2:
+        bins = xedges
+    else:
+        raise ValueError("xedges must be either 1D (nedges,) or 2D (nbins, 2)")
+
+    if np.any(bins[:, 1] <= bins[:, 0]):
+        raise ValueError("Each bin must satisfy xmax > xmin")
+
+    for (_bins, _xt, _wt, M) in cache:
+        if (
+            _bins.shape == bins.shape
+            and np.allclose(_bins, bins)
+            and np.allclose(_xt, xt)
+            and np.allclose(_wt, wt)
+        ):
+            return M
+
+    # Antiderivative interpolation matrix evaluated at all bin endpoints
+    endpoints = np.concatenate([bins[:, 0], bins[:, 1]])   # shape (2*nbins,)
+    Aint = matrix_spline_interp(xt, endpoints, deriv=-1, interp_order=interp_order)
+    nbins = bins.shape[0]
+
+    # Bin integral operator: F(xmax) - F(xmin)
+    B = Aint[nbins:, :] - Aint[:nbins, :]   # shape (nbins, len(xt))
+
+    wt = np.asarray(wt)
+    # Weighted average in each bin
+    W = B @ wt                 # shape (nbins,)
+    M = (B * wt[None, :]) / W[:, None]
+
+    cache.append((bins.copy(), xt.copy(), wt.copy(), M))
+    return M
+
+
+def matrix_project_to_spectrum(edges, theory, interp_order=3):
     if edges.ndim < 2:
         edges = np.column_stack((edges[:-1], edges[1:]))
-    matrices = []
+    matrices, cache = [], []
     for pole in theory.flatten(level=1):
         kin = pole.coords('k')
         #edgesin = pole.edges('k')
-        k = np.mean(edges, axis=-1)
-        w = matrix_spline_interp(kin, k, interp_order=interp_order)
-        #w *= np.diff(edgesin**3, axis=-1)[None, :, 0] / np.diff(edges**3, axis=-1)
+        w = matrix_rebin(edges, kin, wt=xin**2, interp_order=interp_order, cache=cache)
         matrices.append(w)
     from scipy.linalg import block_diag
     matrix = block_diag(*matrices)
@@ -564,7 +702,7 @@ def project_to_spectrum(edges, theory, interp_order=3):
 from .utils import get_spherical_jn_tophat_integral
 
 
-def project_to_correlation(edges, theory, window_deconvolution=None):
+def matrix_project_to_correlation(edges, theory, window_deconvolution=None):
     """Return matrix to project spectrum covariance to correlation multipoles."""
     # Window_deconvolution: convolved correlation multipoles -> deconvolved correlation multipoles
     if edges.ndim < 2:
