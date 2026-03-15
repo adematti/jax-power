@@ -772,7 +772,7 @@ def _exchange_particles_jax(attrs, positions: jax.Array | np.ndarray=None, retur
     #size_devices = shape_devices.prod(dtype='i4')
     idx_out_devices = (positions + attrs.boxsize / 2. - attrs.boxcenter) / (attrs.boxsize / shape_devices)
     idx_out_devices = jnp.floor(idx_out_devices).astype('i4')
-    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    assert jnp.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize + (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = jnp.ravel_multi_index(jnp.unstack(idx_out_devices, axis=-1), tuple(shape_devices))
 
     positions = _exchange_array_jax(positions, idx_out_devices, pad=_get_pad_uniform_jax(attrs), return_indices=return_inverse)
@@ -1175,7 +1175,7 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     positions = get(positions)
     idx_out_devices = (positions + attrs.boxsize / 2. - attrs.boxcenter) / (attrs.boxsize / shape_devices)
     idx_out_devices = np.floor(idx_out_devices).astype('i4')
-    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize +  (mattrs.boxcenter - mattrs.boxsize / 2.)'
+    assert all(mpicomm.allgather(np.all((idx_out_devices >= 0) & (idx_out_devices < shape_devices)))), 'some particles are out of the box; wrap particle positions: (positions - (mattrs.boxcenter - mattrs.boxsize / 2.)) % mattrs.boxsize + (mattrs.boxcenter - mattrs.boxsize / 2.)'
     idx_out_devices = np.ravel_multi_index(tuple(idx_out_devices.T), tuple(shape_devices))
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(sharding_mesh.axis_names,))
     devices = sharding.mesh.devices.ravel().tolist()

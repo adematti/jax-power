@@ -140,6 +140,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
     windows = {name: {} for name in ['WW', 'WS', 'SW', 'SS']}
     pairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each inner P(k)
     compute_mesh2_window = jax.jit(compute_mesh2, static_argnames=['los'])
+
     for pair in itertools.product(pairs, pairs):
         wfield = sum(pair, start=tuple())
         if wfield not in windows['WW']:
@@ -147,7 +148,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
             masks = [None] * len(_fkps)
             if split is not None:
                 masks = split_masks(_fkps, split=split, fields=list(wfield))
-            W = ws = [get_W(_fkps[0], mask=masks[0]) * get_W(_fkps[1], mask=masks[1]),
+            W0, W1 = [get_W(_fkps[0], mask=masks[0]) * get_W(_fkps[1], mask=masks[1]),
                       get_W(_fkps[2], mask=masks[2]) * get_W(_fkps[3], mask=masks[3])]
             # mattrs = W[0].attrs
             # norm is sum(cellsize * W^2) * sum(cellsize * W^2)
@@ -155,17 +156,17 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
             #norm = ws[0].sum() * ws[-1].sum() #* mattrs.cellsize.prod()**2 / mattrs.cellsize.prod()**2
             # We could have used the normalization from the power spectrum estimation,
             # but this is anyway degenerate with the approximation we're making that W * W ~ W^2
-            update = dict(norm=[ws[0].sum() * ws[1].sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
-            windows['WW'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+            update = dict(norm=[W0.sum() * W1.sum() * jnp.ones_like(bin.xavg)] * len(bin.ells))
+            windows['WW'][wfield] = compute_mesh2_window(W0, W1, bin=bin, los=los).clone(**update)
             if wfield[3] == wfield[2]:
-                ws = [W[0], get_S(_fkps[2:], masks[2])]
-                windows['WS'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+                windows['WS'][wfield] = compute_mesh2_window(W0, get_S(_fkps[2:], masks[2]), bin=bin, los=los).clone(**update)
+            del W0
             if wfield[1] == wfield[0]:
-                ws = [get_S(_fkps[:2], masks[0]), W[1]]
-                windows['SW'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+                windows['SW'][wfield] = compute_mesh2_window(get_S(_fkps[:2], masks[0]), W1, bin=bin, los=los).clone(**update)
+            del W1
             if wfield[1] == wfield[0] and wfield[3] == wfield[2]:
-                ws = [get_S(_fkps[:2], mask=masks[0]), get_S(_fkps[2:], mask=masks[2])]
-                windows['SS'][wfield] = compute_mesh2_window(*ws, bin=bin, los=los).clone(**update)
+                windows['SS'][wfield] = compute_mesh2_window(get_S(_fkps[:2], mask=masks[0]), get_S(_fkps[2:], mask=masks[2]),
+                                                             bin=bin, los=los).clone(**update)
     return ObservableTree([ObservableTree(list(windows[name].values()), fields=[tuple(wfield) for wfield in windows[name]]) for name in windows], types=list(windows))
 
 
@@ -254,7 +255,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
 
     Notes
     -----
-    If 'fftlog' in ``flags``, compute windows (:func:`compute_fkp2_covariance_window`) with arguments ``basis='bessel'``,
+    Most accurate option: 'fftlog' in ``flags``, compute windows (:func:`compute_fkp2_covariance_window`) with arguments ``basis='bessel'``,
     and interpolate with :func:`interpolate_window_function`.
     Else, use fine :math:`s`-binning (smaller than the :math:`pi / k_\mathrm{max}`, where :math:`k_\mathrm{max}` is the maximum wavenumber of the covariance matrix).
 
