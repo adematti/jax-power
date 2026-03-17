@@ -212,6 +212,26 @@ def create_sharded_array(func, *args, shape=(), in_specs=(), out_specs=None, sha
     return f(*args)
 
 
+def _fold_in(key, data):
+    # Fold-in that supports int64
+    data = jnp.asarray(data)
+
+    if not jnp.issubdtype(data.dtype, jnp.integer):
+        raise TypeError(f"data must be an integer dtype, got {data.dtype}")
+
+    # 64-bit integers → split into two uint32 words
+    if data.dtype.itemsize == 8:
+        data = data.astype(jnp.uint64)
+        lo = jnp.uint32(data & jnp.uint64(0xffffffff))
+        hi = jnp.uint32(data >> jnp.uint64(32))
+        key = jax.random.fold_in(key, lo)
+        key = jax.random.fold_in(key, hi)
+    else:
+        key = jax.random.fold_in(key, data.astype(jnp.uint32))
+
+    return key
+
+
 #@partial(jax.jit, static_argnames=('func', 'shape', 'out_specs', 'sharding_mesh'))
 @default_sharding_mesh
 def _create_sharded_random(func, key=None, ids=None, shape=(), out_specs=None, sharding_mesh=None):
@@ -245,7 +265,7 @@ def _create_sharded_random(func, key=None, ids=None, shape=(), out_specs=None, s
             base = key
             def _func(id, shape):
                 idshape = id.shape
-                toret = jax.vmap(lambda id: func(jax.random.fold_in(base, id), shape=()))(id.reshape(-1))
+                toret = jax.vmap(lambda id: func(_fold_in(base, id), shape=()))(id.reshape(-1))
                 return toret.reshape(idshape + toret.shape[1:])
         key = ids
     return create_sharded_array(_func, key, shape=shape, in_specs=in_specs, out_specs=out_specs, sharding_mesh=sharding_mesh)
@@ -296,6 +316,8 @@ def create_sharded_random(func, seed, shape=(), out_specs=None, sharding_mesh=No
                 if start is None:
                     start, stop = 0, shape[axis]
                 indices.append(np.arange(start, stop))
+            intmax = np.iinfo(indices[0].dtype).max
+            assert np.prod(shape, dtype='i8') < intmax, f'array size is larger than int maximum = {intmax:d}'
             return jnp.ravel_multi_index(np.meshgrid(*indices, indexing='ij'), dims=shape)
 
         if sharding_mesh.axis_names:
