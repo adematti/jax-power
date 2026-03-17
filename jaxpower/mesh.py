@@ -440,6 +440,7 @@ def _get_pad_constant_numpy(constant_values):
 
     def pad(array, pad_width):
         pad = np.zeros((1,) + array.shape[1:], dtype=array.dtype) + constant_values
+        pad = pad.astype(array.dtype)
         return np.append(array, np.repeat(pad, pad_width[0][1], axis=0), axis=0)
 
     return pad
@@ -449,6 +450,7 @@ def _get_pad_constant_jax(constant_values):
 
     def pad(array, pad_width):
         pad = jnp.zeros((1,) + array.shape[1:], dtype=array.dtype) + constant_values
+        pad = pad.astype(array.dtype)
         return jnp.append(array, jnp.repeat(jax.device_get(pad), pad_width[0][1], axis=0), axis=0)
 
     return pad
@@ -1188,7 +1190,7 @@ def _exchange_particles_mpi(attrs, positions: jax.Array | np.ndarray=None, retur
     if return_type == 'jax':
         positions = make_array_from_single_device_arrays(sharding, positions, pad=_get_pad_uniform_numpy(attrs))
 
-    def exchange(values, pad=0.):
+    def exchange(values, pad=0):
         values = get(values)
         per_device_arrays = _exchange_array_mpi(values, idx_out_devices, local_devices=idx_local_devices, return_indices=False, mpicomm=mpicomm)
         if return_type == 'jax':
@@ -1254,7 +1256,7 @@ def exchange_particles(attrs, positions: jax.Array | np.ndarray=None, return_inv
     """
     if not len(sharding_mesh.axis_names):
 
-        def exchange(values, pad=0.):
+        def exchange(values, pad=0):
             return values
 
         def inverse(values):
@@ -3173,7 +3175,7 @@ def split_particles(*particles, seed=0, fields: tuple=None, return_masks=False):
         x = create_sharded_random(jax.random.uniform, _process_seed(seed), particles[field_indices[0]].size, out_specs=P(sharding_mesh.axis_names,))
         nsplits = len(field_indices)
         for isplit, field_index in enumerate(field_indices):
-            mask = (x >= isplit / nsplits) & (x < (isplit + 1) / nsplits)
+            mask = (x >= isplit * 1. / nsplits) & (x < (isplit + 1) * 1. / nsplits)
             if return_masks:
                 toret[field_index] = mask
             else:
