@@ -219,7 +219,7 @@ def _fold_in(key, data):
     if not jnp.issubdtype(data.dtype, jnp.integer):
         raise TypeError(f"data must be an integer dtype, got {data.dtype}")
 
-    # 64-bit integers → split into two uint32 words
+    # 64-bit integers => split into two uint32 words
     if data.dtype.itemsize == 8:
         data = data.astype(jnp.uint64)
         lo = jnp.uint32(data & jnp.uint64(0xffffffff))

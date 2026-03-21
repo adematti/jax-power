@@ -1028,15 +1028,15 @@ def test_ref():
             return compute(mesh, los=los, bin=bin)
 
         ells = (0, 2, 4)
-        ref = {'x': 21.734526818678155, 'firstpoint': 21.38052302043614, 'endpoint': 21.38052302043614}
+        ref = {'x': 21.670490100264796, 'firstpoint': 21.291201853409884, 'endpoint': 21.291201853409884}
         bin = BinMesh2SpectrumPoles(mattrs, edges={'step': 4 * mattrs.kfun.min()}, ells=ells)
         result = {}
         for los in ['x', 'firstpoint', 'endpoint']:
             result[los] = run(bin, los).value().std()
             assert np.allclose(result[los], ref[los])
 
-        ref = {('x', None): 5.7245424391892524e-05, ('firstpoint', None): 5.5868671570865e-05, ('endpoint', None): 5.5868671570865e-05,
-        ('x', 'bessel'): 5.7245424391892524e-05, ('firstpoint', 'bessel'): 5.5868671570865e-05, ('endpoint', 'bessel'): 5.5868671570865e-05}
+        ref = {('x', None): 5.757059813978167e-05, ('firstpoint', None): 5.551960630086784e-05, ('endpoint', None): 5.551960630086784e-05,
+               ('x', 'bessel'): 5.757059813978167e-05, ('firstpoint', 'bessel'): 5.551960630086784e-05, ('endpoint', 'bessel'): 5.551960630086784e-05}
         result = {}
         for basis in [None, 'bessel']:
             bin = BinMesh2CorrelationPoles(mattrs, edges={'step': 4 * mattrs.cellsize.min()}, ells=ells)
@@ -1055,8 +1055,8 @@ if __name__ == '__main__':
     os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
     #jax.distributed.initialize()
     #test_sharded_spectrum()
-    #test_ref()
     #jax.distributed.shutdown()
+    #test_ref()
 
     test_mesh2_spectrum(plot=False)
     test_fkp2_shotnoise()

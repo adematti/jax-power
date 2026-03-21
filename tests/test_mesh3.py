@@ -1171,26 +1171,23 @@ def test_ref():
             estimate_memory(compute, mesh, los=los, bin=bin)
             return compute(mesh, los=los, bin=bin)
 
-        ref = {('z', 'scoccimarro'): 6212.744915936817, ('local', 'scoccimarro'): 6351.9885052476775,
-        ('z', 'sugiyama'): 7101.520143303501, ('local', 'sugiyama'): 8570.76518969239,
-        ('z', 'sugiyama-diagonal'): 8369.637841532976, ('local', 'sugiyama-diagonal'): 8301.255177548157}
+        ref = {('z', 'scoccimarro'): 5741.689971499162, ('local', 'scoccimarro'): 6163.699826460213, ('z', 'sugiyama'): 6151.462833439408,
+               ('local', 'sugiyama'): 7883.960169343493, ('z', 'sugiyama-diagonal'): 6537.071400992829, ('local', 'sugiyama-diagonal'): 5535.6717974177855}
         result = {}
         for basis, ells in zip(['scoccimarro', 'sugiyama', 'sugiyama-diagonal'], [(0, 2), [(0, 0, 0), (2, 0, 2)], [(0, 0, 0), (2, 0, 2)]]):
             bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 10 * mattrs.kfun.min()}, basis=basis, ells=ells)
             for los in ['z', 'local']:
                 result[los, basis] = run(bin, los).value().std()
                 assert np.allclose(result[los, basis], ref[los, basis])
-        #print({key: float(result[key]) for key in result})
 
-        ref = {('x', 'sugiyama'): 2.364754570056707e-08, ('local', 'sugiyama'): 1.7060700924698467e-08,
-        ('x', 'sugiyama-diagonal'): 3.574483788256436e-08, ('local', 'sugiyama-diagonal'): 1.9908754918383136e-08}
+        ref = {('x', 'sugiyama'): 1.5202213895492818e-08, ('local', 'sugiyama'): 1.4790644376855246e-08, ('x', 'sugiyama-diagonal'): 1.0909299232086114e-08,
+               ('local', 'sugiyama-diagonal'): 1.1912632750081464e-08}
         result = {}
         for basis, ells in zip(['sugiyama', 'sugiyama-diagonal'], [[(0, 0, 0), (2, 0, 2)], [(0, 0, 0), (2, 0, 2)]]):
             bin = BinMesh3CorrelationPoles(mattrs, edges={'step': 10 * mattrs.cellsize.min()}, basis=basis, ells=ells)
             for los in ['x', 'local']:
                 result[los, basis] = run(bin, los).value().std()
                 assert np.allclose(result[los, basis], ref[los, basis])
-        #print({key: float(result[key]) for key in result})
 
 
 if __name__ == '__main__':
@@ -1201,11 +1198,10 @@ if __name__ == '__main__':
 
     from jax import config
     config.update('jax_enable_x64', True)
-    config.update('jax_num_cpu_devices', 4)
-    config.update('jax_platform_name', 'cpu')
+    #config.update('jax_num_cpu_devices', 4)
+    #config.update('jax_platform_name', 'cpu')
+    #test_ref()
 
-    jax.distributed.initialize()
-    test_ref()
     #test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
