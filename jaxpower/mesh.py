@@ -2829,8 +2829,8 @@ def _get_hermitian_weights(coords, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('sharding_mesh', 'ravel'))  # if we want to save some memory, consider linear binning
-def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
+@partial(jax.jit, static_argnames=('sharding_mesh', 'ravel', 'sort'))  # if we want to save some memory, consider linear binning
+def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sharding_mesh=None, ravel: bool=True, sort: bool=False):
 
     def _get_attrs(coords, edges, weights):
         r"""Return bin index, binned number of modes and coordinates."""
@@ -2838,12 +2838,22 @@ def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sha
         coords = coords.ravel()
 
         ibin = jnp.digitize(coords, edges, right=False)
-        x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
-        del coords
-        nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+        argsort = np.zeros((), dtype=int)
+        if sort:
+            argsort = jnp.argsort(ibin, stable=False)
+            ibin = ibin[argsort]
+            x = jax.ops.segment_sum(coords[argsort] if weights is None else (coords * weights)[argsort],
+                                    ibin, num_segments=len(edges) + 1, indices_are_sorted=True)[1:-1]
+            del coords
+            nmodes = jax.ops.segment_sum((weights[argsort] if weights is not None else jnp.ones(ibin.shape, dtype=int)),
+                                         ibin, num_segments=len(edges) + 1, indices_are_sorted=True)[1:-1]
+        else:
+            x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+            del coords
+            nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
         if not ravel:
             ibin = ibin.reshape(shape)
-        return ibin, nmodes, x
+        return ibin, nmodes, x, argsort
 
     get_attrs = _get_attrs
 
@@ -2851,14 +2861,15 @@ def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sha
 
         def get_attrs(coords, edges, weights):
             r"""Return bin index, binned number of modes and coordinates."""
-            ibin, nmodes, x = _get_attrs(coords, edges, weights)
+            ibin, nmodes, x, argsort = _get_attrs(coords, edges, weights)
             nmodes = jax.lax.psum(nmodes, sharding_mesh.axis_names)
             x = jax.lax.psum(x, sharding_mesh.axis_names)
-            return ibin, nmodes, x
+            return ibin, nmodes, x, argsort
 
         get_attrs = shard_map(get_attrs, mesh=sharding_mesh,
                     in_specs=(P(*sharding_mesh.axis_names), P(None), P(sharding_mesh.axis_names)),
-                    out_specs=(P(sharding_mesh.axis_names) if ravel else P(*sharding_mesh.axis_names), P(None), P(None)))
+                    out_specs=(P(sharding_mesh.axis_names) if ravel else P(*sharding_mesh.axis_names), P(None), P(None),
+                               P(sharding_mesh.axis_names) if sort else P()))
 
     return get_attrs(coords, edges, weights)
 
@@ -2873,41 +2884,46 @@ def _get_bin_attrs_edges2d(coords, edges: jax.Array, weights: None | jax.Array=N
 
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=('length', 'sharding_mesh'))
-def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
+def _bincount(ibin, value, weights=None, length=None, argsort=1, sharding_mesh=None):
 
     if not isinstance(ibin, (tuple, list)):
         ibin = [ibin]
 
-    def _count(value, *ibin):
+    def _count(value, ibin, argsort):
         value = value.ravel()
         if weights is not None:
             value *= weights
 
-        def count(ib):
-            return jnp.bincount(ib, weights=value, length=length + 2)
+        def count_real(value, ibin, argsort):
+            ibin = ibin.ravel() if ibin.ndim > 1 else ibin
+            if argsort.ndim:
+                return jax.ops.segment_sum(value[argsort], ibin, num_segments=length + 2, indices_are_sorted=True)
+            return jnp.bincount(ibin, weights=value, length=length + 2)
+
+        count = count_real
 
         if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
 
-            def count(ib):
-                return jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
+            def count(value, ibin, argsort):
+                return count_real(value.real, ibin, argsort) + 1j * count_real(value.imag, ibin, argsort)
 
-        value = sum(count(ib.ravel() if ib.ndim > 1 else ib) for ib in ibin)
+        value = sum(count(value, ibin, argsort) for ibin, argsort in zip(ibin, argsort, strict=True))
         return value[1:-1] / len(ibin)
 
     count = _count
 
     if sharding_mesh.axis_names:
 
-        def count(value, *ibin):
-            value = _count(value, *ibin)
+        def count(value, ibin, argsort):
+            value = _count(value, ibin, argsort)
             return jax.lax.psum(value, sharding_mesh.axis_names)
 
-        in_specs = (P(*sharding_mesh.axis_names),)
-        for ib in ibin:
-            in_specs += (P(sharding_mesh.axis_names) if ib.ndim <= 1 else P(*sharding_mesh.axis_names),)
+        in_specs = (P(*sharding_mesh.axis_names),
+                    P(sharding_mesh.axis_names) if ibin[0].ndim <= 1 else P(*sharding_mesh.axis_names),
+                    P(sharding_mesh.axis_names) if argsort[0].ndim else P())
         count = shard_map(count, mesh=sharding_mesh, in_specs=in_specs, out_specs=P(None))
 
-    return count(value, *ibin)
+    return count(value, ibin, argsort)
 
 
 @partial(jax.tree_util.register_dataclass, data_fields=['data', 'randoms'], meta_fields=[])

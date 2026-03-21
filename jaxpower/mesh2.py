@@ -22,7 +22,7 @@ from .mesh import (BaseMeshField, RealMeshField, ComplexMeshField, ParticleField
 prod = functools.partial(functools.reduce, operator.mul)
 
 
-def _make_edges2(kind, mattrs, edges, ells, mode_oversampling=0):
+def _make_edges2(kind, mattrs, edges, ells, mode_oversampling=0, sort_ibin=False):
     wmodes = None
     if kind == 'complex':
         vec = mattrs.kcoords(kind='separation', sparse=True)
@@ -47,19 +47,20 @@ def _make_edges2(kind, mattrs, edges, ells, mode_oversampling=0):
         edges = np.append(edges[:, 0], edges[-1, 1])
     shifts = [jnp.arange(-mode_oversampling, mode_oversampling + 1)] * len(mattrs.meshsize)
     shifts = list(itertools.product(*shifts))
-    ibin, nmodes, xsum = [], 0, 0
+    ibin, nmodes, xsum, argsort = [], 0, 0, []
     for shift in shifts:
         coords = jnp.sqrt(sum((xx + ss)**2 for (xx, ss) in zip(vec, shift)))
-        bin = _get_bin_attrs(coords, edges, weights=wmodes)
+        bin = _get_bin_attrs(coords, edges, weights=wmodes, sort=sort_ibin)
         del coords
         ibin.append(bin[0])
         nmodes += bin[1]
         xsum += bin[2]
+        argsort.append(bin[3])
     edges = np.column_stack([edges[:-1], edges[1:]])
     ells = _format_ells(ells)
     if len(shifts) > 1:  # else keep as an integer
         nmodes = nmodes / len(shifts)
-    return dict(edges=edges, nmodes=nmodes, xavg=xsum / nmodes, ibin=ibin, wmodes=wmodes, ells=ells, mattrs=mattrs)
+    return dict(edges=edges, nmodes=nmodes, xavg=xsum / nmodes, ibin=ibin, argsort=argsort, wmodes=wmodes, ells=ells, mattrs=mattrs)
 
 
 @partial(register_pytree_dataclass, meta_fields=['ells'])
@@ -87,14 +88,16 @@ class BinMesh2SpectrumPoles(object):
     nmodes: jax.Array = None
     xavg: jax.Array = None
     ibin: jax.Array = None
+    argsort: jax.Array = None
     wmodes: jax.Array = None
     ells: tuple = None
     mattrs: MeshAttrs = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0,
+                 mode_oversampling: int=0, sort_ibin: bool=False):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges2('complex', mattrs, edges=edges, ells=ells, mode_oversampling=mode_oversampling)
+        kw = _make_edges2('complex', mattrs, edges=edges, ells=ells, mode_oversampling=mode_oversampling, sort_ibin=sort_ibin)
         self.__dict__.update(kw)
 
     def __call__(self, mesh, remove_zero=False):
@@ -116,7 +119,7 @@ class BinMesh2SpectrumPoles(object):
         value = mesh.value if isinstance(mesh, BaseMeshField) else mesh
         if remove_zero:
             value = value.at[(0,) * value.ndim].set(0.)
-        return _bincount(self.ibin, value, weights=weights, length=len(self.xavg)) / self.nmodes
+        return _bincount(self.ibin, value, weights=weights, length=len(self.xavg), argsort=self.argsort) / self.nmodes
 
 
 @partial(register_pytree_dataclass, meta_fields=['ells', 'basis', 'batch_size'])
@@ -144,16 +147,18 @@ class BinMesh2CorrelationPoles(object):
     nmodes: jax.Array = None
     xavg: jax.Array = None
     ibin: jax.Array = None
+    argsort: jax.Array = None
     ells: tuple = None
     basis: str = None
     batch_size: int = None
     klimit: tuple = None
     mattrs: MeshAttrs = None
 
-    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0, basis=None, klimit=None, batch_size: int=None):
+    def __init__(self, mattrs: MeshAttrs | BaseMeshField, edges: staticarray | dict | None=None, ells: int | tuple=0, mode_oversampling: int=0,
+                 basis=None, klimit=None, batch_size: int=None, sort_ibin: bool=False):
         if not isinstance(mattrs, MeshAttrs):
             mattrs = mattrs.attrs
-        kw = _make_edges2('real', mattrs, edges=edges, ells=ells, mode_oversampling=mode_oversampling)
+        kw = _make_edges2('real', mattrs, edges=edges, ells=ells, mode_oversampling=mode_oversampling, sort_ibin=sort_ibin)
         kw.pop('wmodes')
         if isinstance(klimit, bool) and klimit: klimit = (0, mattrs.knyq.min())
         kw.update(basis=basis, batch_size=batch_size, klimit=klimit)
@@ -189,7 +194,7 @@ class BinMesh2CorrelationPoles(object):
         else:
             if remove_zero:
                 value = value.at[(0,) * value.ndim].set(0.)
-            return _bincount(self.ibin, value, weights=None, length=len(self.xavg)) / self.nmodes
+            return _bincount(self.ibin, value, weights=None, length=len(self.xavg), argsort=self.argsort) / self.nmodes
 
 
 def _get_los_vector(los: str | np.ndarray, ndim=3):
