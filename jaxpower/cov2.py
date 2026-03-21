@@ -575,7 +575,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
         return covs
 
 
-def matrix_spline_interp(xt, xo, deriv=0, interp_order=3):
+def matrix_spline_interp(xt, xo, deriv: int=0, interp_order: int=3):
     r"""
     Matrix for spline interpolation from samples on `xt` to evaluations at `xo`.
 
@@ -693,7 +693,7 @@ def matrix_project_to_spectrum(edges, theory, interp_order=3):
     for pole in theory.flatten(level=1):
         kin = pole.coords('k')
         #edgesin = pole.edges('k')
-        w = matrix_rebin(edges, kin, wt=xin**2, interp_order=interp_order, cache=cache)
+        w = matrix_rebin(edges, kin, wt=kin**2, interp_order=interp_order, cache=cache)
         matrices.append(w)
     from scipy.linalg import block_diag
     matrix = block_diag(*matrices)
