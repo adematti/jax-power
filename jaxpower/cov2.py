@@ -123,19 +123,13 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
         mesh = randoms[0].clone(weights=randoms[0].weights * randoms[1].weights).paint(**kwargs, out='real')
         return alpha * mesh / mesh.cellsize.prod()
 
-    def split_masks(fkps, split, fields):
-        unique_fields = []
-        for field in fields:
-            if field not in unique_fields:
-                unique_fields.append(field)
-        seed = [split[fields.index(ufield)] for ufield in unique_fields]
-        return split_particles(*[get_randoms(fkp) for fkp in fkps], seed=seed, fields=fields, return_masks=True)
-
     if fields is None:
         fields = list(range(len(fkps)))
-    if split is not None and not isinstance(split, list):
-        assert len(split) == len(fields), 'provide as many seeds as fields'
-        split = [split]
+    splits = None
+    if split is not None:
+        if not isinstance(split, list):
+            split = [split]
+        splits = {field: split for field, split in zip(fields, split, strict=True)}
     fkps = {field: fkp for field, fkp in zip(fields, fkps, strict=True)}
     windows = {name: {} for name in ['WW', 'WS', 'SW', 'SS']}
     pairs = tuple(itertools.combinations_with_replacement(tuple(fields), 2))  # pairs of fields for each inner P(k)
@@ -147,7 +141,9 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
             _fkps = [fkps[field] for field in wfield]
             masks = [None] * len(_fkps)
             if split is not None:
-                masks = split_masks(_fkps, split=split, fields=list(wfield))
+                # Only for unique fields
+                seed = list({field: splits[field] for field in wfield}.values())
+                masks = split_particles(*[get_randoms(fkp) for fkp in _fkps], seed=seed, fields=list(wfield), return_masks=True)
             W0, W1 = [get_W(_fkps[0], mask=masks[0]) * get_W(_fkps[1], mask=masks[1]),
                       get_W(_fkps[2], mask=masks[2]) * get_W(_fkps[3], mask=masks[3])]
             # mattrs = W[0].attrs
