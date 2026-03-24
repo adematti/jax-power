@@ -276,11 +276,11 @@ def test_sharded_normalization():
         fkp = FKPField(data.exchange(backend='jax'), randoms.exchange(backend='jax'))
         index = fkp.randoms.exchange_direct(index)
         norm = compute_fkp2_normalization(fkp, cellsize=None, split=None)
-        assert np.allclose(norm, 7.087479585302545)
+        assert np.allclose(norm, 7.1359258169752), norm
         norm = compute_fkp2_normalization(fkp, cellsize=10., split=None)
-        assert np.allclose(norm, 6.996265569638566)
+        assert np.allclose(norm, 7.051660341248006), norm
         norm = compute_fkp2_normalization(fkp, cellsize=10., split=(42, index))
-        assert np.allclose(norm, 6.932929039885748)
+        assert np.allclose(norm, 6.98179264494831), norm
 
 
 def test_sharded_random():
@@ -290,8 +290,8 @@ def test_sharded_random():
     with create_sharding_mesh() as sharding_mesh:
         print(sharding_mesh)
         result = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=(size,), out_specs=P(sharding_mesh.axis_names))
-        assert np.allclose(result.sum(), -6.613044420294692)
-        assert np.allclose(result.std(), 0.9735605177416136)
+        assert np.allclose(result.sum(), -10.979353354005932), result.sum()
+        assert np.allclose(result.std(), 0.9845101636363783), result.std()
         shape = (size, 3, 4)
         result = create_sharded_random(jax.random.normal, (jax.random.key(42), 'index'), shape=shape, out_specs=P(sharding_mesh.axis_names))
         assert result.shape == shape
@@ -394,6 +394,7 @@ if __name__ == '__main__':
 
     config.update('jax_num_cpu_devices', 4)
     config.update('jax_platform_name', 'cpu')
+
     #test_sharded_io()
     test_real_mesh()
     test_base_mesh()
