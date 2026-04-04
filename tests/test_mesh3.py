@@ -304,8 +304,8 @@ def test_triumvirate_box_spectrum(plot=False):
     mesh = mesh - mean
     edges = np.arange(0.01, mattrs.knyq[0], 0.01)
     ell = (0, 0, 0)
-    ell = (1, 0, 1)
-    #ell = (2, 0, 2)
+    #ell = (1, 0, 1)
+    ell = (2, 0, 2)
     #ell = (3, 1, 2)
     #ell = (1, 3, 2)
     los = 'z'
@@ -1201,6 +1201,9 @@ if __name__ == '__main__':
     #config.update('jax_num_cpu_devices', 4)
     #config.update('jax_platform_name', 'cpu')
     #test_ref()
+
+    test_triumvirate_box_spectrum(plot=True)
+    exit()
 
     #test_misc()
     #test_fftlog2(plot=True)

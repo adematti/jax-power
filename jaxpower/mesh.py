@@ -696,10 +696,10 @@ def _exchange_array_jax(array, device, pad=0, return_indices=False):
     # TODO: generalize to any axis
     sharding = array.sharding
     ndevices = sharding.num_devices
-    per_device_arrays = [_.data for _ in array.addressable_shards]
+    per_host_arrays = [_.data for _ in array.addressable_shards]
     per_host_devices = [_.data for _ in device.addressable_shards]
     devices = sharding.mesh.devices.ravel().tolist()
-    local_devices = [_.device for _ in per_device_arrays]
+    local_devices = [_.device for _ in per_host_arrays]
     per_device_final_arrays = [None] * len(local_devices)
     per_host_indices = [[] for i in range(len(local_devices))]
     slices = [None] * ndevices
@@ -707,7 +707,7 @@ def _exchange_array_jax(array, device, pad=0, return_indices=False):
     for idevice in range(ndevices):
         # single-device arrays
         per_device_chunks = []
-        for ilocal_device, (per_host_array, per_host_device, local_device) in enumerate(zip(per_device_arrays, per_host_devices, local_devices)):
+        for ilocal_device, (per_host_array, per_host_device, local_device) in enumerate(zip(per_host_arrays, per_host_devices, local_devices)):
             mask_idevice = per_host_device == idevice
             per_device_chunks.append(jax.device_put(per_host_array[mask_idevice], local_device, donate=True))
             if return_indices: per_host_indices[ilocal_device].append(jax.device_put(np.flatnonzero(mask_idevice), local_device, donate=True))

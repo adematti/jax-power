@@ -105,7 +105,7 @@ def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
 
 def read(mesh: jax.Array, positions, order: int=2, out=None):
     """Read the value at the positions from the mesh."""
-    dtype = 'int16' # int16 -> +/- 32_767, trkl
+    dtype = 'int16' # int16 -> +/- 32_767, should be enough
     shape = np.asarray(mesh.shape, dtype=dtype)
 
     def wrap(idx):
