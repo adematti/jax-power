@@ -264,7 +264,6 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
     cov : CovarianceMatrix
         Covariance matrix.
     """
-    # TODO: check for multiple fields
     single_field = False
 
     def with_fields(poles):
@@ -426,18 +425,22 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                 toret.flat[kmask] = tmp
                 return toret
 
-        def get_window_field(window, fields, test=False):
+        def get_window_field(window, fields):
+            if isinstance(window, tuple):  # symmetize
+                w1 = get_window_field(window[0], fields)
+                w2 = get_window_field(window[1], fields[2:] + fields[:2])
+                return w1.clone(value=(w1.value() + w2.value()) / 2.)
             def sort(field):
                 return tuple(sorted(field[:2])) + tuple(sorted(field[2:]))
             wfields = [sort(field) for field in window.fields]
             fields = sort(fields)
             if fields in wfields:
-                if test: return True
                 return window.get(window.fields[wfields.index(fields)])
-            if test: return False
             raise ValueError(f'{fields} not found in {window}')
 
         cov_WW, cov_WS, cov_SS = {}, {}, {}
+        symmetrize = True
+
         for field in itertools.combinations_with_replacement(fields, 2):
             field = sum(field, start=tuple())
             cross_fields = [(field[0], field[2]), (field[1], field[3])]
@@ -461,7 +464,6 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
 
             for factor, swap, cross_fields in cross_fields:
                 window_fields = sum(cross_fields, start=tuple())
-                window_fields_swap = sum(cross_fields[::-1], start=tuple())
                 pole1, pole2 = poles.get(cross_fields[0]), poles.get(cross_fields[1])
 
                 cache_WW, cache_WS1, cache_WS2 = {}, {}, {}
@@ -471,7 +473,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                     k1 = pole1.get(ell1).coords('k', center=center)
                     k1edges = pole1.get(ell1).edges('k', default=_edges_from_centers(k1))
                     k2 = pole2.get(ell2).coords('k', center=center)
-                    k2edges = pole1.get(ell1).edges('k', default=_edges_from_centers(k2))
+                    k2edges = pole2.get(ell2).edges('k', default=_edges_from_centers(k2))
                     for p1, p2 in itertools.product(ells, ells):
                         q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
                         q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
@@ -483,7 +485,8 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                             if (q1, q2) in cache_WW:
                                 wj = cache_WW[q1, q2]
                             else:
-                                wj = get_wj(get_window_field(WW, window_fields), k1, k2, k1edges, k2edges, q1, q2)
+                                wj = get_window_field((WW, WW) if symmetrize else WW, window_fields)
+                                wj = get_wj(wj, k1, k2, k1edges, k2edges, q1, q2)
                                 cache_WW[q1, q2] = wj
                             if swap:
                                 pk12 = pole1.get(p1).value()[:, None] * pole2.get(p2).value() * wj
@@ -497,70 +500,77 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                                 coeff *= (-1)**((q1 - q2) // 2)
                             cov_WW[field][ill1][ill2] += coeff * pk12 / 2.
                     if not has_shotnoise: continue
-                    if get_window_field(WS, window_fields, test=True):
-                        # WS
-                        for p1 in ells:
-                            q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
-                            for q1 in q1:
-                                q2 = q1
-                                coeff = legendre_product(ell1, p1, q1)
-                                if coeff == 0.: continue
-                                coeff *= factor * (2 * ell1 + 1) * (2 * ell2 + 1) * (2 * q1 + 1)
-                                if (q1, ell2) in cache_WS1:
-                                    wj = cache_WS1[q1, ell2]
-                                else:
-                                    wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, k1edges, k2edges, q1, ell2)
-                                    if window_fields_swap != window_fields:
-                                        # conjugate * in ref paper: actually SW
-                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, k1edges, k2edges, q1, ell2)
-                                    wj = (wj1, wj2)
-                                    cache_WS1[q1, ell2] = wj
-                                if swap:
-                                    pk1 = pole1.get(p1).value()[:, None]
-                                    pk2 = (-1)**(p1 % 2) * pole2.get(p1).value()[:, None]
-                                    coeff *= (-1)**((q1 + ell2) // 2)  #-k2 -> +k2 in window
-                                else:
-                                    # P^ac, P^bd in k
-                                    pk1 = pole1.get(p1).value()[:, None]
-                                    pk2 = (-1)**(p1 % 2) * pole2.get(p1).value()[:, None]
-                                    coeff *= (-1)**((q1 - ell2) // 2)
-                                cov_WS[field][ill1][ill2] += coeff * (wj[0] * pk1 + wj[1] * pk2) / 2.
+                    # WS in k
+                    for p1 in ells:
+                        q1 = list(range(abs(ell1 - p1), ell1 + p1 + 1))
+                        for q1 in q1:
+                            q2 = q1
+                            coeff = legendre_product(ell1, p1, q1)
+                            if coeff == 0.: continue
+                            coeff *= factor * (2 * ell1 + 1) * (2 * ell2 + 1) * (2 * q1 + 1)
+                            if (q1, ell2) in cache_WS1:
+                                wj = cache_WS1[q1, ell2]
+                            else:
+                                wj1 = wj2 = np.zeros((k1.size, k2.size))
+                                if window_fields[3] == window_fields[2]:
+                                    wj1 = get_window_field((WS, SW) if symmetrize else WS, window_fields)
+                                    wj1 = get_wj(wj1, k1, k2, k1edges, k2edges, q1, ell2)
+                                if window_fields[1] == window_fields[0]:
+                                    wj2 = get_window_field((SW, WS) if symmetrize else SW, window_fields)
+                                    wj2 = get_wj(wj2, k1, k2, k1edges, k2edges, q1, ell2)
+                                cache_WS1[q1, ell2] = wj = (wj1, wj2)
+                            if swap:
+                                # P^ad, P^bc in k
+                                pk1 = pole1.get(p1).value()[:, None]
+                                pk2 = (-1)**(p1 % 2) * pole2.get(p1).value()[:, None]
+                                coeff *= (-1)**((q1 + ell2) // 2)  #-k2 -> +k2 in window
+                            else:
+                                # P^ac, P^bd in k
+                                pk1 = pole1.get(p1).value()[:, None]
+                                pk2 = (-1)**(p1 % 2) * pole2.get(p1).value()[:, None]
+                                coeff *= (-1)**((q1 - ell2) // 2)
+                            cov_WS[field][ill1][ill2] += coeff * (wj[0] * pk1 + wj[1] * pk2) / 2.
 
-                        # WS swap
-                        for p2 in ells:
-                            q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
-                            for q2 in q2:
-                                coeff = legendre_product(ell2, p2, q2)
-                                if coeff == 0.: continue
-                                coeff *= factor * (2 * ell1 + 1) * (2 * ell2 + 1) * (2 * q2 + 1)
-                                if (ell1, q2) in cache_WS2:
-                                    wj = cache_WS2[ell1, q2]
-                                else:
-                                    wj1 = wj2 = get_wj(get_window_field(WS, window_fields), k1, k2, k1edges, k2edges, ell1, q2)
-                                    if window_fields_swap != window_fields:
-                                        # conjugate * in ref paper: actually SW
-                                        wj2 = get_wj(get_window_field(SW, window_fields_swap), k1, k2, k1edges, k2edges, ell1, q2)
-                                    wj = (wj1, wj2)
-                                    cache_WS2[ell1, q2] = wj
-                                if swap:
-                                    pk1 = (-1)**(p2 % 2) * pole1.get(p2).value()[None, :]
-                                    pk2 = pole2.get(p2).value()[None, :]
-                                    coeff *= (-1)**((ell1 + q2) // 2)  #-k2 -> +k2 in window
-                                else:
-                                    # P^ac, P^bd in k'
-                                    pk1 = pole1.get(p2).value()[None, :]
-                                    pk2 = (-1)**(p2 % 2) * pole2.get(p2).value()[None, :]
-                                    coeff *= (-1)**((ell1 - q2) // 2)
-                                cov_WS[field][ill1][ill2] += coeff * (wj[0] * pk1 + wj[1] * pk2) / 2.
-                    if get_window_field(SS, window_fields, test=True):
-                        # SS
-                        coeff = factor * (2 * ell1 + 1) * (2 * ell2 + 1)
-                        if swap:
-                            coeff *= (-1)**((ell1 + ell2) // 2)  #-k2 -> +k2 in window
-                        else:
-                            coeff *= (-1)**((ell1 - ell2) // 2)
-                        cov_SS[field][ill1][ill2] += coeff * get_wj(get_window_field(SS, window_fields), k1, k2, k1edges, k2edges, ell1, ell2)
+                    # WS in k'
+                    for p2 in ells:
+                        q2 = list(range(abs(ell2 - p2), ell2 + p2 + 1))
+                        for q2 in q2:
+                            coeff = legendre_product(ell2, p2, q2)
+                            if coeff == 0.: continue
+                            coeff *= factor * (2 * ell1 + 1) * (2 * ell2 + 1) * (2 * q2 + 1)
+                            if (ell1, q2) in cache_WS2:
+                                wj = cache_WS2[ell1, q2]
+                            else:
+                                wj1 = wj2 = np.zeros((k1.size, k2.size))
+                                if window_fields[3] == window_fields[2]:
+                                    wj1 = get_window_field((WS, SW) if symmetrize else WS, window_fields)
+                                    wj1 = get_wj(wj1, k1, k2, k1edges, k2edges, ell1, q2)
+                                if window_fields[1] == window_fields[0]:
+                                    wj2 = get_window_field((SW, WS) if symmetrize else SW, window_fields)
+                                    wj2 = get_wj(wj2, k1, k2, k1edges, k2edges, ell1, q2)
+                                cache_WS2[ell1, q2] = wj = (wj1, wj2)
+                            if swap:
+                                # P^ad, P^bc in k'
+                                pk1 = (-1)**(p2 % 2) * pole1.get(p2).value()[None, :]
+                                pk2 = pole2.get(p2).value()[None, :]
+                                coeff *= (-1)**((ell1 + q2) // 2)  #-k2 -> +k2 in window
+                            else:
+                                # P^ac, P^bd in k'
+                                pk1 = pole1.get(p2).value()[None, :]
+                                pk2 = (-1)**(p2 % 2) * pole2.get(p2).value()[None, :]
+                                coeff *= (-1)**((ell1 - q2) // 2)
+                            cov_WS[field][ill1][ill2] += coeff * (wj[0] * pk1 + wj[1] * pk2) / 2.
 
+                    # SS
+                    coeff = factor * (2 * ell1 + 1) * (2 * ell2 + 1)
+                    if swap:
+                        coeff *= (-1)**((ell1 + ell2) // 2)  #-k2 -> +k2 in window
+                    else:
+                        coeff *= (-1)**((ell1 - ell2) // 2)
+                    wj = np.zeros((k1.size, k2.size))
+                    if window_fields[0] == window_fields[1] == window_fields[2] == window_fields[3]:
+                        wj = get_wj(get_window_field(SS, window_fields), k1, k2, k1edges, k2edges, ell1, ell2)
+                    cov_SS[field][ill1][ill2] += coeff * wj
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))
             if return_type != 'list':
