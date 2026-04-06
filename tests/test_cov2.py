@@ -10,7 +10,7 @@ from jaxpower import (MeshAttrs, compute_mesh2_covariance_window, compute_fkp2_c
                       generate_anisotropic_gaussian_mesh, generate_uniform_particles, BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, Mesh2SpectrumPole, Mesh2SpectrumPoles,
                       read, compute_mesh2_spectrum, compute_mesh2_correlation, interpolate_window_function, Mesh2CorrelationPole, Mesh2CorrelationPoles)
 from jaxpower.cov2 import matrix_spline_interp, matrix_rebin
-from jaxpower.types import ObservableTree
+from jaxpower.types import ObservableTree, read
 
 
 dirname = Path('_tests')
@@ -609,28 +609,43 @@ def test_multitracer_covariance(plot=False):
 
     window_fn = dirname / 'window_fkp_multitracer.h5'
 
-    if False: #window_fn.exists():
+    if window_fn.exists():
         windows = read(window_fn)
     else:
         windows = compute_fkp2_covariance_window([randoms1, randoms2], edges=edges, interlacing=2, resampler='tsc', los='local', fields=['a', 'b'])
         windows.write(window_fn)
 
+    #pole = windows.get(types='WW', fields=('a', 'a', 'b', 'b'), ells=0)
+    #pole2 = windows.get(types='WW', fields=('b', 'b', 'a', 'a'), ells=0)
+    #assert np.allclose(pole.value(), pole2.value())
+
+    #windows = windows.map(lambda pole, label: pole.clone(value=(label['ells'] == 0) * pole.value()), input_label=True)
     #windows = list(windows)
     #for i, window in enumerate(windows):
     #    windows[i] = ObservableTree([next(iter(window))] * len(window.fields), fields=window.fields)
 
     #theory = ObservableTree([theory] * 4, fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
-    theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())], fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
-    covs = compute_spectrum2_covariance(windows, theory, return_type='list')
+    theory = ObservableTree([theory, theory.clone(value=0.8 * theory.value()), theory.clone(value=0.8 * theory.value()), theory.clone(value=0.9 * theory.value())],
+                            fields=[('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')])
+    #theory = theory.get(ells=[0])
+    covs = compute_spectrum2_covariance(windows, theory, return_type='list', delta=0.1)
+    #covs[0].write(dirname / 'cov_ww.h5')
     assert covs[0].observable.fields == [('a', 'a'), ('a', 'b'), ('b', 'a'), ('b', 'b')]
     scov = 0.
     for name, cov in zip(['WW', 'WS', 'SS'], covs):
+        block = cov.at.observable.get(fields=('a', 'b')).value()
+        block2 = cov.at.observable.get(fields=('b', 'a')).value()
+        assert np.allclose(block, block2.T), name
+        sub = cov.at.observable.get(fields=[('a', 'b'), ('b', 'a')])
+        size = sub.observable.get(fields=('a', 'b')).size
+        assert np.allclose(np.diag(sub.value()[size:, size:]), np.diag(sub.value()[:size, :size]))
+        assert np.allclose(np.diag(sub.value()[:size, size:]), np.diag(sub.value()[:size, :size]))
         cov = cov.value()
         assert np.allclose(cov, cov.T), name
         scov += cov
 
-    cov = compute_spectrum2_covariance(windows, theory)
-    assert np.allclose(cov, scov)
+    cov = compute_spectrum2_covariance(windows, theory, delta=0.1)
+    assert np.allclose(cov.value(), scov)
 
 
 def test_fftlog2():
@@ -840,10 +855,10 @@ if __name__ == '__main__':
     #test_cutsky2_spectrum_covariance(plot=True)
     #test_cutsky2_correlation_covariance(plot=True)
     #test_pre_post_covariance()
-    #test_multitracer_covariance()
+    test_multitracer_covariance()
     #save_fkp_mocks()
     #test_fkp2_window(plot=True)
     #test_fkp2_covariance(plot=True)
     #test_bspline()
-    test_matrix_spline_integral_polynomial(degree=3)
-    test_rebin2d()
+    #test_matrix_spline_integral_polynomial(degree=3)
+    #test_rebin2d()

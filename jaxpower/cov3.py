@@ -140,7 +140,6 @@ def get_S(ells):
     return Sell
 
 
-
 def compute_spectrum3_covariance(window2, observable, theory=None):
 
     if isinstance(window2, MeshAttrs):
