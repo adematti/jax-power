@@ -1450,9 +1450,14 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         else:
             raise NotImplementedError(f'theory los {theory_los} not implemented')
 
-    observable = []
+    wmat = np.array(wmat)
+    observable, start = [], 0
     for ill, ell in enumerate(ells):
         observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=jnp.zeros_like(bin.xavg), num_shotnoise=jnp.zeros_like(bin.xavg), norm=jnp.ones_like(bin.xavg) * norm[ill], ell=ell))
+        stop = start + observable[-1].size
+        wmat[start:stop] = wmat[start:stop].real if ell % 2 == 0 else wmat[start:stop].imag
+        stop = start
+    wmat = wmat.real
     observable = Mesh2SpectrumPoles(observable)
 
     theory = []

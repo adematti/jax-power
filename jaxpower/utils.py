@@ -488,7 +488,6 @@ class BesselIntegral(object):
         else:
             norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
         if method == 'rect':
-            w = norm
             x = xeval[..., None] * xp
             self.w = norm * get_spherical_jn(ell)(x)
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
@@ -497,7 +496,7 @@ class BesselIntegral(object):
             self.w = norm * jnp.sum(get_spherical_jn(ell)(x), axis=-1) / 2.
             if volume: self.w *= (4. / 3. * np.pi) * (edges[:, 1]**3 - edges[:, 0]**3)
         else:  # exact
-            self.w = get_spherical_jn_tophat_integral(ell)(xeval, edges)
+            self.w = norm * get_spherical_jn_tophat_integral(ell)(xeval, edges)
             if not volume:
                 self.w /= (4. * np.pi) / 3. * (edges[:, 1]**3 - edges[:, 0]**3)
 
