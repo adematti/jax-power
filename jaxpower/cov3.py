@@ -1,65 +1,10 @@
-import dataclasses
-import itertools
-import operator
-import functools
-from functools import partial
-
 import numpy as np
-from scipy import special
 import jax
 from jax import numpy as jnp
 
 from .mesh import MeshAttrs
-from . import utils
 from .utils import wigner_3j, get_legendre
-
-
-prod = partial(functools.reduce, operator.mul)
-
-
-@dataclasses.dataclass
-class Integral1D:
-    x: np.ndarray
-    w: np.ndarray
-
-
-class IntegralND:
-
-    def __init__(self, **kwargs):
-        self.integ = dict(kwargs)
-
-    def x(self, names=None, sparse=True):
-        """Points at which to evaluate the integrand. If `names` is None, return all points as a list. Otherwise, return the points corresponding to the given names."""
-        all_names = list(self.integ.keys())
-        if names is None:
-            names = all_names
-        grids = np.meshgrid(*[self.integ[name].x for name in all_names], sparse=sparse, indexing='ij')
-        if np.ndim(names) == 0:
-            return grids[all_names.index(names)]
-        return [grids[all_names.index(name)] for name in names]
-
-    @property
-    def w(self):
-        """Weights for the integral, i.e. product of the weights of each dimension."""
-        w = [integ.w for integ in self.integ.values()]
-        return prod(np.meshgrid(*w, sparse=True, indexing='ij'))
-
-    @property
-    def ndim(self):
-        """Dimension of the integral, i.e. number of integration variables."""
-        return len(self.integ)
-
-    def __call__(self, integrand):
-        """Integrate the given integrand over the dimensions of this :class:`IntegralND` instance."""
-        axes = tuple(range(integrand.ndim - self.ndim, integrand.ndim))
-        return np.sum(integrand * self.w, axis=axes)
-
-
-def integration(a=0., b=1., size=5, method='leggauss'):
-    nodes, weights = np.polynomial.legendre.leggauss(size)
-    nodes = 0.5 * (b - a) * nodes + 0.5 * (a + b)
-    weights = 0.5 * (b - a) * weights
-    return Integral1D(x=nodes, w=weights)
+from .pt import integration, IntegralND, get_S
 
 
 def unitvec(mu, phi):
@@ -105,39 +50,6 @@ def get_kvec5(k1norm, k2norm, k2pnorm, mu1, mu2, phi2, mu2p, phi2p):
     return (k1norm, k2norm, k3norm, k2pnorm, k3pnorm), \
            (k1hat, k2hat, k3hat, k2phat, k3phat), \
            (k1vec, k2vec, k3vec, k2pvec, k3pvec)
-
-
-def get_S(ells):
-    ell1, ell2, ell3 = ells
-    H = wigner_3j(ell1, ell2, ell3, 0, 0, 0)
-
-    if abs(H) < 1e-12:
-        return lambda *args: 0.
-
-    ms = [np.arange(-ell, ell + 1) for ell in ells]
-    coeffs = []
-    for m1, m2, m3 in itertools.product(*ms):
-        gaunt = wigner_3j(ell1, ell2, ell3, m1, m2, m3) / H
-        if abs(gaunt) > 1e-12:
-            coeffs.append((m1, m2, m3, gaunt))
-
-    def get_Ylm(ell, m, xhat):
-        mu = xhat[..., 2]
-        phi = np.arctan2(xhat[..., 1], xhat[..., 0])
-        fac = special.factorial(ell - abs(m), exact=False) / special.factorial(ell + abs(m), exact=False)
-        amp = np.sqrt(fac)
-        return amp * special.lpmv(abs(m), ell, mu) * np.exp(1j * m * phi)
-
-    def Sell(*xhats):
-        out = 0.
-        for m1, m2, m3, gaunt in coeffs:
-            out = out + gaunt * prod(
-                get_Ylm(ell, m, xhat)
-                for ell, m, xhat in zip(ells, (m1, m2, m3), xhats)
-            )
-        return out.real if ((ell1 + ell2 + ell3) % 2 == 0) else out.imag
-
-    return Sell
 
 
 def compute_spectrum3_covariance(window2, observable, theory=None):
@@ -224,7 +136,7 @@ def compute_spectrum3_covariance(window2, observable, theory=None):
                     block = (2 * ell + 1) * (2 * ellp + 1) * integ((term1 + term2) * leg(mu) * legp(mu)) / 2.
 
                 if T_abapbp is not None:
-                    block = block + (2 * ell + 1) * (2 * ellp + 1) / (volume if volume is not None else 1.) * integ(T_abapbp(kvec, -kvec, kpvec, -kpvec) * leg(mu) * legp(mu)) / 2.
+                    block = block + (2 * ell + 1) * (2 * ellp + 1) / volume * integ(T_abapbp(kvec, -kvec, kpvec, -kpvec) * leg(mu) * legp(mu)) / 2.
 
             # ------------------------------------------------------------------
             # PB block
