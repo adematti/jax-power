@@ -505,23 +505,24 @@ def test_window_box(plot=False):
     edgesin = theory.get(ells=0).edges('k')
     ellsin = (0, 2, 4)
     # bin is still the binning operator
-    wmat = compute_mesh2_spectrum_window(mattrs, edgesin=edgesin, ellsin=ellsin, bin=bin, los=los, pbar=True)
-    test = wmat.dot(theory, return_type=None)
-    wmat_rebin = wmat.at.theory.select(k=slice(0, None, 2)).at.theory.select(k=slice(0, -1))
-    test_rebin = wmat_rebin.dot(theory.select(k=slice(0, None, 2)).select(k=slice(0, -1)), return_type=None)
+    for flags in [(), ('infinite',)][1:]:
+        wmat = compute_mesh2_spectrum_window(mattrs, edgesin=edgesin, ellsin=ellsin, bin=bin, los=los, flags=flags, pbar=True)
+        test = wmat.dot(theory, return_type=None)
+        #wmat_rebin = wmat.at.theory.select(k=slice(0, None, 2)).at.theory.select(k=slice(0, -1))
+        #test_rebin = wmat_rebin.dot(theory.select(k=slice(0, None, 2)).select(k=slice(0, -1)), return_type=None)
 
-    if plot:
-        from matplotlib import pyplot as plt
-        ax = plt.gca()
-        for ill, ell in enumerate(test.ells):
-            color = 'C{:d}'.format(ill)
-            pole = mean.get(ells=ell)
-            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle='-')
-            pole = test.get(ells=ell)
-            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle='--')
-            pole = test_rebin.get(ells=ell)
-            ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle=':')
-        plt.show()
+        if plot:
+            from matplotlib import pyplot as plt
+            ax = plt.gca()
+            for ill, ell in enumerate(test.ells):
+                color = 'C{:d}'.format(ill)
+                pole = mean.get(ells=ell)
+                ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle='-')
+                pole = test.get(ells=ell)
+                ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle='--')
+                #pole = test_rebin.get(ells=ell)
+                #ax.plot(pole.coords('k'), pole.coords('k') * pole.value(), color=color, linestyle=':')
+            plt.show()
 
 
 def test_window(plot=False):
