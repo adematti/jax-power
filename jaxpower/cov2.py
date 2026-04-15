@@ -231,6 +231,88 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
     return ObservableTree(list(window.values()), fields=[tuple(wfield) for wfield in window])
 
 
+def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, ell2,
+                                              fields=None, cache=None,
+                                              method='fftlog', delta=None):
+    if cache is None:
+        cache = {}
+
+    def get_window_field(window, fields):
+        if isinstance(window, tuple):  # symmetrize
+            w1 = get_window_field(window[0], fields)
+            w2 = get_window_field(window[1], fields[2:] + fields[:2])
+            return w1.clone(value=(w1.value() + w2.value()) / 2.)
+        def sort(field):
+            return tuple(sorted(field[:2])) + tuple(sorted(field[2:]))
+        wfields = [sort(field) for field in window.fields]
+        fields = sort(fields)
+        if fields in wfields:
+            return window.get(window.fields[wfields.index(fields)])
+        raise ValueError(f'{fields} not found in {window}')
+
+    if fields is not None:
+        window2 = get_window_field(window2, fields)
+
+    def get_wij(ww, q1, q2):
+
+        shape = k1edges.shape[:1] + k2edges.shape[:1]
+        w = sum(legendre_product(q1, q2, q) *  ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
+        if w.size <= 1:
+            return np.zeros(shape)
+        tmpw = next(iter(ww))
+        s = tmpw.coords('s')
+
+        def rebin2d(xedges, yedges, xp, yp, fp, cache=cache):
+            """Rebin fp sampled on (xp, yp) to bins centered on (x, y)."""
+            interp_order = 3
+            Mx = matrix_rebin(xedges, xp, wt=xp**2, interp_order=interp_order, cache=cache)
+            My = matrix_rebin(yedges, yp, wt=yp**2, interp_order=interp_order, cache=cache)
+            return Mx @ fp @ My.T
+
+        if method == 'fftlog':
+            s = tmpw.coords('s')
+            fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
+            tmp = fftlog(w)[1]
+            #from scipy.interpolate import RectBivariateSpline
+            #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
+            #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
+            toret = rebin2d(k1edges, k2edges, fftlog.k, fftlog.k, tmp)
+            #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
+            #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
+            return toret
+
+        else:
+
+            k1 = np.mean(k1edges, axis=-1) if k1edges.ndim == 2 else k1edges
+            k2 = np.mean(k2edges, axis=-1) if k2edges.ndim == 2 else k2edges
+
+            k1, k2 = np.meshgrid(k1, k2, indexing='ij', sparse=False)
+            k1, k2 = k1.ravel(), k2.ravel()
+            kmask = Ellipsis
+            if delta is not None:
+                kmask = np.abs(k2 - k1) <= delta
+                k1, k2 = k1[kmask], k2[kmask]
+
+            if 'volume' in tmpw.values():
+                vol = tmpw.values('volume')
+                #vol = 4. / 3. * np.pi * np.diff(tmpw.edges('s')**3, axis=-1)[..., 0]
+                #print(vol / vol2)
+                w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
+                w *= vol
+
+            def f(k12):
+                k1, k2 = k12
+                return jnp.sum(w * get_spherical_jn(q1)(k1 * s) * get_spherical_jn(q2)(k2 * s))
+
+            batch_size = int(min(max(1e7 / (k1.size * s.size), 1), k1.size))
+            tmp = jax.lax.map(f, (k1, k2), batch_size=batch_size)
+            toret = np.zeros(shape)
+            toret.flat[kmask] = tmp
+            return toret
+
+    return get_wij(window2, ell1, ell2)
+
+
 def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, flags=('smooth',)):
     r"""
     Compute the covariance matrix for the 2-point power spectrum, given window matrices and poles.
@@ -426,7 +508,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                 return toret
 
         def get_window_field(window, fields):
-            if isinstance(window, tuple):  # symmetize
+            if isinstance(window, tuple):  # symmetrize
                 w1 = get_window_field(window[0], fields)
                 w2 = get_window_field(window[1], fields[2:] + fields[:2])
                 return w1.clone(value=(w1.value() + w2.value()) / 2.)
