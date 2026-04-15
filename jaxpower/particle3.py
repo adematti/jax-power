@@ -11,10 +11,10 @@ from jax.sharding import PartitionSpec as P
 from .mesh import MeshAttrs, staticarray, ParticleField, get_sharding_mesh, _make_input_tuple
 from .mesh2 import FKPField, _format_ells, _format_meshes
 from .utils import get_legendre, get_spherical_jn, set_env, register_pytree_dataclass
-from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Particle2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
+from .types import Particle3SpectrumPole, Particle3SpectrumPoles, Particle3CorrelationPole, Particle3CorrelationPoles, ObservableLeaf, ObservableTree
 
 
-def _make_edges2(kind, mattrs, edges: staticarray | dict | None=None, xavg: staticarray | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=0):
+def _make_edges3(kind, mattrs, edges: staticarray | dict | None=None, xavg: staticarray | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=0):
     from cucount.jax import SelectionAttrs, WeightAttrs
     if kind == 'complex':
         max_ = mattrs.knyq.max()
@@ -44,83 +44,7 @@ def _make_edges2(kind, mattrs, edges: staticarray | dict | None=None, xavg: stat
 
 @partial(register_pytree_dataclass, meta_fields=['edges', 'xavg', 'sattrs', 'wattrs', 'ells'])
 @dataclass(init=False, frozen=True)
-class BinParticle2SpectrumPoles(object):
-    """
-    Binning class for estimating the 2-point power spectrum from particle pairs.
-
-    Parameters
-    ----------
-    mattrs : MeshAttrs, optional
-        Mesh attributes, e.g., boxsize, k-space limits.
-    edges : array-like or dict, optional
-        Bin edges or binning specification.
-    sattrs : dict, cucount.jax.SelectionAttrs, optional
-        Selection criteria for pairs.
-    wattrs : dict, cucount.jax.WeightAttrs, optional
-        Weight attributes.
-    ells : int or array-like, optional
-        Multipole orders to compute.
-
-    Attributes
-    ----------
-    edges : ndarray
-        Bin edges for pair separation.
-    sattrs : cucount.jax.SelectionAttrs
-        Selection criteria.
-    wattrs : cucount.jax.WeightAttrs
-        Weight attributes.
-    ells : tuple
-        Multipole orders.
-    """
-    edges: staticarray = None
-    xavg: staticarray = None
-    sattrs: dict = None
-    wattrs: dict = None
-
-    def __init__(self, mattrs=None, edges: staticarray | dict | None=None, xavg: staticarray | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=0):
-        kw = _make_edges2('complex', mattrs, edges=edges, xavg=xavg, sattrs=sattrs, wattrs=wattrs, ells=ells)
-        self.__dict__.update(kw)
-
-    def __call__(self, *particles, los='firstpoint'):
-        """
-        Compute the binned power spectrum multipoles from particle pairs.
-
-        Parameters
-        ----------
-        *particles : cucount.jax.Particles
-            Particle fields to correlate (autocorrelation if one provided).
-        los : str, optional
-            Line-of-sight definition.
-
-        Returns
-        -------
-        spectrum : ndarray
-            Power spectrum multipoles for each bin.
-        """
-        from cucount.jax import Particles, count2, BinAttrs
-        particles = _make_input_tuple(*particles)
-        particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
-        particles = _format_meshes(*particles)[0]
-
-        def call(*particles):
-            #setup_logging('error')
-            battrs = BinAttrs(k=np.asarray(self.xavg), pole=(self.ells, los))
-            return count2(*particles, battrs=battrs, sattrs=self.sattrs, wattrs=self.wattrs)['weight'].T
-
-        # Note about parallel computation:
-        # To create a shard array, with same size on all process,
-        # we add particles with weight 0 located at the mean position of the data chunk.
-        # This creates a lot of repeats at the same location,
-        # which would lead to an increased computation time in the pair counting,
-        # as it is dominated by the pairs in that spatial bin.
-        # So in cucount we remove all particles with weight 0 prior to pair counting.
-        # Loop to reduce the memory footprint
-        return call(*particles)
-
-
-@partial(register_pytree_dataclass, meta_fields=['edges', 'xavg', 'sattrs', 'wattrs', 'ells'])
-@dataclass(init=False, frozen=True)
-class BinParticle2CorrelationPoles(object):
+class BinParticle3CorrelationPoles(object):
     """
     Binning class for estimating the 2-point correlation function from particle pairs.
 
@@ -154,7 +78,7 @@ class BinParticle2CorrelationPoles(object):
     wattrs: dict = None
 
     def __init__(self, mattrs=None, edges: staticarray | dict | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=0):
-        kw = _make_edges2('real', mattrs, edges=edges, sattrs=sattrs, wattrs=wattrs, ells=ells)
+        kw = _make_edges3('real', mattrs, edges=edges, sattrs=sattrs, wattrs=wattrs, ells=ells)
         self.__dict__.update(kw)
 
     def __call__(self, *particles, los='firstpoint'):
@@ -207,7 +131,7 @@ def convert_particles(particles: ParticleField, weights=None, exchange_weights: 
 
 
 
-def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles | BinParticle2CorrelationPoles=None, los='firstpoint'):
+def compute_particle3(*particles: ParticleField, bin: BinParticle3CorrelationPoles=None, los='firstpoint'):
     """
     Compute the 2-point spectrum or correlation function from particles.
 
@@ -215,32 +139,29 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
     ----------
     *particles : ParticleField or cucount.jax.Particles
         Particles to correlate (autocorrelation if one provided).
-    bin : BinParticle2SpectrumPoles or BinParticle2CorrelationPoles
+    bin : BinParticle3SpectrumPoles or BinParticle3CorrelationPoles
         Binning object specifying edges, selection, and multipoles.
     los : str, optional
         Line-of-sight definition.
 
     Returns
     -------
-    result : Particle2CorrelationPoles or Particle2SpectrumPoles
+    result : Particle3CorrelationPoles or Particle3SpectrumPoles
         Resulting spectrum or correlation function object.
     """
     ells = bin.ells
     num = bin(*particles, los=los)
 
-    if isinstance(bin, BinParticle2CorrelationPoles):
+    if isinstance(bin, BinParticle3CorrelationPoles):
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Particle2CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
-        return Particle2CorrelationPoles(correlation)
-    else:  # 'complex'
-        spectrum = []
-        for ill, ell in enumerate(ells):
-            spectrum.append(Particle2SpectrumPole(k=bin.xavg, k_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
-        return Particle2SpectrumPoles(spectrum)
+            correlation.append(Particle3CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
+        return Particle3CorrelationPoles(correlation)
+    else:
+        raise NotImplementedError
 
 
-def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2SpectrumPoles | BinParticle2CorrelationPoles=None, fields: tuple=None):
+def compute_particle3_shotnoise(*particles: ParticleField, bin: BinParticle3CorrelationPoles=None, fields: tuple=None):
     """
     Compute the shot noise for the particle-based power spectrum and correlation function multipoles.
 
@@ -248,7 +169,7 @@ def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2Spec
     ----------
     particles : ParticleField or cucount.jax.Particles
         Particles.
-    bin : BinParticle2SpectrumPoles or BinParticle2CorrelationPoles, optional
+    bin : BinParticle3SpectrumPoles or BinParticle3CorrelationPoles, optional
         Binning operator.
     fields : tuple, list, optional
         Field identifiers; pass e.g. [0, 0] if two fields sharing the same positions are given as input.
@@ -270,9 +191,8 @@ def compute_particle2_shotnoise(*particles: ParticleField, bin: BinParticle2Spec
 
     ells = bin.ells
     num_shotnoise = [(2 * ell + 1) * get_legendre(ell)(0.) * num_shotnoise for ell in ells]
-    if isinstance(bin, BinParticle2CorrelationPoles):
+    if isinstance(bin, BinParticle3CorrelationPoles):
         mask_shotnoise = (bin.edges[..., 0] <= 0.) & (bin.edges[..., 1] >= 0.)
     else:
-        mask_shotnoise = jnp.ones_like(bin.xavg)
-        num_shotnoise = [sn * (ell == 0) for ell, sn in zip(ells, num_shotnoise)]
+        raise NotImplementedError
     return [num_shotnoise[ill] * mask_shotnoise for ill, ell in enumerate(ells)]

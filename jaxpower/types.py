@@ -206,7 +206,10 @@ Mesh2SpectrumPoles.to_correlation = observable_spectrum_to_correlation
 
 
 class Particle2SpectrumPole(Mesh2SpectrumPole): pass
+
+
 class Particle2SpectrumPoles(Mesh2SpectrumPoles): pass
+
 
 class Particle2CorrelationPole(Mesh2CorrelationPole):
 
@@ -224,6 +227,7 @@ class Particle2CorrelationPole(Mesh2CorrelationPole):
         Particle2SpectrumPole
         """
         return observable_correlation_to_spectrum(self, k)
+
 
 class Particle2CorrelationPoles(Mesh2CorrelationPoles):
 
