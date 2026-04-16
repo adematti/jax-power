@@ -103,6 +103,56 @@ WindowMatrix = make_window_pytree(WindowMatrix)
 CovarianceMatrix = make_covariance_pytree(CovarianceMatrix)
 
 
+import operator
+import functools
+
+prod = functools.partial(functools.reduce, operator.mul)
+
+
+def _pole_transform(xout, pole, label, mode='forward'):
+    # for mode = 'forward': xin is s, xout is k
+    # for mode = 'backward': xin is k, xout is s
+    from .utils import BesselIntegral
+
+    ell = label['ells']
+    ndim = isinstance(ell, (tuple, list))  # 3-point
+
+    def unravel(leaf):
+        if hasattr(leaf, 'unravel'):
+            return leaf.unravel()
+        return unravel
+
+    if ndim:
+        pole = unravel(pole)
+
+    leaf = None
+    if isinstance(xout, ObservableLeaf):
+        leaf = xout
+    elif isinstance(xout, ObservableTree):
+        leaf = xout.get(**label)
+    if leaf is not None:
+        if ndim:
+            leaf = unravel(leaf)
+        xout = list(leaf.coords().values())
+
+    xout = xout if isinstance(xout, (tuple, list)) else [xout]
+    xin = list(pole.coords().values())
+    w = [BesselIntegral(xxin, xxout, ell=ell, method='rect', mode=mode, edges=False, volume=False).w for xxin, xxout in zip(xin, xout, strict=True)]
+    w = prod(jnp.meshgrid(w, indexing='ij', sparse=False))
+    # self.weights = volume factor
+    transformed = pole.value()
+    if 'volume' in pole.values():
+        volume = pole.values('volume')
+        transformed = jnp.where(volume == 0., 0., transformed)
+    else:
+        volume = 1.
+    value = jnp.sum(w * volume * transformed)
+    if leaf is not None:
+        return leaf.clone(value=value)
+    coords = list(pole.coords())
+    return ObservableLeaf(**dict(zip(coords, xout)), value=value, coords=coords)
+
+
 
 def observable_correlation_to_spectrum(correlation, k):
     """
@@ -117,37 +167,11 @@ def observable_correlation_to_spectrum(correlation, k):
     -------
     Particle2SpectrumPoles
     """
-    from .utils import BesselIntegral
-
-    def pole_to_spectrum(pole, **label):
-        leaf = None
-        if isinstance(k, ObservableLeaf):
-            leaf = k
-        elif isinstance(k, ObservableTree):
-            leaf = k.get(**label)
-        if leaf is not None:
-            kk = leaf.coords('k')
-        else:
-            kk = k
-        ell = label['ells']
-        integ = BesselIntegral(pole.coords('s'), kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
-        #num.append(integ(self._value[ill]))
-        # self.weights = volume factor
-        correlation = pole.value()
-        if 'volume' in pole.values():
-            volume = pole.values('volume')
-            correlation = jnp.where(volume == 0., 0., correlation)
-        else:
-            volume = 1.
-        value = integ(volume * correlation)
-        if leaf is not None:
-            return leaf.clone(value=value)
-        return ObservableLeaf(k=k, value=value, coords=['k'])
-
+    pole_to_spectrum = functools.partial(_pole_transform, k, mode='forward')
     if isinstance(correlation, ObservableTree):  # multipoles
         branches = []
         for label in correlation.labels():
-            branches.append(pole_to_spectrum(correlation.get(**label), **label))
+            branches.append(pole_to_spectrum(correlation.get(**label), label))
         return ObservableTree(branches, **correlation.labels(return_type='unflatten'))
     return pole_to_spectrum(correlation)
 
@@ -165,38 +189,11 @@ def observable_spectrum_to_correlation(spectrum, s):
     -------
     Particle2CorrelationPoles
     """
-    from .utils import BesselIntegral
-
-    def pole_to_correlation(pole, **label):
-        leaf = None
-        if isinstance(s, ObservableLeaf):
-            leaf = s
-        elif isinstance(s, ObservableTree):
-            leaf = s.get(**label)
-        if leaf is not None:
-            ss = leaf.coords('s')
-        else:
-            ss = s
-        ell = label['ells']
-        integ = BesselIntegral(pole.coords('k'), ss, ell=ell, method='rect', mode='backward', edges=False, volume=False)
-        #integ = BesselIntegral(pole.edges('k'), ss, ell=ell, method='trapz', mode='backward', edges=True, volume=False)
-        #num.append(integ(self._value[ill]))
-        # self.weights = volume factor
-        spectrum = pole.value()
-        if 'volume' in pole.values():
-            volume = pole.values('volume')
-            spectrum = jnp.where(volume == 0., 0., spectrum)
-        else:
-            volume = 1.
-        value = integ(volume * spectrum)
-        if leaf is not None:
-            return leaf.clone(value=value)
-        return ObservableLeaf(s=s, value=value, coords=['s'])
-
+    pole_to_correlation = functools.partial(_pole_transform, s, mode='backward')
     if isinstance(spectrum, ObservableTree):  # multipoles
         branches = []
         for label in spectrum.labels():
-            branches.append(pole_to_correlation(spectrum.get(**label), **label))
+            branches.append(pole_to_correlation(spectrum.get(**label), label))
         return ObservableTree(branches, **spectrum.labels(return_type='unflatten'))
     return pole_to_correlation(spectrum)
 
@@ -243,5 +240,48 @@ class Particle2CorrelationPoles(Mesh2CorrelationPoles):
         Returns
         -------
         Particle2SpectrumPoles
+        """
+        return observable_correlation_to_spectrum(self, k)
+
+
+
+class Particle3SpectrumPole(Mesh2SpectrumPole): pass
+
+
+class Particle3SpectrumPoles(Mesh2SpectrumPoles): pass
+
+
+class Particle3CorrelationPole(Mesh2CorrelationPole):
+
+    def to_spectrum(self, k):
+        """
+        Convert the correlation function multipole to power spectrum multipole.
+
+        Parameters
+        ----------
+        k : array-like or Particle3SpectrumPoles
+            Wavenumber bin centers or :class:`Particle3SpectrumPoles` instance.
+
+        Returns
+        -------
+        Particle3SpectrumPole
+        """
+        return observable_correlation_to_spectrum(self, k)
+
+
+class Particle3CorrelationPoles(Mesh2CorrelationPoles):
+
+    def to_spectrum(self, k):
+        """
+        Convert the correlation function multipoles to power spectrum multipoles.
+
+        Parameters
+        ----------
+        k : array-like or Particle3SpectrumPoles
+            Wavenumber bin centers or :class:`Particle3SpectrumPoles` instance.
+
+        Returns
+        -------
+        Particle3SpectrumPoles
         """
         return observable_correlation_to_spectrum(self, k)

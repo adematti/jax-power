@@ -11,8 +11,8 @@ from jax import random
 from dataclasses import dataclass
 
 from .mesh import (BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, FKPField, staticarray, get_sharding_mesh, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs, _bincount, create_sharded_random,
-compute_normalization, compute_box_normalization, split_particles)
-from .mesh2 import _get_los_vector, __format_meshes
+compute_normalization, compute_box_normalization, split_particles, __format_meshes)
+from .mesh2 import _get_los_vector
 from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableLeaf, ObservableTree, WindowMatrix
 from .utils import real_gaunt, get_legendre, get_spherical_jn, get_Ylm, wigner_3j, wigner_9j, register_pytree_dataclass
 
@@ -81,6 +81,9 @@ def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None
                 edge = np.arange(edge.get('min', 0.), edge.get('max', vecmax), step)
         else:
             edge = np.asarray(edge)
+        if edge.ndim == 2:
+            assert np.allclose(edge[1:, 0], edge[:-1, 1])
+            edge = np.append(edge[:, 0], edge[-1, 1])
         edges[iedge] = edge
 
     ells = _format_ells(ells, basis=basis)

@@ -1,16 +1,12 @@
-import os
 from functools import partial
 from dataclasses import dataclass
 
 import numpy as np
-import jax
 from jax import numpy as jnp
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as P
 
-from .mesh import MeshAttrs, staticarray, ParticleField, get_sharding_mesh, _make_input_tuple
+from .mesh import staticarray, ParticleField, _make_input_tuple
 from .mesh2 import FKPField, _format_ells, _format_meshes
-from .utils import get_legendre, get_spherical_jn, set_env, register_pytree_dataclass
+from .utils import get_legendre, register_pytree_dataclass
 from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Particle2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
 
 
@@ -145,7 +141,7 @@ class BinParticle2CorrelationPoles(object):
         Selection criteria.
     wattrs : cucount.jax.WeightAttrs
         Weight attributes.
-    ells : ndarray
+    ells : tuple
         Multipole orders.
     """
     edges: staticarray = None
