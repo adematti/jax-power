@@ -1,3 +1,4 @@
+import numpy as np
 import jax
 from jax import numpy as jnp
 
@@ -115,14 +116,15 @@ def _pole_transform(xout, pole, label, mode='forward'):
     from .utils import BesselIntegral
 
     ell = label['ells']
-    ndim = isinstance(ell, (tuple, list))  # 3-point
+    multidim = isinstance(ell, (tuple, list))  # 3-point, sugiyama basis
+    if not multidim: ell = [ell]
 
     def unravel(leaf):
-        if hasattr(leaf, 'unravel'):
+        if hasattr(leaf, 'unravel') and leaf.is_raveled:
             return leaf.unravel()
-        return unravel
+        return leaf
 
-    if ndim:
+    if multidim:
         pole = unravel(pole)
 
     leaf = None
@@ -131,27 +133,50 @@ def _pole_transform(xout, pole, label, mode='forward'):
     elif isinstance(xout, ObservableTree):
         leaf = xout.get(**label)
     if leaf is not None:
-        if ndim:
-            leaf = unravel(leaf)
         xout = list(leaf.coords().values())
+        if multidim and len(xout) == 1:
+            xout = xout[0]
+    index_out = None
+    if not isinstance(xout, (tuple, list)):
+        if multidim:
+            assert xout.ndim == 2
+            xout_unraveled, index_out = [], []
+            for i in range(xout.shape[1]):
+                unique, index = np.unique(xout[:, i], return_inverse=True)
+                xout_unraveled.append(unique)
+                index_out.append(index)
+        else:
+            assert xout.ndim == 1
+            xout_unraveled = [xout]
+        xout = [xout]
+    else:
+        xout_unraveled = xout
+    xin_unraveled = list(pole.coords().values())
 
-    xout = xout if isinstance(xout, (tuple, list)) else [xout]
-    xin = list(pole.coords().values())
-    w = [BesselIntegral(xxin, xxout, ell=ell, method='rect', mode=mode, edges=False, volume=False).w for xxin, xxout in zip(xin, xout, strict=True)]
-    w = prod(jnp.meshgrid(w, indexing='ij', sparse=False))
-    # self.weights = volume factor
+    # sugiyama basis: bessel transform on the first 2 ells
+    weights = [BesselIntegral(xxin, xxout, ell=ell, method='rect', mode=mode, edges=False, volume=False).w for xxin, xxout, ell in zip(xin_unraveled, xout_unraveled, ell[:len(xout_unraveled)], strict=True)]
     transformed = pole.value()
     if 'volume' in pole.values():
         volume = pole.values('volume')
         transformed = jnp.where(volume == 0., 0., transformed)
     else:
         volume = 1.
-    value = jnp.sum(w * volume * transformed)
+    value = volume * transformed
+    for idim, ww in enumerate(weights):
+        # tensordot would move idim to first axis, so let's simplify
+        value = np.moveaxis(value, idim, -1)
+        value = np.tensordot(value, ww.T, axes=(-1, 0))
+        value = np.moveaxis(value, -1, idim)
+    if index_out is not None:
+        value = value[tuple(index_out)]
     if leaf is not None:
         return leaf.clone(value=value)
-    coords = list(pole.coords())
+    base_coord = 'k' if mode == 'forward' else 's'
+    if multidim and index_out is None:
+        coords = [f'{base_coord}{idim:d}' for idim in range(len(xout_unraveled))]
+    else:
+        coords = [base_coord]
     return ObservableLeaf(**dict(zip(coords, xout)), value=value, coords=coords)
-
 
 
 def observable_correlation_to_spectrum(correlation, k):
@@ -245,13 +270,13 @@ class Particle2CorrelationPoles(Mesh2CorrelationPoles):
 
 
 
-class Particle3SpectrumPole(Mesh2SpectrumPole): pass
+class Particle3SpectrumPole(Mesh3SpectrumPole): pass
 
 
-class Particle3SpectrumPoles(Mesh2SpectrumPoles): pass
+class Particle3SpectrumPoles(Mesh3SpectrumPoles): pass
 
 
-class Particle3CorrelationPole(Mesh2CorrelationPole):
+class Particle3CorrelationPole(Mesh3CorrelationPole):
 
     def to_spectrum(self, k):
         """
@@ -269,7 +294,7 @@ class Particle3CorrelationPole(Mesh2CorrelationPole):
         return observable_correlation_to_spectrum(self, k)
 
 
-class Particle3CorrelationPoles(Mesh2CorrelationPoles):
+class Particle3CorrelationPoles(Mesh3CorrelationPoles):
 
     def to_spectrum(self, k):
         """

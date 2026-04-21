@@ -334,8 +334,8 @@ def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
     return Ylm
 
 
+# Store in cache
 [[get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
-
 
 
 _registered_legendre = [None] * 11
@@ -535,7 +535,6 @@ class Interpolator1D(object):
             toret = (1. - self.fidx) * fun[self.idx] + self.fidx * fun[self.idx + 1]
         toret *= self.mask
         return toret
-
 
 
 def compute_sympy_real_gaunt(*ellms):

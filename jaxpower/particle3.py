@@ -101,7 +101,7 @@ class BinParticle3CorrelationPoles(object):
         kw = _make_edges3('real', mattrs, edges=edges, sattrs=sattrs, wattrs=wattrs, ells=ells)
         self.__dict__.update(kw)
 
-    def __call__(self, *particles, cross=('12',), **kwargs):
+    def __call__(self, *particles, cross=('12', '21'), **kwargs):
         """
         Compute the binned correlation function multipoles from particle pairs.
 
