@@ -12,8 +12,7 @@ from .types import Particle3SpectrumPole, Particle3SpectrumPoles, Particle3Corre
 
 
 def _make_edges3(kind, mattrs, edges: staticarray | dict | None=None,
-                 sattrs: list | None=None,
-                 wattrs: dict | None=None,
+                 wattrs: dict | None=None, sattrs: dict | None=None,
                  ells: tuple=(0, 0, 0)):
     from cucount.jax import SelectionAttrs, WeightAttrs
     if kind == 'complex':
@@ -22,9 +21,6 @@ def _make_edges3(kind, mattrs, edges: staticarray | dict | None=None,
         max_ = jnp.sqrt(jnp.sum(mattrs.boxsize**2))
     if edges is None:
         edges = {}
-    if not isinstance(battrs, (tuple, list)):
-        ndim = 2
-        battrs = [battrs] * ndim
     ndim = 2
     if not isinstance(edges, (tuple, list)):
         edges = [edges] * ndim
@@ -34,10 +30,6 @@ def _make_edges3(kind, mattrs, edges: staticarray | dict | None=None,
     if np.ndim(ells[0]) == 0:
         ells = [ells]
     ells = list(ells)
-    if not isinstance(sattrs, (tuple, list)):
-        sattrs = [sattrs] * ndim
-    assert len(sattrs) == ndim
-    sattrs = list(sattrs)
     xavg = [None] * ndim
     for iedge, edge in enumerate(edges):
         if isinstance(edge, dict):
@@ -53,16 +45,23 @@ def _make_edges3(kind, mattrs, edges: staticarray | dict | None=None,
         edge = np.column_stack([edge[:-1], edge[1:]])
         edges[iedge] = edge
         xavg[iedge] = 3. / 4. * (edge[..., 1]**4 - edge[..., 0]**4) / (edge[..., 1]**3 - edge[..., 0]**3)
-        if not isinstance(sattrs[iedge], SelectionAttrs):
-            sattrs[iedge] = SelectionAttrs(**(sattrs[iedge] or {}))
+    if not isinstance(sattrs, SelectionAttrs):
+        sattrs = SelectionAttrs(**(sattrs or {}))
     if not isinstance(wattrs, WeightAttrs):
         wattrs = WeightAttrs(**(wattrs or {}))
-    return dict(edges=[staticarray(edge) for edge in edges],
-                xavg=[staticarray(xx) for xx in xavg],
-                sattrs=sattrs, wattrs=wattrs, ells=ells)
+    edges1d = [staticarray(edge) for edge in edges]
+    xavg1d = [staticarray(xx) for xx in xavg]
+
+    def _cproduct(array):
+        grid = np.meshgrid(*array, sparse=False, indexing='ij')
+        return np.column_stack([tmp.ravel() for tmp in grid])
+
+    edges = staticarray(np.concatenate([_cproduct([edge[..., 0] for edge in edges1d])[..., None], _cproduct([edge[..., 1] for edge in edges1d])[..., None]], axis=-1))
+    xavg = staticarray(_cproduct(xavg1d))
+    return dict(edges1d=edges1d, xavg1d=xavg1d, edges=edges, xavg=xavg, sattrs=sattrs, wattrs=wattrs, ells=ells)
 
 
-@partial(register_pytree_dataclass, meta_fields=['edges', 'xavg', 'sattrs', 'wattrs', 'ells'])
+@partial(register_pytree_dataclass, meta_fields=['edges1d', 'xavg1d', 'edges', 'xavg', 'sattrs', 'wattrs', 'ells'])
 @dataclass(init=False, frozen=True)
 class BinParticle3CorrelationPoles(object):
     """
@@ -92,16 +91,18 @@ class BinParticle3CorrelationPoles(object):
     ells : list
         Multipole orders.
     """
+    edges1d: list = None
+    xavg1d: list = None
     edges: list = None
     xavg: list = None
-    sattrs: list = None
+    sattrs: dict = None
     wattrs: dict = None
 
     def __init__(self, mattrs=None, edges: staticarray | dict | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=(0, 0, 0)):
         kw = _make_edges3('real', mattrs, edges=edges, sattrs=sattrs, wattrs=wattrs, ells=ells)
         self.__dict__.update(kw)
 
-    def __call__(self, *particles, cross=('12', '21'), **kwargs):
+    def __call__(self, *particles, close_pair=((1, 2), (1, 3), (2, 3)), **kwargs):
         """
         Compute the binned correlation function multipoles from particle pairs.
 
@@ -121,29 +122,33 @@ class BinParticle3CorrelationPoles(object):
         particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
         particles = _format_meshes(*particles)[0]
+        if np.ndim(close_pair[0]) == 0:
+            close_pair = [close_pair]
 
-        def call(*particles, cross='12'):
+        def call(*particles, close_pair=(1, 2)):
             #setup_logging('error')
             ells = triposh_to_poles(self.ells)
             battrs = []
-            for edges, ells in zip(self.edges, ells, strict=True):
+            for edges, ells in zip(self.edges1d, ells, strict=True):
                 edges = np.append(edges[:, 0], edges[-1, 1])
                 # los irrelevant here
                 battrs.append(BinAttrs(s=edges, pole=(ells, 'firstpoint')))
-            sattrs = self.sattrs
-            if cross == '13':
-                particles = [particles[0], particles[2], particles[1]]
-                battrs = [battrs[1], battrs[0]]
-                sattrs = [sattrs[1], sattrs[0], sattrs[2]]
-                kwargs.setdefault('veto13', True)
-            matrix = triposh_transform_matrix(battrs[0], battrs[1], self.ells)
-            counts = count3close(*particles, battrs12=battrs[0], battrs13=battrs[1],
-                                 sattrs12=sattrs[0], sattrs12=sattrs[1], sattrs23=sattrs[2],
-                                 wattrs=self.wattrs, **kwargs)['weight']
+                #battrs.append(BinAttrs(s=edges))
+            kw = dict(kwargs)
+            kw[f'sattrs{close_pair[0]:d}{close_pair[1]:d}'] = self.sattrs
+            if close_pair == (1, 3):
+                kw.setdefault('veto12', self.sattrs)
+            elif close_pair == (2, 3):
+                kw.setdefault('veto12', self.sattrs)
+                kw.setdefault('veto13', self.sattrs)
+            ells, matrix = triposh_transform_matrix(battrs[0], battrs[1], self.ells)
+            assert ells == self.ells
+            counts = count3close(*particles, close_pair=close_pair, battrs12=battrs[0], battrs13=battrs[1],
+                                 wattrs=self.wattrs, **kw)['weight']
             # In sugiyama = triposh basis, multipoles on first axis
-            return jnp.moveaxis(counts.dot(matrix), -1, 0)
+            return jnp.dot(matrix, jnp.moveaxis(counts, -1, 0).reshape(counts.shape[-1], -1))
 
-        return sum(call(*particles, cross=cross) for cross in cross)
+        return sum(call(*particles, close_pair=close_pair) for close_pair in close_pair)
 
 
 def convert_particles(particles: ParticleField, weights=None, exchange_weights: bool=True, index_value: bool=None):
