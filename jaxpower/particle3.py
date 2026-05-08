@@ -124,6 +124,7 @@ class BinParticle3CorrelationPoles(object):
         particles = _format_meshes(*particles)[0]
         if np.ndim(close_pair[0]) == 0:
             close_pair = [close_pair]
+        with_veto = len(close_pair) > 1
 
         def call(*particles, close_pair=(1, 2)):
             #setup_logging('error')
@@ -136,11 +137,12 @@ class BinParticle3CorrelationPoles(object):
                 #battrs.append(BinAttrs(s=edges))
             kw = dict(kwargs)
             kw[f'sattrs{close_pair[0]:d}{close_pair[1]:d}'] = self.sattrs
-            if close_pair == (1, 3):
-                kw.setdefault('veto12', self.sattrs)
-            elif close_pair == (2, 3):
-                kw.setdefault('veto12', self.sattrs)
-                kw.setdefault('veto13', self.sattrs)
+            if with_veto:
+                if close_pair == (1, 3):
+                    kw.setdefault('veto12', self.sattrs)
+                elif close_pair == (2, 3):
+                    kw.setdefault('veto12', self.sattrs)
+                    kw.setdefault('veto13', self.sattrs)
             ells, matrix = triposh_transform_matrix(battrs[0], battrs[1], self.ells)
             assert ells == self.ells
             counts = count3close(*particles, close_pair=close_pair, battrs12=battrs[0], battrs13=battrs[1],
