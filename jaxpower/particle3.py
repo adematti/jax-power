@@ -118,7 +118,8 @@ class BinParticle3CorrelationPoles(object):
         correlation : ndarray
             Correlation function multipoles for each bin.
         """
-        from cucount.jax import Particles, count3close, BinAttrs, triposh_to_poles, triposh_transform_matrix
+        from cucount.jax import Particles, count3close, BinAttrs, symmetrize_poles
+        from lsstypes.types import convert_ells, build_basis_transform_matrix3
         particles = _make_input_tuple(*particles)
         particles = [convert_particles(particle) if not isinstance(particle, Particles) else particle for particle in particles]
         particles = _format_meshes(*particles)[0]
@@ -128,7 +129,8 @@ class BinParticle3CorrelationPoles(object):
 
         def call(*particles, close_pair=(1, 2)):
             #setup_logging('error')
-            ells = triposh_to_poles(self.ells)
+            ells = convert_ells(self.ells, 'sugiyama', 'slepian')
+            ells = ells12, ells13 = [tuple(np.unique([ell[idim] for ell in ells])) for idim in range(2)]
             battrs = []
             for edges, ells in zip(self.edges1d, ells, strict=True):
                 edges = np.append(edges[:, 0], edges[-1, 1])
@@ -143,12 +145,14 @@ class BinParticle3CorrelationPoles(object):
                 elif close_pair == (2, 3):
                     kw.setdefault('veto12', self.sattrs)
                     kw.setdefault('veto13', self.sattrs)
-            ells, matrix = triposh_transform_matrix(battrs[0], battrs[1], self.ells)
-            assert ells == self.ells
+
             counts = count3close(*particles, close_pair=close_pair, battrs12=battrs[0], battrs13=battrs[1],
                                  wattrs=self.wattrs, **kw)['weight']
-            # In sugiyama = triposh basis, multipoles on first axis
-            return jnp.dot(matrix, jnp.moveaxis(counts, -1, 0).reshape(counts.shape[-1], -1))
+            counts, ells = symmetrize_poles(counts, ells12, ells13)
+            # multipoles on first axis
+            counts = jnp.moveaxis(counts, -1, 0).reshape(counts.shape[-1], -1)
+            matrix = build_basis_transform_matrix3(ells, basis_in='slepian', basis_out='sugiyama', ells_out=self.ells)[1]
+            return jnp.tensordot(matrix, counts, axes=(0, 0))
 
         return sum(call(*particles, close_pair=close_pair) for close_pair in close_pair)
 
