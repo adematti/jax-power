@@ -1,3 +1,4 @@
+import numpy as np
 import jax
 from jax import numpy as jnp
 
@@ -103,6 +104,80 @@ WindowMatrix = make_window_pytree(WindowMatrix)
 CovarianceMatrix = make_covariance_pytree(CovarianceMatrix)
 
 
+import operator
+import functools
+
+prod = functools.partial(functools.reduce, operator.mul)
+
+
+def _pole_transform(xout, pole, label, mode='forward'):
+    # for mode = 'forward': xin is s, xout is k
+    # for mode = 'backward': xin is k, xout is s
+    from .utils import BesselIntegral
+
+    ell = label['ells']
+    multidim = isinstance(ell, (tuple, list))  # 3-point, sugiyama basis
+    if not multidim: ell = [ell]
+
+    def unravel(leaf):
+        if hasattr(leaf, 'unravel') and leaf.is_raveled:
+            return leaf.unravel()
+        return leaf
+
+    if multidim:
+        pole = unravel(pole)
+
+    leaf = None
+    if isinstance(xout, ObservableLeaf):
+        leaf = xout
+    elif isinstance(xout, ObservableTree):
+        leaf = xout.get(**label)
+    if leaf is not None:
+        xout = list(leaf.coords().values())
+        if multidim and len(xout) == 1:
+            xout = xout[0]
+    index_out = None
+    if not isinstance(xout, (tuple, list)):
+        if multidim:
+            assert xout.ndim == 2
+            xout_unraveled, index_out = [], []
+            for i in range(xout.shape[1]):
+                unique, index = np.unique(xout[:, i], return_inverse=True)
+                xout_unraveled.append(unique)
+                index_out.append(index)
+        else:
+            assert xout.ndim == 1
+            xout_unraveled = [xout]
+        xout = [xout]
+    else:
+        xout_unraveled = xout
+    xin_unraveled = list(pole.coords().values())
+
+    # sugiyama basis: bessel transform on the first 2 ells
+    weights = [BesselIntegral(xxin, xxout, ell=ell, method='rect', mode=mode, edges=False, volume=False).w for xxin, xxout, ell in zip(xin_unraveled, xout_unraveled, ell[:len(xout_unraveled)], strict=True)]
+    transformed = pole.value()
+    if 'volume' in pole.values():
+        volume = pole.values('volume')
+        transformed = jnp.where(volume == 0., 0., transformed)
+    else:
+        volume = 1.
+    value = volume * transformed
+    for idim, ww in enumerate(weights):
+        # tensordot would move idim to first axis, so let's simplify
+        value = np.moveaxis(value, idim, -1)
+        value = np.tensordot(value, ww.T, axes=(-1, 0))
+        value = np.moveaxis(value, -1, idim)
+    if index_out is not None:
+        value = value[tuple(index_out)]
+    if leaf is not None:
+        return leaf.clone(value=value)
+    base_coord = 'k' if mode == 'forward' else 's'
+    if multidim and index_out is None:
+        coords = [f'{base_coord}{idim:d}' for idim in range(len(xout_unraveled))]
+    else:
+        coords = [base_coord]
+    return ObservableLeaf(**dict(zip(coords, xout)), value=value, coords=coords)
+
 
 def observable_correlation_to_spectrum(correlation, k):
     """
@@ -117,37 +192,11 @@ def observable_correlation_to_spectrum(correlation, k):
     -------
     Particle2SpectrumPoles
     """
-    from .utils import BesselIntegral
-
-    def pole_to_spectrum(pole, **label):
-        leaf = None
-        if isinstance(k, ObservableLeaf):
-            leaf = k
-        elif isinstance(k, ObservableTree):
-            leaf = k.get(**label)
-        if leaf is not None:
-            kk = leaf.coords('k')
-        else:
-            kk = k
-        ell = label['ells']
-        integ = BesselIntegral(pole.coords('s'), kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
-        #num.append(integ(self._value[ill]))
-        # self.weights = volume factor
-        correlation = pole.value()
-        if 'volume' in pole.values():
-            volume = pole.values('volume')
-            correlation = jnp.where(volume == 0., 0., correlation)
-        else:
-            volume = 1.
-        value = integ(volume * correlation)
-        if leaf is not None:
-            return leaf.clone(value=value)
-        return ObservableLeaf(k=k, value=value, coords=['k'])
-
+    pole_to_spectrum = functools.partial(_pole_transform, k, mode='forward')
     if isinstance(correlation, ObservableTree):  # multipoles
         branches = []
         for label in correlation.labels():
-            branches.append(pole_to_spectrum(correlation.get(**label), **label))
+            branches.append(pole_to_spectrum(correlation.get(**label), label))
         return ObservableTree(branches, **correlation.labels(return_type='unflatten'))
     return pole_to_spectrum(correlation)
 
@@ -165,38 +214,11 @@ def observable_spectrum_to_correlation(spectrum, s):
     -------
     Particle2CorrelationPoles
     """
-    from .utils import BesselIntegral
-
-    def pole_to_correlation(pole, **label):
-        leaf = None
-        if isinstance(s, ObservableLeaf):
-            leaf = s
-        elif isinstance(s, ObservableTree):
-            leaf = s.get(**label)
-        if leaf is not None:
-            ss = leaf.coords('s')
-        else:
-            ss = s
-        ell = label['ells']
-        integ = BesselIntegral(pole.coords('k'), ss, ell=ell, method='rect', mode='backward', edges=False, volume=False)
-        #integ = BesselIntegral(pole.edges('k'), ss, ell=ell, method='trapz', mode='backward', edges=True, volume=False)
-        #num.append(integ(self._value[ill]))
-        # self.weights = volume factor
-        spectrum = pole.value()
-        if 'volume' in pole.values():
-            volume = pole.values('volume')
-            spectrum = jnp.where(volume == 0., 0., spectrum)
-        else:
-            volume = 1.
-        value = integ(volume * spectrum)
-        if leaf is not None:
-            return leaf.clone(value=value)
-        return ObservableLeaf(s=s, value=value, coords=['s'])
-
+    pole_to_correlation = functools.partial(_pole_transform, s, mode='backward')
     if isinstance(spectrum, ObservableTree):  # multipoles
         branches = []
         for label in spectrum.labels():
-            branches.append(pole_to_correlation(spectrum.get(**label), **label))
+            branches.append(pole_to_correlation(spectrum.get(**label), label))
         return ObservableTree(branches, **spectrum.labels(return_type='unflatten'))
     return pole_to_correlation(spectrum)
 
@@ -206,7 +228,10 @@ Mesh2SpectrumPoles.to_correlation = observable_spectrum_to_correlation
 
 
 class Particle2SpectrumPole(Mesh2SpectrumPole): pass
+
+
 class Particle2SpectrumPoles(Mesh2SpectrumPoles): pass
+
 
 class Particle2CorrelationPole(Mesh2CorrelationPole):
 
@@ -225,6 +250,7 @@ class Particle2CorrelationPole(Mesh2CorrelationPole):
         """
         return observable_correlation_to_spectrum(self, k)
 
+
 class Particle2CorrelationPoles(Mesh2CorrelationPoles):
 
     def to_spectrum(self, k):
@@ -239,5 +265,48 @@ class Particle2CorrelationPoles(Mesh2CorrelationPoles):
         Returns
         -------
         Particle2SpectrumPoles
+        """
+        return observable_correlation_to_spectrum(self, k)
+
+
+
+class Particle3SpectrumPole(Mesh3SpectrumPole): pass
+
+
+class Particle3SpectrumPoles(Mesh3SpectrumPoles): pass
+
+
+class Particle3CorrelationPole(Mesh3CorrelationPole):
+
+    def to_spectrum(self, k):
+        """
+        Convert the correlation function multipole to power spectrum multipole.
+
+        Parameters
+        ----------
+        k : array-like or Particle3SpectrumPoles
+            Wavenumber bin centers or :class:`Particle3SpectrumPoles` instance.
+
+        Returns
+        -------
+        Particle3SpectrumPole
+        """
+        return observable_correlation_to_spectrum(self, k)
+
+
+class Particle3CorrelationPoles(Mesh3CorrelationPoles):
+
+    def to_spectrum(self, k):
+        """
+        Convert the correlation function multipoles to power spectrum multipoles.
+
+        Parameters
+        ----------
+        k : array-like or Particle3SpectrumPoles
+            Wavenumber bin centers or :class:`Particle3SpectrumPoles` instance.
+
+        Returns
+        -------
+        Particle3SpectrumPoles
         """
         return observable_correlation_to_spectrum(self, k)

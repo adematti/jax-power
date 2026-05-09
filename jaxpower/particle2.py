@@ -1,17 +1,13 @@
-import os
 from functools import partial
 from dataclasses import dataclass
 
 import numpy as np
-import jax
 from jax import numpy as jnp
-from jax.experimental.shard_map import shard_map
-from jax.sharding import PartitionSpec as P
 
-from .mesh import MeshAttrs, staticarray, ParticleField, get_sharding_mesh, _make_input_tuple
+from .mesh import staticarray, ParticleField, _make_input_tuple
 from .mesh2 import FKPField, _format_ells, _format_meshes
-from .utils import get_legendre, get_spherical_jn, set_env, register_pytree_dataclass
-from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Mesh2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
+from .utils import get_legendre, register_pytree_dataclass
+from .types import Particle2SpectrumPole, Particle2SpectrumPoles, Particle2CorrelationPole, Particle2CorrelationPoles, ObservableLeaf, ObservableTree
 
 
 def _make_edges2(kind, mattrs, edges: staticarray | dict | None=None, xavg: staticarray | None=None, sattrs: dict | None=None, wattrs: dict | None=None, ells=0):
@@ -145,7 +141,7 @@ class BinParticle2CorrelationPoles(object):
         Selection criteria.
     wattrs : cucount.jax.WeightAttrs
         Weight attributes.
-    ells : ndarray
+    ells : tuple
         Multipole orders.
     """
     edges: staticarray = None
@@ -231,7 +227,7 @@ def compute_particle2(*particles: ParticleField, bin: BinParticle2SpectrumPoles 
     if isinstance(bin, BinParticle2CorrelationPoles):
         correlation = []
         for ill, ell in enumerate(ells):
-            correlation.append(Mesh2CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
+            correlation.append(Particle2CorrelationPole(s=bin.xavg, s_edges=bin.edges, num_raw=num[ill], norm=jnp.ones_like(num[ill]), ell=ell))
         return Particle2CorrelationPoles(correlation)
     else:  # 'complex'
         spectrum = []
