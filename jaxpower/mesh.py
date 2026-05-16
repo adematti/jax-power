@@ -3156,7 +3156,8 @@ def __format_meshes(*meshes, fields=None, nmeshes=None):
     return meshes, tuple(fields)
 
 
-def split_particles(*particles, seed=0, fields: tuple=None, return_masks=False):
+@default_sharding_mesh
+def split_particles(*particles, seed=0, fields: tuple=None, return_masks=False, sharding_mesh=None):
     """
     Split input particles for estimation of the normalization.
 
@@ -3193,7 +3194,6 @@ def split_particles(*particles, seed=0, fields: tuple=None, return_masks=False):
         toret = list(particles)
     for unique_field, seed in zip(unique_fields, seeds):
         field_indices = [ifield for ifield, field in enumerate(fields) if field == unique_field]
-        sharding_mesh = particles[field_indices[0]].attrs.sharding_mesh
         x = create_sharded_random(jax.random.uniform, _process_seed(seed), particles[field_indices[0]].size, out_specs=P(sharding_mesh.axis_names,))
         nsplits = len(field_indices)
         for isplit, field_index in enumerate(field_indices):
