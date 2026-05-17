@@ -656,7 +656,7 @@ def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
     return toret
 
 
-def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarray | int=4096, order=3):
+def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarray | int=4096, order=3, pad_coords: callable=None, pad_value: callable=None):
     """
     Extrapolate / resample the configuration-space window function.
 
@@ -675,6 +675,12 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
     order : int, optional
         Spline order (degree). Default is 3 (cubic). For 2D interpolation this
         is used for both dimensions (kx = ky = order).
+    pad_coords : callable, optional
+        A function that takes coords and label as input arguments and returns padded coordinates
+        (add 1 element at the first and last positions).
+    pad_value : callable, optional
+        A function that takes leaf value and label as input arguments and returns padded leaf value
+        (add 1 element at the first and last positions).
 
     Returns
     -------
@@ -696,16 +702,18 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
         else:
             return arg_coords
 
-    def pad_coords(coords):
-        if isinstance(coords, list):
-            return [pad_coords(coord) for coord in coords]
-        # Add 0 in front, last value at the end
-        return jnp.pad(coords, (1, 1), mode='constant', constant_values=(0. - (coords[1] - coords[0]), coords[-1] + (coords[-1] - coords[-2])))
+    if pad_coords is None:
+        def pad_coords(coords, label=None):
+            if isinstance(coords, list):
+                return [pad_coords(coord, label=label) for coord in coords]
+            # Add 0 in front, last value at the end
+            return jnp.pad(coords, (1, 1), mode='constant', constant_values=(max(coords[0] - (coords[1] - coords[0]), 0.), coords[-1] + (coords[-1] - coords[-2])))
 
-    def pad_value(value):
-        value = jnp.pad(value, ((0, 1),) * value.ndim, mode='constant', constant_values=0.)
-        value = jnp.pad(value, ((1, 0),) * value.ndim, mode='edge')
-        return value
+    if pad_value is None:
+        def pad_value(value, label=None):
+            value = jnp.pad(value, ((0, 1),) * value.ndim, mode='constant', constant_values=0.)
+            value = jnp.pad(value, ((1, 0),) * value.ndim, mode='edge')
+            return value
 
     def remove_nan(coords, value):
         masks = []
@@ -716,7 +724,7 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
         value = value[np.ix_(*masks)]
         return coords, value
 
-    def extrapolate_leaf(leaf, coords):
+    def extrapolate_leaf(leaf, label=None, coords=None):
         from scipy import interpolate
         old_coords = leaf.coords(center='mid_if_edges_and_nan')
         if not isinstance(coords, tuple):
@@ -725,8 +733,8 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
         if len(old_coords) == 1:
             old_x = list(old_coords.values())[0]
             new_x = get_new_coords(old_x, coords[0])
-            old_x = pad_coords(old_x)
-            old_value = pad_value(leaf.value())
+            old_x = pad_coords(old_x, label=label)
+            old_value = pad_value(leaf.value(), label=label)
             old_x, old_value = remove_nan([old_x], old_value)
             spline = interpolate.UnivariateSpline(old_x[0], old_value, k=order, s=0, ext=3, check_finite=False)
             new_value = spline(new_x)
@@ -734,8 +742,8 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
         elif len(old_coords) == 2:
             old_x = list(old_coords.values())
             new_x = get_new_coords(old_x, coords)
-            old_x = pad_coords(old_x)
-            old_value = pad_value(leaf.value())
+            old_x = pad_coords(old_x, label=label)
+            old_value = pad_value(leaf.value(), label=label)
             old_x, old_value = remove_nan(old_x, old_value)
             spline = interpolate.RectBivariateSpline(*old_x, old_value, kx=order, ky=order, s=0)
             new_value = spline(*new_x, grid=True)
@@ -745,7 +753,7 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
 
     if isinstance(window, ObservableLeaf):
         return extrapolate_leaf(window, coords=coords)
-    return window.map(lambda leaf: extrapolate_leaf(leaf, coords=coords))
+    return window.map(partial(extrapolate_leaf, coords=coords), input_label=True)
 
 
 def get_window_coeffs(ell, ellin):

@@ -1201,10 +1201,6 @@ if __name__ == '__main__':
     #config.update('jax_num_cpu_devices', 4)
     #config.update('jax_platform_name', 'cpu')
     #test_ref()
-
-    test_triumvirate_box_spectrum(plot=True)
-    exit()
-
     #test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
