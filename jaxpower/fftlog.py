@@ -295,23 +295,19 @@ class SpectrumToCorrelation(object):
     """
     def __init__(self, k, ell=0, q=0, complex=False, **kwargs):
         """
-        Initialize power to correlation transform.
+        Initialize spectrum to correlation transform.
 
         Parameters
         ----------
         k : array_like
             Input log-spaced wavenumbers.
             If 1D, is broadcast to the number of provided ``ell``.
-
         ell : int, list of int, default=0
             Poles. If a list is provided, will perform all transforms at once.
-
         q : float, list of floats, default=0
             Power-law tilt(s) to regularise integration.
-
         complex : bool, default=False
             ``False`` assumes the imaginary part of odd power spectrum poles is provided.
-
         kwargs : dict
             Arguments for :class:`FFTlog`.
         """
@@ -328,7 +324,7 @@ class SpectrumToCorrelation(object):
                 phase = (-1j)**ell
             else:
                 # Prefactor is (-i)^ell, but we take in the imaginary part of odd power spectra, hence:
-                # (-i)^ell = (-1)^(ell/2) if ell is even
+                # (-i)^ell = (-1)^(ell//2) if ell is even
                 # (-i)^ell i = (-1)^(ell//2) if ell is odd
                 phase = (-1)**(ell // 2)
             # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
@@ -428,23 +424,19 @@ class CorrelationToSpectrum(object):
     """
     def __init__(self, s, ell=0, q=0, complex=False, **kwargs):
         """
-        Initialize power to correlation transform.
+        Initialize spectrum to correlation transform.
 
         Parameters
         ----------
         s : array_like
             Input log-spaced separations.
             If 1D, is broadcast to the number of provided ``ell``.
-
         ell : int, list of int, default=0
             Poles. If a list is provided, will perform all transforms at once.
-
         q : float, list of floats, default=0
             Power-law tilt(s) to regularise integration.
-
         complex : bool, default=False
             ``False`` returns the real part of even poles, and the imaginary part of odd poles.
-
         kwargs : dict
             Arguments for :class:`FFTlog`.
         """
@@ -455,14 +447,14 @@ class CorrelationToSpectrum(object):
                 kernel = [SphericalBesselJKernel(ell_) for ell_ in ell]
             fftlog = FFTlog(k, kernel, q=1.5 + q, **kwargs)
             fftlog._padded_prefactor *= fftlog._padded_x**3 * (2 * np.pi)**1.5
-            # Convention is (-i)^ell/(2 pi^2)
+            # Convention is 4 \pi i^{\ell}
             ell = np.atleast_1d(ell)
             if complex:
-                phase = (-1j)**ell
+                phase = (1j)**ell
             else:
-                # Prefactor is (-i)^ell, but we take in the imaginary part of odd power spectra, hence:
-                # (-i)^ell = (-1)^(ell/2) if ell is even
-                # (-i)^ell i = (-1)^(ell//2) if ell is odd
+                # Prefactor is i^ell, but we take in the imaginary part of odd power spectra, hence:
+                # i^ell = (-1)^(ell//2) if ell is even
+                # i^ell = (-1)^(ell//2) i if ell is odd
                 phase = (-1)**(ell // 2)
             # Not in-place as phase (and hence padded_postfactor) may be complex instead of float
             fftlog._padded_postfactor *= phase[:, None]

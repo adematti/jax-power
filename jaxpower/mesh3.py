@@ -1335,7 +1335,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                                     _cproduct([edge[..., 1] for edge in grid_edgesin], swap=swap)[..., None]], axis=-1)
         edgesin, edgesin_swap = (_get_edgesin(grid_edgesin, swap=swap) for swap in [False, True])
         kin = _cproduct(grid_kin)
-        if 'soccimarro' in bin.basis:
+        if 'scoccimarro' in bin.basis:
             mask = (kin[:, 2] >= jnp.abs(kin[:, 0] - kin[:, 1])) & (kin[:, 2] <= jnp.abs(kin[:, 0] + kin[:, 1]))
             edgesin, kin = edgesin[mask], kin[mask]
 
