@@ -38,7 +38,7 @@ def test_spectrum2():
         plt.show()
 
     bias_params = {"a": {"b1": 2.0, "b2": 0.5, "bs": -0.3, "b3nl": 0.1, "X_FoG": 1.},
-                  "b": {"b1": 1.7, "b2": 0.2, "bs": -0.2, "b3nl": 0.05, "X_FoG": 1.}}
+                   "b": {"b1": 1.7, "b2": 0.2, "bs": -0.2, "b3nl": 0.05, "X_FoG": 1.}}
 
     if False:
         spectrum = spectrum2_real_tracer(k, pk_callable, bias_params=bias_params)
@@ -58,7 +58,7 @@ def test_spectrum2():
         plt.show()
 
     bias_params = {"a": {"b1": 2.0, "b2": 0.5, "bs": -0.3, "c1": 0.1, "c2": 0.2, 'X_FoG': 2., 'Bshot': 0.1, 'Pshot': 0.1},
-                "b": {"b1": 1.7, "b2": 0.2, "bs": -0.2, "c1": 0.05, "c2": 0.2, 'X_FoG': 2., 'Bshot': 0.1, 'Pshot': 0.1}}
+                   "b": {"b1": 1.7, "b2": 0.2, "bs": -0.2, "c1": 0.05, "c2": 0.2, 'X_FoG': 2., 'Bshot': 0.1, 'Pshot': 0.1}}
     to_Sell = ProjectToSell(ells=[(0, 0, 0), (2, 0, 2)])
     k1norm = k2norm = jnp.linspace(0.01, 0.2, 20)
     k1vec, k2vec = k1norm[:, None, None] * to_Sell.k1hat[None, ...], k2norm[:, None, None] * to_Sell.k2hat[None, ...]

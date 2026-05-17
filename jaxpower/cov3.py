@@ -52,7 +52,7 @@ def get_kvec5(k1norm, k2norm, k2pnorm, mu1, mu2, phi2, mu2p, phi2p):
            (k1vec, k2vec, k3vec, k2pvec, k3pvec)
 
 
-def compute_spectrum3_covariance(window2, observable, theory=None):
+def compute_spectrum3_covariance(window2, observable, theory=None, shotnoise: float=0.):
 
     if isinstance(window2, MeshAttrs):
         mattrs = window2
@@ -96,8 +96,110 @@ def compute_spectrum3_covariance(window2, observable, theory=None):
     def get_H(ell1, ell2, ell3):
         return wigner_3j(ell1, ell2, ell3, 0, 0, 0)
 
+    def get_shotnoise(a, b):
+        if callable(shotnoise):
+            return shotnoise(a, b)
+        if isinstance(shotnoise, dict):
+            return shotnoise.get((a, b), shotnoise.get((b, a), 0.))
+        return shotnoise if a == b else 0.
+
+    def get_zero(kvec):
+        return jnp.zeros_like(jnp.asarray(kvec)[..., 0])
+
+    def get_base(fields):
+        return theory(tuple(fields))
+
     def get_theory(fields):
-        return None if theory is None else theory(tuple(fields))
+        fields = tuple(fields)
+        ndim = len(fields)
+
+        # P^(N)_ab(k) = P_ab(k) + delta_ab / nbar
+        if ndim == 2:
+            a, b = fields
+            P = get_base(fields)
+            sn = get_shotnoise(a, b)
+
+            if P is None and sn == 0:
+                return None
+
+            def P_N(k):
+                out = get_zero(k)
+                if P is not None:
+                    out = out + P(k)
+                if sn != 0:
+                    out = out + sn
+                return out
+
+            return P_N
+
+        # B^(N)_abc(k1,k2,k3)
+        # Eq. (24): B(k1,k2,k3) + 1/nbar [P(k2) + P(k3)]
+        # generalized to fields: contractions of leg 1 with legs 2 and 3
+        if ndim == 3:
+            a, b, c = fields
+            B = get_base(fields)
+            sn_ab = get_shotnoise(a, b)
+            sn_ac = get_shotnoise(a, c)
+            P_ac = get_base((a, c))
+            P_ab = get_base((a, b))
+
+            if B is None and (sn_ab == 0 or P_ac is None) and (sn_ac == 0 or P_ab is None):
+                return None
+
+            def B_N(k1, k2, k3):
+                out = get_zero(k1)
+                if B is not None:
+                    out = out + B(k1, k2, k3)
+                if sn_ab != 0 and P_ac is not None:
+                    out = out + sn_ab * P_ac(k3)
+                if sn_ac != 0 and P_ab is not None:
+                    out = out + sn_ac * P_ab(k2)
+                return out
+
+            return B_N
+
+        # T^(N), Eq. (14), generalized to cross-field shot-noise
+        # Only contractions between the two estimator pairs are included.
+        if ndim == 4:
+            a, b, c, d = fields
+            T = get_base(fields)
+
+            pairs = [(0, 2, get_shotnoise(a, c)), (0, 3, get_shotnoise(a, d)),
+                     (1, 2, get_shotnoise(b, c)), (1, 3, get_shotnoise(b, d))]
+
+            def T_N(k1, k2, k3, k4):
+                ks = (k1, k2, k3, k4)
+                fs = (a, b, c, d)
+                out = get_zero(k1)
+
+                if T is not None:
+                    out = out + T(k1, k2, k3, k4)
+
+                for i, j, sn_ij in pairs:
+                    if sn_ij == 0:
+                        continue
+                    r, s = [m for m in range(4) if m not in (i, j)]
+                    Bij = get_base((fs[r], fs[s], fs[i]))
+                    if Bij is not None:
+                        out = out + sn_ij * Bij(ks[r], ks[s], -ks[r] - ks[s])
+
+                sn_ac = get_shotnoise(a, c)
+                sn_bd = get_shotnoise(b, d)
+                P_ac = get_base((a, c))
+                if sn_ac != 0 and sn_bd != 0 and P_ac is not None:
+                    out = out + sn_ac * sn_bd * P_ac(k1 + k3)
+
+                sn_ad = get_shotnoise(a, d)
+                sn_bc = get_shotnoise(b, c)
+                P_ad = get_base((a, d))
+                if sn_ad != 0 and sn_bc != 0 and P_ad is not None:
+                    out = out + sn_ad * sn_bc * P_ad(k1 + k4)
+
+                return out
+
+            return T_N
+
+        return get_base(fields)
 
     for i1, (label1, observable1) in enumerate(observable.items(level=None)):
         for i2, (label2, observable2) in enumerate(observable.items(level=None)):
@@ -111,9 +213,7 @@ def compute_spectrum3_covariance(window2, observable, theory=None):
             center = 'mid_if_edges_and_nan'
             coords, coordsp = [obs.coords('k', center=center).T for obs in [observable1, observable2]]
 
-            # ------------------------------------------------------------------
             # PP block
-            # ------------------------------------------------------------------
             if nfields1 == 2 and nfields2 == 2:
                 a, b = fields1
                 ap, bp = fields2
@@ -138,9 +238,7 @@ def compute_spectrum3_covariance(window2, observable, theory=None):
                 if T_abapbp is not None:
                     block = block + (2 * ell + 1) * (2 * ellp + 1) / volume * integ(T_abapbp(kvec, -kvec, kpvec, -kpvec) * leg(mu) * legp(mu)) / 2.
 
-            # ------------------------------------------------------------------
             # PB block
-            # ------------------------------------------------------------------
             elif nfields1 == 2 and nfields2 == 3:
                 a, b = fields1
                 c, d, e = fields2
@@ -166,9 +264,7 @@ def compute_spectrum3_covariance(window2, observable, theory=None):
 
                 block = pref * integ(term1 + term2 + term3 + term4 + term5 + term6)
 
-            # ------------------------------------------------------------------
             # BP block
-            # ------------------------------------------------------------------
             elif nfields1 == 3 and nfields2 == 2:
                 a, b, c = fields1
                 dp, ep = fields2
@@ -194,9 +290,7 @@ def compute_spectrum3_covariance(window2, observable, theory=None):
 
                 block = pref * integ(term1 + term2 + term3 + term4 + term5 + term6)
 
-            # ------------------------------------------------------------------
             # BB block
-            # ------------------------------------------------------------------
             elif nfields1 == 3 and nfields2 == 3:
 
                 a, b, c = fields1

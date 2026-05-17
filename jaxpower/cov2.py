@@ -319,7 +319,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
 
     Parameters
     ----------
-    window2 : Obser or MeshAttrs
+    window2 : ObservableTree or MeshAttrs
         Window matrices (WW, WS, SS).
         A :class:`MeshAttrs` instance can be directly provided instead, in case the selection function is trivial (constant).
     poles : ObservableTree or Mesh2SpectrumPoles

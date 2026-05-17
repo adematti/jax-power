@@ -1185,7 +1185,7 @@ def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory 
     # ellin = (ell_1', ell_2', L')
     coeffs = []
     #for ellw in itertools.product(*([range(max(ell) + max(ellin) + 1)] * 3)):
-    for ellw in itertools.product(*[range(ell_ + ellt_ + 1) for ell_, ellt_ in zip(ell, ellin)]):
+    for ellw in itertools.product(*[range(ell_ + ellin_ + 1) for ell_, ellin_ in zip(ell, ellin)]):
         if sum(ellw) % 2: continue
         if ellw[2] % 2: continue
         coeff = prod((2 * ell_ + 1) for ell_ in ell)
