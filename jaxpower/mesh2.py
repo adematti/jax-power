@@ -707,7 +707,7 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
             if isinstance(coords, list):
                 return [pad_coords(coord, label=label) for coord in coords]
             # Add 0 in front, last value at the end
-            return jnp.pad(coords, (1, 1), mode='constant', constant_values=(max(coords[0] - (coords[1] - coords[0]), 0.), coords[-1] + (coords[-1] - coords[-2])))
+            return jnp.pad(coords, (1, 1), mode='constant', constant_values=(coords[0] - (coords[1] - coords[0]), coords[-1] + (coords[-1] - coords[-2])))
 
     if pad_value is None:
         def pad_value(value, label=None):
