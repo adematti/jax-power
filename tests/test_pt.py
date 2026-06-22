@@ -1,13 +1,13 @@
 from matplotlib import pyplot as plt
 from jax import numpy as jnp
 
-from jaxpower.pt import ProjectToMultipoles, ProjectToSell, compute_spt_matter_1loop, prepare_spectrum2_redshift_tracer, spectrum2_redshift_tracer, spectrum3_redshift_tracer
+from jaxpower.pt import ProjectToPoles, ProjectToSell, compute_spt_matter_1loop, prepare_spectrum2_redshift_tracer, spectrum2_redshift_tracer, spectrum3_redshift_tracer
 
 
 def test_spectrum2():
 
     k = jnp.logspace(-2.5, -0.3, 80)
-    to_poles = ProjectToMultipoles(ells=(0, 2, 4))
+    to_poles = ProjectToPoles(ells=(0, 2, 4))
 
     def pk_callable(q):
         return jnp.where(q > 0.0, q * jnp.exp(-q / 0.25), 0.0)

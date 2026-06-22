@@ -1190,6 +1190,7 @@ def test_ref():
                 assert np.allclose(result[los, basis], ref[los, basis])
 
 
+
 if __name__ == '__main__':
 
     #import os
@@ -1204,6 +1205,7 @@ if __name__ == '__main__':
     #test_misc()
     #test_fftlog2(plot=True)
     #test_buffer()
+    test_misc()
     test_mesh3_spectrum()
     test_fkp3_shotnoise()
     test_polybin3d()

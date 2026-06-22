@@ -1,14 +1,12 @@
 import functools
 import operator
-import itertools
 from functools import partial
 
 import numpy as np
-from scipy import special
 import jax
 import jax.numpy as jnp
 
-from .utils import get_legendre, get_spherical_jn, wigner_3j
+from .utils import get_legendre, get_spherical_jn, wigner_3j, get_S
 
 
 prod = partial(functools.reduce, operator.mul)
@@ -613,37 +611,50 @@ def prepare_spectrum2_redshift_tracer(k, pk_callable, pknow_callable, kbao=1.0 /
     return table, table_now
 
 
-def spectrum2_redshift_tracer(mu, table, table_now, f, bias_params, **ct_params):
+def spectrum2_redshift_tracer(mu_or_kvec, table, table_now, f, bias_params, **ct_params):
+    """
+    Evaluate the redshift-space power spectrum.
 
-    interp_kmu = None
-    if mu.ndim == 2:  # kvec
+    Parameters
+    ----------
+    mu_or_kvec : array
+        1-D array of cos(theta) values *or* an array of shape ``(..., 3)``
+        containing 3-D wavevectors.  In the kvec case the function projects
+        P(k, mu) onto multipoles and reconstructs P(kvec) via Legendre
+        expansion, supporting arbitrary leading dimensions.
+    """
+    mu_or_kvec = jnp.asarray(mu_or_kvec)
+    is_kvec = mu_or_kvec.ndim >= 2 and mu_or_kvec.shape[-1] == 3
 
-        def _norm(kvec):
-            return jnp.sqrt(jnp.sum(kvec**2, axis=-1))
-
-        def _mu(kvec, knorm):
-            return jnp.where(knorm > 0., kvec[..., 2] / knorm, 0.)
-
-        kvec = mu
-        knorm = _norm(kvec)
-        mu = _mu(kvec, knorm)
-        interp_kmu = knorm, mu
+    if is_kvec:
+        kvec = mu_or_kvec
+        orig_shape = kvec.shape[:-1]
+        knorm = jnp.sqrt(jnp.sum(kvec**2, axis=-1))
+        mu_kvec = jnp.where(knorm > 0., kvec[..., 2] / knorm, 0.)
         ells = list(range(0, 8, 2))
-        to_poles = ProjectToMultipoles(mu=10, ells=ells)
+        to_poles = ProjectToPoles(mu=10, ells=ells)
+        mu = to_poles.mu  # evaluate EFT on integration nodes, not on kvec mu values
+    else:
+        mu = mu_or_kvec
 
     fields, bias_params = _format_bias_params(bias_params, nfields=2)
     a, b = fields
     pk_eft = spectrum2_redshift_tracer_eft(table['matter'], table['bias'], table['A_B'], table['sigma2v'], mu, f, bias_params, **ct_params)
     pknow_eft = spectrum2_redshift_tracer_eft(table_now['matter'], table_now['bias'], table_now['A_B'], table['sigma2v'], mu, f, bias_params, **ct_params)
     pk_ir = _spectrum2_ir_resum(table['matter']['k'], mu, table['matter']['P11'], table_now['matter']['P11'], pk_eft, pknow_eft, f, table['sigma2'], table['sigma2_delta'], bias_params[a]['b1'], bias_params[b]['b1'])
-    if interp_kmu is not None:
-        poles = to_poles(pk_ir)
-        poles = jax.vmap(lambda pole: jnp.interp(knorm, table['matter']['k'], pole))(poles.T)
-        pk_ir = sum(pole * get_legendre(ell)(mu) for ell, pole in zip(ells, poles))
+
+    if is_kvec:
+        k_table = table['matter']['k']
+        poles = to_poles(pk_ir)  # (n_ells, nk_table)
+        # vmap over ells; each pole has shape (nk_table,) -> interp to (N_flat,)
+        pole_at_k = jax.vmap(lambda pole: jnp.interp(knorm.ravel(), k_table, pole))(poles)  # (n_ells, N_flat)
+        pk_ir = sum(pole_at_k[i].reshape(orig_shape) * get_legendre(ell)(mu_kvec)
+                    for i, ell in enumerate(ells))
+
     return pk_ir
 
 
-class ProjectToMultipoles:
+class ProjectToPoles:
 
     """Helper class to compute multipoles using Legendre polynomials."""
 
@@ -651,58 +662,10 @@ class ProjectToMultipoles:
         self.ells = list(ells)
         integ = integration(a=0, b=1, size=mu)
         self.mu, w = integ.x(), integ.w
-        self.w = np.array([w * (2 * ell + 1) * get_legendre(ell)(self.mu) for ell in self.ells])
+        self.w = jnp.array([w * (2 * ell + 1) * get_legendre(ell)(self.mu) for ell in self.ells])
 
     def __call__(self, f):
         return jnp.sum(f * self.w[(slice(None),) + (None,) * (f.ndim - 1) + (slice(None),)], axis=-1)
-
-
-def get_S(ells, z3=False):
-
-    ell1, ell2, ell3 = ells
-    H = wigner_3j(ell1, ell2, ell3, 0, 0, 0)
-
-    if abs(H) < 1e-12:
-        return lambda *args: 0.
-
-    def get_Ylm(ell, m, xhat):
-        mu = xhat[..., 2]
-        phi = np.arctan2(xhat[..., 1], xhat[..., 0])
-        fac = special.factorial(ell - abs(m), exact=False) / special.factorial(ell + abs(m), exact=False)
-        amp = np.sqrt(fac)
-        return amp * special.lpmv(abs(m), ell, mu) * np.exp(1j * m * phi)
-
-    if z3:  # last vector is z, so m3 = 0
-        coeffs = []
-        mmax = min(ell1, ell2)
-        for m in range(-mmax, mmax + 1):
-            gaunt = wigner_3j(ell1, ell2, ell3, m, -m, 0) / H
-            if abs(gaunt) > 1e-12:
-                coeffs.append((m, gaunt))
-
-        def Sell(xhat1, xhat2):
-            out = 0.0
-            for m, gaunt in coeffs:
-                out += gaunt * get_Ylm(ell1, m, xhat1) * get_Ylm(ell2, -m, xhat2)
-            return out.real if ((ell1 + ell2 + ell3) % 2 == 0) else out.imag
-    else:
-        ms = [np.arange(-ell, ell + 1) for ell in ells]
-        coeffs = []
-        for m1, m2, m3 in itertools.product(*ms):
-            gaunt = wigner_3j(ell1, ell2, ell3, m1, m2, m3) / H
-            if abs(gaunt) > 1e-12:
-                coeffs.append((m1, m2, m3, gaunt))
-
-        def Sell(*xhats):
-            out = 0.
-            for m1, m2, m3, gaunt in coeffs:
-                out = out + gaunt * prod(
-                    get_Ylm(ell, m, xhat)
-                    for ell, m, xhat in zip(ells, (m1, m2, m3), xhats, strict=True)
-                )
-            return out.real if ((ell1 + ell2 + ell3) % 2 == 0) else out.imag
-
-    return Sell
 
 
 class ProjectToSell:
@@ -797,6 +760,13 @@ def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias
         denom = ki * kj
         return jnp.where(denom > 0., jnp.sum(kivec * kjvec, axis=-1) / denom, 0.)
 
+    def _safe_div(num, denom):
+        # Drops the contribution at denom == 0 -- e.g. ki == kj and xij ==
+        # -1 (anti-parallel, equal-magnitude legs) is a genuine, valid
+        # squeezed/folded configuration (ki+kj -> 0), not an error; avoids
+        # 0/0 -> NaN there, matching spectrum4_redshift_tracer's guard.
+        return jnp.where(denom > 0., num / jnp.where(denom > 0., denom, 1.), 0.)
+
     def _Z1(field, mu):
         b1 = _get_bias_params(field, 'b1')
         return b1 + f * mu**2
@@ -809,11 +779,11 @@ def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias
         b1, b2, bs = _get_bias_params(field, ['b1', 'b2', 'bs'])
         km = ki * mui + kj * muj
         term1 = b2 / 2. + bs / 2. * (xij**2 - 1. / 3.)
-        term2 = km / 2. * (mui / ki * f * (b1 + f * muj**2) + muj / kj * f * (b1 + f * mui**2))
-        F2 = 5. / 7. + xij / 2. * (ki / kj + kj / ki) + 2. / 7. * xij**2
-        G2 = 3. / 7. + xij / 2. * (ki / kj + kj / ki) + 4. / 7. * xij**2
+        term2 = km / 2. * (_safe_div(mui, ki) * f * (b1 + f * muj**2) + _safe_div(muj, kj) * f * (b1 + f * mui**2))
+        F2 = 5. / 7. + xij / 2. * (_safe_div(ki, kj) + _safe_div(kj, ki)) + 2. / 7. * xij**2
+        G2 = 3. / 7. + xij / 2. * (_safe_div(ki, kj) + _safe_div(kj, ki)) + 4. / 7. * xij**2
         term3 = b1 * F2
-        mu2 = km**2 / (ki**2 + kj**2 + 2. * ki * kj * xij)
+        mu2 = _safe_div(km**2, ki**2 + kj**2 + 2. * ki * kj * xij)
         term4 = f * mu2 * G2
         return term1 + term2 + term3 + term4
 
@@ -916,6 +886,13 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         denom = ki * kj
         return jnp.where(denom > 0., jnp.sum(kivec * kjvec, axis=-1) / denom, 0.)
 
+    def _safe_div(num, denom):
+        # Drops the contribution at denom == 0 -- e.g. the trispectrum's
+        # "snake" (2-2-1-1) term has a genuine squeezed/collinear pole when
+        # an internal momentum q = k_i + k_l vanishes (a real kinematic
+        # configuration, not a formula error); this avoids 0/0 -> NaN there.
+        return jnp.where(denom > 0., num / jnp.where(denom > 0., denom, 1.), 0.)
+
     def _Z1(field, mu):
         b1 = _get_bias_params(field, 'b1')
         return b1 + f * mu**2
@@ -925,16 +902,16 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         return _Z1(field, mu) - (c1 * mu**2 + c2 * mu**4) * k**2
 
     def _F2(ki, kj, xij):
-        return 5. / 7. + xij / 2. * (ki / kj + kj / ki) + 2. / 7. * xij**2
+        return 5. / 7. + xij / 2. * (_safe_div(ki, kj) + _safe_div(kj, ki)) + 2. / 7. * xij**2
 
     def _G2(ki, kj, xij):
-        return 3. / 7. + xij / 2. * (ki / kj + kj / ki) + 4. / 7. * xij**2
+        return 3. / 7. + xij / 2. * (_safe_div(ki, kj) + _safe_div(kj, ki)) + 4. / 7. * xij**2
 
     def _alpha(ki, kj, xij):
-        return 1. + (kj / ki) * xij
+        return 1. + _safe_div(kj, ki) * xij
 
     def _beta(ki, kj, xij):
-        return xij * (ki**2 + kj**2 + 2. * ki * kj * xij) / (2. * ki * kj)
+        return _safe_div(xij * (ki**2 + kj**2 + 2. * ki * kj * xij), 2. * ki * kj)
 
     def _F3_unsym(ki, kj, kk, xij, xik, xjk):
         q12sq = ki**2 + kj**2 + 2. * ki * kj * xij
@@ -959,7 +936,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         t4 = _F3_unsym(kj, kk, ki, xjk, xij, xik)
         t5 = _F3_unsym(kk, ki, kj, xik, xjk, xij)
         t6 = _F3_unsym(kk, kj, ki, xjk, xik, xij)
-        return t1 + t2 + t3 + t4 + t5 + t6
+        return (t1 + t2 + t3 + t4 + t5 + t6) / 6.
 
     def _G3(ki, kj, kk, xij, xik, xjk):
         t1 = _G3_unsym(ki, kj, kk, xij, xik, xjk)
@@ -968,15 +945,15 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         t4 = _G3_unsym(kj, kk, ki, xjk, xij, xik)
         t5 = _G3_unsym(kk, ki, kj, xik, xjk, xij)
         t6 = _G3_unsym(kk, kj, ki, xjk, xik, xij)
-        return t1 + t2 + t3 + t4 + t5 + t6
+        return (t1 + t2 + t3 + t4 + t5 + t6) / 6.
 
     def _Z2(field, ki, kj, xij, mui, muj):
         b1, b2, bs = _get_bias_params(field, ['b1', 'b2', 'bs'])
         km = ki * mui + kj * muj
         term1 = b2 / 2. + bs / 2. * (xij**2 - 1. / 3.)
-        term2 = km / 2. * (mui / ki * f * (b1 + f * muj**2) + muj / kj * f * (b1 + f * mui**2))
+        term2 = km / 2. * (_safe_div(mui, ki) * f * (b1 + f * muj**2) + _safe_div(muj, kj) * f * (b1 + f * mui**2))
         term3 = b1 * _F2(ki, kj, xij)
-        mu2 = km**2 / (ki**2 + kj**2 + 2. * ki * kj * xij)
+        mu2 = _safe_div(km**2, ki**2 + kj**2 + 2. * ki * kj * xij)
         term4 = f * mu2 * _G2(ki, kj, xij)
         return term1 + term2 + term3 + term4
 
@@ -1034,17 +1011,19 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
 
         pref = f * mu * k
 
-        t12 = pref * A2_12 * (mu3 / k3)
-        t23 = pref * A2_23 * (mu1 / k1)
-        t31 = pref * A2_31 * (mu2 / k2)
+        t12 = pref * A2_12 * _safe_div(mu3, k3)
+        t23 = pref * A2_23 * _safe_div(mu1, k1)
+        t31 = pref * A2_31 * _safe_div(mu2, k2)
 
-        u12 = pref * A1_1 * (mu23 / k23) * G2_23
-        u23 = pref * A1_2 * (mu31 / k31) * G2_31
-        u31 = pref * A1_3 * (mu12 / k12) * G2_12
+        # k12/k23/k31 are composite (sum-of-two-legs) momenta and can vanish
+        # at the genuine squeezed/folded configuration -- guard like q above.
+        u12 = pref * A1_1 * _safe_div(mu23, k23) * G2_23
+        u23 = pref * A1_2 * _safe_div(mu31, k31) * G2_31
+        u31 = pref * A1_3 * _safe_div(mu12, k12) * G2_12
 
-        v12 = 0.5 * pref**2 * A1_1 * (mu2 / k2) * (mu3 / k3)
-        v23 = 0.5 * pref**2 * A1_2 * (mu3 / k3) * (mu1 / k1)
-        v31 = 0.5 * pref**2 * A1_3 * (mu1 / k1) * (mu2 / k2)
+        v12 = 0.5 * pref**2 * A1_1 * _safe_div(mu2, k2) * _safe_div(mu3, k3)
+        v23 = 0.5 * pref**2 * A1_2 * _safe_div(mu3, k3) * _safe_div(mu1, k1)
+        v31 = 0.5 * pref**2 * A1_3 * _safe_div(mu1, k1) * _safe_div(mu2, k2)
 
         return b1 * F3 + f * mu**2 * G3 + t12 + t23 + t31 + u12 + u23 + u31 + v12 + v23 + v31
 
@@ -1111,6 +1090,63 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         _t3111_term(b, c, d, a, k2vec, k3vec, k4vec)
     )
 
+    # Dedicated covariance/parallelogram branch.  The generic permutation
+    # representation contains internal channels such as k1 + k2 = 0 when the
+    # requested configuration is T(k, -k, k', -k').  Evaluating those channels
+    # term-by-term creates spurious numerical 0/0 or large cancellations.  The
+    # reduced expression below keeps only the two physical exchanged momenta
+    # q_plus = k + k' and q_minus = k - k'.
+    para_tol = 1e-10
+    is_para = (_norm(k1vec + k2vec) < para_tol) & (_norm(k3vec + k4vec) < para_tol)
+
+    def _para_channel(rvec, fr, fmr):
+        # Channel q = k + r, with r either +k' or -k'.
+        r = _norm(rvec)
+        mur = _mu(rvec, r)
+        mrvec = -rvec
+
+        qvec = k1vec + rvec
+        q = _norm(qvec)
+        muq = _mu(qvec, q)
+
+        Pk = _IR_pk(k1, mu1)
+        Pr = _IR_pk(r, mur)
+        Pq = _IR_pk(q, muq)
+
+        Z1_k = _Z1eff(a, k1, mu1)
+        Z1_mk = _Z1eff(b, k2, mu2)
+        Z1_r = _Z1eff(fr, r, mur)
+        Z1_mr = _Z1eff(fmr, r, -mur)
+
+        x_mk_q = _xcos(-k1vec, qvec, k1, q)
+        x_mr_q = _xcos(mrvec, qvec, r, q)
+
+        # Z2 arguments correspond to Z2(-k, q) and Z2(-r, q).
+        Z2_k = _Z2(a, k1, q, x_mk_q, -mu1, muq)
+        Z2_r = _Z2(fr, r, q, x_mr_q, -mur, muq)
+
+        # Parallelogram/reduced snake terms. For identical fields this reduces
+        # to the usual compact expression; for cross fields this keeps the
+        # external Z1 factors attached to their legs.
+        t2211 = (
+            8. * Z1_k * Z1_mk * Z2_k**2 * Pk**2 * Pq
+            + 8. * Z1_r * Z1_mr * Z2_r**2 * Pr**2 * Pq
+            + 16. * Z1_k * Z1_r * Z2_k * Z2_r * Pk * Pr * Pq
+        )
+
+        # Star terms with one third-order kernel on either hard pair.
+        Z3_kkr = _Z3(a, k1vec, -k1vec, rvec)
+        Z3_rrk = _Z3(fr, rvec, -rvec, k1vec)
+        t3111 = 12. * (
+            Z1_k * Z1_mk * Z1_r * Z3_kkr * Pk**2 * Pr
+            + Z1_r * Z1_mr * Z1_k * Z3_rrk * Pr**2 * Pk
+        )
+        return t2211 + t3111
+
+    # Both physical diagonals: q = k + k' and q = k - k'.
+    t_para = _para_channel(k3vec, c, d) + _para_channel(k4vec, d, c)
+    trispec_tree = jnp.where(is_para, t_para, 4. * t2211 + 6. * t3111)
+
     X1, X2, X3, X4 = [_get_bias_params(field, 'X_FoG') for field in fields]
     W = fog_damping((k1 * mu1, X1), (k2 * mu2, X2), (k3 * mu3, X3), (k4 * mu4, X4), f=f, sigma2v=sigma2v, damping=damping)
 
@@ -1127,4 +1163,4 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     shot = 0.25 * (leg1 * leg2 + leg1 * leg3 + leg1 * leg4 + leg2 * leg3 + leg2 * leg4 + leg3 * leg4)\
     + 0.5 * (leg1 * Pshot1 + leg2 * Pshot2 + leg3 * Pshot3 + leg4 * Pshot4) + shot
 
-    return W * (4. * t2211 + 6. * t3111) + shot
+    return W * trispec_tree + shot

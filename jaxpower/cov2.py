@@ -6,7 +6,7 @@ from jax import numpy as jnp
 
 from .mesh import MeshAttrs, RealMeshField, split_particles, compute_normalization
 from .mesh2 import BinMesh2SpectrumPoles, BinMesh2CorrelationPoles, compute_mesh2, FKPField, prod
-from .types import CovarianceMatrix, Mesh2SpectrumPoles, ObservableTree
+from .types import CovarianceMatrix, ObservableTree
 from .utils import legendre_product, get_spherical_jn
 
 
@@ -89,6 +89,8 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
     WW : dict
         Dictionary of window matrices for pairs of fields.
     WS : dict
+        Dictionary of window matrices for field-shotnoise cross terms.
+    SW : dict
         Dictionary of window matrices for field-shotnoise cross terms.
     SS : dict
         Dictionary of window matrices for shotnoise terms.
@@ -234,8 +236,53 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
 def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, ell2,
                                               fields=None, cache=None,
                                               method='fftlog', delta=None):
+    r"""
+    Return one :math:`(k_1, k_2)` covariance-window block.
+
+    This helper projects a configuration-space covariance window multipole pair
+    onto the two Fourier-space multipoles ``ell1`` and ``ell2``.  The input
+    window can either already be the requested field block, or an
+    ``ObservableTree`` from which a field block is selected with ``fields``.
+
+    Parameters
+    ----------
+    window2 : ObservableTree or tuple of ObservableTree
+        Covariance-window multipoles.  If a tuple is provided, the two windows
+        are symmetrized after selecting ``fields`` and ``fields[2:] + fields[:2]``.
+    k1edges, k2edges : array
+        Output :math:`k` bins.  They can be either conventional 1D bin edges
+        with size ``nbin + 1``, or explicit per-bin edges with shape
+        ``(nbin, 2)``.  For non-FFTLog integration, bin centers are inferred
+        from these edges.
+    ell1, ell2 : int
+        Fourier-space multipoles of the requested block.
+    fields : tuple, optional
+        Four field labels selecting the window block.  Field pairs are sorted
+        internally, consistently with the covariance symmetries.
+    cache : dict or list, optional
+        Cache passed to :func:`matrix_rebin`, useful when many blocks share the
+        same input and output grids.
+    method : {'fftlog', 'bessel'}, optional
+        Projection method.  ``'fftlog'`` uses :class:`Correlation2Spectrum` and
+        rebins the resulting grid.  Any other value uses direct spherical
+        Bessel summation at the output bin centers.
+    delta : float, optional
+        For direct Bessel summation, only compute entries with
+        :math:`|k_2 - k_1| <= delta`; all other entries are left to zero.
+
+    Returns
+    -------
+    wij : array
+        Window block with shape ``(n_k1, n_k2)``.
+    """
     if cache is None:
         cache = {}
+
+    def _bin_centers(edges):
+        edges = np.asarray(edges)
+        if edges.ndim == 1:
+            return 0.5 * (edges[:-1] + edges[1:])
+        return np.mean(edges, axis=-1)
 
     def get_window_field(window, fields):
         if isinstance(window, tuple):  # symmetrize
@@ -255,7 +302,9 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
 
     def get_wij(ww, q1, q2):
 
-        shape = k1edges.shape[:1] + k2edges.shape[:1]
+        k1 = _bin_centers(k1edges)
+        k2 = _bin_centers(k2edges)
+        shape = k1.shape + k2.shape
         w = sum(legendre_product(q1, q2, q) *  ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
         if w.size <= 1:
             return np.zeros(shape)
@@ -282,9 +331,6 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
             return toret
 
         else:
-
-            k1 = np.mean(k1edges, axis=-1) if k1edges.ndim == 2 else k1edges
-            k2 = np.mean(k2edges, axis=-1) if k2edges.ndim == 2 else k2edges
 
             k1, k2 = np.meshgrid(k1, k2, indexing='ij', sparse=False)
             k1, k2 = k1.ravel(), k2.ravel()
@@ -455,71 +501,6 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
             edges[-1] = x[-1] + 0.5 * (x[-1] - x[-2])
             return edges
 
-        def get_wj(ww, k1, k2, k1edges, k2edges, q1, q2):
-            shape = k1.shape + k2.shape
-            w = sum(legendre_product(q1, q2, q) *  ww.get(q).value().real if q in ww.ells else jnp.zeros(()) for q in list(range(abs(q1 - q2), q1 + q2 + 1)))
-            if w.size <= 1:
-                return np.zeros(shape)
-            tmpw = next(iter(ww))
-            s = tmpw.coords('s')
-
-            def rebin2d(xedges, yedges, xp, yp, fp, cache=cache_rebin):
-                """Rebin fp sampled on (xp, yp) to bins centered on (x, y)."""
-                interp_order = 3
-                Mx = matrix_rebin(xedges, xp, wt=xp**2, interp_order=interp_order, cache=cache)
-                My = matrix_rebin(yedges, yp, wt=yp**2, interp_order=interp_order, cache=cache)
-                return Mx @ fp @ My.T
-
-            if 'fftlog' in flags:
-                s = tmpw.coords('s')
-                fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
-                tmp = fftlog(w)[1]
-                #from scipy.interpolate import RectBivariateSpline
-                #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
-                #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
-                toret = rebin2d(k1edges, k2edges, fftlog.k, fftlog.k, tmp)
-                #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
-                #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
-                return toret
-
-            else:
-                k1, k2 = np.meshgrid(k1, k2, indexing='ij', sparse=False)
-                k1, k2 = k1.ravel(), k2.ravel()
-                kmask = Ellipsis
-                if delta is not None:
-                    kmask = np.abs(k2 - k1) <= delta
-                    k1, k2 = k1[kmask], k2[kmask]
-
-                if 'volume' in tmpw.values():
-                    vol = tmpw.values('volume')
-                    #vol = 4. / 3. * np.pi * np.diff(tmpw.edges('s')**3, axis=-1)[..., 0]
-                    #print(vol / vol2)
-                    w, s = np.where(vol == 0, 1, w), np.where(vol == 0, 0, s)
-                    w *= vol
-
-                def f(k12):
-                    k1, k2 = k12
-                    return jnp.sum(w * get_spherical_jn(q1)(k1 * s) * get_spherical_jn(q2)(k2 * s))
-
-                batch_size = int(min(max(1e7 / (k1.size * s.size), 1), k1.size))
-                tmp = jax.lax.map(f, (k1, k2), batch_size=batch_size)
-                toret = np.zeros(shape)
-                toret.flat[kmask] = tmp
-                return toret
-
-        def get_window_field(window, fields):
-            if isinstance(window, tuple):  # symmetrize
-                w1 = get_window_field(window[0], fields)
-                w2 = get_window_field(window[1], fields[2:] + fields[:2])
-                return w1.clone(value=(w1.value() + w2.value()) / 2.)
-            def sort(field):
-                return tuple(sorted(field[:2])) + tuple(sorted(field[2:]))
-            wfields = [sort(field) for field in window.fields]
-            fields = sort(fields)
-            if fields in wfields:
-                return window.get(window.fields[wfields.index(fields)])
-            raise ValueError(f'{fields} not found in {window}')
-
         cov_WW, cov_WS, cov_SS = {}, {}, {}
         symmetrize = True
 
@@ -567,8 +548,9 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                             if (q1, q2) in cache_WW:
                                 wj = cache_WW[q1, q2]
                             else:
-                                wj = get_window_field((WW, WW) if symmetrize else WW, window_fields)
-                                wj = get_wj(wj, k1, k2, k1edges, k2edges, q1, q2)
+                                wj = compute_spectrum2_covariance_window_block(
+                                    (WW, WW) if symmetrize else WW, k1edges, k2edges, q1, q2,
+                                    fields=window_fields, cache=cache_rebin, method='fftlog' if 'fftlog' in flags else 'bessel', delta=delta)
                                 cache_WW[q1, q2] = wj
                             if swap:
                                 pk12 = pole1.get(p1).value()[:, None] * pole2.get(p2).value() * wj
@@ -595,11 +577,13 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                             else:
                                 wj1 = wj2 = np.zeros((k1.size, k2.size))
                                 if window_fields[3] == window_fields[2]:
-                                    wj1 = get_window_field((WS, SW) if symmetrize else WS, window_fields)
-                                    wj1 = get_wj(wj1, k1, k2, k1edges, k2edges, q1, ell2)
+                                    wj1 = compute_spectrum2_covariance_window_block(
+                                        (WS, SW) if symmetrize else WS, k1edges, k2edges, q1, ell2,
+                                        fields=window_fields, cache=cache_rebin, method='fftlog' if 'fftlog' in flags else 'bessel', delta=delta)
                                 if window_fields[1] == window_fields[0]:
-                                    wj2 = get_window_field((SW, WS) if symmetrize else SW, window_fields)
-                                    wj2 = get_wj(wj2, k1, k2, k1edges, k2edges, q1, ell2)
+                                    wj2 = compute_spectrum2_covariance_window_block(
+                                        (SW, WS) if symmetrize else SW, k1edges, k2edges, q1, ell2,
+                                        fields=window_fields, cache=cache_rebin, method='fftlog' if 'fftlog' in flags else 'bessel', delta=delta)
                                 cache_WS1[q1, ell2] = wj = (wj1, wj2)
                             if swap:
                                 # P^ad, P^bc in k
@@ -625,11 +609,13 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                             else:
                                 wj1 = wj2 = np.zeros((k1.size, k2.size))
                                 if window_fields[3] == window_fields[2]:
-                                    wj1 = get_window_field((WS, SW) if symmetrize else WS, window_fields)
-                                    wj1 = get_wj(wj1, k1, k2, k1edges, k2edges, ell1, q2)
+                                    wj1 = compute_spectrum2_covariance_window_block(
+                                        (WS, SW) if symmetrize else WS, k1edges, k2edges, ell1, q2,
+                                        fields=window_fields, cache=cache_rebin, method='fftlog' if 'fftlog' in flags else 'bessel', delta=delta)
                                 if window_fields[1] == window_fields[0]:
-                                    wj2 = get_window_field((SW, WS) if symmetrize else SW, window_fields)
-                                    wj2 = get_wj(wj2, k1, k2, k1edges, k2edges, ell1, q2)
+                                    wj2 = compute_spectrum2_covariance_window_block(
+                                        (SW, WS) if symmetrize else SW, k1edges, k2edges, ell1, q2,
+                                        fields=window_fields, cache=cache_rebin, method='fftlog' if 'fftlog' in flags else 'bessel', delta=delta)
                                 cache_WS2[ell1, q2] = wj = (wj1, wj2)
                             if swap:
                                 # P^ad, P^bc in k'
@@ -650,8 +636,10 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
                     else:
                         coeff *= (-1)**((ell1 - ell2) // 2)
                     wj = np.zeros((k1.size, k2.size))
-                    if window_fields[0] == window_fields[1] == window_fields[2] == window_fields[3]:
-                        wj = get_wj(get_window_field(SS, window_fields), k1, k2, k1edges, k2edges, ell1, ell2)
+                    if window_fields[0] == window_fields[1] and window_fields[2] == window_fields[3]:
+                        wj = compute_spectrum2_covariance_window_block(
+                            SS, k1edges, k2edges, ell1, ell2, fields=window_fields,
+                            cache=cache_rebin, method='fftlog' if 'fftlog' in flags else 'bessel', delta=delta)
                     cov_SS[field][ill1][ill2] += coeff * wj
         if has_shotnoise:
             covs = tuple(map(finalize, (cov_WW, cov_WS, cov_SS)))

@@ -486,7 +486,7 @@ class BesselIntegral(object):
         if mode == 'forward':
             norm = (-1)**(ell // 2)
         else:
-            norm = (-1)**((ell + 1) // 2) / (2 * np.pi)**3
+            norm = (-1)**(ell // 2) / (2 * np.pi)**3
         if method == 'rect':
             x = xeval[..., None] * xp
             self.w = norm * get_spherical_jn(ell)(x)
@@ -648,6 +648,77 @@ def legendre_product(*ells):
     if len(ells) == 3:
         return _legendre_product3.get(ells, 0.)
     raise NotImplementedError('product of 3-legendre polynomials only is implemented')
+
+
+def get_S(ells, z3=False):
+    r"""
+    Return a function computing the Gaunt-coefficient-weighted triple
+    spherical-harmonic coupling basis :math:`S_{\ell_1\ell_2\ell_3}(\hat x_1, \hat x_2, \hat x_3)`,
+    built from the JAX-traceable spherical harmonics in :func:`get_Ylm`.
+
+    Parameters
+    ----------
+    ells : tuple
+        (ell1, ell2, ell3).
+    z3 : bool, default=False
+        If True, the returned function takes only two unit vectors
+        (``xhat1``, ``xhat2``); the third leg is implicitly aligned with the
+        line of sight (i.e. its harmonic order is fixed to ``m3 = 0``).
+
+    Returns
+    -------
+    Sell : callable
+    """
+    ell1, ell2, ell3 = ells
+    H = wigner_3j(ell1, ell2, ell3, 0, 0, 0)
+
+    if abs(H) < 1e-12:
+        return lambda *args: 0.
+
+    def _Ylm(ell, m, xhat):
+        # get_Ylm's non-real convention carries an extra (-1)**m for m < 0 only
+        # (none for m >= 0) relative to the plain amp * lpmv(|m|, ell, mu) *
+        # exp(i m phi) used to derive the Gaunt coefficients below; compensate
+        # so Sell is unchanged.
+        sign = (-1) ** m if m < 0 else 1
+        out = sign * get_Ylm(ell, m, reduced=True)(xhat[..., 0], xhat[..., 1], xhat[..., 2])
+        # For e.g. ell = m = 0, get_Ylm's (lambdified) expression does not
+        # depend on xhat at all, so it returns a bare scalar that doesn't
+        # carry xhat's shape; broadcast explicitly.
+        return jnp.broadcast_to(out, jnp.shape(xhat)[:-1])
+
+    if z3:  # last vector is z, so m3 = 0
+        coeffs = []
+        mmax = min(ell1, ell2)
+        for m in range(-mmax, mmax + 1):
+            gaunt = wigner_3j(ell1, ell2, ell3, m, -m, 0) / H
+            if abs(gaunt) > 1e-12:
+                coeffs.append((m, gaunt))
+
+        def Sell(xhat1, xhat2):
+            out = 0.0
+            for m, gaunt in coeffs:
+                out = out + gaunt * _Ylm(ell1, m, xhat1) * _Ylm(ell2, -m, xhat2)
+            return out.real if ((ell1 + ell2 + ell3) % 2 == 0) else out.imag
+
+    else:
+        ms = [range(-ell, ell + 1) for ell in ells]
+        coeffs = []
+        for m1, m2, m3 in itertools.product(*ms):
+            gaunt = wigner_3j(ell1, ell2, ell3, m1, m2, m3) / H
+            if abs(gaunt) > 1e-12:
+                coeffs.append((m1, m2, m3, gaunt))
+
+        def Sell(*xhats):
+            out = 0.
+            for m1, m2, m3, gaunt in coeffs:
+                term = gaunt
+                for ell, m, xhat in zip(ells, (m1, m2, m3), xhats, strict=True):
+                    term = term * _Ylm(ell, m, xhat)
+                out = out + term
+            return out.real if ((ell1 + ell2 + ell3) % 2 == 0) else out.imag
+
+    return Sell
 
 
 def register_pytree_dataclass(cls, meta_fields=None):
