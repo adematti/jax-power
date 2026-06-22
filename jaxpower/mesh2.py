@@ -707,7 +707,7 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
             if isinstance(coords, list):
                 return [pad_coords(coord, label=label) for coord in coords]
             # Add 0 in front, last value at the end
-            return jnp.pad(coords, (1, 1), mode='constant', constant_values=(max(coords[0] - (coords[1] - coords[0]), 0.), coords[-1] + (coords[-1] - coords[-2])))
+            return jnp.pad(coords, (1, 1), mode='constant', constant_values=(coords[0] - (coords[1] - coords[0]), coords[-1] + (coords[-1] - coords[-2])))
 
     if pad_value is None:
         def pad_value(value, label=None):
@@ -800,7 +800,7 @@ def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
 
 
 
-def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('rect',)) -> WindowMatrix:
+def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('rect',), batch_size=None) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) power spectrum window matrix.
 
@@ -814,6 +814,8 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         Input multipole orders. Optional when ``edgesin`` is provided.
     bin : BinMesh2SpectrumPoles
         Output binning.
+    batch_size : int, optional
+        Size of the batch for each step to execute in parallel.
 
     Returns
     -------
@@ -874,7 +876,6 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                     #spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
                     return spectrum#.ravel()
 
-                batch_size = int(min(max(1e7 / (kout.size * savg.size), 1), edgesin.shape[0]))
                 tmp = jax.lax.map(f, xs=edgesin, batch_size=batch_size).T
             else:
                 # fftlog
@@ -890,7 +891,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                     correlation = correlation * Qs * to_correlation.s**wain
                     return jnp.interp(kout, to_spectrum.k, to_spectrum(correlation)[1], left=0., right=0.)
 
-                tmp = jax.lax.map(convolve, jnp.arange(edgesin.shape[0])).T
+                tmp = jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
             wmat_tmp[ellin, wain].append(tmp)
         wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
