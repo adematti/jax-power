@@ -1670,11 +1670,124 @@ def _project_window_laguerre(s1, s2, value, ell1=0, ell2=0, sigma=None, nmax=8, 
     return c.reshape(nmax, nmax), float(sigma), float(np.linalg.norm(fit - value) / max(np.linalg.norm(value), 1e-300))
 
 
+def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_ordered=None,
+                                          fix_legs=None, atol=1e-9):
+    r"""
+    Matrix :math:`S` scattering an ORDERED theory vector onto the UNORDERED
+    :math:`(k_1', k_2', k_3')` grid that :func:`compute_smooth3_spectrum_window` integrates
+    over: ``theory_unordered = S @ theory_ordered``.
+
+    The estimator bins ORDERED triangles :math:`k_1' \leq k_2' \leq k_3'`, but the window
+    convolution runs over all of :math:`k'`-space, so the matrix must be given the unordered
+    grid (pass ``edgesin`` as raw per-axis edges and it builds one). Filling that grid requires
+    knowing :math:`B_{L'}` at each ordering, which is a THEORY-side question and is only a
+    relabelling when the multipole is invariant under the permutation -- hence this is a helper
+    the caller opts into, not something the window matrix assumes.
+
+    Validity, per multipole:
+
+    - ``fix_legs=(2,)``: exact for EVERY :math:`L'`. The scoccimarro :math:`B_{L'}` is referred
+      to :math:`\hat{k}_3 \cdot \hat{z}` (the estimator applies the output Legendre to the
+      third leg), and swapping :math:`k_1 \leftrightarrow k_2` leaves that leg alone, so
+      :math:`B_{L'}(k_1,k_2,k_3) = B_{L'}(k_2,k_1,k_3)` identically.
+    - ``fix_legs=None`` (all permutations): exact for :math:`L' = 0` only, since :math:`B_0` is
+      an orientation average of a rigid triangle and therefore symmetric. For :math:`L' > 0`
+      a reordering moves the line-of-sight reference to a different leg, mixing :math:`L` and
+      involving the second angular coordinate this basis drops -- so it is NOT a relabelling,
+      and the theory must supply those entries itself.
+
+    Rows with no admissible permutation are left ZERO, i.e. that part of :math:`k'`-space
+    contributes nothing; the box-limit sum rule then falls short by the corresponding weight,
+    which is the honest signal that the theory is incomplete there.
+
+    Either grid may be left out and is then inferred from the other:
+
+    - ``kin_ordered=None``: taken as the distinct sorted triples occurring in ``kin``, in order
+      of first appearance.
+    - ``kin=None``: built as every distinct permutation of ``kin_ordered``. Note this ignores
+      ``fix_legs`` on purpose -- the grid is a property of :math:`k'`-space, not of any one
+      multipole's symmetry, so a single grid (hence a single window matrix) serves every
+      :math:`L'`, each with its own ``fix_legs`` and therefore its own :math:`S`.
+
+    Parameters
+    ----------
+    kin : array_like, optional
+        ``(n_unordered, 3)`` representative :math:`(k_1', k_2', k_3')` of the grid the window
+        matrix is built on (``wmatrix.theory.get(...).coords('k')``). Inferred from
+        ``kin_ordered`` when absent.
+    kin_ordered : array_like, optional
+        ``(n_ordered, 3)`` representative triangles of the ordered theory vector. Inferred from
+        ``kin`` when absent.
+    edges_ordered : array_like, optional
+        ``(n_ordered, 3, 2)`` bin edges of the ordered vector. Permuted alongside a ``kin``
+        built here and returned, so the caller can construct ``edgesin`` without redoing the
+        permutation enumeration.
+    fix_legs : tuple, optional
+        Leg positions the permutation must leave in place, e.g. ``(2,)`` to keep the third leg
+        third. ``None`` allows every permutation.
+    atol : float, default=1e-9
+        Tolerance for matching a sorted triple to a row of ``kin_ordered``.
+
+    Returns
+    -------
+    S : np.ndarray
+        ``(n_unordered, n_ordered)``, entries 0 or 1.
+    kin : np.ndarray
+        The unordered grid, as passed or as built.
+    kin_ordered : np.ndarray
+        The ordered grid, as passed or as inferred. Returned so the column order of ``S`` is
+        never in doubt.
+    edges : np.ndarray or None
+        ``(n_unordered, 3, 2)`` permuted edges, when ``edges_ordered`` was given and ``kin`` was
+        built here; ``None`` otherwise.
+    """
+    if kin is None and kin_ordered is None:
+        raise ValueError('provide at least one of kin, kin_ordered')
+    rnd = lambda t: tuple(np.round(np.asarray(t).ravel(), 12))
+    edges = None
+    if kin_ordered is None:
+        kin = np.asarray(kin, dtype='f8')
+        seen, rows = set(), []
+        for t in kin:
+            key = rnd(np.sort(t))
+            if key in seen: continue
+            seen.add(key); rows.append(np.sort(t))
+        kin_ordered = np.array(rows)
+    elif kin is None:
+        kin_ordered = np.asarray(kin_ordered, dtype='f8')
+        eo = None if edges_ordered is None else np.asarray(edges_ordered, dtype='f8')
+        seen, rows, erows = set(), [], []
+        for j, t in enumerate(kin_ordered):
+            for pm in itertools.permutations(range(3)):
+                pl = list(pm)
+                # dedupe on the BOX when edges are known (degenerate legs give identical boxes),
+                # else on the triple
+                key = rnd(eo[j][pl]) if eo is not None else rnd(t[pl])
+                if key in seen: continue
+                seen.add(key); rows.append(t[pl])
+                if eo is not None: erows.append(eo[j][pl])
+        kin = np.array(rows)
+        if eo is not None: edges = np.array(erows)
+    kin, kin_ordered = np.asarray(kin, dtype='f8'), np.asarray(kin_ordered, dtype='f8')
+    fix = () if fix_legs is None else tuple(int(l) for l in np.atleast_1d(fix_legs))
+    lookup = {}
+    for j, t in enumerate(kin_ordered):
+        lookup.setdefault(rnd(np.sort(t)), j)
+    S = np.zeros((len(kin), len(kin_ordered)))
+    for i, t in enumerate(kin):
+        ts = np.sort(t)
+        # admissible only if sorting leaves every fixed leg where it already is
+        if any(abs(t[l] - ts[l]) > atol for l in fix): continue
+        j = lookup.get(rnd(ts))
+        if j is not None: S[i, j] = 1.
+    return S, kin, kin_ordered, edges
+
+
+
 def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None,
                                     flags: tuple=None, batch_size: int=None, ellmax: int=4,
                                     ninsub: int=1, noutsub: int=1, interp: str='tophat',
-                                    exact_box_limit: bool | float=False, permute_in: bool=True,
-                                    permute_lgt0: str='slot3') -> WindowMatrix:
+                                    exact_box_limit: bool | float=False) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 
@@ -1699,52 +1812,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         squeezed configurations.
     batch_size : int, optional
         Size of the batch for each step to execute in parallel.
-    permute_in : bool, default=True
-        For the scoccimarro basis: sum each theory bin's contribution over all distinct
-        permutations of its :math:`(k_1', k_2', k_3')` box.
-
-        The estimator bins ORDERED triangles :math:`k_1' \\le k_2' \\le k_3'`, so ``edgesin``
-        typically covers only the ordered octant -- but the convolution integral runs over
-        all of :math:`k'`-space. Summing the ordered octant alone drops every configuration
-        that leaves it under window smearing, which breaks the box-limit sum rule
-        :math:`\\sum_j W_{ij} = Q_\\infty` by an amount set by triangle SHAPE rather than
-        scale.
-
-        This is not a multiplicity factor: the kernel is not symmetric under permuting
-        :math:`k'` at fixed :math:`k`, so each assignment carries its own kernel and is
-        integrated separately. It accumulates into the SORTED bin's column, which is exact
-        because :math:`B` is symmetric. Permutations that reproduce a box already present in
-        ``edgesin`` are skipped, so a caller passing a full (unordered) product grid is
-        unaffected and nothing is double-counted.
-
-        For :math:`L' > 0` the theory substitution is only valid for the permutations selected
-        by ``permute_lgt0`` (default ``'slot3'``); see there.
-
-        Set ``False`` to recover the pre-fix behaviour (regression comparisons only).
-    permute_lgt0 : str, default='slot3'
-        Which permutations to use for the :math:`L' > 0` theory blocks (the :math:`L' = 0`
-        block always uses all of them, where the substitution is exact).
-
-        The estimator applies the output Legendre to the THIRD leg (``meshes[2]``) and the
-        binning mask orders the bins, so :math:`B_{L'}` at an ordered bin is the multipole
-        referred to the leg in slot 3, i.e. the LONGEST leg. A permuted box puts a different
-        bin in slot 3, and the kernel then refers the line-of-sight Legendre to that leg --
-        correctly, cf. Philcox 2021 Eq. (55), where the Legendre sits inside the permutation
-        sum -- but the value supplied is still the long-leg multipole. For :math:`L' = 0` there
-        is no line-of-sight dependence and the substitution is exact; for :math:`L' > 0` it
-        silently swaps one quantity for another.
-
-        - ``'full'``: all distinct permutations (exact only for :math:`L' = 0`).
-        - ``'slot3'``: only permutations that leave slot 3 holding a leg in the SAME bin as
-          the ordered triple's third, so the theory's leg reference always matches the
-          kernel's. Exact for every :math:`L'`, but recovers less of :math:`k'`-space
-          (the 1<->2 swaps only).
-        - ``'none'``: identity only for :math:`L' > 0`, i.e. pre-fix behaviour there.
-
-        Re-referring a quadrupole to a different leg mixes :math:`L` and involves the second
-        angular coordinate that this basis drops, so the ``'full'`` permuted :math:`L' > 0`
-        terms cannot be reconstructed exactly from :math:`L' = 0, 2` about one leg alone.
-
     Returns
     -------
     wmat : WindowMatrix
@@ -1978,58 +2045,9 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             kout_sub = jnp.asarray(_ksub.reshape(-1, 3))
             kout_weight = jnp.asarray(_wsub)
 
-        # THEORY-SIDE k'-SPACE ENUMERATION (see permute_in in the docstring).
-        # W_ij = sum over every k'-space box whose SORTED bin is j, of the kernel integrated
-        # over that box. edgesin covers only the ordered octant, so the rows below expand
-        # each bin into its distinct permutations, all accumulating back into column j.
-        _edges_np, _kin_np = np.asarray(edgesin), np.asarray(kin)
-        _bkey = lambda e: tuple(np.round(np.asarray(e).ravel(), 12))
-        _existing = {_bkey(_edges_np[j]): j for j in range(len(_edges_np))}
-        if permute_lgt0 not in ('full', 'slot3', 'none'):
-            raise ValueError(f"permute_lgt0 must be 'full', 'slot3' or 'none', got {permute_lgt0}")
-
-        def _make_rows(mode):
-            rows_e, rows_k, rows_col = [], [], []
-            for j in range(len(_edges_np)):
-                _seen = set()
-                _perms = itertools.permutations(range(3)) if (permute_in and mode != 'none') else [(0, 1, 2)]
-                for _p in _perms:
-                    # 'slot3': keep the theory's line-of-sight leg reference. Compare BINS, not
-                    # positions, so a degenerate third leg (b == c) still admits its swap.
-                    if mode == 'slot3' and _bkey(_edges_np[j][_p[2]]) != _bkey(_edges_np[j][2]):
-                        continue
-                    _pl = list(_p)
-                    _e = _edges_np[j][_pl]
-                    _kk = _bkey(_e)
-                    # degenerate legs: this permutation reproduces a box already taken for bin j
-                    if _kk in _seen: continue
-                    _seen.add(_kk)
-                    # that box is another bin's own column (caller passed a full product grid)
-                    if _existing.get(_kk, j) != j: continue
-                    rows_e.append(_e); rows_k.append(_kin_np[j][_pl]); rows_col.append(j)
-            return (jnp.asarray(np.array(rows_e)), jnp.asarray(np.array(rows_k)),
-                    jnp.asarray(np.array(rows_col)), len(rows_col))
-
-        _nbins = len(_edges_np)
-        _ROWS = {'full': _make_rows('full')}
-        if permute_lgt0 != 'full': _ROWS[permute_lgt0] = _make_rows(permute_lgt0)
-        _SPL = {}
-        import logging
-        for _m, _r in _ROWS.items():
-            if _r[3] != _nbins:
-                logging.getLogger('Mesh3').info(
-                    f'theory-side k\' enumeration [{_m}]: {_nbins} bins -> {_r[3]} permuted boxes '
-                    f'(x{_r[3] / _nbins:.2f}); set permute_in=False for the pre-fix behaviour')
-
         for ellin, wain in ellsin:  # ellin = L' or (L', M'), wain wide-angle order
             wmat_tmp[ellin, wain] = []
             m_in = ellin[1] if isinstance(ellin, tuple) else 0  # M'
-            # L' = 0 always takes every permutation (the theory substitution is exact there);
-            # L' > 0 follows permute_lgt0, since B_{L'} is referred to the ordered triple's
-            # third leg and a permuted box may put a different leg in slot 3.
-            _L_in = ellin[0] if isinstance(ellin, tuple) else ellin
-            _mode = 'full' if _L_in == 0 else permute_lgt0
-            _perm_edges, _perm_kin, _perm_col, _nrows = _ROWS[_mode]
             for ill, ell in enumerate(ells):  # ell = L
 
                 # Then sum over \ell_1, \ell_2, \ell_1', \ell_2', \ell_1'', \ell_2'', L''
@@ -2052,18 +2070,18 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                             # Theta y_l is rapidly varying AND discontinuous, so the
                             # point value is not the bin average (this breaks the
                             # box-limit sum rule by tens of per cent otherwise).
-                            lo3, hi3 = _perm_edges[idx, 2, 0], _perm_edges[idx, 2, 1]
+                            lo3, hi3 = edgesin[idx, 2, 0], edgesin[idx, 2, 1]
                             k3n = lo3 + 0.5 * (hi3 - lo3) * (_u_in + 1.)
                             w3n = 0.5 * (hi3 - lo3) * _wu_in
                             qs = (to_spectrum.k[0][:, None, None], to_spectrum.k[1][None, :, None], k3n[None, None, :])
                             volume = (-1)**ell2t * jnp.sum(w3n * qs[2]**2 / (2. * jnp.pi**2) * compute_I((ell2t, -m_in), qs), axis=-1)
                         else:
-                            volume = (_perm_edges[idx, 2, 1]**3 - _perm_edges[idx, 2, 0]**3) / (6. * jnp.pi**2) * (-1)**ell2t * compute_I((ell2t, -m_in), _perm_kin[idx].T)
+                            volume = (edgesin[idx, 2, 1]**3 - edgesin[idx, 2, 0]**3) / (6. * jnp.pi**2) * (-1)**ell2t * compute_I((ell2t, -m_in), kin[idx].T)
                         if _interp_in == 'spline':
                             _Min, _ii = _sc_spline[0], _sc_spline[1][idx]
                             spectrum = (_Min[0][:, _ii[0]][:, None] * _Min[1][:, _ii[1]][None, :]) * volume
                         else:
-                            spectrum = tophat(to_spectrum.k, _perm_edges[idx, :2], volume)
+                            spectrum = tophat(to_spectrum.k, edgesin[idx, :2], volume)
                         correlation = to_correlation(spectrum)[1]
                         correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
                         # Estimator side: B_L(k1, k2, k3) = sum_{ell_1 ell_2} Legendre_{ell_2}(cos theta_12) B_{ell_1 ell_2 L}(k1, k2)
@@ -2092,18 +2110,11 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                         # who does not mask, so return 0 as the grid branch does.
                         return jnp.nan_to_num(spectrum)
 
-                    if interp != 'tophat' and _mode not in _SPL:
-                        # keyed on the PERMUTED boxes: their (k1', k2') centres are a superset
-                        # of the ordered bins', so building this from edgesin would leave the
-                        # permuted rows indexing a basis that lacks their own centres. Cached
-                        # per permutation mode, since each mode has its own row list.
-                        _i_in, _M_in = axis_basis_matrices(_perm_edges[:, :2], to_spectrum.k, kind='spline')
+                    if interp != 'tophat' and _sc_spline is None:
+                        _i_in, _M_in = axis_basis_matrices(edgesin[:, :2], to_spectrum.k, kind='spline')
                         _i_out, _M_out = axis_basis_matrices(np.asarray(bin.edges)[:, :2], to_spectrum.k, kind='rebin')
-                        _SPL[_mode] = (_M_in, _i_in, _M_out, _i_out)
-                    _sc_spline = _SPL.get(_mode)
-                    # (nrows, nkout) -> sum permuted boxes back into their sorted bin's column
-                    _res = jax.lax.map(convolve, jnp.arange(_nrows), batch_size=batch_size)
-                    tmp += jax.ops.segment_sum(_res, _perm_col, num_segments=_nbins).T
+                        _sc_spline = (_M_in, _i_in, _M_out, _i_out)
+                    tmp += jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
                 wmat_tmp[ellin, wain].append(tmp)
 
@@ -2176,8 +2187,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         window_const = ObservableTree(poles, ells=list(window.ells))
         wmat_const = compute_smooth3_spectrum_window(
             window_const, _edgesin_arg, ellsin=_ellsin_arg, bin=bin, flags=flags, batch_size=batch_size,
-            ellmax=ellmax, ninsub=ninsub, noutsub=noutsub, interp=interp, exact_box_limit=False,
-            permute_in=permute_in, permute_lgt0=permute_lgt0)
+            ellmax=ellmax, ninsub=ninsub, noutsub=noutsub, interp=interp, exact_box_limit=False)
 
         # Delta: the exact binned identity. Diagonal in L, and only for the pure
         # Legendre-multipole channel -- the wide-angle terms vanish in the box limit.

@@ -304,7 +304,7 @@ def _window_bin_attrs(ells, ellsin, ellmax, ellwmax=None):
 
 
 def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp='tophat', exact_box_limit=False,
-        permute_in=True, permute_lgt0='full',
+        symmetrize=None,
         theory_patch=None,
         ellsin_theory=None, from_cache=False, wcoords=256, worder=3, swstep=None, batch_size=None, buffer_size=0, geometry='cutsky',
         theory_los='local', los='local', wpole_ellcut=None, kmin_theory=None):
@@ -519,17 +519,35 @@ def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp=
     # noutsub: output-side bin averaging of L_{ell2}(cos theta12), ms.tex caveat (ii). Removed
     # here when the grid path went (the original did not accept it); re-added now that
     # compute_smooth3_spectrum_window implements it.
-    # permute_in: sum each theory bin over all distinct permutations of its (k1',k2',k3')
-    # box. edgesin here is the ORDERED-triangle set, so without it the convolution covers
-    # only the ordered octant and the ell=0 row sums come out 0.41-0.83 instead of ~Q_inf.
+    # symmetrize: the estimator bins ORDERED triangles, but the convolution runs over all of
+    # k'-space, so the matrix must be handed the UNORDERED grid. Filling it is a THEORY-side
+    # question: get_scoccimarro_symmetrization_matrix scatters the ordered vector onto the permuted
+    # grid, which is a relabelling only where B_{L'} is invariant -- exact for every L' with
+    # fix_legs=(2,) (swapping k1<->k2 leaves the LOS leg alone), and for L'=0 with all
+    # permutations. symmetrize maps ell' -> fix_legs, e.g. {0: None, 2: (2,)}.
+    sym = None
+    if symmetrize is not None:
+        from jaxpower import get_scoccimarro_symmetrization_matrix as _sym_matrix
+        # one grid serves every L' (it is a property of k'-space); each ell' gets its own S
+        _, k_un, _, e_un = _sym_matrix(kin_ordered=np.asarray(k_in), edges_ordered=np.asarray(kedges_in))
+        sym = {ell: _sym_matrix(kin=k_un, kin_ordered=np.asarray(k_in),
+                                fix_legs=symmetrize.get(ell))[0] for ell in ellsin_theory}
+        print(f'symmetrize: {len(k_in)} ordered -> {len(k_un)} unordered theory bins; '
+              + ', '.join(f'ell={ell}: {int((sym[ell].sum(1)>0).sum())} filled '
+                          f'(fix_legs={symmetrize.get(ell)})' for ell in ellsin_theory), flush=True)
+        edgesin = ObservableTree([Mesh3SpectrumPole(k=jnp.asarray(k_un), k_edges=jnp.asarray(e_un),
+                                                    num_raw=jnp.zeros(len(k_un)), basis='sugiyama')
+                                  for _ in ellsin_theory],
+                                 ells=list(ellsin_theory), wa_orders=[(0, 0)] * len(ellsin_theory))
+
     wmatrix = compute_smooth3_spectrum_window(Q, edgesin=edgesin, ellsin=ellsin_theory, bin=bin3,
                                               ellmax=ellmax, ninsub=ninsub, noutsub=noutsub,
-                                              interp=interp, exact_box_limit=exact_box_limit,
-                                              permute_in=permute_in, permute_lgt0=permute_lgt0)
+                                              interp=interp, exact_box_limit=exact_box_limit)
     print(f'window matrix built in {time.time() - t0:.1f}s (ninsub={ninsub}, '
           f'exact_box_limit={exact_box_limit})', flush=True)
 
     theory = [truth_mean[ells.index(ell)][valid_in] for ell in ellsin_theory]
+    if sym is not None: theory = [sym[ell] @ t for ell, t in zip(ellsin_theory, theory)]
     theory_vec = np.concatenate([t.ravel() for t in theory])
     pred = wmatrix.dot(theory_vec, return_type=None)
 
@@ -543,7 +561,9 @@ def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp=
     # The window matrix is linear, so pred_i = W . truth_i costs one dot per mock.
     pred_vals = []
     for i in range(nm):
-        tv = np.concatenate([np.asarray(truth_vals[i][ells.index(ell)][valid_in]).ravel() for ell in ellsin_theory])
+        tv = [np.asarray(truth_vals[i][ells.index(ell)][valid_in]).ravel() for ell in ellsin_theory]
+        if sym is not None: tv = [sym[ell] @ t for ell, t in zip(ellsin_theory, tv)]
+        tv = np.concatenate(tv)
         pi = wmatrix.dot(tv, return_type=None)
         pred_vals.append(np.stack([np.asarray(pi.get(ells=ell).value()) for ell in ells]))
     pred_vals = np.asarray(pred_vals)                      # (nmocks, nells, nout)
@@ -620,7 +640,6 @@ if __name__ == '__main__':
     ap.add_argument('--interp', default='tophat', choices=['tophat', 'spline', 'tophat-rebin', 'spline-read'], help='theory-side/output-side binning primitives')
     ap.add_argument('--noutsub', type=int, default=1, help='output-side bin averaging of L_ell2(cos theta12); ms.tex caveat (ii)')
     ap.add_argument('--exact-box-limit', action='store_true')
-    ap.add_argument('--no-permute-in', action='store_true', help='pre-fix behaviour: sum theory k\' over the ordered octant only')
     ap.add_argument('--ellsin-theory', type=int, nargs='+', default=None)
     ap.add_argument('--from-cache', action='store_true')
     ap.add_argument('--wcoords', type=int, default=256)
@@ -641,6 +660,5 @@ if __name__ == '__main__':
         if _val is not None: _g[_name] = _val
     set_geometry(args.meshsize, args.mask_sigma)
     run(nmocks=args.nmocks, seed0=args.seed0, ellmax=args.ellmax, ellwmax=args.ellwmax, ninsub=args.ninsub, noutsub=args.noutsub, interp=args.interp, exact_box_limit=args.exact_box_limit,
-        permute_in=not args.no_permute_in,
         batch_size=args.batch_size, buffer_size=args.buffer_size, theory_los=args.theory_los, los=args.los, ellsin_theory=args.ellsin_theory, from_cache=args.from_cache, wcoords=args.wcoords, worder=args.worder, swstep=args.swstep,
         geometry=args.geometry)

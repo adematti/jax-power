@@ -305,6 +305,126 @@ def test_fkp_spectrum(plot=False):
     print('test_fkp_spectrum OK')
 
 
+def test_generate_spectrum2_alm(nmocks=150):
+    # The generator's convention must match compute_angular2_spectrum: the ensemble mean of the
+    # measured C_ell reproduces the input, and unitary_amplitude reproduces it exactly.
+    from jaxpower import generate_spectrum2_alm
+
+    ellmax = 32
+    attrs = AngularAttrs(ellmax=ellmax, nside=32)
+    cl = lambda ell: 1e-3 / (1. + (np.asarray(ell) / 8.)**2)
+    bin = BinAngular2Spectrum(attrs, edges={'min': 0, 'step': 4})
+    ells, wbin = np.arange(ellmax + 1), np.asarray(bin.wbin)
+    # input, averaged over each band with the (2l+1) weights the estimator uses
+    ref = np.array([np.sum((2 * ells + 1) * cl(ells) * w) / np.sum((2 * ells + 1) * w) for w in wbin])
+
+    measured = np.array([np.asarray(compute_angular2_spectrum(generate_spectrum2_alm(attrs, cl=cl, seed=imock), bin=bin).value())
+                         for imock in range(nmocks)])
+    mean, err = measured.mean(axis=0), measured.std(axis=0) / np.sqrt(nmocks)
+    nsig = (mean - ref) / err
+    assert np.all(np.abs(nsig) < 4.), np.column_stack([ref, mean, err, nsig])
+
+    # no scatter, and exact, when the modulus is fixed
+    unitary = np.array([np.asarray(compute_angular2_spectrum(generate_spectrum2_alm(attrs, cl=cl, seed=imock, unitary_amplitude=True), bin=bin).value())
+                        for imock in range(3)])
+    assert np.allclose(unitary, ref, rtol=1e-10), unitary
+
+    # m > ell must be zero, and a_l0 real
+    alm = generate_spectrum2_alm(attrs, cl=cl, seed=7).value
+    upper = np.arange(ellmax + 1)[:, None] < np.arange(ellmax + 1)[None, :]
+    assert np.all(np.asarray(alm)[upper] == 0.)
+    assert np.allclose(np.asarray(alm)[:, 0].imag, 0.)
+
+    # jit, with an explicit key (an int seed cannot be traced, as elsewhere in mock.py)
+    f = jax.jit(lambda key: generate_spectrum2_alm(attrs, cl=cl, seed=key).value)
+    assert np.allclose(f(jax.random.key(3)), generate_spectrum2_alm(attrs, cl=cl, seed=jax.random.key(3)).value)
+    print('test_generate_spectrum2_alm OK (residuals in sigma: {})'.format(', '.join(f'{s:+.1f}' for s in nsig)))
+
+
+def test_generate_spectrum3(nmocks=120):
+    # local construction delta = g + alpha2_local (g^2 - <g^2>) has b = 2 alpha2_local (C1C2 + C2C3 + C3C1),
+    # exactly constant for a white C_l. Bin from ell >= 2: bands holding the monopole fall short,
+    # since subtracting <g^2> removes the quadratic term's ell = 0 piece by construction.
+    from jaxpower import generate_spectrum2_alm, generate_spectrum3_alm, generate_spectrum3_mesh, generate_gaussian_mesh
+
+    ellmax, nside, amplitude, alpha2_local = 8, 32, 1., 0.05
+    attrs = AngularAttrs(ellmax=ellmax, nside=nside)
+    cl = lambda ell: amplitude + 0. * np.asarray(ell)
+    bin3 = BinAngular3Spectrum(attrs, edges={'min': 2, 'step': 3})
+    target = 6. * alpha2_local * amplitude**2
+
+    # antisymmetric in alpha2_local: cancels the pure-Gaussian noise and the even orders
+    diff = []
+    for imock in range(nmocks):
+        alms = [generate_spectrum3_alm(attrs, cl=cl, alpha2_local=sign * alpha2_local, seed=imock) for sign in (1, -1)]
+        values = [np.asarray(compute_angular3_spectrum(alm, bin=bin3).value()).real for alm in alms]
+        diff.append((values[0] - values[1]) / 2.)
+    diff = np.array(diff)
+    mean, err = diff.mean(axis=0), diff.std(axis=0) / np.sqrt(nmocks)
+    nsig = (mean - target) / err
+    assert np.all(np.abs(nsig) < 4.), np.column_stack([mean, err, nsig])
+
+    # alpha2_local = 0 must reproduce the Gaussian generators exactly
+    assert np.allclose(generate_spectrum3_alm(attrs, cl=cl, alpha2_local=0., seed=3).value,
+                       generate_spectrum2_alm(attrs, cl=cl, seed=3).to_pixel().to_alm().value)
+    mattrs = MeshAttrs(meshsize=32, boxsize=1000.)
+    power = lambda kvec: 1e4 * jnp.exp(-jnp.sqrt(sum(kk**2 for kk in kvec)) / 0.1)
+    assert np.allclose(generate_spectrum3_mesh(mattrs, power=power, alpha2_local=0., seed=3).value,
+                       generate_gaussian_mesh(mattrs, power=power, seed=3).value)
+    # the quadratic term is mean-free, so the mesh mean is unchanged
+    gaussian = generate_gaussian_mesh(mattrs, power=power, seed=3)
+    mesh = generate_spectrum3_mesh(mattrs, power=power, alpha2_local=1e-3, seed=3)
+    assert np.allclose(jnp.mean(mesh.value), jnp.mean(gaussian.value), atol=1e-8 * jnp.std(gaussian.value))
+    print('test_generate_spectrum3 OK (residuals in sigma: {})'.format(', '.join(f'{s:+.1f}' for s in nsig)))
+
+
+def test_inject_spectrum3(nmocks=100):
+    # Injecting a bispectrum into one band triplet must be recovered there, and leave the others at zero.
+    # A bin-restricted target is separable, so the quadratic kernel B/(3 P1 P2) costs a few transforms.
+    from jaxpower import generate_spectrum3_alm, generate_spectrum3_mesh
+    from jaxpower import BinMesh3SpectrumPoles, compute_mesh3_spectrum
+
+    def antisymmetric(generate, measure):
+        # cancels the pure-Gaussian noise and the even orders in the injected amplitude
+        out = []
+        for imock in range(nmocks):
+            values = [measure(generate(sign, imock)) for sign in (1, -1)]
+            out.append((values[0] - values[1]) / 2.)
+        out = np.array(out)
+        return out.mean(axis=0), out.std(axis=0) / np.sqrt(len(out))
+
+    # --- sphere
+    attrs = AngularAttrs(ellmax=8, nside=32)
+    edges = {'min': 2, 'step': 3}
+    bin3 = BinAngular3Spectrum(attrs, edges=edges)
+    cl = lambda ell: 1. + 0. * np.asarray(ell)
+    target, amplitude = (0, 1, 1), 0.4
+    mean, err = antisymmetric(
+        lambda sign, imock: generate_spectrum3_alm(attrs, cl=cl, edges=edges, seed=imock,
+                                                   spectrum3={target: sign * amplitude}),
+        lambda alm: np.asarray(compute_angular3_spectrum(alm, bin=bin3).value()).real)
+    for ibin, bands in enumerate(np.asarray(bin3.ibands)):
+        expected = amplitude if tuple(bands) == target else 0.
+        assert abs(mean[ibin] - expected) < 4. * err[ibin], (bands, mean[ibin], err[ibin], expected)
+
+    # --- mesh; compute_mesh3_spectrum already returns the bispectrum, so no normalization applies
+    # (compute_box3_normalization is for a density field with a mean, not a zero-mean delta)
+    mattrs = MeshAttrs(meshsize=48, boxsize=1000.)
+    p0 = 1e4
+    power = lambda kvec: p0 + 0. * jnp.sqrt(sum(kk**2 for kk in kvec))
+    kedges = np.array([0.05, 0.10, 0.15])
+    binmesh = BinMesh3SpectrumPoles(mattrs, edges=kedges, basis='scoccimarro', ells=[0])
+    amplitude = 1e8  # ~1% of P^2, so the O(amplitude^3) terms stay negligible
+    mean, err = antisymmetric(
+        lambda sign, imock: generate_spectrum3_mesh(mattrs, power=power, edges=kedges, seed=imock,
+                                                    spectrum3={target: sign * amplitude}),
+        lambda mesh: np.asarray(compute_mesh3_spectrum(mesh, bin=binmesh, los='z').get(ells=0).value()))
+    for ibin in range(len(mean)):
+        expected = amplitude if ibin == 2 else 0.  # (0, 1, 1) is the last sorted triplet of 2 bands
+        assert abs(mean[ibin] - expected) < max(4. * err[ibin], 0.02 * amplitude), (ibin, mean[ibin], err[ibin], expected)
+    print('test_inject_spectrum3 OK')
+
+
 def test_angular3_gaunt():
     # The filtered-map estimator must reproduce the exact Gaunt sum
     #   num_ijk = sum_{l in bands} sum_{m1m2m3} G^{m1m2m3}_{l1l2l3} a a a,
@@ -524,6 +644,9 @@ if __name__ == '__main__':
     test_sharded_pixel()
     test_fkp_spectrum()
     test_window()
+    test_generate_spectrum2_alm()
+    test_generate_spectrum3()
+    test_inject_spectrum3()
     test_angular3_gaunt()
     test_angular3_shotnoise()
     test_angular3_window()

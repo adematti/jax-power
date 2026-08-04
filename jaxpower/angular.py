@@ -356,6 +356,19 @@ def alm2map(alm: AlmField, nside: int=None, backend: str=None) -> 'PixelField':
     return PixelField(value=value, attrs=attrs)
 
 
+def _get_method(method: str=None, attrs: AngularAttrs=None):
+    """
+    Resolve the estimation method: if not given, use 'healpix' when a resolution ``nside`` is
+    available, and the pixel-free 'direct' summation otherwise.
+    """
+    if method is None:
+        return 'direct' if getattr(attrs, 'nside', None) is None else 'healpix'
+    assert method in ('direct', 'healpix'), f'unknown method {method}'
+    if method == 'healpix' and getattr(attrs, 'nside', None) is None:
+        raise ValueError("method='healpix' requires attrs.nside; provide it, or use method='direct'")
+    return method
+
+
 def _get_pixel_backend(backend: str=None):
     """Return the backend to use for pixelated operations, defaulting to 'jax_healpy' if importable."""
     if backend is None:
@@ -516,7 +529,7 @@ def _compute_alm_direct(positions: jax.Array, weights: jax.Array, ellmax: int, b
     return alm
 
 
-def to_alm(field, weights=None, attrs: AngularAttrs=None, method: str='direct', backend: str=None, batch_size: int=None) -> AlmField:
+def to_alm(field, weights=None, attrs: AngularAttrs=None, method: str=None, backend: str=None, batch_size: int=None) -> AlmField:
     """
     Compute harmonic coefficients of the input field.
 
@@ -531,8 +544,9 @@ def to_alm(field, weights=None, attrs: AngularAttrs=None, method: str='direct', 
     attrs : AngularAttrs, optional
         Angular attributes (``ellmax``, and ``nside`` for ``method='healpix'``).
     method : str, optional
-        'direct' (default): direct summation over particles (https://arxiv.org/abs/2312.12285).
+        'direct': pixel-free direct summation over particles (https://arxiv.org/abs/2312.12285).
         'healpix': paint particles onto a healpix map of resolution ``attrs.nside``, then transform.
+        If ``None`` (default), 'healpix' is used when ``attrs.nside`` is set, else 'direct'.
     backend : str, optional
         Backend for ``method='healpix'``: 'jax_healpy' (default when importable), which keeps the whole
         path jit- and grad-compatible, or 'healpy' / 'quadrature', see :meth:`PixelField.to_alm`.
@@ -549,11 +563,11 @@ def to_alm(field, weights=None, attrs: AngularAttrs=None, method: str='direct', 
             return AlmField(value=field.value[:attrs.ellmax + 1, :attrs.ellmax + 1], attrs=field.attrs.clone(ellmax=attrs.ellmax))
         return field
     assert attrs is not None, 'provide attrs (ellmax)'
+    method = _get_method(method, attrs)
     if isinstance(field, PixelField):
         return field.to_alm(ellmax=attrs.ellmax, backend=backend, batch_size=batch_size)
     if method == 'healpix':
         return to_pixel(field, attrs=attrs, backend=backend).to_alm(backend=backend, batch_size=batch_size)
-    assert method == 'direct', f'unknown method {method}'
     if isinstance(field, FKPField):
         field = field.particles
     if isinstance(field, ParticleField):
@@ -634,14 +648,14 @@ def _compute_cross_power(alm1: AlmField, alm2: AlmField):
     return jnp.real(prod[:, 0]) + 2. * jnp.sum(jnp.real(prod[:, 1:]), axis=-1)
 
 
-def compute_angular2(*fields, bin: BinAngular2Spectrum=None, method: str='direct', backend: str=None, batch_size: int=None):
+def compute_angular2(*fields, bin: BinAngular2Spectrum=None, method: str=None, backend: str=None, batch_size: int=None):
     """Dispatch to :func:`compute_angular2_spectrum` (single ``bin`` type for now)."""
     if isinstance(bin, BinAngular2Spectrum):
         return compute_angular2_spectrum(*fields, bin=bin, method=method, backend=backend, batch_size=batch_size)
     raise ValueError(f'bin must be BinAngular2Spectrum, not {type(bin)}')
 
 
-def compute_angular2_spectrum(*fields, bin: BinAngular2Spectrum=None, method: str='direct', backend: str=None, batch_size: int=None) -> Angular2Spectrum:
+def compute_angular2_spectrum(*fields, bin: BinAngular2Spectrum=None, method: str=None, backend: str=None, batch_size: int=None) -> Angular2Spectrum:
     r"""
     Compute the angular power spectrum :math:`C_\ell` (auto or cross).
 
@@ -653,7 +667,7 @@ def compute_angular2_spectrum(*fields, bin: BinAngular2Spectrum=None, method: st
     bin : BinAngular2Spectrum
         Binning operator.
     method : str, optional
-        'direct' (default) or 'healpix', see :func:`to_alm`.
+        'direct', 'healpix', or ``None`` (default) to pick from ``attrs.nside``, see :func:`to_alm`.
     batch_size : int, optional
         Number of particles processed at once.
 
@@ -846,6 +860,9 @@ class BinAngular3Spectrum(object):
     def __init__(self, attrs: AngularAttrs, edges: staticarray | dict | None=None):
         if not isinstance(attrs, AngularAttrs):
             attrs = attrs.attrs
+        # the estimator is intrinsically pixel-based (it integrates a product of band-filtered maps),
+        # so fail here rather than at the first transform
+        assert attrs.nside is not None, 'provide attrs.nside: the bispectrum estimator needs band-filtered maps'
         bin2 = _make_edges_angular(attrs, edges)
         band_edges, wbin = np.asarray(bin2['edges']), np.asarray(bin2['wbin'])
         nbands = len(band_edges)
@@ -895,7 +912,7 @@ class BinAngular3Spectrum(object):
         return jnp.stack([one(w) for w in wbin])
 
 
-def compute_angular3_spectrum(*fields, bin: BinAngular3Spectrum=None, method: str='direct',
+def compute_angular3_spectrum(*fields, bin: BinAngular3Spectrum=None, method: str=None,
                               backend: str=None, batch_size: int=None) -> Angular3Spectrum:
     r"""
     Compute the angular bispectrum :math:`b_{\ell_1 \ell_2 \ell_3}`, binned in :math:`\ell`-bands,
@@ -909,7 +926,7 @@ def compute_angular3_spectrum(*fields, bin: BinAngular3Spectrum=None, method: st
     bin : BinAngular3Spectrum
         Binning operator.
     method : str, optional
-        'direct' (default) or 'healpix', see :func:`to_alm`.
+        'direct', 'healpix', or ``None`` (default) to pick from ``attrs.nside``, see :func:`to_alm`.
     backend : str, optional
         Backend for the harmonic transforms, see :meth:`PixelField.to_alm`.
     batch_size : int, optional
@@ -987,23 +1004,31 @@ def compute_fkp_angular3_normalization(*fkps: FKPField, bin: BinAngular3Spectrum
     return alpha * compute_angular_normalization(*randoms, attrs=attrs)
 
 
-def compute_fkp_angular3_shotnoise(*fkps: FKPField, bin: BinAngular3Spectrum=None, spectrum=None,
-                                   nside: int=None, fields: tuple=None):
+def compute_fkp_angular3_shotnoise(*fkps: FKPField, bin: BinAngular3Spectrum=None, method: str=None,
+                                   backend: str=None, batch_size: int=None, fields: tuple=None):
     r"""
     Compute the Poisson shot noise of the angular bispectrum, in the same (raw) units as
-    :attr:`Angular3Spectrum.num_raw`:
+    :attr:`Angular3Spectrum.num_raw`, entirely from the catalogs.
+
+    Decomposing the triple sum over particles by coincidences, the two-point term is
+    :math:`\int d\Omega\, A_{ij} M_k` with :math:`A_{ij}(\hat{n}) = \sum_p w_p^2 K_i K_j`. Expanding
+    the kernel product in Legendre polynomials, :math:`K_i K_j = \sum_L c^{ij}_L \frac{2L + 1}{4\pi} P_L`
+    with :math:`c^{ij}_L = \sum_{\ell_1 \in i, \ell_2 \in j} h^2_{\ell_1 \ell_2 L} / (2L + 1)`, so it
+    collapses onto the cross pseudo-spectrum :math:`X_L = \sum_m X_{\ell m} a_{\ell m}^*` between the
+    :math:`w^2`-weighted field and the field itself. Removing the self-pairs it shares with the
+    three-point term,
 
     .. math::
 
-        \mathrm{num}^\mathrm{shot}_{ijk} = \sum_{3\ \mathrm{pairings}} \mathcal{N}_{w^2} \bar{C}_{\ell} + \frac{S_3}{4\pi},
+        \mathrm{num}^\mathrm{shot}_{ijk} = \frac{1}{N_{ijk}} \sum_{3\ \mathrm{pairings}}
+        \sum_{\ell_1 \ell_2 L} h^2_{\ell_1 \ell_2 L} \frac{X_L}{2L + 1} - \frac{2 S_3}{4\pi},
 
-    where the first (two points coincident) term couples the :math:`w^2`-weighted density to the measured
-    angular power spectrum, :math:`\bar{C}_\ell` being the :math:`h^2`-weighted average of :math:`C_\ell`
-    over the remaining band, and the second (three points coincident) term is flat, with
-    :math:`S_3 = \sum_D w^3 - \alpha^3 \sum_R w^3`.
+    with :math:`S_3 = \sum_D w^3 - \alpha^3 \sum_R w^3`.
 
-    Normalized by :func:`compute_fkp_angular3_normalization`, this reduces for a uniform full-sky
-    Poisson sample to the familiar :math:`[C_{\ell_1} + C_{\ell_2} + C_{\ell_3}]/\bar{n} + 1/\bar{n}^2`.
+    Nothing needs to be supplied: the :math:`C_\ell`-like term is measured, not modelled. For a uniform
+    Poisson sample :math:`X_L / (2L + 1) \to S_3 / 4\pi` and this collapses to the flat
+    :math:`S_3 / 4\pi`; normalized by :func:`compute_fkp_angular3_normalization`, it then reduces to
+    the familiar :math:`[C_{\ell_1} + C_{\ell_2} + C_{\ell_3}] / \bar{n} + 1 / \bar{n}^2`.
 
     Parameters
     ----------
@@ -1011,13 +1036,14 @@ def compute_fkp_angular3_shotnoise(*fkps: FKPField, bin: BinAngular3Spectrum=Non
         FKP fields or particles.
     bin : BinAngular3Spectrum
         Binning operator.
-    spectrum : Angular2Spectrum or array-like or callable, optional
-        The measured (normalized, shot-subtracted) angular power spectrum, used for the
-        two-point-coincidence term; if ``None``, only the :math:`S_3` term is returned.
-    nside : int, optional
-        Healpix resolution for the :math:`\bar{n}` estimate.
+    method : str, optional
+        'direct', 'healpix', or ``None`` to pick from ``attrs.nside``, see :func:`to_alm`.
+    backend : str, optional
+        Backend for the harmonic transforms, see :meth:`PixelField.to_alm`.
+    batch_size : int, optional
+        Number of particles processed at once.
     fields : tuple, optional
-        Field identifiers.
+        Field identifiers; the shot noise vanishes unless the three fields share the same points.
 
     Returns
     -------
@@ -1025,33 +1051,25 @@ def compute_fkp_angular3_shotnoise(*fkps: FKPField, bin: BinAngular3Spectrum=Non
         Array of shape ``(nbins,)``.
     """
     fkps, fields = _format_meshes3(*fkps, fields=fields)
-    same = all(field == fields[0] for field in fields)
-
-    def get_sums(fkp, power):
-        if isinstance(fkp, FKPField):
-            alpha = fkp.data.sum() / fkp.randoms.sum()
-            return jnp.sum(fkp.data.weights**power) + (-alpha)**power * jnp.sum(fkp.randoms.weights**power)
-        return jnp.sum(fkp.weights**power)
-
     num = jnp.zeros(len(bin.nmodes))
-    if not same:  # distinct fields never share points
+    if not all(field == fields[0] for field in fields):  # distinct fields never share points
         return num
     fkp = fkps[0]
-    num = num + get_sums(fkp, 3) / (4. * np.pi)
 
-    if spectrum is not None:
-        cl = _get_cl_array(spectrum, ellmax=bin.attrs.ellmax)
-        # w^2-weighted density crossed with the density: same as the 2-point normalization,
-        # with w -> w^2 on one leg
-        if isinstance(fkp, FKPField):
-            alpha = fkp.data.sum() / fkp.randoms.sum()
-            w2 = fkp.randoms.clone(weights=alpha**2 * fkp.randoms.weights**2)
-            norm_w2 = compute_angular_normalization(w2, alpha * fkp.randoms, attrs=AngularAttrs(ellmax=0, nside=nside or bin.attrs.nside or 64))
-        else:
-            w2 = fkp.clone(weights=fkp.weights**2)
-            norm_w2 = compute_angular_normalization(w2, fkp, attrs=AngularAttrs(ellmax=0, nside=nside or bin.attrs.nside or 64))
-        num = num + norm_w2 * _average_cl_over_bands(bin, cl)
-    return num
+    if isinstance(fkp, FKPField):
+        alpha = fkp.data.sum() / fkp.randoms.sum()
+        sum3 = jnp.sum(fkp.data.weights**3) - alpha**3 * jnp.sum(fkp.randoms.weights**3)
+        # the w^2-weighted field is a *sum*: both (+1)^2 and (-alpha)^2 are positive
+        field_w2 = (fkp.data.clone(weights=fkp.data.weights**2)
+                    + fkp.randoms.clone(weights=alpha**2 * fkp.randoms.weights**2))
+    else:
+        sum3 = jnp.sum(fkp.weights**3)
+        field_w2 = fkp.clone(weights=fkp.weights**2)
+
+    kw = dict(attrs=bin.attrs, method=method, backend=backend, batch_size=batch_size)
+    xl = _compute_cross_power(to_alm(field_w2, **kw), to_alm(fkp, **kw))
+    xl = xl / (2. * np.arange(bin.attrs.ellmax + 1) + 1.)
+    return _average_cl_over_bands(bin, xl) - 2. * sum3 / (4. * np.pi)
 
 
 def _get_cl_array(spectrum, ellmax: int):
@@ -1125,7 +1143,7 @@ def _compute_wigner3j000_sq(ell1, ell2, ell3):
 
 
 def compute_angular2_spectrum_window(*fields, edgesin: staticarray | dict=None, bin: BinAngular2Spectrum=None,
-                                     norm=None, method: str='direct', backend: str=None, batch_size: int=None) -> WindowMatrix:
+                                     norm=None, method: str=None, backend: str=None, batch_size: int=None) -> WindowMatrix:
     r"""
     Compute the mode-coupling (window) matrix of the pseudo-:math:`C_\ell` estimator:
     :math:`\langle \tilde{C}_\ell \rangle = \sum_{\ell'} M_{\ell \ell'} C_{\ell'}` with
@@ -1151,7 +1169,7 @@ def compute_angular2_spectrum_window(*fields, edgesin: staticarray | dict=None, 
         from the same mask harmonic coefficients, :math:`\sum_L (2L + 1) W_L / (4\pi)`
         (consistent with :func:`compute_fkp_angular2_normalization`).
     method : str, optional
-        'direct' (default) or 'healpix', see :func:`to_alm`.
+        'direct', 'healpix', or ``None`` (default) to pick from ``attrs.nside``, see :func:`to_alm`.
     batch_size : int, optional
         Number of particles processed at once.
 
@@ -1203,6 +1221,19 @@ def compute_angular2_spectrum_window(*fields, edgesin: staticarray | dict=None, 
     return WindowMatrix(observable=observable, theory=theory, value=wmat)
 
 
+def _gather_phi(phi: np.ndarray, m):
+    r"""
+    Index :math:`\Phi_{\ell m}`, stored for :math:`m \geq 0` only, at (possibly negative) ``m``,
+    using :math:`\Phi_{\ell,-m} = (-1)^m \Phi_{\ell m}^*` (the mask and band kernel being real).
+    """
+    m = np.asarray(m)
+    out = phi[np.abs(m)]
+    if not np.any(m < 0):
+        return out
+    negative = (m < 0).reshape(m.shape + (1,) * (out.ndim - m.ndim))
+    return np.where(negative, (-1.)**np.abs(m).reshape(negative.shape) * np.conj(out), out)
+
+
 def _band_triplets(wbin: np.ndarray, ellmax: int, group: tuple):
     r"""
     Enumerate the canonical *ordered* band triplets under the permutation ``group`` (the stabilizer of
@@ -1241,7 +1272,8 @@ def _get_mask_map(field, attrs: AngularAttrs, backend: str=None) -> np.ndarray:
 
 
 def compute_angular3_spectrum_window(*masks, edgesin: staticarray | dict=None, bin: BinAngular3Spectrum=None,
-                                     ellmaxin: int=None, norm=None, backend: str=None, fields: tuple=None) -> WindowMatrix:
+                                     ellmaxin: int=None, norm=None, backend: str=None, fields: tuple=None,
+                                     dtype=np.complex128) -> WindowMatrix:
     r"""
     Compute the window (mode-coupling) matrix of the binned angular bispectrum, mapping the theory
     reduced bispectrum :math:`b_{\ell_1 \ell_2 \ell_3}` (piecewise constant on band triplets) to the
@@ -1278,6 +1310,10 @@ def compute_angular3_spectrum_window(*masks, edgesin: staticarray | dict=None, b
     This is exact, but costs :math:`\mathcal{O}(\ell_\mathrm{max}^2)` spherical harmonic transforms
     per distinct mask, plus :math:`\mathcal{O}(N_\mathrm{obs} N_\mathrm{theory} \ell^2 N_\mathrm{pix})`
     for the Gaunt contraction, so it is only affordable at modest :math:`\ell_\mathrm{max}`.
+    The peak memory is that of :math:`\Phi`, ``itemsize * nbands * npix * (ellmaxin + 1)(ellmaxin + 2) / 2``
+    per distinct mask (only :math:`m \geq 0` is stored, and only the :math:`\ell` spanned by a theory
+    band) -- quadratic in :math:`\ell_\mathrm{max}`, and quartic once ``nside`` is made to track
+    :math:`\ell_\mathrm{max}` as the quadrature requires. Pass ``dtype='complex64'`` to halve it.
 
     Parameters
     ----------
@@ -1298,6 +1334,10 @@ def compute_angular3_spectrum_window(*masks, edgesin: staticarray | dict=None, b
     fields : tuple, optional
         Field identifiers; pass e.g. [0, 0, 1] if the first two legs share the same mask, which merges
         the theory bins accordingly.
+    dtype : optional
+        Precision of the stored :math:`\Phi`; 'complex64' halves the peak memory, at a cost well below
+        the healpix quadrature error of the estimator itself. The contraction always accumulates in
+        double precision.
 
     Returns
     -------
@@ -1314,6 +1354,7 @@ def compute_angular3_spectrum_window(*masks, edgesin: staticarray | dict=None, b
     masks, ids = _format_meshes3(*masks, fields=fields)
     attrs = bin.attrs
     npix, pixarea = attrs.npix, attrs.pixarea
+    cdtype = np.dtype(dtype)
     uids = list(dict.fromkeys(ids))
     nbars = {uid: _get_mask_map(masks[ids.index(uid)], attrs=attrs, backend=backend) for uid in uids}
     if norm is None:
@@ -1337,18 +1378,21 @@ def compute_angular3_spectrum_window(*masks, edgesin: staticarray | dict=None, b
         ls = hp.Alm.getlm(ellmax)[0]
         return np.stack([hp.alm2map(np.where(w[ls], alm, 0.), attrs.nside, lmax=ellmax, pol=False) for w in wbin])
 
-    # Phi[uid][ell][m + ell, iband, ipix], one set of transforms per distinct mask
+    # Phi[uid][ell][m, iband, ipix], one set of transforms per distinct mask.
+    # Only m >= 0 is stored: the mask and the band kernel are real, so
+    # Phi_{ell,-m} = (-1)^m conj(Phi_{ell,m}), applied on the fly by _gather_phi.
+    # Only the ell actually spanned by a theory band are built.
+    ellsin_needed = np.flatnonzero(np.any(wbinin, axis=0))
     Phi = {}
     for uid in uids:
-        nbar, phi_uid = nbars[uid], []
-        for ell in range(ellmaxin + 1):
-            phi_ell = np.zeros((2 * ell + 1, nbands, npix), dtype=complex)
+        nbar, phi_uid = nbars[uid], {}
+        for ell in ellsin_needed:
+            ell = int(ell)
+            phi_ell = np.zeros((ell + 1, nbands, npix), dtype=cdtype)
             for m in range(ell + 1):
                 ylm = nbar * Ylm(ell, m, theta, phi)
-                phi_ell[ell + m] = band_filter(ylm.real) + 1j * band_filter(ylm.imag)
-                if m > 0:  # Y_{l,-m} = (-1)^m conj(Y_lm), and the filter and mask are real
-                    phi_ell[ell - m] = (-1.)**m * np.conj(phi_ell[ell + m])
-            phi_uid.append(phi_ell)
+                phi_ell[m] = band_filter(ylm.real) + 1j * band_filter(ylm.imag)
+            phi_uid[ell] = phi_ell
         Phi[uid] = phi_uid
 
     obs = np.asarray(bin.ibands)
@@ -1371,7 +1415,9 @@ def compute_angular3_spectrum_window(*masks, edgesin: staticarray | dict=None, b
             keep = np.abs(m3) <= ell3
             if not keep.any(): continue
             g = _compute_wigner3j(ell1, ell2, ell3, m1, ms2[keep], m3[keep])
-            total = total + np.sum(g[:, None] * A[ell1 + m1] * B[ell2 + ms2[keep]] * C[ell3 + m3[keep]])
+            # accumulate in double precision even if Phi is stored single
+            term = _gather_phi(A, m1) * _gather_phi(B, ms2[keep]) * _gather_phi(C, m3[keep])
+            total = total + np.sum(g[:, None] * term.astype(np.complex128))
         return h * total * pixarea
 
     perms = list(itertools.permutations(range(3)))
