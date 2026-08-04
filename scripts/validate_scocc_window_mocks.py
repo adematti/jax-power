@@ -39,6 +39,9 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
 import jax
 from jax import random
 from jax import numpy as jnp
@@ -57,7 +60,9 @@ dirname = Path(__file__).parent
 # between sessions (this dataset was lost twice that way), and regenerating 16
 # Zel'dovich realizations costs ~30 min. Keep it inside the repo's test-output
 # directory instead.
-CACHE_DIR = Path('/local/home/adematti/Bureau/DESI/NERSC/cosmodesi/jax-power/tests/_tests')
+# Cached mocks and window functions stay under tests/_tests (they predate this script's
+# move to scripts/, and rebuilding them costs hours), so resolve that relative to the repo.
+CACHE_DIR = Path(__file__).resolve().parent.parent / 'tests' / '_tests'
 CACHE_FN = CACHE_DIR / 'scocc_window_mock_bk.npz'
 
 
@@ -303,7 +308,111 @@ def _window_bin_attrs(ells, ellsin, ellmax, ellwmax=None):
     return kw
 
 
-def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp='tophat', exact_box_limit=False,
+# Reference-palette categorical slots 1-3 (light). Documented all-pairs result:
+# worst-pair CVD dE 9.2, normal-vision 24.0. Identity is never carried by colour
+# alone: measured vs predicted differ by marker vs line, and the k-panel series
+# are directly labelled (slot 3 sits below 3:1 on the light surface -> relief rule).
+BLUE, ORANGE, AQUA = '#2a78d6', '#eb6834', '#1baf7a'
+INK, INK2, INK3 = '#0b0b0b', '#52514e', '#8a8880'
+SERIES = {0: BLUE, 2: ORANGE}
+
+
+def make_figure(d, fn):
+    ells = list(d['ells'])
+    valid = d['valid']
+    idx = np.where(valid)[0]
+    x = np.arange(len(idx))
+    k = d['xavg'][idx]                      # (ntri, 3)
+    kprod = k.prod(axis=-1)
+
+    nres = len(ells)
+    fig, axes = plt.subplots(2 + nres, 1, figsize=(max(9., 0.20 * len(x) + 4.), 4.2 + 1.9 * nres),
+                             sharex=True, height_ratios=[3.0] + [1.5] * nres + [1.6],
+                             gridspec_kw=dict(hspace=0.12))
+    for ax in axes:
+        ax.grid(True, color='#e6e5e1', linewidth=0.6, zorder=0)
+        ax.set_axisbelow(True)
+        for side in ('top', 'right'):
+            ax.spines[side].set_visible(False)
+        for side in ('left', 'bottom'):
+            ax.spines[side].set_color(INK3)
+            ax.spines[side].set_linewidth(0.8)
+        ax.tick_params(colors=INK2, labelsize=9, length=3, width=0.8)
+
+    # ---- panel 1: k1 k2 k3 B ----
+    ax = axes[0]
+    for ell in ells:
+        ill = ells.index(ell)
+        c = SERIES[ell]
+        ax.errorbar(x, kprod * d['wind_mean'][ill][idx], yerr=kprod * d['wind_err'][ill][idx],
+                    fmt='o', ms=4.5, mfc='white', mec=c, mew=1.4, ecolor=c, elinewidth=1.0,
+                    capsize=0, zorder=3, label=f'measured  $\\ell={ell}$')
+        ax.plot(x, kprod * d['pred'][ill][idx], '-', color=c, lw=1.8, zorder=2,
+                label=f'full window  $\\ell={ell}$')
+        if 'pred_ident' in d:
+            ax.plot(x, kprod * d['pred_ident'][ill][idx], '--', color=c, lw=1.3, alpha=0.85, zorder=2,
+                    label=f'identity $\\times Q^\\infty$  $\\ell={ell}$')
+    ax.axhline(0., color=INK3, lw=0.8, zorder=1)
+    ax.set_ylabel(r'$k_1 k_2 k_3\, B_\ell(k_1,k_2,k_3)$', color=INK, fontsize=10)
+    leg = ax.legend(ncol=3, frameon=False, fontsize=8.5, labelcolor=INK2, loc='upper left')
+    ttl = (f"windowed bispectrum: predicted (theory $\\times$ window) vs measured   "
+           f"[{d['geometry']}, {d['nmocks']} mocks, mesh ${d['meshsize']}^3$, "
+           f"$\\bar n$={d['nbar']:g}, $\\ell_{{\\max}}$={d['ellmax']}, "
+           f"ninsub={d['ninsub']}, noutsub={d.get('noutsub', 1)}]")
+    ax.set_title(ttl, color=INK, fontsize=10.5, loc='left', pad=10)
+
+    # ---- panels 2..: residuals in sigma, one per multipole ----
+    for j, ell in enumerate(ells):
+        ill = ells.index(ell)
+        ax = axes[1 + j]
+        c = SERIES[ell]
+        err = d['wind_err'][ill][idx]
+        nsig = np.where(err > 0, (d['pred'][ill][idx] - d['wind_mean'][ill][idx]) / np.where(err > 0, err, 1.), np.nan)
+        for lev, ls in [(1., ':'), (3., '--')]:
+            for sgn in (-1., 1.):
+                ax.axhline(sgn * lev, color=INK3, lw=0.7, ls=ls, zorder=1)
+        ax.axhline(0., color=INK3, lw=0.8, zorder=1)
+        if 'pred_ident' in d:
+            nsig_d = np.where(err > 0, (d['pred_ident'][ill][idx] - d['wind_mean'][ill][idx]) / np.where(err > 0, err, 1.), np.nan)
+            ax.plot(x, nsig_d, '--', color=c, lw=1.2, alpha=0.7, zorder=2)
+        ax.plot(x, nsig, 'o-', color=c, ms=4., lw=1.1, mfc='white', mec=c, mew=1.2, zorder=3)
+        ax.set_ylabel(r'$\Delta B / \sigma$' + f'\n$\\ell={ell}$', color=INK, fontsize=10)
+        lim = max(3.6, np.nanmax(np.abs(nsig)) * 1.12,
+                  min(np.nanmax(np.abs(nsig_d)) * 1.12 if 'pred_ident' in d else 0., 30.))
+        ax.set_ylim(-lim, lim)
+        med = np.nanmedian(np.abs(nsig))
+        lbl = f'median $|\\Delta B/\\sigma|$ = {med:.2f}'
+        if 'pred_ident' in d:
+            lbl += f'   (identity $\\times Q^\\infty$: {np.nanmedian(np.abs(nsig_d)):.2f})'
+        ax.text(0.006, 0.93, lbl, transform=ax.transAxes, ha='left', va='top', fontsize=8.5, color=INK2)
+        if j == 0:  # band key once, not on every panel
+            ax.text(0.994, 0.93, r'dotted $1\sigma$   dashed $3\sigma$', transform=ax.transAxes,
+                    ha='right', va='top', fontsize=8.5, color=INK3)
+
+    # ---- last panel: the k1, k2, k3 values ----
+    ax = axes[-1]
+    for leg_i, (c, lab, ls) in enumerate(zip((BLUE, ORANGE, AQUA), ('$k_1$', '$k_2$', '$k_3$'),
+                                             ('-', '-', '-'))):
+        ax.plot(x, k[:, leg_i], ls, color=c, lw=1.6, zorder=3 + leg_i, label=lab)
+    # legend above the axes: the k lines sweep the full panel, so any in-axes
+    # placement collides with one of them
+    ax.legend(ncol=3, frameon=False, fontsize=9.5, labelcolor=INK2, loc='lower left',
+              bbox_to_anchor=(0., 1.005), handlelength=1.6, columnspacing=1.6)
+    ax.set_ylabel(r'$k$  [$h\,\mathrm{Mpc}^{-1}$]', color=INK, fontsize=10)
+    ax.set_xlabel('triangle index', color=INK, fontsize=10)
+    ax.set_xlim(-0.8, len(x) - 0.2)
+
+    fig.savefig(fn, dpi=160, bbox_inches='tight', facecolor='#fcfcfb')
+    print('wrote', fn)
+
+
+# ---------------------------------------------------------------------------
+# Comparison figure (merged from the former tests/plot_window_vs_mocks.py, which did nothing
+# but import this module and call run(); --plot now selects it).
+# ---------------------------------------------------------------------------
+
+
+def run(nmocks=16, seed0=1000, ellmax=8, ellwmax=5, ninsub=16, noutsub=2,
         symmetrize=None,
         theory_patch=None,
         ellsin_theory=None, from_cache=False, wcoords=256, worder=3, swstep=None, batch_size=None, buffer_size=0, geometry='cutsky',
@@ -542,9 +651,9 @@ def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp=
 
     wmatrix = compute_smooth3_spectrum_window(Q, edgesin=edgesin, ellsin=ellsin_theory, bin=bin3,
                                               ellmax=ellmax, ninsub=ninsub, noutsub=noutsub,
-                                              interp=interp, exact_box_limit=exact_box_limit)
+                                              )
     print(f'window matrix built in {time.time() - t0:.1f}s (ninsub={ninsub}, '
-          f'exact_box_limit={exact_box_limit})', flush=True)
+          f')', flush=True)
 
     theory = [truth_mean[ells.index(ell)][valid_in] for ell in ellsin_theory]
     if sym is not None: theory = [sym[ell] @ t for ell, t in zip(ellsin_theory, theory)]
@@ -606,7 +715,7 @@ def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp=
     nsig_all = np.array(nsig_all)
     print()
     print(f'SUMMARY geometry={geometry} nmocks={nm} ellmax={ellmax} ellwmax={ellwmax} '
-          f'ninsub={ninsub} noutsub={noutsub} interp={interp} exact_box_limit={exact_box_limit}')
+          f'ninsub={ninsub} noutsub={noutsub}')
     print(f'  |nsigma|: n={len(nsig_all)} median={np.median(nsig_all):.3f} mean={nsig_all.mean():.3f} '
           f'max={nsig_all.max():.3f}  frac<=1: {(nsig_all <= 1).mean():.3f}  frac<=3: {(nsig_all <= 3).mean():.3f}')
 
@@ -617,7 +726,7 @@ def run(nmocks=16, seed0=1000, ellmax=2, ellwmax=5, ninsub=1, noutsub=1, interp=
                 pred_vals=pred_vals, paired_err=paired_err, truth_vals=truth_vals, wind_vals=np.asarray(wind_vals),
                 valid_in=valid_in,
                 nsig=nsig_all, geometry=geometry, ellmax=ellmax, ellwmax=ellwmax,
-                ninsub=ninsub, noutsub=noutsub, interp=interp, exact_box_limit=exact_box_limit,
+                ninsub=ninsub, noutsub=noutsub,
                 meshsize=int(np.min(mattrs.meshsize)), nbar=nbar)
 
 
@@ -629,17 +738,17 @@ if __name__ == '__main__':
     ap.add_argument('--mask-sigma', type=float, default=None, help='selection width [Mpc/h]; default boxsize/6')
     ap.add_argument('--dk', type=float, default=None)
     ap.add_argument('--kmax', type=float, default=None)
+    ap.add_argument('--kmin', type=float, default=None, help="first k edge; the CACHE NAME encodes it, so omitting it misses a cache built with --kmin 0 (KMIN=None means 'start at dk')")
     ap.add_argument('--buffer-size', type=int, default=0, help='band-powers computed at once in the estimator (BinMesh3SpectrumPoles)')
     ap.add_argument('--batch-size', type=int, default=None, help='batch for the window-matrix theory-bin map')
+    ap.add_argument('--boxsize', type=float, default=None, help='box size [Mpc/h]; 500 gives sigma = 6.4 cells and kNyq = 0.40, against 1.6 cells and kmax AT Nyquist for 1000')
     ap.add_argument('--meshsize', type=int, default=64, help='kNyq = pi*meshsize/boxsize; 64 keeps all k bins below Nyquist')
     ap.add_argument('--seed0', type=int, default=1000)
-    ap.add_argument('--ellmax', type=int, default=2)
+    ap.add_argument('--ellmax', type=int, default=8)
     ap.add_argument('--wpole-ellcut', type=int, default=None, help="zero window multipoles with max(l1,l2,L) above this; the discrete 9j coupling reaches l''~2*ellmax where the measured window is pure noise")
     ap.add_argument('--ellwmax', type=int, default=2, help='cap on ALL window multipole indices max(l1,l2,L); absent multipoles are treated as zero')
-    ap.add_argument('--ninsub', type=int, default=1)
-    ap.add_argument('--interp', default='tophat', choices=['tophat', 'spline', 'tophat-rebin', 'spline-read'], help='theory-side/output-side binning primitives')
-    ap.add_argument('--noutsub', type=int, default=1, help='output-side bin averaging of L_ell2(cos theta12); ms.tex caveat (ii)')
-    ap.add_argument('--exact-box-limit', action='store_true')
+    ap.add_argument('--ninsub', type=int, default=16)
+    ap.add_argument('--noutsub', type=int, default=2, help='output-side bin averaging of L_ell2(cos theta12); ms.tex caveat (ii)')
     ap.add_argument('--ellsin-theory', type=int, nargs='+', default=None)
     ap.add_argument('--from-cache', action='store_true')
     ap.add_argument('--wcoords', type=int, default=256)
@@ -648,7 +757,17 @@ if __name__ == '__main__':
     ap.add_argument('--geometry', choices=['cutsky', 'box', 'periodic'], default='cutsky')
     ap.add_argument('--los', choices=['local', 'z'], default='local', help='LOS used CONSISTENTLY for the RSD imprint, the estimator and the window measurement')
     ap.add_argument('--theory-los', choices=['local', 'z'], default='local', help="'z': take the theory vector from the GLOBAL-LOS (periodic) cache, the convention the window matrix assumes")
+    ap.add_argument('--kmin-theory', type=float, default=None, help='drop theory triangles with any leg below this. 0.02 is what the validated runs used: admitting the leg-below-0.02 bins degrades ell=0 (chi2/n 5.24 -> 8.54), because the fully squeezed one is pure noise')
+    ap.add_argument('--symmetrize', default=None, help="ordered -> unordered theory scatter, as ell:fix_legs, e.g. '0:none,2:2' (all permutations for ell'=0, the k1<->k2 swaps only for ell'=2). Omit for the ordered octant alone, which breaks the box sum rule")
+    ap.add_argument('--plot', action='store_true', help='also write the per-triangle comparison figure')
+    ap.add_argument('--out', default=None, help='figure path (with --plot)')
     args = ap.parse_args()
+    _sym = None
+    if args.symmetrize:
+        _sym = {}
+        for _tok in args.symmetrize.split(','):
+            _k, _v = _tok.split(':')
+            _sym[int(_k)] = None if _v.lower() == 'none' else tuple(int(c) for c in _v.split('+'))
     # Assign into THIS module's globals. `import validate_scocc_window_mocks as
     # _self` does not work when the file is run as a script: the running module is
     # __main__ and that import binds a SECOND copy, so run() -- which reads
@@ -656,9 +775,13 @@ if __name__ == '__main__':
     # ignored that way (and --dk/--kmax only appeared to work because the values
     # passed happened to equal the defaults).
     _g = globals()
-    for _name, _val in [('nbar', args.nbar), ('RFAC', args.rfac), ('DK', args.dk), ('KMAX', args.kmax)]:
+    for _name, _val in [('nbar', args.nbar), ('RFAC', args.rfac), ('DK', args.dk), ('KMAX', args.kmax), ('KMIN', args.kmin)]:
         if _val is not None: _g[_name] = _val
-    set_geometry(args.meshsize, args.mask_sigma)
-    run(nmocks=args.nmocks, seed0=args.seed0, ellmax=args.ellmax, ellwmax=args.ellwmax, ninsub=args.ninsub, noutsub=args.noutsub, interp=args.interp, exact_box_limit=args.exact_box_limit,
-        batch_size=args.batch_size, buffer_size=args.buffer_size, theory_los=args.theory_los, los=args.los, ellsin_theory=args.ellsin_theory, from_cache=args.from_cache, wcoords=args.wcoords, worder=args.worder, swstep=args.swstep,
+    set_geometry(args.meshsize, args.mask_sigma, boxsize=args.boxsize)
+    _d = run(nmocks=args.nmocks, seed0=args.seed0, ellmax=args.ellmax, ellwmax=args.ellwmax, ninsub=args.ninsub, noutsub=args.noutsub,
+        batch_size=args.batch_size, buffer_size=args.buffer_size, theory_los=args.theory_los, los=args.los, ellsin_theory=args.ellsin_theory, kmin_theory=args.kmin_theory, symmetrize=_sym, from_cache=args.from_cache, wcoords=args.wcoords, worder=args.worder, swstep=args.swstep,
         geometry=args.geometry)
+    if args.plot:
+        out = args.out or (CACHE_DIR / f"window_vs_mocks_{args.geometry}{_box_suffix()}_mesh{args.meshsize}"
+                           f"_n{args.nmocks}_ellmax{args.ellmax}.png")
+        make_figure(_d, out)

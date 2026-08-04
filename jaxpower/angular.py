@@ -85,8 +85,15 @@ class AngularAttrs(object):
 
     def clone(self, **kwargs):
         """Create a new instance, updating some attributes."""
-        state = dict(ellmax=self.ellmax, nside=self.nside) | kwargs
+        state = dict(self) | kwargs
         return self.__class__(**state)
+
+    # For mapping, as :class:`MeshAttrs`
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def keys(self):
+        return self.__annotations__.keys()
 
 
 @partial(register_pytree_dataclass, meta_fields=['attrs'])
@@ -481,7 +488,11 @@ def _compute_alm_direct(positions: jax.Array, weights: jax.Array, ellmax: int, b
     rdtype = positions.dtype
     weights = jnp.asarray(weights, dtype=rdtype)
     cdtype = jnp.zeros(0, dtype=rdtype).astype(complex).dtype
-    unit = positions / jnp.linalg.norm(positions, axis=-1, keepdims=True)
+    # guard degenerate positions: particle exchange pads shards with zero-weight particles at the
+    # mean position, which sits at the origin for a box centered there. 0 / 0 would give NaN, and
+    # NaN * 0 stays NaN, poisoning the whole sum
+    norm = jnp.linalg.norm(positions, axis=-1, keepdims=True)
+    unit = positions / jnp.where(norm == 0., 1., norm)
     size = unit.shape[0]
     if batch_size is None:
         batch_size = max(1, 2**22 // (ellmax + 1))

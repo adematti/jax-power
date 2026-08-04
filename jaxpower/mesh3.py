@@ -221,9 +221,9 @@ class BinMesh3SpectrumPoles(object):
         xmid = jnp.mean(self.edges, axis=-1).T
 
         if 'scoccimarro' in basis:
-            symfactor = jnp.ones_like(xmid[0])
-            symfactor = jnp.where((xmid[1] == xmid[0]) | (xmid[2] == xmid[0]) | (xmid[2] == xmid[1]), 2, symfactor)
-            symfactor = jnp.where((xmid[1] == xmid[0]) & (xmid[2] == xmid[0]), 6, symfactor)
+            #symfactor = jnp.ones_like(xmid[0])
+            #symfactor = jnp.where((xmid[1] == xmid[0]) | (xmid[2] == xmid[0]) | (xmid[2] == xmid[1]), 2, symfactor)
+            #symfactor = jnp.where((xmid[1] == xmid[0]) & (xmid[2] == xmid[0]), 6, symfactor)
 
             def bin(axis, ibin):
                 return mattrs.c2r(self.ibin1d[axis] == ibin)
@@ -1329,7 +1329,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
     -------
     coeffs : list of (sugiyama_ell, sugiyama_ellt, [(ellw, coeff), ...])
         ``sugiyama_ell = (ell_1, ell_2, L)`` is the estimator-side TripoSH multipole
-        (to be resummed with weight :math:`\mathcal{L}_{\ell_2}(\cos\theta_{12})`),
+        (to be resummed with weight :math:`\\mathcal{L}_{\\ell_2}(\\cos\\theta_{12})`),
         ``sugiyama_ellt = (ell_1', ell_2', L')`` the theory-side one (to be projected
         with weight :math:`I_{000}\, y_{\ell_2'}^{-M'}`); the projection prefactor
         :math:`N' H' (3j) / \sqrt{4\pi(2L'+1)}` is folded into the window coefficients ``coeff``.
@@ -1428,246 +1428,6 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: boo
     if return_ellsin:
         return ellw, non_zero_ellsin
     return ellw
-
-
-# Exact radial kernels and window-expansion helpers for the bispectrum window matrix.
-
-
-def _gaussian_bessel_product(ell, k, kp, sigma):
-    r"""
-    Exact radial kernel for a Gaussian window, equal Bessel orders:
-
-    .. math:: F^{(\sigma)}_{\ell\ell}(k, k') = \int_0^\infty r^2 dr\, e^{-r^2/2\sigma^2} j_\ell(kr) j_\ell(k'r)
-              = \sqrt{\pi/2}\, \sigma^3 e^{-\sigma^2(k^2+k'^2)/2}\, i_\ell(\sigma^2 k k')
-
-    with :math:`i_\ell` the modified spherical Bessel function. This is the
-    building block of the Gaussian-expansion route (``eq:gaussian_radial_kernel``
-    of ``jax_window_notes/ms.tex``): expanding the window multipoles on separable
-    Gaussian products factorizes the radial double integral of
-    ``eq:scoccimarro_window_matrix_explicit`` into a product of two of these, each
-    a single elementary function.
-
-    Unlike the 2D-FFTlog chain it replaces, this has NO absolute noise floor: it
-    is accurate at any smallness, so the :math:`\ell`-sum can be pushed as far as
-    the physics requires. The infinite sum can also be done outright,
-    :math:`\sum_\ell (2\ell+1) \mathcal{L}_\ell(\mu) F_{\ell\ell} =
-    \sqrt{\pi/2}\sigma^3 e^{-\sigma^2 |\mathbf{k}-\mathbf{k}'|^2/2}`
-    (``eq:gaussian_resum``), and the box limit is the :math:`\sigma \to \infty`
-    member of the family, tending to :math:`(\pi/2k^2)\delta^D(k-k')`
-    independently of :math:`\ell` -- i.e. the identity.
-
-    Evaluated as :math:`\frac{\pi}{2}\sigma^3 z^{-1/2} e^{-\sigma^2(k-k')^2/2}
-    \tilde I_{\ell+1/2}(z)`, :math:`z=\sigma^2 k k'`, with
-    :math:`\tilde I_\nu = e^{-z}I_\nu` the exponentially scaled Bessel function:
-    the growth of :math:`i_\ell` cancels the decay of the prefactor exactly, so
-    nothing overflows.
-
-    Note this is a host-side (NumPy/SciPy) routine: JAX has no general
-    :math:`I_\nu`, so it is not traceable. The window matrix is built eagerly, so
-    that is not a limitation in practice.
-
-    Parameters
-    ----------
-    ell : int
-        Bessel order (same on both factors).
-    k, kp : array_like
-        Wavenumbers; broadcast against each other.
-    sigma : float
-        Gaussian width of the window, :math:`w(r) = e^{-r^2/2\sigma^2}`.
-
-    Returns
-    -------
-    F : np.ndarray
-    """
-    from scipy import special
-    k, kp = np.broadcast_arrays(np.asarray(k, dtype='f8'), np.asarray(kp, dtype='f8'))
-    z = sigma**2 * k * kp
-    small = z < 1e-12  # i_ell(z) ~ z^ell / (2ell+1)!! : vanishes for ell > 0
-    zs = np.where(small, 1., z)
-    out = 0.5 * np.pi * sigma**3 * zs**-0.5 * np.exp(-sigma**2 * (k - kp)**2 / 2.) * special.ive(ell + 0.5, zs)
-    if np.any(small):
-        lim = np.sqrt(np.pi / 2.) * sigma**3 * np.exp(-sigma**2 * (k**2 + kp**2) / 2.) if ell == 0 else 0. * k
-        out = np.where(small, lim, out)
-    return out
-
-
-def _bessel_product_compact(ell, ellp, k, kp, moment, nquad=96):
-    r"""
-    Exact radial kernel for an ARBITRARY radial window, any Bessel orders:
-
-    .. math:: F^{(w)}_{\ell\ell'}(k,k') = \frac{1}{4 i^{\ell+\ell'}}
-              \int_{-1}^{1}\!dt \int_{-1}^{1}\!ds\, \mathcal{L}_\ell(t) \mathcal{L}_{\ell'}(s)\, R_w(kt + k's)
-
-    where :math:`R_w(A) = \int_0^\infty r^2 w(r) e^{iAr} dr` (``eq:radial_compact``).
-    Obtained by applying :math:`j_\ell(z) = (2i^\ell)^{-1}\int_{-1}^1 \mathcal{L}_\ell(t)e^{izt}dt`
-    to both Bessel functions: a compact, smooth 2-D quadrature against a single
-    1-D moment of the window, exact under modest Gauss-Legendre.
-
-    This is what the unequal-order case needs (:math:`\ell \neq \ell'` arises as
-    soon as the window is anisotropic, since :math:`H_{\ell\ell'\ell''}` then no
-    longer forces equality), and it is not specific to Gaussians -- any window
-    whose moment one is willing to tabulate works, which makes it a general
-    replacement for the 2D-FFTlog chain.
-
-    Parameters
-    ----------
-    ell, ellp : int
-        Bessel orders of the two factors (need not be equal).
-    k, kp : array_like
-        Wavenumbers; broadcast against each other.
-    moment : callable
-        ``moment(A)`` returning :math:`R_w(A) = \int_0^\infty r^2 w(r) e^{iAr} dr`,
-        broadcasting over its argument. For :math:`\ell + \ell'` even only the
-        even (cosine) part contributes, so a real
-        :math:`C_w(A) = \int_0^\infty r^2 w(r)\cos(Ar) dr` may be passed instead.
-        Elementary for a Gaussian, tophat or exponential window; otherwise
-        tabulate it once by 1-D quadrature and interpolate.
-    nquad : int, default=96
-        Gauss-Legendre nodes per axis of the compact :math:`(t, s)` square. The
-        integrand is smooth (a polynomial times the window moment), so this
-        converges exponentially; 96 is exact to ~8 digits in the cases checked.
-
-    Returns
-    -------
-    F : np.ndarray
-        Real array, broadcast over ``k``, ``kp``.
-    """
-    from scipy import special
-    k, kp = np.broadcast_arrays(np.asarray(k, dtype='f8'), np.asarray(kp, dtype='f8'))
-    t, wq = np.polynomial.legendre.leggauss(nquad)
-    Pl = special.eval_legendre(ell, t) * wq
-    Plp = special.eval_legendre(ellp, t) * wq
-    # Accumulate over the t axis rather than materializing the full
-    # (k.shape, nquad, nquad) array of arguments: for a k-grid of size n that
-    # would be n * nquad^2 entries (~700 MB at n = 1e4, nquad = 96), whereas
-    # this holds only (k.shape, nquad) at a time.
-    out = np.zeros(k.shape, dtype='c16')
-    for i in range(nquad):
-        A = k[..., None] * t[i] + kp[..., None] * t
-        out += Pl[i] * np.sum(np.asarray(moment(A)) * Plp, axis=-1)
-    out = out / (4. * (1j)**(ell + ellp))
-    # F is real for a real window: the phase and the (t, s) parity conspire to
-    # cancel the imaginary part exactly (kept explicit rather than assumed).
-    return out.real
-
-
-
-def _project_window_gaussian(s1, s2, value, ell1=0, ell2=0, widths=None, nwidth=8, rcond=1e-10):
-    r"""
-    Project a window multipole :math:`Q_{\ell_1\ell_2L}(s_1, s_2)` onto SEPARABLE
-    Gaussian-polynomial products,
-
-    .. math:: Q_{\ell_1\ell_2 L}(s_1, s_2) \simeq \sum_{nm} c_{nm}\;
-              s_1^{\ell_1} e^{-a_n s_1^2}\; s_2^{\ell_2} e^{-a_m s_2^2}
-
-    (``eq:gaussian_mixture`` of ``jax_window_notes/ms.tex``). The point of this basis
-    is that every radial integral of the window matrix then reduces to
-    :func:`_gaussian_bessel_product` (equal orders) or :func:`_bessel_product_compact`
-    (unequal), i.e. to elementary functions with no FFTlog grid, no ringing and no
-    absolute noise floor -- and the box limit is the :math:`a \to 0` member of the
-    same family, so it needs no separate treatment.
-
-    The widths :math:`a_n` are FIXED on a logarithmic grid rather than fitted, which
-    makes the problem a linear least squares in :math:`c_{nm}` -- well conditioned and
-    solved in one shot, instead of the ill-conditioned nonlinear fit a variable-width
-    (or shifted) Gaussian basis would require. The :math:`s^{\ell}` prefactors carry
-    the small-separation behaviour of the multipole exactly.
-
-    Parameters
-    ----------
-    s1, s2 : array_like
-        Separation grids (1-D each).
-    value : array_like
-        ``(len(s1), len(s2))`` window multipole.
-    ell1, ell2 : int
-        Multipole orders on each leg; set the :math:`s^{\ell}` prefactors.
-    widths : array_like, optional
-        Gaussian widths :math:`\sigma_n` (so :math:`a_n = 1/2\sigma_n^2`). Default:
-        ``nwidth`` values log-spaced across the span of the input grid.
-    nwidth : int, default=8
-        Number of widths per axis when ``widths`` is not given.
-    rcond : float, default=1e-10
-        Cutoff for small singular values in the least-squares solve.
-
-    Returns
-    -------
-    coeffs : np.ndarray
-        ``(nwidth, nwidth)`` coefficients :math:`c_{nm}`.
-    widths : np.ndarray
-        The widths used.
-    residual : float
-        Relative residual ``||fit - value|| / ||value||``; check this before trusting
-        the expansion.
-    """
-    s1, s2, value = np.asarray(s1, dtype='f8'), np.asarray(s2, dtype='f8'), np.asarray(value, dtype='f8')
-    if widths is None:
-        smin = max(np.min(s1[s1 > 0]) if np.any(s1 > 0) else 1., 1e-3)
-        widths = np.geomspace(smin, np.max(s1), nwidth)
-    widths = np.asarray(widths, dtype='f8')
-    a = 1. / (2. * widths**2)
-    # separable design matrices per axis, then a Kronecker least squares
-    B1 = s1[:, None]**ell1 * np.exp(-a[None, :] * s1[:, None]**2)     # (ns1, nw)
-    B2 = s2[:, None]**ell2 * np.exp(-a[None, :] * s2[:, None]**2)     # (ns2, nw)
-    A = np.einsum('in,jm->ijnm', B1, B2).reshape(s1.size * s2.size, widths.size**2)
-    c, *_ = np.linalg.lstsq(A, value.reshape(-1), rcond=rcond)
-    fit = (A @ c).reshape(value.shape)
-    nrm = np.linalg.norm(value)
-    return c.reshape(widths.size, widths.size), widths, float(np.linalg.norm(fit - value) / max(nrm, 1e-300))
-
-
-def _project_window_laguerre(s1, s2, value, ell1=0, ell2=0, sigma=None, nmax=8, rcond=1e-12):
-    r"""
-    Project a window multipole onto the ORTHOGONAL Gauss--Laguerre basis
-
-    .. math:: \phi^{(\ell)}_n(s) = s^{\ell}\, L_n(s^2/2\sigma^2)\, e^{-s^2/2\sigma^2}
-
-    (``eq:gauss_laguerre_basis`` of ``jax_window_notes/ms.tex``), i.e.
-    :math:`Q_{\ell_1\ell_2L}(s_1,s_2) \simeq \sum_{nm} c_{nm}\phi^{(\ell_1)}_n(s_1)\phi^{(\ell_2)}_m(s_2)`.
-
-    Preferred over :func:`_project_window_gaussian`: a mixture of Gaussians of
-    *different widths* is strongly non-orthogonal, so its design matrix is
-    ill-conditioned and the least squares is unstable -- measured, that basis leaves
-    a 3e-2 residual on a function it represents EXACTLY, with a residual that is not
-    even monotonic in the number of widths. The Laguerre functions share a single
-    width and are orthogonal, so the fit is stable and converges with ``nmax``.
-
-    The closed forms survive: :math:`L_n(s^2/2\sigma^2)e^{-s^2/2\sigma^2}` is a finite
-    combination of :math:`s^{2p}e^{-as^2}`, and :math:`s^{2p}e^{-as^2} =
-    (-\partial/\partial a)^p e^{-as^2}`, so every radial integral is an
-    :math:`a`-derivative of :func:`_gaussian_bessel_product`.
-
-    Returns
-    -------
-    coeffs : np.ndarray
-        ``(nmax, nmax)``.
-    sigma : float
-    residual : float
-        Relative residual; should fall monotonically with ``nmax``.
-    """
-    from numpy.polynomial import laguerre
-    s1, s2, value = np.asarray(s1, dtype='f8'), np.asarray(s2, dtype='f8'), np.asarray(value, dtype='f8')
-    if sigma is None:
-        # Width matched to the input's own SECOND MOMENT, not to the grid extent.
-        # Getting this wrong is the dominant error: with sigma tied to max(s), a
-        # narrow window needs many high-order terms and the fit stalls (measured
-        # 2e-2 at nmax=12 for a sigma=50 input on a grid reaching 500, versus 1e-8
-        # for a sigma=150 input on the same grid).
-        w = np.abs(value).sum(axis=1)
-        sigma = np.sqrt(max((w * s1**2).sum() / max(w.sum(), 1e-300), 1e-300)) / np.sqrt(2.)
-
-    def design(s, ell):
-        u = s**2 / (2. * sigma**2)
-        cols = []
-        for n in range(nmax):
-            cn = np.zeros(n + 1); cn[n] = 1.
-            cols.append(s**ell * laguerre.lagval(u, cn) * np.exp(-u / 2.))
-        return np.column_stack(cols)
-
-    B1, B2 = design(s1, ell1), design(s2, ell2)
-    A = np.einsum('in,jm->ijnm', B1, B2).reshape(s1.size * s2.size, nmax * nmax)
-    c, *_ = np.linalg.lstsq(A, value.reshape(-1), rcond=rcond)
-    fit = (A @ c).reshape(value.shape)
-    return c.reshape(nmax, nmax), float(sigma), float(np.linalg.norm(fit - value) / max(np.linalg.norm(value), 1e-300))
 
 
 def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_ordered=None,
@@ -1785,9 +1545,8 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
 
 
 def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None,
-                                    flags: tuple=None, batch_size: int=None, ellmax: int=4,
-                                    ninsub: int=1, noutsub: int=1, interp: str='tophat',
-                                    exact_box_limit: bool | float=False) -> WindowMatrix:
+                                    flags: tuple=None, batch_size: int=None, ellmax: int=8,
+                                    ninsub: int=16, noutsub: int=2) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 
@@ -1803,13 +1562,26 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         or tuples :math:`(L', M')`, see :func:`get_scoccimarro_window_convolution_coeffs`.
     bin : BinMesh2SpectrumPoles
         Output binning.
-    ellmax : int, default=4
+    ellmax : int, default=8
         For the scoccimarro basis: truncation of the TripoSH multipole sums resolving
         the internal (opening-angle) dependence, see
         :func:`get_scoccimarro_window_convolution_coeffs`. Use the same value as passed to
         :func:`get_smooth3_window_bin_attrs` (window multipoles missing from ``window``
         are silently treated as zero). Convergence should be checked, especially for
         squeezed configurations.
+    ninsub : int, default=16
+        Theory-side sub-binning of the :math:`k_3^{\\prime}` measure integral. Not optional: the
+        point value breaks the box-limit sum rule by tens of per cent (16% at ``ninsub = 1``,
+        1.9% at 16). Measured on the injected-bispectrum test, ``ninsub = 1`` gives
+        :math:`\\chi^2/n = 4.41` against 3.25 for 4, 16 and 64 (identical), so 4 already
+        converges and 16 is margin.
+    noutsub : int, default=2
+        Output-side sub-binning: the full 3-D bin average of the rapidly varying angular factor
+        :math:`\\mathcal{L}_{\\ell_2}(\\cos\\theta_{12})`, all three legs sub-binned and weighted
+        by :math:`k_1^2k_2^2k_3^2` times the triangle measure. Setting it to 1 evaluates that
+        factor at the bin's representative triangle, which is 20-40% wrong on squeezed
+        configurations; measured, ``noutsub = 1`` shifts individual bins by up to 47% and the
+        fitted amplitude from 0.971 to 1.055. Converged at 2 (2, 4, 6 agree to 3 digits).
     batch_size : int, optional
         Size of the batch for each step to execute in parallel.
     Returns
@@ -1817,10 +1589,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     wmat : WindowMatrix
     """
     ells = bin.ells
-    # the constant-window pass below must receive the CALLER's arguments, not the
-    # rebound/parsed ones: ellsin is turned into (ellin, wain) pairs further down
-    _edgesin_arg, _ellsin_arg = edgesin, ellsin
-
     if isinstance(edgesin, ObservableTree):
         ellsin = edgesin.ells
         if 'wa_orders' in edgesin.labels(return_type='keys'):
@@ -2007,26 +1775,13 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # shape dependence -- large for squeezed ISOSCELES, small for squeezed scalene or for
         # equal-but-short legs -- is exactly the pattern of the box-limit residual.
         # The bin average is the ratio of bin-integrated measures, all three legs sub-binned.
-        # interp='spline': the SAME primitives the sugiyama branch uses -- a smooth spline basis on
-        # the theory side (matrix_spline_interp) in place of the sharp `tophat`, and a k^2-weighted
-        # bin average on the output side (matrix_rebin) in place of `read`, which interpolates
-        # linearly at the bin's representative (k1, k2) with no k^2 weight and no bin average --
-        # a plausible source of a low-k/high-k tilt.
-        # interp names the (theory-side, output-side) pair so the two can be isolated:
-        #   'tophat'        = (tophat mask, linear read)      -- the historical path
-        #   'spline'        = (spline basis, k^2 rebin)        -- both swapped, as the sugiyama branch
-        #   'tophat-rebin'  = (tophat mask, k^2 rebin)         -- keeps the exact bin tiling on the
-        #                     theory side (which the box-limit sum rule needs) while gaining a
-        #                     proper k^2-weighted bin average on the output
-        #   'spline-read'   = (spline basis, linear read)
-        _INTERP = {'tophat': ('tophat', 'read'), 'spline': ('spline', 'rebin'),
-                   'tophat-rebin': ('tophat', 'rebin'), 'spline-read': ('spline', 'read')}
-        if interp not in _INTERP:
-            raise ValueError(f"interp must be one of {sorted(_INTERP)}, got {interp}")
-        _interp_in, _interp_out = _INTERP[interp]
+        # Theory-side primitive is the sharp tophat: it tiles the bins exactly, which the
+        # box-limit sum rule requires, and it measured BETTER than the smooth spline basis on the
+        # injected-bispectrum test (weighted pred/meas 0.971, chi2/n 3.25, versus 0.945 and 3.76).
+        # The output side is the noutsub bin average below. `rebin` -- a k^2-weighted average over
+        # (k1, k2) only, leaving the angular factor at the bin's representative triangle --
+        # survives solely as the noutsub = 1 fallback, and is why noutsub = 1 is not recommended.
         _sc_spline = None
-        if interp != 'tophat':
-            assert 'scoccimarro' in bin.basis, f'interp={interp} implemented for the scoccimarro branch'
 
         if noutsub > 1:
             from .pt import integration as _integration_out
@@ -2054,10 +1809,19 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 tmp = jnp.zeros(shape=(len(kout), len(edgesin)))
 
                 for sugiyama_ell, sugiyama_ellt, wcoeffs in get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=ellmax):
+                    Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
+                    # Skip terms whose window multipoles are ALL absent from `window`: get_w_rect
+                    # returns a 0-d zero for each, so Qs stays 0-d and the term contributes exactly
+                    # nothing -- yet it would otherwise pay a full 2D-FFTlog pair per theory bin.
+                    # This is the bulk of the cost at low ellwmax: the term count grows as
+                    # (ellmax + 1)^2 per (ell <- ellin) block while only ~(ellmax + 1) terms have a
+                    # non-zero window, so 67% (ellmax=2) to 89% (ellmax=8) of the work is wasted.
+                    # Absent multipoles are already treated as zero downstream, so this changes no
+                    # result -- only the runtime, from O(ellmax^2) to O(ellmax).
+                    if np.ndim(Qs) == 0: continue
                     # fftlog
                     to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=sugiyama_ell, check_level=1, minfolds=0)
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sugiyama_ellt, minfolds=0)
-                    Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
 
                     def convolve(idx):
                         # Theory side: \int_{bin} k_3'^2 dk_3' / (2 pi^2) x I_000(k') y_{ell_2'}^{-M'}(cos theta_12', 0);
@@ -2077,7 +1841,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                             volume = (-1)**ell2t * jnp.sum(w3n * qs[2]**2 / (2. * jnp.pi**2) * compute_I((ell2t, -m_in), qs), axis=-1)
                         else:
                             volume = (edgesin[idx, 2, 1]**3 - edgesin[idx, 2, 0]**3) / (6. * jnp.pi**2) * (-1)**ell2t * compute_I((ell2t, -m_in), kin[idx].T)
-                        if _interp_in == 'spline':
+                        if _sc_spline is not None and noutsub <= 1:
                             _Min, _ii = _sc_spline[0], _sc_spline[1][idx]
                             spectrum = (_Min[0][:, _ii[0]][:, None] * _Min[1][:, _ii[1]][None, :]) * volume
                         else:
@@ -2086,18 +1850,27 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                         correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
                         # Estimator side: B_L(k1, k2, k3) = sum_{ell_1 ell_2} Legendre_{ell_2}(cos theta_12) B_{ell_1 ell_2 L}(k1, k2)
                         ell2 = sugiyama_ell[1]
-                        if _interp_out == 'rebin':
-                            _Mo, _io = _sc_spline[2], _sc_spline[3]
-                            _rb = _Mo[0] @ to_spectrum(correlation)[1] @ _Mo[1].T
-                            spectrum = _rb[_io[:, 0], _io[:, 1]]
-                            spectrum = spectrum * compute_I(ell2, kout.T) * (-1)**ell2 / compute_I(0, kout.T)
-                            return jnp.nan_to_num(spectrum)
+                        # noutsub takes PRECEDENCE over 'rebin': it is the full 3-D output-bin
+                        # average (all three legs sub-binned, weighted by k1^2 k2^2 k3^2 and the
+                        # I_0 triangle measure), whereas 'rebin' averages only (k1, k2) and then
+                        # applies the rapidly varying angular factor
+                        # L_{ell2}(cos theta12) = (-1)^ell2 I_{ell2}/I_0 at the single
+                        # representative triangle. This branch used to sit AFTER an early return
+                        # from 'rebin', so noutsub was silently inert for interp in
+                        # ('spline', 'tophat-rebin') -- noutsub = 1, 2, 4 gave bit-identical
+                        # results -- and the 20-40% midpoint error of L_{ell2} on squeezed
+                        # triangles was never corrected on that path.
                         if noutsub > 1:
                             # bin average = sum_sub w k^2 I_{ell2} read  /  sum_sub w k^2 I_0
                             sub = read(kout_sub.T, to_spectrum.k, to_spectrum(correlation)[1])
                             num = jnp.sum(kout_weight * (sub * compute_I(ell2, kout_sub.T) * (-1)**ell2).reshape(-1, nout_sub), axis=-1)
                             den = jnp.sum(kout_weight * compute_I(0, kout_sub.T).reshape(-1, nout_sub), axis=-1)
                             spectrum = num / jnp.where(den == 0., 1., den)
+                        elif _sc_spline is not None:
+                            _Mo, _io = _sc_spline[2], _sc_spline[3]
+                            _rb = _Mo[0] @ to_spectrum(correlation)[1] @ _Mo[1].T
+                            spectrum = _rb[_io[:, 0], _io[:, 1]]
+                            spectrum = spectrum * compute_I(ell2, kout.T) * (-1)**ell2 / compute_I(0, kout.T)
                         else:
                             spectrum = read(kout.T, to_spectrum.k, to_spectrum(correlation)[1])
                             spectrum *= compute_I(ell2, kout.T) * (-1)**ell2 / compute_I(0, kout.T)
@@ -2110,7 +1883,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                         # who does not mask, so return 0 as the grid branch does.
                         return jnp.nan_to_num(spectrum)
 
-                    if interp != 'tophat' and _sc_spline is None:
+                    if noutsub <= 1 and _sc_spline is None:
                         _i_in, _M_in = axis_basis_matrices(edgesin[:, :2], to_spectrum.k, kind='spline')
                         _i_out, _M_out = axis_basis_matrices(np.asarray(bin.edges)[:, :2], to_spectrum.k, kind='rebin')
                         _sc_spline = (_M_in, _i_in, _M_out, _i_out)
@@ -2164,47 +1937,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
 
     wmat = jnp.concatenate(list(wmat_tmp.values()), axis=1)
-
-    if exact_box_limit is not False:
-        # Identity split: W^refac = W[Q] - Qinf W[e_000] + Qinf Delta, with
-        # Qinf = Q_000(s -> 0). The truncated pipeline cannot reproduce the box
-        # limit, because at fixed (k1, k2) the identity in k3 is a delta in
-        # cos(theta12) and its Legendre series needs l -> infinity; handling that
-        # term analytically makes the box limit exact at ANY truncation, and the
-        # shared truncation error largely cancels between the two pipeline passes.
-        poles, Qinf = [], None
-        for q in window.ells:
-            wpole = window.get(ells=q)
-            value = wpole.value()
-            if tuple(np.atleast_1d(q).ravel()) == (0, 0, 0):
-                Qinf = float(jnp.real(value.ravel()[0]))
-                value = jnp.ones_like(value)
-            else:
-                value = jnp.zeros_like(value)
-            poles.append(wpole.clone(value=value))
-        assert Qinf is not None, 'exact_box_limit needs the (0, 0, 0) window multipole'
-        if exact_box_limit is not True: Qinf = float(exact_box_limit)
-        window_const = ObservableTree(poles, ells=list(window.ells))
-        wmat_const = compute_smooth3_spectrum_window(
-            window_const, _edgesin_arg, ellsin=_ellsin_arg, bin=bin, flags=flags, batch_size=batch_size,
-            ellmax=ellmax, ninsub=ninsub, noutsub=noutsub, interp=interp, exact_box_limit=False)
-
-        # Delta: the exact binned identity. Diagonal in L, and only for the pure
-        # Legendre-multipole channel -- the wide-angle terms vanish in the box limit.
-        kout_ = np.asarray(bin.xavg)
-        edges_ = np.asarray(edgesin)
-        inside = np.all((kout_[:, None, :] >= edges_[None, :, :, 0])
-                        & (kout_[:, None, :] < edges_[None, :, :, 1]), axis=-1).astype(float)
-        blocks = []
-        for ellin, wain in ellsin:
-            L_in = ellin[0] if isinstance(ellin, tuple) else ellin
-            M_in = ellin[1] if isinstance(ellin, tuple) else 0
-            pure = (tuple(wain) == (0, 0)) and (M_in == 0)
-            blocks.append(jnp.concatenate([jnp.asarray(inside) if (pure and ell == L_in)
-                                           else jnp.zeros_like(jnp.asarray(inside))
-                                           for ell in ells], axis=0))
-        delta = jnp.concatenate(blocks, axis=1)
-        wmat = wmat - Qinf * jnp.asarray(wmat_const.value()) + Qinf * delta
 
     observable = []
     for ill, ell in enumerate(ells):

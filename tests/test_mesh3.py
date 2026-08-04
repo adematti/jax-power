@@ -1,4 +1,5 @@
 import time
+import itertools
 from pathlib import Path
 from functools import partial
 
@@ -1059,57 +1060,6 @@ def test_smooth_window_scoccimarro_synthetic(plot=False):
         plt.show()
 
 
-def test_smooth_window_scoccimarro_exact_box_limit():
-    """exact_box_limit=True must make the box (large-selection-function) limit
-    EXACTLY diagonal, structurally -- i.e. for ANY ellmax / nmu / ninsub, not
-    just for tuned settings.
-
-    Without it, the box limit is recovered only through the completeness of the
-    internal-angle Legendre sums: at fixed (k1, k2) the identity in k3 IS a
-    delta in cos(theta12), and delta(mu - mu0) = sum_l (2l+1)/2 L_l(mu0) L_l(mu)
-    needs l -> infinity. Truncated, the pipeline returns the measure-weighted k3
-    AVERAGE instead of a delta, so the matrix is badly non-diagonal (measured:
-    diagonal 0.17 instead of 1, off-diagonal leakage 2.6x the diagonal) and
-    raising ellmax does not help. Since the kernel is linear in the window,
-    Q = Qinf e_000 + dQ gives W[Q] = Qinf W[e_000] + W[dQ], and replacing the
-    first term by the exact binned identity makes a uniform window reproduce
-    Qinf * I identically.
-    """
-    from lsstypes import ObservableLeaf, ObservableTree
-
-    mattrs = MeshAttrs(boxsize=1000., meshsize=32, boxcenter=[0., 0., 1500.])
-    ells = ellsin = [0, 2]
-    edges3 = np.array([0.02, 0.06, 0.10, 0.14, 0.18])
-    bin = BinMesh3SpectrumPoles(mattrs, edges=edges3, basis='scoccimarro', ells=ells, mask_edges='')
-
-    # uniform window: Q_000 = 1, every other multipole exactly 0
-    coords = jnp.logspace(-2, 3, 128)
-    wells = [(0, 0, 0), (2, 0, 2), (0, 2, 2)]
-    poles = [ObservableLeaf(s1=coords, s2=coords, coords=['s1', 's2'], meta={'ell': q},
-                            value=jnp.ones((len(coords),) * 2) if q == (0, 0, 0) else jnp.zeros((len(coords),) * 2))
-             for q in wells]
-    window = ObservableTree(poles, ells=wells)
-    edgesin = (edges3, edges3, edges3)
-
-    kout = np.asarray(bin.xavg)
-    for ellmax, ninsub in [(0, 1), (2, 1), (2, 8)]:
-        wmat = compute_smooth3_spectrum_window(window, edgesin=edgesin, ellsin=ellsin, bin=bin,
-                                               ellmax=ellmax, ninsub=ninsub, exact_box_limit=True)
-        value = np.asarray(wmat.value())
-        kedgesin = np.asarray(wmat.theory.get(ells=ellsin[0]).edges('k'))
-        nin = kedgesin.shape[0]
-
-        # expected: Qinf (= 1 here) times the identity, block-diagonal in ell
-        expected = np.zeros_like(value)
-        for iout in range(len(kout)):
-            inside = np.all((kout[iout][None, :] >= kedgesin[..., 0]) & (kout[iout][None, :] < kedgesin[..., 1]), axis=-1)
-            for illout, ell in enumerate(ells):
-                for illin, ellin in enumerate(ellsin):
-                    if ell == ellin:
-                        expected[illout * len(kout) + iout, illin * nin:(illin + 1) * nin] = inside
-        np.testing.assert_allclose(value, expected, rtol=0., atol=1e-9)
-
-
 def test_smooth_window_scoccimarro_per_ell_norm():
     """Per-L normalization of the grid window matrix, and agreement with the
     discrete-sum branch for L > 0.
@@ -1311,6 +1261,184 @@ def test_ref():
 
 
 
+def test_scoccimarro_symmetrization_matrix():
+    """The ordered -> unordered theory scatter matrix, and its two inference directions.
+
+    The estimator bins ordered triangles k1 <= k2 <= k3, but the window convolution runs over all
+    of k'-space, so the matrix must be handed the unordered grid; filling it is a theory-side
+    statement about which permutations leave B_L' invariant. fix_legs=(2,) is exact for EVERY L'
+    (swapping k1 <-> k2 leaves the line-of-sight leg alone), all six only for L' = 0.
+    """
+    from jaxpower import get_scoccimarro_symmetrization_matrix as sym
+
+    cen = np.array([0.03, 0.05, 0.07])
+    ordered = np.array([[a, b, c] for a in cen for b in cen for c in cen if a <= b <= c])
+    edges_ordered = np.stack([ordered - 0.01, ordered + 0.01], axis=-1)
+
+    # build the unordered grid from the ordered one, edges carried along
+    S, kin, kin_ord, edges = sym(kin_ordered=ordered, edges_ordered=edges_ordered)
+    assert np.allclose(kin_ord, ordered)                      # echoed unchanged
+    assert edges.shape == (len(kin), 3, 2)
+    assert len(kin) == 27, len(kin)                           # 3^3 distinct permuted boxes
+    # every unordered box draws from exactly one ordered bin, and the column sums are the
+    # permutation multiplicities: 1 (equilateral), 3 (two equal), 6 (all distinct)
+    assert np.all(S.sum(axis=1) == 1.)
+    assert set(np.unique(S.sum(axis=0)).astype(int)) == {1, 3, 6}, np.unique(S.sum(axis=0))
+    for j, t in enumerate(ordered):
+        assert int(S[:, j].sum()) == len(set(itertools.permutations(np.round(t, 12))))
+
+    # fix_legs=(2,) keeps only the k1 <-> k2 swaps: multiplicity 1 or 2, and a strict subset
+    Sf, *_ = sym(kin=kin, kin_ordered=ordered, fix_legs=(2,))
+    assert set(np.unique(Sf.sum(axis=0)).astype(int)) <= {1, 2}
+    assert np.all(Sf <= S) and Sf.sum() < S.sum()
+    # rows with no admissible permutation stay ZERO -- missing k'-space must show up as a
+    # sum-rule shortfall, never be invented
+    assert np.any(Sf.sum(axis=1) == 0.)
+
+    # infer the ordered grid back from the unordered one
+    S2, _, ord2, edges2 = sym(kin=kin)
+    assert edges2 is None                                     # not inferrable from centres alone
+    assert np.allclose(np.sort(ord2, axis=0), np.sort(ordered, axis=0))
+    assert np.allclose(S2, S)
+    try:
+        sym()
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('expected ValueError when both grids are omitted')
+    print('test_scoccimarro_symmetrization_matrix OK')
+
+
+def _analytic_gaussian_q000(mattrs, sigma, coords):
+    """Exact Q000 for a Gaussian selection, so the test needs no measured window.
+
+    int d^3x W(x)W(x+s1)W(x+s2) with W = exp(-d^2/2 sigma^2) gives, on completing the square,
+    exp(-[s1^2 + s2^2 - s1.s2]/3 sigma^2); its isotropic part is
+
+        Q000(s1,s2) = exp(-(s1^2+s2^2) a) sinh(z)/z,   z = s1 s2 a,  a = 1/(3 sigma^2),
+
+    normalized to 1 at s -> 0. Combine the prefactor INTO the sinh: the coords grid reaches
+    s ~ 1e4, where exp(z) overflows while the prefactor underflows, and 0 * inf = NaN silently
+    zeroes the whole prediction.
+    """
+    from jaxpower.types import Mesh3CorrelationPole
+    from lsstypes import ObservableTree, ObservableLeaf
+    s1 = s2 = np.asarray(coords)
+    a = 1. / (3. * sigma**2)
+    S1, S2 = s1[:, None], s2[None, :]
+    z, q2 = S1 * S2 * a, (S1**2 + S2**2) * a
+    with np.errstate(divide='ignore', invalid='ignore'):
+        val = (np.exp(-(q2 - z)) - np.exp(-(q2 + z))) / (2. * z)
+    val = np.where(z < 1e-8, np.exp(-q2) * (1. + z**2 / 6.), val)
+    assert np.all(np.isfinite(val))
+    pole = ObservableLeaf(s1=s1, s2=s2, value=jnp.asarray(val / val.ravel()[0]),
+                          coords=['s1', 's2'], meta={'ell': (0, 0, 0)})
+    return ObservableTree([pole], ells=[(0, 0, 0)])
+
+
+def test_smooth_window_scoccimarro_inject(nmocks=20, plot=False):
+    """End-to-end window-matrix test against an EXACTLY KNOWN bispectrum.
+
+    generate_spectrum3_mesh(spectrum3={(i,j,k): amp}) injects a known amplitude into one band
+    triplet, so the theory is a delta in band space and the windowed measurement reads ONE COLUMN
+    of the window matrix. Working at MESH level (multiply by the selection rather than painting
+    particles) removes shot noise AND the integral constraint, and the window is the closed-form
+    Gaussian Q000, so the only inputs are the injected amplitude and an analytic window.
+
+    A SCALENE target makes this discriminate: B is symmetric, so the theory is amp at all six
+    permutations of the target and an ordered-octant-only vector would supply just one.
+
+    Conventions that must not be broken (each was a wrong answer once):
+      * compute_mesh3_spectrum already carries the right norm for a zero-mean delta
+        (= compute_normalization(1,1,1)); for the windowed field SCALE it by <W^3>, never replace it;
+      * antisymmetric in amp (same seed, +amp/-amp, half the difference) cancels the Gaussian
+        noise and all even orders, without which the O(amp) signal is buried;
+      * bands must start above k = 0, since subtracting <g^2> removes the k = 0 piece.
+    """
+    from jaxpower import generate_spectrum3_mesh, get_scoccimarro_symmetrization_matrix
+    from jaxpower.types import Mesh3SpectrumPole
+    from lsstypes import ObservableTree
+
+    # meshsize must keep kmax / kNyq <~ 0.4: the WINDOWED field is a real-space product, i.e. a
+    # k-space convolution, so it carries power to higher k than the box field and meets Nyquist
+    # discreteness sooner. Measured, meshsize = 48 (kmax/kNyq = 0.53) biases the fitted window
+    # amplitude to 1.36 while the injection arm stays unbiased at 0.99; meshsize = 64 (0.40) gives
+    # 1.04 +- 0.05. Neither ellmax 8 nor 10 changes this (identical to 4 digits).
+    boxsize, meshsize, sigma = 500., 64, 50.
+    p0, amp, target = 2.0e4, 2.0e7, (2, 3, 4)
+    mattrs = MeshAttrs(boxsize=boxsize, meshsize=meshsize, boxcenter=[0., 0., 1500.])
+    # k range must extend WELL ABOVE the injected triangle: the window scatters the delta into
+    # neighbouring configurations, and truncating the grid just above the target throws that
+    # leakage away (with kmax = 0.12 against a target at k3 = 0.11 the fitted amplitude comes out
+    # 17% high, versus consistent with 1 here).
+    kedges = np.arange(0.02, 0.1601, 0.02)
+    power = lambda kvec: p0 + 0. * jnp.sqrt(sum(kk**2 for kk in kvec))
+    bin3 = BinMesh3SpectrumPoles(mattrs, edges=kedges, basis='scoccimarro', ells=[0])
+    xa, ked = np.asarray(bin3.xavg), np.asarray(bin3.edges)
+    kmid = 0.5 * (kedges[:-1] + kedges[1:])
+    itar = int(np.argmin(np.abs(xa - np.array([kmid[t] for t in target])[None, :]).sum(axis=1)))
+
+    xvec = mattrs.xcoords(kind='position', sparse=False)
+    d2 = sum((xx - cc)**2 for xx, cc in zip(xvec, mattrs.boxcenter))
+    W = mattrs.create(kind='real', fill=jnp.exp(-0.5 * d2 / sigma**2))
+    ones = mattrs.create(kind='real', fill=1.)
+    normW = compute_normalization(W, W, W)
+
+    jitted = jax.jit(compute_mesh3_spectrum, static_argnames=['los'])
+
+    def measure(mesh, norm=None):
+        s3 = jitted(mesh, bin=bin3, los='z')
+        if norm is not None: s3 = s3.map(lambda pole: pole.clone(norm=norm))
+        return np.asarray(s3.get(ells=0).value())
+
+    box, win = [], []
+    for imock in range(nmocks):
+        vb, vw = [], []
+        for sign in (1, -1):   # antisymmetric: cancels the Gaussian noise and the even orders
+            mesh = generate_spectrum3_mesh(mattrs, power=power, edges=kedges, seed=imock,
+                                           spectrum3={target: sign * amp})
+            vb.append(measure(mesh))                  # default norm: already the bispectrum
+            vw.append(measure(mesh * W, normW))       # windowed: int 1^3 -> int W^3
+        box.append((vb[0] - vb[1]) / 2.); win.append((vw[0] - vw[1]) / 2.)
+    box, win = np.array(box), np.array(win)
+    bm, be = box.mean(axis=0), box.std(axis=0) / np.sqrt(nmocks)
+    wm, we = win.mean(axis=0), win.std(axis=0) / np.sqrt(nmocks)
+
+    # --- the injection itself: amp in the target bin, nothing anywhere else ---
+    assert abs(bm[itar] / amp - 1.) < max(4. * be[itar] / amp, 0.03), (bm[itar] / amp, be[itar] / amp)
+    valid = np.abs((xa[:, 2]**2 - xa[:, 0]**2 - xa[:, 1]**2) / (2 * xa[:, 0] * xa[:, 1])) <= 1.
+    other = valid & (np.arange(len(xa)) != itar)
+    assert np.max(np.abs(bm[other])) / amp < 0.06, np.max(np.abs(bm[other])) / amp
+
+    # --- window matrix on the UNORDERED grid, theory = amp at every permutation of the target ---
+    # s-grid matters: the window matrix takes its FFTlog grid straight from the Q coords, so use
+    # the same range the validated runs used (1 to 1e4, 256 log points). A narrower/shifted grid
+    # (1e-2 to 1e3) biased the fitted amplitude by tens of per cent.
+    Q = _analytic_gaussian_q000(mattrs, sigma, np.logspace(0., 4., 256))
+    oi = np.where(valid)[0]
+    S, k_un, _, e_un = get_scoccimarro_symmetrization_matrix(kin_ordered=xa[oi], edges_ordered=ked[oi])
+    theory = S @ (np.eye(len(oi))[int(np.where(oi == itar)[0][0])] * amp)
+    assert np.count_nonzero(theory) == len(set(itertools.permutations(target)))
+    edgesin = ObservableTree([Mesh3SpectrumPole(k=jnp.asarray(k_un), k_edges=jnp.asarray(e_un),
+                                                num_raw=jnp.zeros(len(k_un)), basis='sugiyama')],
+                             ells=[0], wa_orders=[(0, 0)])
+    wmat = compute_smooth3_spectrum_window(Q, edgesin=edgesin, ellsin=[0], bin=bin3)
+    pred = np.asarray(wmat.dot(jnp.asarray(theory), return_type=None).get(ells=0).value())
+
+    # Judge on the bins the window actually populates, selected from the PREDICTION: a cut on the
+    # measurement would move with nmocks and make runs incomparable.
+    sel = oi[np.abs(pred[oi]) > 0.01 * amp]
+    assert len(sel) > 8, len(sel)
+    # inverse-variance amplitude fit meas = s * pred; an unweighted mean of per-bin ratios is
+    # unusable here, since bins whose measurement sits near zero give wild ratios
+    P, M, E = pred[sel], wm[sel], we[sel]
+    s_fit = np.sum(P * M / E**2) / np.sum(P * P / E**2)
+    ratio, err = 1. / s_fit, (1. / np.sqrt(np.sum(P * P / E**2))) / s_fit**2
+    assert abs(ratio - 1.) < max(4. * err, 0.10), (ratio, err)
+    print(f'test_smooth_window_scoccimarro_inject OK (injection {bm[itar] / amp:.4f}, '
+          f'window amplitude {ratio:.4f} +- {err:.4f} on {len(sel)} bins)')
+
+
 if __name__ == '__main__':
 
     #import os
@@ -1335,4 +1463,6 @@ if __name__ == '__main__':
     test_fftlog2()
     test_smooth_window_sugiyama_synthetic()
     test_smooth_window()
+    test_scoccimarro_symmetrization_matrix()
+    test_smooth_window_scoccimarro_inject()
     #test_mesh3_spectrum_soccimarro_shotnoise()
