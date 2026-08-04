@@ -4,7 +4,8 @@ from jax import numpy as jnp
 
 from lsstypes import (Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles,
                       ObservableLeaf, ObservableTree, WindowMatrix, CovarianceMatrix, read, write)
-from lsstypes.base import from_state, _edges_names, register_type
+from lsstypes.base import from_state, _edges_names, register_type, _check_data_names, _check_data_shapes
+from lsstypes.utils import plotter, my_ones_like, my_zeros_like
 
 
 def make_leaf_pytree(cls):
@@ -271,6 +272,141 @@ class Particle2CorrelationPoles(Mesh2CorrelationPoles):
         """
         return observable_correlation_to_spectrum(self, k)
 
+
+
+@register_type
+class Angular2Spectrum(Mesh2SpectrumPole):
+    r"""
+    Container for an angular power spectrum :math:`C_\ell`.
+
+    Stores the binned (bandpower) angular power spectrum, including shot noise, normalization, and mode counts.
+
+    Parameters
+    ----------
+    ell : array-like
+        Bin centers for multipole :math:`\ell`.
+    ell_edges : array-like
+        Bin edges for multipole :math:`\ell`.
+    num_raw : array-like
+        Raw angular power spectrum measurements.
+    num_shotnoise : array-like, optional
+        Shot noise contribution (default: zeros).
+    norm : array-like, optional
+        Normalization factor (default: ones).
+    nmodes : array-like, optional
+        Number of modes :math:`\sum_{\ell \in b} (2\ell + 1)` per bin (default: ones).
+    attrs : dict, optional
+        Additional attributes.
+    """
+    _name = 'angular2_spectrum'
+
+    def __init__(self, ell=None, ell_edges=None, num_raw=None, num_shotnoise=None, norm=None, nmodes=None, attrs=None, **kwargs):
+        kw = dict(ell=ell, ell_edges=ell_edges)
+        if ell_edges is None: kw.pop('ell_edges')
+        self.__pre_init__(**kw, coords=['ell'], attrs=attrs)
+        if num_shotnoise is None: num_shotnoise = my_zeros_like(num_raw)
+        if norm is None: norm = my_ones_like(num_raw)
+        if nmodes is None: nmodes = my_ones_like(num_raw, dtype='i4')
+        self._values_names = ['value', 'num_shotnoise', 'norm', 'nmodes']
+        for name in list(kwargs):
+            if name not in self._values_names:
+                raise ValueError(f'{name} not unknown')
+        self._update(num_raw=num_raw, num_shotnoise=num_shotnoise, norm=norm, nmodes=nmodes, **kwargs)
+        _check_data_names(self)
+        _check_data_shapes(self)
+
+    def _plabel(self, name):
+        if name == 'ell':
+            return r'$\ell$'
+        if name == 'value':
+            return r'$C_\ell$'
+        return None
+
+    @plotter
+    def plot(self, fig=None, **kwargs):
+        r"""
+        Plot the angular power spectrum.
+
+        Parameters
+        ----------
+        fig : matplotlib.figure.Figure, default=None
+            Optionally, a figure with at least 1 axis.
+        fn : str, Path, default=None
+            Optionally, path where to save figure.
+        kw_save : dict, default=None
+            Optionally, arguments for :meth:`matplotlib.figure.Figure.savefig`.
+        show : bool, default=False
+            If ``True``, show figure.
+        """
+        from matplotlib import pyplot as plt
+        if fig is None:
+            fig, ax = plt.subplots()
+        else:
+            ax = fig.axes[0]
+        ax.plot(self.ell, self.value, **kwargs)
+        ax.set_xlabel(self._plabel('ell'))
+        ax.set_ylabel(self._plabel('value'))
+        return fig
+
+
+Angular2Spectrum = make_leaf_pytree(Angular2Spectrum)
+
+
+@register_type
+class Angular3Spectrum(Mesh3SpectrumPole):
+    r"""
+    Container for an angular bispectrum :math:`b_{\ell_1 \ell_2 \ell_3}`, binned in :math:`\ell`-bands.
+
+    Triplets of bands are raveled: ``ell`` has shape ``(nbins, 3)`` (and ``ell_edges`` shape ``(nbins, 3, 2)``),
+    since the triangle and parity conditions leave a subset of the band triplets.
+
+    Parameters
+    ----------
+    ell : array-like
+        Band centers, shape ``(nbins, 3)``.
+    ell_edges : array-like
+        Band edges, shape ``(nbins, 3, 2)``.
+    num_raw : array-like
+        Raw bispectrum measurements.
+    num_shotnoise : array-like, optional
+        Shot noise contribution (default: zeros).
+    norm : array-like, optional
+        Normalization factor (default: ones).
+    nmodes : array-like, optional
+        Number of triangles :math:`N_{i_1 i_2 i_3} = \sum_{\ell_1 \ell_2 \ell_3} h^2_{\ell_1 \ell_2 \ell_3}` per bin.
+    attrs : dict, optional
+        Additional attributes.
+    """
+    _name = 'angular3_spectrum'
+
+    def __init__(self, ell=None, ell_edges=None, num_raw=None, num_shotnoise=None, norm=None, nmodes=None, attrs=None):
+        kw = dict(ell=ell, ell_edges=ell_edges)
+        if ell_edges is None: kw.pop('ell_edges')
+        coords = ['ell']
+        if isinstance(ell, tuple):
+            kw = {f'ell{idim + 1:d}': coord for idim, coord in enumerate(ell)}
+            coords = list(kw)
+            if ell_edges is not None:
+                kw.update({f'ell{idim + 1:d}_edges': edge for idim, edge in enumerate(ell_edges)})
+        self.__pre_init__(**kw, coords=coords, attrs=attrs)
+        if num_shotnoise is None: num_shotnoise = my_zeros_like(num_raw)
+        if norm is None: norm = my_ones_like(num_raw)
+        if nmodes is None: nmodes = my_ones_like(num_raw, dtype='f8')
+        self._values_names = ['value', 'num_shotnoise', 'norm', 'nmodes']
+        self._update(**kw, num_raw=num_raw, num_shotnoise=num_shotnoise, norm=norm, nmodes=nmodes)
+        _check_data_names(self)
+        _check_data_shapes(self)
+        self._meta['basis'] = ''
+
+    def _plabel(self, name):
+        if name.startswith('ell'):
+            return r'$\ell_{}$'.format(name[3:]) if name[3:] else r'$\ell$'
+        if name == 'value':
+            return r'$b_{\ell_1 \ell_2 \ell_3}$'
+        return None
+
+
+Angular3Spectrum = make_leaf_pytree(Angular3Spectrum)
 
 
 class Particle3SpectrumPole(Mesh3SpectrumPole): pass

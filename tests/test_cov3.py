@@ -394,8 +394,117 @@ def test_fkp3_covariance_periodic_approx(plot=False):
     return cov_win, cov_box
 
 
+def test_cov3_bb_ties_modesum():
+    """Validate the periodic-box BB tie families against an exact discrete
+    mode-sum, with a SCALE-DEPENDENT bispectrum theory.
+
+    B = 1 only checks the tie normalizations (angular fractions, Ntilde):
+    the historical unit-vector-legs bug in the (a)/(b) mu12 closure ties
+    (B'/T evaluated at |k| ~ 1 instead of the physical leg magnitudes,
+    suppressing those ties by x10-30 for any scale-dependent theory) passed
+    a constant-B check. A separable, scale-dependent B catches it.
+
+    Reference: exact Kronecker tie sums over the k-grid of the box,
+      arm (i, j < 3):    sum over tied k_i = k'_j mode pairs,
+      closure (i or j = 3): sum over pairs with |k1 + k2| in the tied bin,
+    each weighted by B(k1, k2, k3) B'(k'_1, k'_2, k'_3) evaluated on the
+    modes, normalized per pair count -- computed here for the diagonal
+    (b, b) entries with theory-only (no shot noise) input.
+    """
+    import itertools
+    boxsize = 1000.
+    pattrs = MeshAttrs(boxsize=boxsize, boxcenter=[0., 0., 1200.], meshsize=64)
+    kf = 2. * np.pi / boxsize
+    edges = np.array([[0.02, 0.03], [0.03, 0.04]])
+    kc = 0.5 * edges.sum(axis=-1)
+
+    # scale-dependent, isotropic, separable test theory
+    def Bth(k1v, k2v, k3v):
+        k1 = jnp.sqrt(jnp.sum(jnp.asarray(k1v)**2, axis=-1))
+        k2 = jnp.sqrt(jnp.sum(jnp.asarray(k2v)**2, axis=-1))
+        k3 = jnp.sqrt(jnp.sum(jnp.asarray(k3v)**2, axis=-1))
+        p = lambda k: 1. / (1e-4 + k**2)
+        return p(k1) * p(k2) + p(k2) * p(k3) + p(k3) * p(k1)
+
+    def theory(fields):
+        return Bth if len(fields) == 3 else None
+
+    # ---- exact discrete mode-sum, diagonal Sugiyama bins ----
+    nmax = int(np.ceil(edges.max() / kf)) + 1
+    n = np.arange(-nmax, nmax + 1)
+    NX, NY, NZ = np.meshgrid(n, n, n, indexing='ij')
+    modes = kf * np.stack([NX.ravel(), NY.ravel(), NZ.ravel()], axis=-1)
+    kmag = np.sqrt((modes**2).sum(-1))
+    shells = [modes[(kmag >= lo) & (kmag < hi)] for lo, hi in edges]
+
+    ref = []
+    for b, sh in enumerate(shells):
+        N = len(sh)
+        arm = 0.
+        k3_list, Bw_list = [], []
+        chunk = max(1, int(2e6 // N))
+        for i0 in range(0, N, chunk):
+            k1 = sh[i0:i0 + chunk][:, None, :]
+            k2 = sh[None, :, :]
+            k3 = -(k1 + k2)
+            k3m = np.sqrt((k3**2).sum(-1))
+            Bv = np.asarray(Bth(k1, k2, k3))
+            # arm tie (1,1): Kronecker k'_1 = k1 -> pair sums factorize per
+            # tied mode: sum_k1 (sum_k2 B)^2; estimator norms cancel in the
+            # closure/arm ratio.
+            arm += (Bv.sum(axis=1)**2).sum()
+            in_b = (k3m >= edges[b, 0]) & (k3m < edges[b, 1])
+            k3_list.append(k3[in_b])
+            Bw_list.append(Bv[in_b])
+        # closure tie (3,1): k'_1 = -k3 (in shell by construction); primed
+        # sum over free k'_2 -- chunk over the flattened in-bin (k1, k2)
+        # pairs to bound memory.
+        k3f = np.concatenate(k3_list) if k3_list else np.zeros((0, 3))
+        Bwf = np.concatenate(Bw_list) if Bw_list else np.zeros((0,))
+        clos = 0.
+        for i0 in range(0, len(k3f), 20000):
+            k3c = k3f[i0:i0 + 20000][:, None, :]
+            Bc = Bwf[i0:i0 + 20000]
+            inner = 0.
+            for j0 in range(0, N, 512):
+                kp2 = sh[None, j0:j0 + 512, :]
+                inner = inner + np.asarray(Bth(-k3c, kp2, k3c - kp2)).sum(axis=1)
+            clos += (Bc * inner).sum()
+        ref.append(clos / arm)
+    ref = np.asarray(ref)
+
+    # ---- box path, closure/arm ratio via the COV3_BB_TERMS knob ----
+    bin3 = BinMesh3SpectrumPoles(pattrs, edges=jnp.asarray(np.concatenate([edges[:, 0], edges[-1:, 1]])),
+                                 ells=[(0, 0, 0)], basis='sugiyama-diagonal')
+    observable3 = Mesh3SpectrumPoles([
+        Mesh3SpectrumPole(k=bin3.xavg, k_edges=bin3.edges, nmodes=bin3.nmodes[ill],
+                          num_raw=jnp.zeros_like(bin3.xavg[..., 0]), basis=bin3.basis, ell=ell)
+        for ill, ell in enumerate(bin3.ells)])
+    observable = types.ObservableTree([observable3], fields=[(0, 0, 0)])
+
+    import os
+    vals = {}
+    for sel in ['arm', 'closure']:
+        os.environ['COV3_BB_TERMS'] = sel
+        os.environ['COV3_PT_TERMS'] = sel
+        cov = compute_spectrum3_covariance(pattrs, pattrs, observable, theory=theory, shotnoise=0., cache={})
+        vals[sel] = np.diag(np.asarray(cov.value()))
+    os.environ.pop('COV3_BB_TERMS'); os.environ.pop('COV3_PT_TERMS')
+
+    ratio = vals['closure'] / vals['arm']
+    print('closure/arm: box =', ratio, ' mode-sum ref =', ref)
+    # arm counts 4 (li, lj < 2) pairs vs the single (1,1) reference pair and
+    # closure counts 5 pairs vs the single (3,1) reference: normalize by the
+    # pair multiplicities before comparing orders of magnitude.
+    ratio_per_pair = ratio * 4. / 5.
+    # agreement to a factor ~2 (quadrature vs discrete, per-pair variations);
+    # the unit-vector-legs bug fails this by x10-30.
+    assert np.all(ratio_per_pair / ref > 0.4) and np.all(ratio_per_pair / ref < 2.5), (ratio_per_pair, ref)
+
+
 if __name__ == '__main__':
 
     #test_fkp3_covariance(plot=True)
     #test_fkp2_covariance_pp_vs_ww(plot=True)
-    test_fkp3_covariance_periodic_approx(plot=True)
+    #test_fkp3_covariance_periodic_approx(plot=True)
+    test_cov3_bb_ties_modesum()

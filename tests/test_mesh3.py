@@ -1059,6 +1059,126 @@ def test_smooth_window_scoccimarro_synthetic(plot=False):
         plt.show()
 
 
+def test_smooth_window_scoccimarro_exact_box_limit():
+    """exact_box_limit=True must make the box (large-selection-function) limit
+    EXACTLY diagonal, structurally -- i.e. for ANY ellmax / nmu / ninsub, not
+    just for tuned settings.
+
+    Without it, the box limit is recovered only through the completeness of the
+    internal-angle Legendre sums: at fixed (k1, k2) the identity in k3 IS a
+    delta in cos(theta12), and delta(mu - mu0) = sum_l (2l+1)/2 L_l(mu0) L_l(mu)
+    needs l -> infinity. Truncated, the pipeline returns the measure-weighted k3
+    AVERAGE instead of a delta, so the matrix is badly non-diagonal (measured:
+    diagonal 0.17 instead of 1, off-diagonal leakage 2.6x the diagonal) and
+    raising ellmax does not help. Since the kernel is linear in the window,
+    Q = Qinf e_000 + dQ gives W[Q] = Qinf W[e_000] + W[dQ], and replacing the
+    first term by the exact binned identity makes a uniform window reproduce
+    Qinf * I identically.
+    """
+    from lsstypes import ObservableLeaf, ObservableTree
+
+    mattrs = MeshAttrs(boxsize=1000., meshsize=32, boxcenter=[0., 0., 1500.])
+    ells = ellsin = [0, 2]
+    edges3 = np.array([0.02, 0.06, 0.10, 0.14, 0.18])
+    bin = BinMesh3SpectrumPoles(mattrs, edges=edges3, basis='scoccimarro', ells=ells, mask_edges='')
+
+    # uniform window: Q_000 = 1, every other multipole exactly 0
+    coords = jnp.logspace(-2, 3, 128)
+    wells = [(0, 0, 0), (2, 0, 2), (0, 2, 2)]
+    poles = [ObservableLeaf(s1=coords, s2=coords, coords=['s1', 's2'], meta={'ell': q},
+                            value=jnp.ones((len(coords),) * 2) if q == (0, 0, 0) else jnp.zeros((len(coords),) * 2))
+             for q in wells]
+    window = ObservableTree(poles, ells=wells)
+    edgesin = (edges3, edges3, edges3)
+
+    kout = np.asarray(bin.xavg)
+    for ellmax, ninsub in [(0, 1), (2, 1), (2, 8)]:
+        wmat = compute_smooth3_spectrum_window(window, edgesin=edgesin, ellsin=ellsin, bin=bin,
+                                               ellmax=ellmax, ninsub=ninsub, exact_box_limit=True)
+        value = np.asarray(wmat.value())
+        kedgesin = np.asarray(wmat.theory.get(ells=ellsin[0]).edges('k'))
+        nin = kedgesin.shape[0]
+
+        # expected: Qinf (= 1 here) times the identity, block-diagonal in ell
+        expected = np.zeros_like(value)
+        for iout in range(len(kout)):
+            inside = np.all((kout[iout][None, :] >= kedgesin[..., 0]) & (kout[iout][None, :] < kedgesin[..., 1]), axis=-1)
+            for illout, ell in enumerate(ells):
+                for illin, ellin in enumerate(ellsin):
+                    if ell == ellin:
+                        expected[illout * len(kout) + iout, illin * nin:(illin + 1) * nin] = inside
+        np.testing.assert_allclose(value, expected, rtol=0., atol=1e-9)
+
+
+def test_smooth_window_scoccimarro_per_ell_norm():
+    """Per-L normalization of the grid window matrix, and agreement with the
+    discrete-sum branch for L > 0.
+
+    A uniform window is the identity for EVERY L, so feeding B_L = 1 (other
+    multipoles 0) must return B~_L = 1 -- on output rows whose whole
+    triangle-allowed k3 range lies inside the theory bins, where
+    int_{|k1-k2|}^{k1+k2} k3 dk3 = 2 k1 k2 makes the expectation exactly 1.
+
+    This caught a real bug in the (now removed) grid path, which used the 3-D Gaunt
+    coefficient sqrt((2L+1)(2L'+1)(2J+1)/4pi) H for what is a 1-D Legendre triple
+    product in mu_x (coupling (2L+1) H^2), leaving a spurious sqrt(2L+1) in the L
+    output -- exactly 1 for L = 0, hence invisible in every existing test, and
+    sqrt(5) too large for L = 2 (measured response 2.260 instead of 1). That bug
+    lived in the (now removed) grid path; the discrete sum was correct throughout,
+    and this test guards it.
+    """
+    from lsstypes import ObservableLeaf, ObservableTree
+
+    mattrs = MeshAttrs(boxsize=1000., meshsize=64, boxcenter=[0., 0., 1500.])
+    ells = ellsin = [0, 2]
+    edges3 = np.arange(0.02, 0.2001, 0.02)
+    k3min, k3max = edges3[0], edges3[-1]
+    bin = BinMesh3SpectrumPoles(mattrs, edges=edges3, basis='scoccimarro', ells=ells, mask_edges='')
+    coords = jnp.logspace(-2, 3, 256)
+    pole = ObservableLeaf(s1=coords, s2=coords, value=jnp.ones((len(coords),) * 2),
+                          coords=['s1', 's2'], meta={'ell': (0, 0, 0)})
+    window = ObservableTree([pole], ells=[(0, 0, 0)])
+
+    kout = np.asarray(bin.xavg)
+    k1, k2 = kout[:, 0], kout[:, 1]
+    valid = (kout[:, 2] >= np.abs(k1 - k2)) & (kout[:, 2] <= k1 + k2)
+    full = valid & (k1 + k2 <= k3max) & (np.abs(k1 - k2) >= k3min)
+    assert full.sum() > 20, 'need enough full-coverage rows for the test to bite'
+
+    for kw, tag in [(dict(), 'discrete')]:
+        wmat = compute_smooth3_spectrum_window(window, edgesin=(edges3, edges3, edges3),
+                                               ellsin=ellsin, bin=bin, ellmax=2, **kw)
+        value = np.asarray(wmat.value())
+        nin = np.asarray(wmat.theory.get(ells=0).coords('k')).shape[0]
+        nout = len(kout)
+        for b, ellin in enumerate(ellsin):
+            theory = np.zeros(len(ellsin) * nin)
+            theory[b * nin:(b + 1) * nin] = 1.
+            out = value @ theory
+            for a, ell in enumerate(ells):
+                o = out[a * nout:(a + 1) * nout][full]
+                if ell == ellin:
+                    # Assert on the WORST row, not the median. The median alone is
+                    # nearly blind here: at ellmax=2 it is 1.017 (passing) while the
+                    # worst full-coverage row is 1.16, and at ellmax=4 the median
+                    # degrades to 1.095 (failing) with the worst row at 1.63. The
+                    # deviation is not scatter but a shape-dependent band structure,
+                    # largest for squeezed isosceles triangles (a short leg plus two
+                    # equal long legs, e.g. k = 0.032, 0.071, 0.071). Adding terms
+                    # makes it WORSE -- a converging truncation cannot do that -- so
+                    # the higher-(ell1, ell2) coefficients are suspect; this bound is
+                    # what pins that down if it is ever fixed.
+                    med, worst = np.median(o), np.abs(o - 1.).max()
+                    assert np.abs(med - 1.) < 0.05, \
+                        f'{tag}: L={ell} median diagonal response {med:.4f} != 1 (per-L normalization)'
+                    assert worst < 0.25, \
+                        f'{tag}: L={ell} worst-row diagonal response deviates by {worst:.4f} ' \
+                        f'(median {med:.4f} hides it); the box-limit sum rule sum_j W_ij = 1 ' \
+                        f'must hold on every full-coverage row, not just typically'
+                else:
+                    assert np.abs(o).max() == 0., f'{tag}: L={ell} <- L\'={ellin} should vanish by Gaunt selection'
+
+
 def test_basis():
     def pk(k):
         kp = 0.03

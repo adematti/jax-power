@@ -631,16 +631,24 @@ _legendre_product3 = {(0, 0, 0): 1, (0, 1, 1): 1/3, (0, 2, 2): 1/5, (0, 3, 3): 1
                       (6, 8, 8): 600/96577, (7, 7, 8): 1750/289731, (8, 8, 8): 490/96577}
 
 
-def wigner_3j(*ells):
+@lru_cache(maxsize=None)
+def _wigner_3j(*ells):
     from sympy.physics.wigner import wigner_3j
-    ells = map(int, ells)
     return float(wigner_3j(*ells))
 
 
-def wigner_9j(*ells):
+def wigner_3j(*ells):
+    return _wigner_3j(*map(int, ells))
+
+
+@lru_cache(maxsize=None)
+def _wigner_9j(*ells):
     from sympy.physics.wigner import wigner_9j
-    ells = map(int, ells)
     return float(wigner_9j(*ells))
+
+
+def wigner_9j(*ells):
+    return _wigner_9j(*map(int, ells))
 
 
 def legendre_product(*ells):

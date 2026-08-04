@@ -66,9 +66,18 @@ class IntegralND:
 
 
 def integration(a=0., b=1., size=5, method='leggauss'):
-    nodes, weights = np.polynomial.legendre.leggauss(size)
-    nodes = 0.5 * (b - a) * nodes + 0.5 * (a + b)
-    weights = 0.5 * (b - a) * weights
+    if method == 'midpoint':
+        # Uniform midpoint rule: for smooth periodic integrands over a full
+        # period this is spectrally accurate (trapezoid-equivalent), better
+        # per node than Gauss-Legendre; the weights equal the cell widths,
+        # so each node owns the cell [x_i - h/2, x_i + h/2] exactly.
+        h = (b - a) / size
+        nodes = a + (np.arange(size) + 0.5) * h
+        weights = np.full(size, h)
+    else:
+        nodes, weights = np.polynomial.legendre.leggauss(size)
+        nodes = 0.5 * (b - a) * nodes + 0.5 * (a + b)
+        weights = 0.5 * (b - a) * weights
     return Integral1D(x=nodes, w=weights)
 
 

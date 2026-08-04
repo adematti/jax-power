@@ -120,8 +120,9 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
 
             a11 = 35. / 18. * p4
             a00 = p0 - 1. / 5. * a11
-            # Cholesky decomposition
-            l00 = jnp.sqrt(a00)
+            # Cholesky decomposition; clip to guard against round-off for rank-deficient
+            # (e.g. exact Kaiser) inputs, which sit on the PSD boundary
+            l00 = jnp.sqrt(jnp.maximum(a00, 0.))
             del a00
 
             a10 = 1. / 2. * p2 - 1. / 7. * a11
@@ -141,7 +142,7 @@ def generate_anisotropic_gaussian_mesh(mattrs: MeshAttrs, poles: ObservableTree 
             mesh2 = normal * _interp(l10)
             del normal
             # The mesh for ell = 2
-            mesh2 += generate_normal(keys[1]) * _interp(jnp.sqrt(a11 - l10**2))
+            mesh2 += generate_normal(keys[1]) * _interp(jnp.sqrt(jnp.maximum(a11 - l10**2, 0.)))
             del a11, l10
             return mesh, mesh2
 

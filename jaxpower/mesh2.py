@@ -179,10 +179,14 @@ class BinMesh2CorrelationPoles(object):
             if remove_zero:
                 value = value.at[(0,) * value.ndim].set(0.)
             knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
+            wmodes = None
+            if self.mattrs.is_hermitian:  # count the missing conjugate modes of the hermitian layout
+                wmodes = _get_hermitian_weights(self.mattrs.kcoords(kind='separation', sparse=True), sharding_mesh=None).reshape(knorm.shape)
 
             def bin(ibin):
                 jn = get_spherical_jn(ell)(knorm * self.xavg[ibin])
                 if self.klimit is not None: jn *= (knorm >= self.klimit[0]) * (knorm < self.klimit[1])
+                if wmodes is not None: jn = jn * wmodes
                 return (-1)**(ell // 2) * jnp.sum(value * jn) / self.mattrs.meshsize.prod(dtype=self.mattrs.rdtype)
 
             return jax.lax.map(bin, jnp.arange(len(self.xavg)), batch_size=self.batch_size)
@@ -727,6 +731,21 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
     def extrapolate_leaf(leaf, label=None, coords=None):
         from scipy import interpolate
         old_coords = leaf.coords(center='mid_if_edges_and_nan')
+        # A high-order spline needs enough input points to be meaningful. On a
+        # coarse grid the padding's drop to zero just past the last data point is
+        # a large feature, and a cubic spline overshoots it: measured 10% (to
+        # 1.10) on a 4-point axis whose exact value is 1 everywhere. The clamp
+        # below removes the unbounded extrapolation, but not this interior
+        # ringing -- so warn, since a silently 10%-wrong window is worse than a
+        # slightly less smooth one.
+        if order >= 3:
+            npts = [coord.size for coord in old_coords.values()]
+            if npts and min(npts) < 8:
+                import warnings
+                warnings.warn(f'interpolate_window_function: spline order={order} on a window axis with only '
+                              f'{min(npts)} points; cubic splines ring on coarse grids (overshoots of ~10% have '
+                              f'been measured where the exact answer is flat). Either tabulate the window on a '
+                              f'finer separation grid or pass order=1.', stacklevel=2)
         if not isinstance(coords, tuple):
             coords = (coords,)
         coords += (coords[-1],) * (len(old_coords) - len(coords))
@@ -746,7 +765,18 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
             old_value = pad_value(leaf.value(), label=label)
             old_x, old_value = remove_nan(old_x, old_value)
             spline = interpolate.RectBivariateSpline(*old_x, old_value, kx=order, ky=order, s=0)
-            new_value = spline(*new_x, grid=True)
+            # RectBivariateSpline has no `ext` option, so -- unlike the 1-D
+            # branch above, which deliberately uses UnivariateSpline(ext=3) to
+            # hold the boundary value -- it EXTRAPOLATES with its own boundary
+            # polynomials. get_new_coords extends the target range a full decade
+            # past the data on each side, so that extrapolation covers most of
+            # the output grid, and a cubic spline rings over it.
+            # Clamp the evaluation points to the (already
+            # padded) data range, reproducing the 1-D branch's ext=3 semantics:
+            # the padding holds the edge value at small separation and drops to
+            # zero beyond the window's support, which is the intended physical
+            # continuation.
+            new_value = spline(*[np.clip(nx, ox.min(), ox.max()) for nx, ox in zip(new_x, old_x)], grid=True)
             new_coords = new_x
         new_coords = {name: coord for name, coord in zip(old_coords, new_coords)}
         return ObservableLeaf(value=new_value, **new_coords, coords=list(new_coords), attrs=dict(leaf.attrs), meta=dict(leaf.meta))

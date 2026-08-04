@@ -328,7 +328,7 @@ def compute_fkp3_covariance_window(fkps, bin=None, los="local", fields=None, spl
 
 def _hankel_matrix(s, ell, cache=None):
     """Explicit ``(n_k, n_s)`` matrix of ``CorrelationToSpectrum(s, ell=ell)``,
-    extracted via ``jax.jacfwd`` (same technique ``Correlation2Spectrum``
+    extracted via ``jax.jacfwd`` (same technique ``CorrelationToSpectrum``
     uses, including its prefactor/postfactor handling: the Jacobian is taken
     of the *raw* FFTlog transform with ``ignore_prepostfactor=True``, and the
     physical normalization is re-applied explicitly afterward as a
@@ -366,7 +366,7 @@ def compute_spectrum3_covariance_window_block(window3, kedges, kpedges,
                                               ell, ellin,
                                               fields1=None, fields2=None, fields3=None,
                                               cache=None, batch_size=None,
-                                              paxes=(0, 1), kp_points=None):
+                                              paxes=(0, 1), kp_points=None, kp_measure=None):
     """
     Compute one smooth covariance-window block W_{ell,ellin}(k1,k2;k1',k2').
 
@@ -376,8 +376,13 @@ def compute_spectrum3_covariance_window_block(window3, kedges, kpedges,
     with each separation axis depends on the Wick permutation), while entry
     2 point-evaluates that axis at the primed *closure*-leg magnitudes
     ``kp_points`` (shape ``(nnodes, nbinsp)``, node- and bin-dependent, as
-    in the box path's exact substitution). With a points axis the result has
-    shape ``(n, npx, nnodes)`` instead of ``(n, npx)``.
+    in the box path's exact substitution) -- or, when ``kp_measure`` (a
+    callable ``measure(fk) -> (nnodes * nbinsp, n_fk)`` exact-phi-measure
+    weight matrix, see ``_closure_measure_matrix``) is given,
+    *cell-averages* the transform over each node's own closure sweep, so
+    window structure narrower than the node spacing cannot slip between nodes.
+    With a points axis the result has shape ``(n, npx, nnodes)`` instead of
+    ``(n, npx)``.
     """
     if cache is None:
         cache = {}
@@ -482,6 +487,12 @@ def compute_spectrum3_covariance_window_block(window3, kedges, kpedges,
     def primed_R(axis, kp_fftlog, Hp):
         spec = paxes[axis]
         if spec == 2:
+            if kp_measure is not None:
+                # Closure leg, cell-averaged with the exact phi measure over
+                # each node's own closure sweep instead of sampled at the
+                # node magnitude (see _closure_measure_matrix).
+                avg = jnp.asarray(kp_measure(np.asarray(kp_fftlog))) @ Hp
+                return jnp.reshape(avg, (np.shape(kp_points)[0], npx, -1))  # (n_nodes, npx, n_s)
             # Closure leg: point-evaluate the transform at the node- and
             # bin-dependent magnitudes (n_nodes, npx), as in the box path.
             pts = jnp.reshape(jnp.asarray(kp_points), (-1,))
@@ -554,15 +565,125 @@ def matrix_spline_interp(xt, xo, interp_order, cache=None):
     return jax.pure_callback(host_fn, out_shape, xo, vmap_method='broadcast_all')
 
 
+def _cumtrapz0(x, table, axis=0):
+    """Trapezoid cumulative integral of ``table`` along ``axis`` (sampled at
+    ``x``), prepended with a zero slice so C[0] = 0 and C has the same length
+    as ``table`` along ``axis``."""
+    t = jnp.moveaxis(jnp.asarray(table), axis, 0)
+    dx = jnp.diff(jnp.asarray(x)).reshape((-1,) + (1,) * (t.ndim - 1))
+    mid = 0.5 * (t[1:] + t[:-1]) * dx
+    C = jnp.concatenate([jnp.zeros_like(t[:1]), jnp.cumsum(mid, axis=0)], axis=0)
+    return jnp.moveaxis(C, 0, axis)
+
+
+def _interp_linear(x, table, xq, axis=0):
+    """Linear interpolation of ``table`` (sampled at ``x`` along ``axis``) at
+    query points ``xq`` (1D). Queries are clipped to the grid. Applied to a
+    cumulative table (see :func:`_cumtrapz0`), this evaluates the exact
+    integral of the piecewise-linear interpolant."""
+    x = jnp.asarray(x)
+    t = jnp.moveaxis(jnp.asarray(table), axis, 0)
+    xq = jnp.clip(jnp.ravel(jnp.asarray(xq)), x[0], x[-1])
+    idx = jnp.clip(jnp.searchsorted(x, xq, side='right') - 1, 0, x.shape[0] - 2)
+    w = (xq - x[idx]) / (x[idx + 1] - x[idx])
+    out = t[idx] + w.reshape((-1,) + (1,) * (t.ndim - 1)) * (t[idx + 1] - t[idx])
+    return jnp.moveaxis(out, 0, axis)
+
+
+def _closure_measure_matrix(fk, lo, hi, ksq, k1k2, c, w, chunk=2048):
+    """Exact phi-measure weight matrix for closure-leg cell averages.
+
+    For each output row (one quadrature node's phi cell x one bispectrum
+    bin), the closure magnitude q3 sweeps [lo, hi]; the phi-measure of any
+    q3 sub-segment is analytic: with mu12(q) = (q^2 - ksq) / (2 k1k2) and
+    x = (mu12 - c) / w (c = mu1 mu2, w = s1 s2), dphi = -dmu12 / (w sin phi)
+    integrates to |arccos(x_hi) - arccos(x_lo)|. Each row distributes the
+    per-grid-segment measures onto the two segment-end grid nodes
+    (trapezoid split) and is normalized to unit sum, so ``M @ table`` is the
+    exact phi-measure average of the (piecewise-linear) table over each
+    node's own cell -- the sharp direction is integrated with its true
+    Jacobian weighting, never point-sampled. Degenerate rows (zero sweep,
+    e.g. a closure turning point) fall back to linear interpolation at the
+    midpoint, the consistent limit.
+
+    Returns a dense ``(n_rows, n_fk)`` numpy array.
+    """
+    fk = np.asarray(fk)
+    nfk = len(fk)
+    lo, hi, ksq, k1k2, c, w = map(np.asarray, (lo, hi, ksq, k1k2, c, w))
+    n = len(lo)
+    out = np.zeros((n, nfk))
+
+    def x_of(q, sl):
+        mu12 = (q**2 - ksq[sl, None]) / (2. * k1k2[sl, None])
+        return np.clip((mu12 - c[sl, None]) / np.maximum(w[sl, None], 1e-300), -1., 1.)
+
+    for start in range(0, n, chunk):
+        sl = slice(start, min(start + chunk, n))
+        m = out[sl].shape[0]
+        # Segment [fk_j, fk_j+1] clipped to the row's sweep [lo, hi].
+        seg_lo = np.maximum(fk[None, :-1], lo[sl, None])
+        seg_hi = np.minimum(fk[None, 1:], hi[sl, None])
+        valid = seg_hi > seg_lo
+        seg_lo = np.where(valid, seg_lo, fk[None, :-1])
+        seg_hi = np.where(valid, seg_hi, fk[None, :-1])
+        dphi = np.abs(np.arccos(x_of(seg_hi, sl)) - np.arccos(x_of(seg_lo, sl))) * valid
+        out[sl, :-1] += 0.5 * dphi
+        out[sl, 1:] += 0.5 * dphi
+        rowsum = out[sl].sum(axis=1)
+        good = rowsum > 1e-12
+        out[sl][good] /= rowsum[good, None]
+        # Degenerate rows: linear-interpolation weights at the midpoint.
+        bad = np.flatnonzero(~good) + start
+        if bad.size:
+            mid = np.clip(0.5 * (lo[bad] + hi[bad]), fk[0], fk[-1])
+            idx = np.clip(np.searchsorted(fk, mid, side='right') - 1, 0, nfk - 2)
+            frac = (mid - fk[idx]) / (fk[idx + 1] - fk[idx])
+            out[bad, :] = 0.
+            out[bad, idx] = 1. - frac
+            out[bad, idx + 1] = frac
+    return out
+
+
+def _cell_average(x, table, intervals, axis=0):
+    """Average ``table`` over per-output cells [lo, hi] along ``axis``:
+    (C(hi) - C(lo)) / (hi - lo) with C the trapezoid cumulative integral --
+    the sharp direction is *integrated*, never point-sampled, so structure
+    narrower than the output cells cannot alias. Degenerate cells (hi = lo,
+    e.g. a closure-leg turning point) fall back to the interpolated point
+    value at the midpoint, the consistent limit."""
+    intervals = jnp.asarray(intervals)
+    lo, hi = intervals[..., 0], intervals[..., 1]
+    mid = 0.5 * (lo + hi)
+    C = _cumtrapz0(x, table, axis=axis)
+    Ihi = _interp_linear(x, C, hi, axis=axis)
+    Ilo = _interp_linear(x, C, lo, axis=axis)
+    x = jnp.asarray(x)
+    # Effective cell width after clipping to the grid (a cell partly outside
+    # the tabulated range must be normalized by its covered part only).
+    delta_cov = jnp.clip(hi, x[0], x[-1]) - jnp.clip(lo, x[0], x[-1])
+    small = delta_cov <= 1e-10 * (jnp.abs(hi) + jnp.abs(lo) + 1e-30)
+    point = _interp_linear(x, table, mid, axis=axis)
+    davg = jnp.where(small, 1., delta_cov)
+    shape = [1] * jnp.asarray(table).ndim
+    shape[axis] = -1
+    return jnp.where(small.reshape(shape), point, (Ihi - Ilo) / davg.reshape(shape))
+
+
 def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, ell2,
                                               fields1=None, fields2=None, cache=None,
-                                              k1_is_points=False, k2_is_points=False):
+                                              k1_is_points=False, k2_is_points=False,
+                                              k1_measure=None, k2_measure=None):
     r"""Return one :math:`(k_1, k_2)` covariance-window block.
 
     If ``k1_is_points`` (``k2_is_points``) is True, ``k1edges`` (``k2edges``) is
     treated as literal k-values (e.g. a derived/closure leg with no native bin
     edges) at which Q_W is interpolated, rather than bin edges Q_W is rebinned
-    into.
+    into. If additionally ``k1_measure`` (``k2_measure``) is given -- a
+    callable ``measure(fk) -> (n, n_fk)`` row-normalized weight matrix (see
+    ``_closure_measure_matrix``) -- Q_W is *cell-averaged* with the exact
+    closure phi measure instead of point-sampled, so window structure
+    narrower than the node spacing cannot slip between nodes.
     """
     if cache is None:
         cache = {}
@@ -631,6 +752,22 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
     fk, spectrum = cached
 
     interp_order = 3
+
+    if k1_measure is not None or k2_measure is not None:
+        # Cell-averaged closure leg(s): average the (concrete, cached)
+        # spectrum table with the exact closure phi measure over each node's
+        # own cell instead of sampling it at the node value -- see the
+        # docstring. The other axis is either rebinned (concrete bin edges)
+        # or cell-averaged too.
+        if k1_measure is not None and k2_measure is not None:
+            W1 = jnp.asarray(k1_measure(fk))
+            W2 = jnp.asarray(k2_measure(fk))
+            return (W1 @ spectrum) @ W2.T
+        if k1_measure is not None:
+            My = matrix_rebin(k2edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
+            return jnp.asarray(k1_measure(fk)) @ (spectrum @ My.T)
+        Mx = matrix_rebin(k1edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
+        return (Mx @ spectrum) @ jnp.asarray(k2_measure(fk)).T
 
     try:
         import interpax
@@ -822,7 +959,77 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
     # checks via the COV3_QUAD_SIZE environment variable.
     _qsize = int(os.environ.get('COV3_QUAD_SIZE', 6))
     integ_mu = integration(-1., 1., size=_qsize)
-    integ_phi = integration(0., 2. * np.pi, size=_qsize)
+    # Azimuthal axes: uniform midpoint rule (spectrally accurate for the
+    # smooth 2 pi-periodic integrands here, and each node owns the cell
+    # [phi_i - h/2, phi_i + h/2] exactly -- the closure-leg interval
+    # construction below relies on that). COV3_PHI_RULE=leggauss restores
+    # the legacy Gauss-Legendre nodes for A/B checks.
+    _phi_rule = os.environ.get('COV3_PHI_RULE', 'midpoint')
+    integ_phi = integration(0., 2. * np.pi, size=_qsize, method=_phi_rule)
+
+    def closure_measure(coords_tri):
+        """Exact closure-leg cell-average operator for the (mu1, mu2, phi2)
+        triangle grid: for each quadrature node, the closure magnitude
+        k3 = |k1 + k2| sweeps a range as phi2 crosses the node's own cell;
+        sharp window factors are averaged over that sweep with the *exact*
+        analytic phi measure (see _closure_measure_matrix) rather than
+        point-sampled at the node's k3 -- nothing narrower than a cell can
+        slip between nodes, with the true Jacobian weighting.
+
+        Cell boundaries are exact for the midpoint phi rule; under
+        COV3_PHI_RULE=leggauss they are approximated by mid-gaps (weights no
+        longer match cell widths exactly -- legacy mode is for A/B only).
+        Since k3(phi2) is monotonic on [0, pi] and [pi, 2 pi] and both 0 and
+        pi land on cell boundaries for even midpoint grids, interval ends at
+        the cell edges bracket the sweep; the node value is folded in too,
+        covering interior extrema of odd/legacy grids at O(cell) accuracy.
+
+        Returns a callable ``measure(fk) -> (n_rows, n_fk)`` weight matrix
+        (cached per fk grid), rows raveled in the same (mu1, mu2, phi2, bin)
+        C-order as the IntegralND node grids.
+        """
+        mu_nodes = np.asarray(integ_mu.x())
+        phi_nodes = np.asarray(integ_phi.x())
+        nphi = len(phi_nodes)
+        if _phi_rule == 'midpoint':
+            h = 2. * np.pi / nphi
+            phi_bounds = np.arange(nphi + 1) * h
+        else:
+            phi_bounds = np.concatenate([[0.], 0.5 * (phi_nodes[:-1] + phi_nodes[1:]), [2. * np.pi]])
+        nmu = len(mu_nodes)
+        mu1g, mu2g = [g.ravel() for g in np.meshgrid(mu_nodes, mu_nodes, indexing='ij', sparse=False)]
+
+        def k3_at(phis):
+            m1 = np.repeat(mu1g, len(phis))
+            m2 = np.repeat(mu2g, len(phis))
+            p2 = np.tile(phis, nmu * nmu)
+            (k1n, k2n, k3n), _, _ = jax.vmap(lambda a, b, c: get_kvec3(coords_tri[0], coords_tri[1], a, b, c))(
+                jnp.asarray(m1), jnp.asarray(m2), jnp.asarray(p2))
+            return np.asarray(k3n).reshape(nmu * nmu, len(phis), -1)
+
+        k3b = k3_at(phi_bounds)      # (nmu^2, nphi + 1, nbins)
+        k3c = k3_at(phi_nodes)       # (nmu^2, nphi, nbins)
+        stack = np.stack([k3b[:, :-1], k3b[:, 1:], k3c], axis=0)
+        lo, hi = stack.min(axis=0), stack.max(axis=0)     # (nmu^2, nphi, nbins)
+        nbins = lo.shape[-1]
+        k1, k2 = np.asarray(coords_tri[0]), np.asarray(coords_tri[1])          # (nbins,)
+        shape = (nmu * nmu, nphi, nbins)
+        ksq = np.broadcast_to((k1**2 + k2**2)[None, None, :], shape)
+        k1k2 = np.broadcast_to((k1 * k2)[None, None, :], shape)
+        cpar = np.broadcast_to((mu1g * mu2g)[:, None, None], shape)
+        wpar = np.broadcast_to((np.sqrt(1. - mu1g**2) * np.sqrt(1. - mu2g**2))[:, None, None], shape)
+        args = tuple(a.reshape(-1) for a in (lo, hi, ksq, k1k2, cpar, wpar))
+
+        _cache = {}
+
+        def measure(fk):
+            fk = np.asarray(fk)
+            key = (fk.shape[0], float(fk[0]), float(fk[-1]))
+            if key not in _cache:
+                _cache[key] = _closure_measure_matrix(fk, *args)
+            return _cache[key]
+
+        return measure
 
     def d_inverse_nmodes(edges, k):
         # edges[..., 0]/[..., 1], not edges[0]/edges[1]: edges has shape
@@ -962,7 +1169,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     continue
                 w3_ells.append((_l1, _l2, _L))
 
-    def _qw_tables(win, rowspec, colspec, fields1, fields2, rows_shape=None, cols_shape=None, F_u=None, F_p=None):
+    def _qw_tables(win, rowspec, colspec, fields1, fields2, rows_shape=None, cols_shape=None, F_u=None, F_p=None,
+                   rows_measure=None, cols_measure=None):
         """Q_W(k, k') multipole tables for one pair of covariance legs, with
         the compute_QW_AB conventions absorbed (ells = qw_ells and the
         (2l1+1)(2l2+1)(-1)^(l1//2)(-1)^(l2//2) prefactor).
@@ -985,7 +1193,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 blk = pref * jnp.asarray(compute_spectrum2_covariance_window_block(
                     win, rowspec, colspec, e1, e2,
                     fields1=fields1, fields2=fields2, cache=cache,
-                    k1_is_points=row_is_pts, k2_is_points=col_is_pts)).real
+                    k1_is_points=row_is_pts, k2_is_points=col_is_pts,
+                    k1_measure=rows_measure, k2_measure=cols_measure)).real
                 if row_is_pts and col_is_pts:
                     blk = blk.reshape(rows_shape + cols_shape) * F_u[e1][:, :, None, None] * F_p[e2][None, None, :, :]
                     out[None] = out.get(None, 0.) + blk
@@ -1135,6 +1344,190 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
             return T_N
 
         return get_base(fields)
+
+    def _c22_closure_tie(Sell, Sellp, f, fp, coords, coordsp, edges, edgesp,
+                         kv_u, kv_p, k3n_u, k3n_p, hat_u, hat_p, w_u, volume_tie,
+                         norm_tie, debug_label=''):
+        """Double-closure (li = lj = 2) BB / PT tie via the exact local-frame
+        angular substitution (shared by the periodic-box and windowed paths):
+        k'_3 = s k_3 is consumed vector-exactly; the partner triangle's
+        remaining freedom (its leg-2 direction) is targeted at its leg-1 bin
+        through an exact mu23 / mu13 sub-interval substitution with the
+        residual azimuth integrated; unprimed- and primed-anchored variants
+        are averaged (see the anchoring-ambiguity note below).
+
+        ``volume_tie`` sets the integrated tie strength: the box volume in
+        the periodic limit, or 1 / Q_W^{(abc)(a'b'c')}(s -> 0) (the
+        effective volume of the two-anchor triple-triple window) in the
+        windowed path -- exact in the periodic limit; the finite window
+        ridge width (a +-20-50%-level effect on single-closure ties) is
+        neglected. The double-Legendre channel representation CANNOT be
+        used for this tie: with two derived directions it only enforces
+        |k3| = |k3'|, overcounting by the directions per shell (x10-30,
+        refuted by the discrete vector-tie mode-sum).
+
+        Returns ``{family: (nbins, nbinsp) block}``, ``norm_tie``
+        (= M / (32 pi^2)) applied.
+        """
+        nu = len(np.asarray(w_u))
+        nbins, nbinsp = coords.shape[-1], coordsp.shape[-1]
+        nchunk = 8
+        xi_c, w_xi_c = np.asarray(integ_mu.x()), np.asarray(integ_mu.w)
+        nxc = len(xi_c)
+        _pt_qmin = max(0.5 * min(np.min(edges), np.min(edgesp)),
+                       0.5 * min(np.min(np.asarray(edges)[..., 1] - np.asarray(edges)[..., 0]),
+                                 np.min(np.asarray(edgesp)[..., 1] - np.asarray(edgesp)[..., 0])))
+        _pt_qmask = make_pt_qmask(_pt_qmin)
+
+        def _keep(family):
+            _sel = os.environ.get('COV3_BB_TERMS' if family == 'bb' else 'COV3_PT_TERMS')
+            if not _sel:
+                return True
+            if _sel.startswith('pair:'):
+                return (2, 2) in {tuple(map(int, t.split(','))) for t in _sel[5:].split(';')}
+            return 'closure' in _sel
+
+        S_u = Sell(hat_u[0], hat_u[1])                                               # (nu, nbins)
+        S_p_out = Sellp(hat_p[0], hat_p[1])                                          # (nu, nbinsp)
+
+        zhat_c = hat_u[2]                                                            # (nu, nbins, 3)
+        ref_c = jnp.where(jnp.abs(zhat_c[..., 0:1]) < 0.9,
+                           jnp.asarray([1., 0., 0.]), jnp.asarray([0., 1., 0.]))
+        e1c = ref_c - zhat_c * jnp.sum(ref_c * zhat_c, axis=-1, keepdims=True)
+        e1c = e1c / jnp.linalg.norm(e1c, axis=-1, keepdims=True)
+        e2c = jnp.cross(zhat_c, e1c)                                                  # (nu, nbins, 3)
+
+        k3mag_c = jnp.asarray(k3n_u)                                                  # (nu, nbins)
+        k2pmag_c = np.asarray(coordsp[1])                                             # (nbinsp,)
+        lo_b, hi_b = np.asarray(edgesp)[:, 0, 0], np.asarray(edgesp)[:, 0, 1]          # (nbinsp,)
+        dk_b = hi_b - lo_b
+        denom_c = 2. * k3mag_c[..., None] * k2pmag_c[None, None, :]
+        mu23_lo = jnp.clip((lo_b[None, None, :]**2 - k3mag_c[..., None]**2 - k2pmag_c[None, None, :]**2) / denom_c, -1., 1.)
+        mu23_hi = jnp.clip((hi_b[None, None, :]**2 - k3mag_c[..., None]**2 - k2pmag_c[None, None, :]**2) / denom_c, -1., 1.)
+        valid_c = mu23_hi > mu23_lo                                                    # (nu, nbins, nbinsp)
+        half_c = 0.5 * (mu23_hi - mu23_lo)
+        mu23_nodes = mu23_lo[..., None] + (jnp.asarray(xi_c)[None, None, None, :] + 1.) * half_c[..., None]   # (nu, nbins, nbinsp, nxc)
+
+        phi_free, w_phi_free = np.asarray(integ_phi.x()), np.asarray(integ_phi.w)      # raw sum 2 pi
+        nphif = len(phi_free)
+        cosphi_f, sinphi_f = jnp.cos(jnp.asarray(phi_free)), jnp.sin(jnp.asarray(phi_free))
+        wcphi = (half_c[..., None, None] * jnp.asarray(w_xi_c)[None, None, None, :, None]
+                  * jnp.asarray(w_phi_free)[None, None, None, None, :])                # (nu, nbins, nbinsp, nxc, nphif)
+        ok_c = valid_c[..., None, None] & jnp.ones((nxc, nphif), dtype=bool)
+
+        # Primed-anchored mirror: the (2, 2) tie has a genuine "which side
+        # supplies the free shape integral" ambiguity (both tied legs are
+        # derived); average the two anchorings.
+        zhat_m = hat_p[2]                                                             # (nu, nbinsp, 3)
+        ref_m = jnp.where(jnp.abs(zhat_m[..., 0:1]) < 0.9,
+                           jnp.asarray([1., 0., 0.]), jnp.asarray([0., 1., 0.]))
+        e1m = ref_m - zhat_m * jnp.sum(ref_m * zhat_m, axis=-1, keepdims=True)
+        e1m = e1m / jnp.linalg.norm(e1m, axis=-1, keepdims=True)
+        e2m = jnp.cross(zhat_m, e1m)                                                   # (nu, nbinsp, 3)
+
+        k3mag_m = jnp.asarray(k3n_p)                                                   # (nu, nbinsp)
+        k2mag_m = np.asarray(coords[1])                                                # (nbins,)
+        lo_a, hi_a = np.asarray(edges)[:, 0, 0], np.asarray(edges)[:, 0, 1]             # (nbins,)
+        dk_a = hi_a - lo_a
+        denom_m = 2. * k3mag_m[..., None] * k2mag_m[None, None, :]
+        mu13_lo = jnp.clip((lo_a[None, None, :]**2 - k3mag_m[..., None]**2 - k2mag_m[None, None, :]**2) / denom_m, -1., 1.)
+        mu13_hi = jnp.clip((hi_a[None, None, :]**2 - k3mag_m[..., None]**2 - k2mag_m[None, None, :]**2) / denom_m, -1., 1.)
+        valid_m = mu13_hi > mu13_lo                                                     # (nu, nbinsp, nbins)
+        half_m = 0.5 * (mu13_hi - mu13_lo)
+        mu13_nodes = mu13_lo[..., None] + (jnp.asarray(xi_c)[None, None, None, :] + 1.) * half_m[..., None]   # (nu, nbinsp, nbins, nxc)
+
+        wcphi_m = (half_m[..., None, None] * jnp.asarray(w_xi_c)[None, None, None, :, None]
+                    * jnp.asarray(w_phi_free)[None, None, None, None, :])               # (nu, nbinsp, nbins, nxc, nphif)
+        ok_m = valid_m[..., None, None] & jnp.ones((nxc, nphif), dtype=bool)
+
+        out = {}
+        for (s_, family) in ((1., 'bb'), (-1., 'pt')):
+            if not _keep(family):
+                continue
+            if family == 'bb':
+                Bu_f = get_theory((f[2], f[0], f[1]))
+                Bp_f = get_theory((fp[2], fp[0], fp[1]))
+                if Bu_f is None or Bp_f is None:
+                    continue
+                Au = Bu_f(kv_u[2], kv_u[0], kv_u[1])                                # (nu, nbins)
+                Ap_m = Bp_f(kv_p[2], kv_p[0], kv_p[1])                              # (nu, nbinsp)
+            else:
+                Pu_f = get_theory((f[2], fp[2]))
+                Pp_f = get_theory((fp[2], f[2]))
+                T_f = get_theory((f[0], f[1], fp[0], fp[1]))
+                T_f_m = get_theory((fp[0], fp[1], f[0], f[1]))
+                if Pu_f is None or Pp_f is None or T_f is None or T_f_m is None:
+                    continue
+                Au = Pu_f(kv_u[2])                                                  # (nu, nbins)
+                Ap_m = Pp_f(kv_p[2])                                                # (nu, nbinsp)
+            wA = jnp.asarray(w_u)[:, None] * S_u * Au                               # (nu, nbins)
+            wA_m = jnp.asarray(w_u)[:, None] * S_p_out * Ap_m                       # (nu, nbinsp)
+            block_t = 0.
+            for sl in [slice(c, c + (nu + nchunk - 1) // nchunk) for c in range(0, nu, (nu + nchunk - 1) // nchunk)]:
+                nc = len(range(*sl.indices(nu)))
+                shp = (nc, nbins, nbinsp, nxc, nphif)
+                mu23_s, s23_s = mu23_nodes[sl], jnp.sqrt(jnp.clip(1. - mu23_nodes[sl]**2, 0., None))
+                zhat_s = jnp.broadcast_to(zhat_c[sl][:, :, None, None, None, :], shp + (3,))
+                e1_s = jnp.broadcast_to(e1c[sl][:, :, None, None, None, :], shp + (3,))
+                e2_s = jnp.broadcast_to(e2c[sl][:, :, None, None, None, :], shp + (3,))
+                mu23_b = jnp.broadcast_to(mu23_s[..., None], shp)
+                cph_b = jnp.broadcast_to(cosphi_f[None, None, None, None, :], shp)
+                sph_b = jnp.broadcast_to(sinphi_f[None, None, None, None, :], shp)
+                s23_b = jnp.broadcast_to(s23_s[..., None], shp)
+                k2phat = mu23_b[..., None] * zhat_s + (s23_b * cph_b)[..., None] * e1_s + (s23_b * sph_b)[..., None] * e2_s
+                k2pvec = k2pmag_c[None, None, :, None, None, None] * k2phat            # (nc, nbins, nbinsp, nxc, nphif, 3)
+                k3pvec_b = jnp.broadcast_to((s_ * kv_u[2][sl])[:, :, None, None, None, :], shp + (3,))
+                k1pvec = -(k3pvec_b + k2pvec)
+                kamag = jnp.sqrt(jnp.sum(k1pvec**2, axis=-1))
+                kasafe = jnp.where(kamag == 0., 1., kamag)
+                ntilde = 4. * np.pi * kasafe * coordsp[0][None, None, :, None, None] * dk_b[None, None, :, None, None] * volume_tie / (2. * np.pi)**3
+                D = jnp.asarray(ok_c[sl]) / ntilde
+                hal = k1pvec / kasafe[..., None]
+                Sp_g = Sellp(hal, k2phat)                                            # (nc, nbins, nbinsp, nxc, nphif)
+                if family == 'bb':
+                    Bp = Bp_f(k3pvec_b, k1pvec, k2pvec)
+                else:
+                    Ta1 = jnp.broadcast_to(kv_u[0][sl][:, :, None, None, None, :], shp + (3,))
+                    Ta2 = jnp.broadcast_to(kv_u[1][sl][:, :, None, None, None, :], shp + (3,))
+                    Bp = T_f(Ta1, Ta2, k1pvec, k2pvec) * _pt_qmask(Ta1, Ta2, k1pvec, k2pvec)
+                integrand = wcphi[sl] * Sp_g * D * Bp
+                block_t = block_t + jnp.einsum('ua,uabnp->ab', wA[sl], integrand)
+
+            block_t_m = 0.
+            for sl in [slice(c, c + (nu + nchunk - 1) // nchunk) for c in range(0, nu, (nu + nchunk - 1) // nchunk)]:
+                nc = len(range(*sl.indices(nu)))
+                shpm = (nc, nbinsp, nbins, nxc, nphif)
+                mu13_s, s13_s = mu13_nodes[sl], jnp.sqrt(jnp.clip(1. - mu13_nodes[sl]**2, 0., None))
+                zhat_sm = jnp.broadcast_to(zhat_m[sl][:, :, None, None, None, :], shpm + (3,))
+                e1_sm = jnp.broadcast_to(e1m[sl][:, :, None, None, None, :], shpm + (3,))
+                e2_sm = jnp.broadcast_to(e2m[sl][:, :, None, None, None, :], shpm + (3,))
+                mu13_b = jnp.broadcast_to(mu13_s[..., None], shpm)
+                cph_bm = jnp.broadcast_to(cosphi_f[None, None, None, None, :], shpm)
+                sph_bm = jnp.broadcast_to(sinphi_f[None, None, None, None, :], shpm)
+                s13_b = jnp.broadcast_to(s13_s[..., None], shpm)
+                k2hat_m = mu13_b[..., None] * zhat_sm + (s13_b * cph_bm)[..., None] * e1_sm + (s13_b * sph_bm)[..., None] * e2_sm
+                k2vec_m = k2mag_m[None, None, :, None, None, None] * k2hat_m           # (nc, nbinsp, nbins, nxc, nphif, 3)
+                k3vec_tied_m = jnp.broadcast_to((s_ * kv_p[2][sl])[:, :, None, None, None, :], shpm + (3,))
+                k1vec_m = -(k3vec_tied_m + k2vec_m)
+                kmag_m = jnp.sqrt(jnp.sum(k1vec_m**2, axis=-1))
+                ksafe_m = jnp.where(kmag_m == 0., 1., kmag_m)
+                ntilde_m = 4. * np.pi * ksafe_m * coords[0][None, None, :, None, None] * dk_a[None, None, :, None, None] * volume_tie / (2. * np.pi)**3
+                Dm = jnp.asarray(ok_m[sl]) / ntilde_m
+                hal_m = k1vec_m / ksafe_m[..., None]
+                S_here_m = Sell(hal_m, k2hat_m)                                       # (nc, nbinsp, nbins, nxc, nphif)
+                if family == 'bb':
+                    Au_m = Bu_f(k3vec_tied_m, k1vec_m, k2vec_m)
+                else:
+                    Tb1 = jnp.broadcast_to(kv_p[0][sl][:, :, None, None, None, :], shpm + (3,))
+                    Tb2 = jnp.broadcast_to(kv_p[1][sl][:, :, None, None, None, :], shpm + (3,))
+                    Au_m = T_f_m(Tb1, Tb2, k1vec_m, k2vec_m) * _pt_qmask(Tb1, Tb2, k1vec_m, k2vec_m)
+                integrand_m = wcphi_m[sl] * S_here_m * Dm * Au_m
+                block_t_m = block_t_m + jnp.einsum('ub,ubanp->ab', wA_m[sl], integrand_m)
+
+            out[family] = norm_tie * 0.5 * (block_t + block_t_m)
+            if os.environ.get('COV3_BOX_DEBUG'):
+                print(f"{debug_label} (c) mu23 {family}: diag = {np.array2string(np.diag(np.asarray(out[family])), precision=3)}")
+        return out
 
     _observable = observable
     for i, (label, observable) in enumerate(_observable.items(level=None)):
@@ -1349,6 +1742,11 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     lo, hi = np.asarray(edges)[:, 0], np.asarray(edges)[:, 1]
                     kk, dk = np.asarray(coords), hi - lo
                     wS_tri = jnp.asarray(w_tri) * Sp(hat1_tri, hat2_tri)
+                    # side == 1 parametrizes the LITERAL k2 leg at (mu1, 0)
+                    # and k1 at (mu2, phi2) (see _oriented_kvec3's order
+                    # (1, 0, 2)): S_{l1 l2 L}(k1hat, k2hat) then takes the
+                    # swapped arguments.
+                    wS_tri_swap = jnp.asarray(w_tri) * Sp(hat2_tri, hat1_tri)
                     # Reference (Eq. covPB_multipole): (2l+1) N H^2 per Wick
                     # route on the normalized triangle measure (raw weights
                     # sum to 8 pi); the reference's leading 2 is the two
@@ -1363,12 +1761,13 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         if _side_out is None:
                             continue
                         qn, muq, PB_u = _side_out
+                        wS = wS_tri_swap if side == 1 else wS_tri
                         Lq = get_legendre(ell)(sign * muq)              # (ntri, nbinsp)
                         mask = (qn[None, ...] >= lo[:, None, None]) & (qn[None, ...] <= hi[:, None, None])
                         qn_safe = jnp.where(qn == 0., 1., qn)
                         ntilde = 4. * np.pi * kk[:, None, None] * qn_safe[None, ...] * dk[:, None, None] * volume / (2. * np.pi)**3
                         invn = mask / ntilde                            # (nbins, ntri, nbinsp)
-                        block = block + pref_box * jnp.einsum('u,ub,aub->ab', wS_tri, Lq * PB_u, invn)
+                        block = block + pref_box * jnp.einsum('u,ub,aub->ab', wS, Lq * PB_u, invn)
                     cov[i][ip] = block
                     cov[ip][i] = block.T
                     continue
@@ -1401,23 +1800,14 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     nbinsp_bisp = coordsp.shape[-1]
                     pre['w_tri'] = w_tri
 
-                    # Dedicated dense azimuthal quadrature for the closure-leg (side == 2)
-                    # tie: on the shared coarse grid the smooth k3 = |k1 + k2| band collapses
-                    # onto the discrete node values (the survey window Q_W(k, k3) is much
-                    # narrower than the node spacing), imprinting spurious ridges at
-                    # k = alpha_node k' with alpha_node = sqrt(2 + 2 mu12(node)). phi2 is the
-                    # right variable to refine: the integrand is smooth in it (no
-                    # substitution-jacobian endpoint singularity) and the induced mu12
-                    # sampling densifies automatically near the band edges (|sin phi2| -> 0).
-                    nphi_closure = int(os.environ.get('COV3_CLOSURE_PHI_SIZE', 128))
-                    integ_tri_c = IntegralND(mu1=integ_mu, mu2=integ_mu, phi2=integration(0., 2. * np.pi, size=nphi_closure))
-                    _tri_c = integ_tri_c.x(['mu1', 'mu2', 'phi2'], sparse=False)
-                    mu1_c, mu2_c, phi2_c = (np.ravel(arr) for arr in _tri_c)
-                    w_c = np.ravel(integ_tri_c.w)
-                    ntri_c = len(w_c)
-                    pre['w_c'] = w_c
-                    pre['hat1_c'] = jax.vmap(lambda m: unitvec(m, jnp.zeros_like(m)))(jnp.asarray(mu1_c))    # (ntri_c, 3)
-                    pre['hat2_c'] = jax.vmap(unitvec)(jnp.asarray(mu2_c), jnp.asarray(phi2_c))               # (ntri_c, 3)
+                    # Closure-leg (side == 2) tie: the survey window Q_W(k, k3)
+                    # is much narrower than the k3 = |k1 + k2| sweep across the
+                    # angular grid, so point-sampling it at node values imprints
+                    # spurious ridges. Instead, cell-average Q_W over each
+                    # node's own closure sweep (see closure_measure /
+                    # _cell_average): the sharp direction is integrated, never
+                    # sampled, on the shared coarse grid.
+                    k3msr_c = closure_measure(coordsp)     # rows: (ntri * nbinsp)
 
                     def _pb_oriented(side, mu1, mu2, phi2):
                         # Return (q, r1, r2), where q is the contracted
@@ -1470,24 +1860,21 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         # field-label order (does not affect P/B, already resolved above).
                         fieldsP, fieldsB = tuple(sorted(fieldsP)), tuple(sorted(fieldsB))
                         _fn = lambda m1, m2, p2: _pb_oriented(side, m1, m2, p2)
-                        if side == 2:
-                            # Closure-leg tie: dense phi2 nodes (see above)
-                            qnorms, qhats, kvecs = jax.vmap(_fn)(jnp.asarray(mu1_c), jnp.asarray(mu2_c), jnp.asarray(phi2_c))
-                        else:
-                            qnorms, qhats, kvecs = jax.vmap(_fn)(jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
+                        qnorms, qhats, kvecs = jax.vmap(_fn)(jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
                         qn, qh = qnorms[0], qhats[0]                    # (ntri, nbinsp[, 3]) or (ntri[, 3]) for side < 2
                         qvec, r1vec, r2vec = kvecs
                         PB_u = P(qvec) * B(qvec, r1vec, r2vec)          # (ntri, nbinsp)
                         entry = {'side': side, 'sign': sign}
                         if side == 2:
-                            # k3 has no native bin edges: interpolate Q_W at
-                            # its literal values; its khat . n is
-                            # bin-dependent. Absorb L_e2(mu_q) x P x B into
-                            # the table's node axis.
-                            muq = qh[..., 2]                            # (ntri_c, nbinsp)
+                            # k3 has no native bin edges: cell-average Q_W
+                            # over each node's own closure sweep (see above);
+                            # its khat . n is bin-dependent. Absorb
+                            # L_e2(mu_q) x P x B into the table's node axis.
+                            muq = qh[..., 2]                            # (ntri, nbinsp)
                             F_p = {e2: get_legendre(e2)(muq) * PB_u for e2 in qw_ells}
                             entry['tab'] = _qw_tables(window2, edges, np.asarray(jnp.ravel(qn)), fieldsP, fieldsB,
-                                                      cols_shape=(ntri_c, nbinsp_bisp), F_p=F_p)
+                                                      cols_shape=(ntri, nbinsp_bisp), F_p=F_p,
+                                                      cols_measure=k3msr_c)
                         else:
                             # edgesp is bin-major, shape (nbins, 2, 2):
                             # axis 1 selects the leg. The contracted leg's
@@ -1504,7 +1891,9 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 # ---- Per-(ell, ellp) assembly (cheap) ----
                 mu_s, w_mu = pre['mu_s'], pre['w_mu']
                 wS_tri = jnp.asarray(pre['w_tri']) * Sp(pre['hat1'], pre['hat2'])
-                wS_closure = jnp.asarray(pre['w_c']) * Sp(pre['hat1_c'], pre['hat2_c'])
+                # side == 1 places the literal k2 leg at (mu1, 0) and k1 at
+                # (mu2, phi2); S's literal-leg arguments are then swapped.
+                wS_tri_swap = jnp.asarray(pre['w_tri']) * Sp(pre['hat2'], pre['hat1'])
                 # (2l+1) N H^2 acting on normalized measures (see
                 # _cov3_math.tex): /2 for the spectrum side's dmu/2 and
                 # /(8 pi) for the triangle side's (dmu1/2)(dmu2 dphi2/4pi) --
@@ -1517,14 +1906,15 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 block = 0.
                 for entry in pre['terms']:
                     tab, sign = entry['tab'], entry['sign']
+                    wS = wS_tri_swap if entry['side'] == 1 else wS_tri
                     for e1 in qw_ells:
                         # Spectrum-side scalar: sum_mu w L_ell(mu) L_e1(sign mu).
                         lsc = np.sum(w_mu * leg(mu_s) * get_legendre(e1)(sign * mu_s))
                         if entry['side'] == 2:
-                            block = block + prefPB * lsc * jnp.einsum('aub,u->ab', tab['e1', e1], wS_closure)
+                            block = block + prefPB * lsc * jnp.einsum('aub,u->ab', tab['e1', e1], wS)
                         else:
                             for e2 in qw_ells:
-                                cvec = (wS_tri * get_legendre(e2)(jnp.asarray(entry['muq']))) @ entry['PB_u']   # (nbinsp,)
+                                cvec = (wS * get_legendre(e2)(jnp.asarray(entry['muq']))) @ entry['PB_u']   # (nbinsp,)
                                 block = block + prefPB * lsc * tab['e12', e1, e2] * cvec[None, :]
 
             # BP block
@@ -1583,6 +1973,10 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     lo, hi = np.asarray(edgesp)[:, 0], np.asarray(edgesp)[:, 1]
                     kk, dk = np.asarray(coordsp), hi - lo
                     wS_tri = jnp.asarray(w_tri) * S(hat1_tri, hat2_tri)
+                    # side == 1: literal k2 leg at (mu1, 0), k1 at
+                    # (mu2, phi2) -- S's literal-leg arguments swapped (see
+                    # the PB box branch).
+                    wS_tri_swap = jnp.asarray(w_tri) * S(hat2_tri, hat1_tri)
                     # See the PB box branch: (2l'+1) N H^2 per Wick route (no
                     # extra 2, the six bp_terms_spec entries are the routes);
                     # radial delta W(k, q) / Ntilde_mode(k, q).
@@ -1593,12 +1987,13 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         if _side_out is None:
                             continue
                         qn, muq, PB_u = _side_out
+                        wS = wS_tri_swap if side == 1 else wS_tri
                         Lq = get_legendre(ellp)(sign * muq)             # (ntri, nbins)
                         mask = (qn[..., None] >= lo[None, None, :]) & (qn[..., None] <= hi[None, None, :])
                         qn_safe = jnp.where(qn == 0., 1., qn)
                         ntilde = 4. * np.pi * kk[None, None, :] * qn_safe[..., None] * dk[None, None, :] * volume / (2. * np.pi)**3
                         invn = mask / ntilde                            # (ntri, nbins, nbinsp)
-                        block = block + pref_box * jnp.einsum('u,ua,uab->ab', wS_tri, Lq * PB_u, invn)
+                        block = block + pref_box * jnp.einsum('u,ua,uab->ab', wS, Lq * PB_u, invn)
                     cov[i][ip] = block
                     cov[ip][i] = block.T
                     continue
@@ -1626,16 +2021,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     nbins_bisp = coords.shape[-1]
                     pre['w_tri'] = w_tri
 
-                    # Dense closure-leg azimuthal quadrature; see the PB block.
-                    nphi_closure = int(os.environ.get('COV3_CLOSURE_PHI_SIZE', 128))
-                    integ_tri_c = IntegralND(mu1=integ_mu, mu2=integ_mu, phi2=integration(0., 2. * np.pi, size=nphi_closure))
-                    _tri_c = integ_tri_c.x(['mu1', 'mu2', 'phi2'], sparse=False)
-                    mu1_c, mu2_c, phi2_c = (np.ravel(arr) for arr in _tri_c)
-                    w_c = np.ravel(integ_tri_c.w)
-                    ntri_c = len(w_c)
-                    pre['w_c'] = w_c
-                    pre['hat1_c'] = jax.vmap(lambda m: unitvec(m, jnp.zeros_like(m)))(jnp.asarray(mu1_c))    # (ntri_c, 3)
-                    pre['hat2_c'] = jax.vmap(unitvec)(jnp.asarray(mu2_c), jnp.asarray(phi2_c))               # (ntri_c, 3)
+                    # Closure-leg cell-averaged window tables; see the PB block.
+                    k3msr_c = closure_measure(coords)     # rows: (ntri * nbins)
 
                     def _bp_oriented(side, mu1, mu2, phi2):
                         # Return (q, r1, r2), where q is the contracted side
@@ -1679,24 +2066,21 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         # field-label order (does not affect P/B, already resolved above).
                         fieldsP, fieldsB = tuple(sorted(fieldsP)), tuple(sorted(fieldsB))
                         _fn = lambda m1, m2, p2: _bp_oriented(side, m1, m2, p2)
-                        if side == 2:
-                            # Closure-leg tie: dense phi2 nodes (see above)
-                            qnorms, qhats, kvecs = jax.vmap(_fn)(jnp.asarray(mu1_c), jnp.asarray(mu2_c), jnp.asarray(phi2_c))
-                        else:
-                            qnorms, qhats, kvecs = jax.vmap(_fn)(jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
+                        qnorms, qhats, kvecs = jax.vmap(_fn)(jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
                         qn, qh = qnorms[0], qhats[0]
                         qvec, r1vec, r2vec = kvecs
                         PB_u = P(qvec) * B(qvec, r1vec, r2vec)          # (ntri, nbins)
                         entry = {'side': side, 'sign': sign}
                         if side == 2:
-                            # k3 has no native bin edges: interpolate Q_W at
-                            # its literal values; its khat . n is
-                            # bin-dependent. Absorb L_e1(mu_q) x P x B into
-                            # the table's node axis.
-                            muq = qh[..., 2]                            # (ntri_c, nbins)
+                            # k3 has no native bin edges: cell-average Q_W
+                            # over each node's own closure sweep (see the PB
+                            # block); its khat . n is bin-dependent. Absorb
+                            # L_e1(mu_q) x P x B into the table's node axis.
+                            muq = qh[..., 2]                            # (ntri, nbins)
                             F_u = {e1: get_legendre(e1)(muq) * PB_u for e1 in qw_ells}
                             entry['tab'] = _qw_tables(window2, np.asarray(jnp.ravel(qn)), edgesp, fieldsP, fieldsB,
-                                                      rows_shape=(ntri_c, nbins_bisp), F_u=F_u)
+                                                      rows_shape=(ntri, nbins_bisp), F_u=F_u,
+                                                      rows_measure=k3msr_c)
                         else:
                             # edges is bin-major, shape (nbins, 2, 2):
                             # axis 1 selects the leg. The contracted leg's
@@ -1713,7 +2097,9 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 # ---- Per-(ell, ellp) assembly (cheap) ----
                 mu_s, w_mu = pre['mu_s'], pre['w_mu']
                 wS_tri = jnp.asarray(pre['w_tri']) * S(pre['hat1'], pre['hat2'])
-                wS_closure = jnp.asarray(pre['w_c']) * S(pre['hat1_c'], pre['hat2_c'])
+                # side == 1: literal k2 leg at (mu1, 0), k1 at (mu2, phi2) --
+                # S's literal-leg arguments swapped (see the PB assembly).
+                wS_tri_swap = jnp.asarray(pre['w_tri']) * S(pre['hat2'], pre['hat1'])
                 # Mirror of the PB normalization (Cov^BP is the PB
                 # transpose): (2l'+1) N H^2 on normalized measures, /2 for
                 # the spectrum side and /(8 pi) for the triangle side; the
@@ -1723,14 +2109,15 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 block = 0.
                 for entry in pre['terms']:
                     tab, sign = entry['tab'], entry['sign']
+                    wS = wS_tri_swap if entry['side'] == 1 else wS_tri
                     for e2 in qw_ells:
                         # Spectrum-side scalar: sum_mu w L_ellp(mu) L_e2(sign mu).
                         rsc = np.sum(w_mu * legp(mu_s) * get_legendre(e2)(sign * mu_s))
                         if entry['side'] == 2:
-                            block = block + prefBP * rsc * jnp.einsum('uab,u->ab', tab['e2', e2], wS_closure)
+                            block = block + prefBP * rsc * jnp.einsum('uab,u->ab', tab['e2', e2], wS)
                         else:
                             for e1 in qw_ells:
-                                rvec = (wS_tri * get_legendre(e1)(jnp.asarray(entry['muq']))) @ entry['PB_u']   # (nbins,)
+                                rvec = (wS * get_legendre(e1)(jnp.asarray(entry['muq']))) @ entry['PB_u']   # (nbins,)
                                 block = block + prefBP * rsc * tab['e12', e1, e2] * rvec[:, None]
 
             # BB block
@@ -1923,6 +2310,13 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # between the two ways of computing an i != ip
                     # cross-multipole block, non-convergent with
                     # quadrature order).
+                    def _tie_keep(family, is_closure):
+                        # Debug knob (see the windowed branch): COV3_BB_TERMS /
+                        # COV3_PT_TERMS = 'arm' | 'closure' restrict the tie
+                        # families; unset keeps everything.
+                        _sel = os.environ.get('COV3_BB_TERMS' if family == 'bb' else 'COV3_PT_TERMS')
+                        return (not _sel) or (('closure' in _sel) == bool(is_closure))
+
                     for li in range(2):
                         for lj in range(2):
                             ljf = 1 - lj
@@ -1931,6 +2325,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                             D = _delta_D(vmag, np.asarray(edgesp)[:, lj, :], jnp.asarray(coordsp[lj]),
                                          jnp.asarray(edgesp[:, lj, 1] - edgesp[:, lj, 0]))     # (nu, nbins, nbinsp)
                             for (s, family) in ((1., 'bb'), (-1., 'pt')):
+                                if not _tie_keep(family, False):
+                                    continue
                                 if family == 'bb':
                                     Bu_f = get_theory((f[li], f[r1[li]], f[r2[li]]))
                                     Bp_f = get_theory((fp[lj], fp[r1[lj]], fp[r2[lj]]))
@@ -1986,6 +2382,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         lo_p, hi_p = np.asarray(edgesp)[:, lj, 0], np.asarray(edgesp)[:, lj, 1]   # (nbinsp,)
                         dkp_lj = hi_p - lo_p
                         coordp_lj = np.asarray(coordsp[lj])                                       # (nbinsp,)
+                        coordp_ljf = np.asarray(coordsp[ljf])                                     # (nbinsp,)
                         k1v2, k2v2 = k1v[:, None], k2v[:, None]
                         denom = 2. * k1v2 * k2v2
                         mu12_lo = np.clip((lo_p[None, :]**2 - k1v2**2 - k2v2**2) / denom, -1., 1.)
@@ -1995,6 +2392,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         mu12_nodes = mu12_lo[..., None] + (xi_c[None, None, :] + 1.) * half[..., None]   # (nbins, nbinsp, nxc)
 
                         for (s, family) in ((1., 'bb'), (-1., 'pt')):
+                            if not _tie_keep(family, True):
+                                continue
                             if family == 'bb':
                                 Bu_f = get_theory((f[2], f[0], f[1]))
                                 Bp_f = get_theory((fp[lj], fp[r1[lj]], fp[r2[lj]]))
@@ -2060,10 +2459,18 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                                     qsl = slice(q0, min(q0 + max(n2 // nchunk, 1), n2))
                                     nqc = qsl.stop - qsl.start
                                     shp = (nbins, nbinsp, nxc, nqc)
-                                    tied = _bcast((s * khat3)[..., None, :], shp)
-                                    free = _bcast(dir2[None, None, None, qsl, :], shp)
-                                    clos = -(s * khat3)[..., None, :] - dir2[None, None, None, qsl, :]
-                                    legs = {lj: tied, ljf: free, 2: _bcast(clos, shp)}
+                                    # FULL primed-leg vectors (magnitude x direction), not
+                                    # bare unit directions: the tied leg is exactly
+                                    # s k3vec, the free leg its own bin-center magnitude
+                                    # (unit vectors left B'/T evaluated at |k| ~ 1,
+                                    # suppressing these ties by orders of magnitude for
+                                    # any scale-dependent theory).
+                                    tied_v = (s * k3vec)[..., None, :]
+                                    free_v = jnp.asarray(coordp_ljf)[None, :, None, None, None] * dir2[None, None, None, qsl, :]
+                                    tied = _bcast(tied_v, shp)
+                                    free = jnp.broadcast_to(free_v, shp + (3,))
+                                    clos = -tied - free
+                                    legs = {lj: tied, ljf: free, 2: clos}
                                     if family == 'bb':
                                         Bp = Bp_f(legs[lj], legs[r1[lj]], legs[r2[lj]])                          # (nbins, nbinsp, nxc, nqc)
                                     else:
@@ -2082,7 +2489,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                             block_t = jax.vmap(_node_fn)(m1_flat, wm1_flat, m2_flat, wm2_flat, branch_flat).sum(axis=0)
 
                             if os.environ.get('COV3_BOX_DEBUG'):
-                                print(f"box33 (a) mu12 {family} lj={lj}: max|term| = {np.abs(np.asarray(norm_tie * block_t)).max():.3e}")
+                                print(f"box33 (a) mu12 {family} lj={lj}: diag = {np.array2string(np.diag(np.asarray(norm_tie * block_t)), precision=3)}")
                             parts[family] = parts[family] + norm_tie * block_t
 
                     # (b) li < 2 tied to the primed closure (lj = 2),
@@ -2098,6 +2505,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         lo_u, hi_u = np.asarray(edges)[:, li, 0], np.asarray(edges)[:, li, 1]   # (nbins,)
                         dku_li = hi_u - lo_u
                         coordu_li = np.asarray(coords[li])                                       # (nbins,)
+                        coordu_lif = np.asarray(coords[lif])                                     # (nbins,)
                         k1pv2, k2pv2 = k1pv[:, None], k2pv[:, None]
                         denomp = 2. * k1pv2 * k2pv2
                         mu12p_lo = np.clip((lo_u[None, :]**2 - k1pv2**2 - k2pv2**2) / denomp, -1., 1.)
@@ -2107,6 +2515,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         mu12p_nodes = mu12p_lo[..., None] + (xi_c[None, None, :] + 1.) * halfp[..., None]   # (nbinsp, nbins, nxc)
 
                         for (s, family) in ((1., 'bb'), (-1., 'pt')):
+                            if not _tie_keep(family, True):
+                                continue
                             if family == 'bb':
                                 Bp_f = get_theory((fp[2], fp[0], fp[1]))
                                 Bu_f = get_theory((f[li], f[r1[li]], f[r2[li]]))
@@ -2167,10 +2577,15 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                                     qsl = slice(q0, min(q0 + max(n2 // nchunk, 1), n2))
                                     nqc = qsl.stop - qsl.start
                                     shp = (nbinsp, nbins, nxc, nqc)
-                                    tied = _bcast((s * khat3p)[..., None, :], shp)
-                                    free = _bcast(dir2[None, None, None, qsl, :], shp)
-                                    clos = -(s * khat3p)[..., None, :] - dir2[None, None, None, qsl, :]
-                                    legs = {li: tied, lif: free, 2: _bcast(clos, shp)}
+                                    # FULL unprimed-leg vectors (see the mirror comment in
+                                    # (a, li = 2)): tied = s k3pvec exactly, free at its
+                                    # own bin-center magnitude.
+                                    tied_v = (s * k3pvec)[..., None, :]
+                                    free_v = jnp.asarray(coordu_lif)[None, :, None, None, None] * dir2[None, None, None, qsl, :]
+                                    tied = _bcast(tied_v, shp)
+                                    free = jnp.broadcast_to(free_v, shp + (3,))
+                                    clos = -tied - free
+                                    legs = {li: tied, lif: free, 2: clos}
                                     if family == 'bb':
                                         Bu = Bu_f(legs[li], legs[r1[li]], legs[r2[li]])                          # (nbinsp, nbins, nxc, nqc)
                                     else:
@@ -2189,175 +2604,21 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                             block_t = jax.vmap(_node_fn)(m1_flat, wm1_flat, m2_flat, wm2_flat, branch_flat).sum(axis=0)
 
                             if os.environ.get('COV3_BOX_DEBUG'):
-                                print(f"box33 (b) mu12 {family} li={li}: max|term| = {np.abs(np.asarray(norm_tie * block_t)).max():.3e}")
+                                print(f"box33 (b) mu12 {family} li={li}: diag = {np.array2string(np.diag(np.asarray(norm_tie * block_t)), precision=3)}")
                             parts[family] = parts[family] + norm_tie * block_t
 
-                    # (c) double-closure tie (li = lj = 2): k'_3 = s k_3 is
-                    # exact (both are derived closure legs, no bin edges of
-                    # their own -- no delta needed for this part). The
-                    # remaining freedom, k'_2's direction, is targeted via an
-                    # exact LOCAL-frame substitution around khat_3: mu23 =
-                    # khat_3.khat'_2 is set to hit k'_1 = -(k'_3+k'_2)'s
-                    # target bin (edgesp[:, 0, :]) exactly, and the residual
-                    # azimuth phi_free around khat_3 stays free (no branch
-                    # doubling needed here, unlike (a)/(b): dOmega = dmu23
-                    # dphi_free is already the natural local measure).
-                    zhat_c = hat_u[2]                                                            # (nu, nbins, 3)
-                    ref_c = jnp.where(jnp.abs(zhat_c[..., 0:1]) < 0.9,
-                                       jnp.asarray([1., 0., 0.]), jnp.asarray([0., 1., 0.]))
-                    e1c = ref_c - zhat_c * jnp.sum(ref_c * zhat_c, axis=-1, keepdims=True)
-                    e1c = e1c / jnp.linalg.norm(e1c, axis=-1, keepdims=True)
-                    e2c = jnp.cross(zhat_c, e1c)                                                  # (nu, nbins, 3)
-
-                    k3mag_c = jnp.asarray(k3n_u)                                                  # (nu, nbins)
-                    k2pmag_c = np.asarray(coordsp[1])                                             # (nbinsp,)
-                    lo_b, hi_b = np.asarray(edgesp)[:, 0, 0], np.asarray(edgesp)[:, 0, 1]          # (nbinsp,)
-                    dk_b = hi_b - lo_b
-                    denom_c = 2. * k3mag_c[..., None] * k2pmag_c[None, None, :]
-                    mu23_lo = jnp.clip((lo_b[None, None, :]**2 - k3mag_c[..., None]**2 - k2pmag_c[None, None, :]**2) / denom_c, -1., 1.)
-                    mu23_hi = jnp.clip((hi_b[None, None, :]**2 - k3mag_c[..., None]**2 - k2pmag_c[None, None, :]**2) / denom_c, -1., 1.)
-                    valid_c = mu23_hi > mu23_lo                                                    # (nu, nbins, nbinsp)
-                    half_c = 0.5 * (mu23_hi - mu23_lo)
-                    mu23_nodes = mu23_lo[..., None] + (jnp.asarray(xi_c)[None, None, None, :] + 1.) * half_c[..., None]   # (nu, nbins, nbinsp, nxc)
-
-                    phi_free, w_phi_free = np.asarray(integ_phi.x()), np.asarray(integ_phi.w)      # raw sum 2 pi
-                    nphif = len(phi_free)
-                    cosphi_f, sinphi_f = jnp.cos(jnp.asarray(phi_free)), jnp.sin(jnp.asarray(phi_free))
-                    # Combined (mu23, phi_free) weight, replacing w_2d's raw dmu dphi measure
-                    # (sums to the same 4 pi when the mu23 sub-range is unclipped).
-                    wcphi = (half_c[..., None, None] * jnp.asarray(w_xi_c)[None, None, None, :, None]
-                              * jnp.asarray(w_phi_free)[None, None, None, None, :])                # (nu, nbins, nbinsp, nxc, nphif)
-                    ok_c = valid_c[..., None, None] & jnp.ones((nxc, nphif), dtype=bool)
-
-                    # Mirror precompute: (li=2, lj=2) maps to itself under the
-                    # unprimed <-> primed swap, but -- unlike the bin-native
-                    # self-paired (0,0)/(1,1) baseline terms, which tie two
-                    # FIXED values with no shape-integral choice -- both tied
-                    # legs here are derived/continuous, so there is a genuine
-                    # "which side supplies the free 3D shape integral" choice
-                    # (cf. why (a) and (b) are separate, mutually-transposed
-                    # terms). Verified empirically: (a)+(b) alone reproduce
-                    # blockA/blockB.T to machine precision, but the single
-                    # unprimed-anchored formula above is NOT self-transpose-
-                    # symmetric on its own. Fix: also compute the primed-
-                    # anchored mirror (primed shape integral via kv_p/hat_p,
-                    # unprimed leg free) and average the two -- the same
-                    # "differently-anchored quadratures approximate the same
-                    # integral" logic already used for i == ip below, applied
-                    # unconditionally since this ambiguity is intrinsic to
-                    # the (2, 2) term, not particular to the diagonal case.
-                    zhat_m = hat_p[2]                                                             # (nu, nbinsp, 3)
-                    ref_m = jnp.where(jnp.abs(zhat_m[..., 0:1]) < 0.9,
-                                       jnp.asarray([1., 0., 0.]), jnp.asarray([0., 1., 0.]))
-                    e1m = ref_m - zhat_m * jnp.sum(ref_m * zhat_m, axis=-1, keepdims=True)
-                    e1m = e1m / jnp.linalg.norm(e1m, axis=-1, keepdims=True)
-                    e2m = jnp.cross(zhat_m, e1m)                                                   # (nu, nbinsp, 3)
-
-                    k3mag_m = jnp.asarray(k3n_p)                                                   # (nu, nbinsp)
-                    k2mag_m = np.asarray(coords[1])                                                # (nbins,)
-                    lo_a, hi_a = np.asarray(edges)[:, 0, 0], np.asarray(edges)[:, 0, 1]             # (nbins,)
-                    dk_a = hi_a - lo_a
-                    denom_m = 2. * k3mag_m[..., None] * k2mag_m[None, None, :]
-                    mu13_lo = jnp.clip((lo_a[None, None, :]**2 - k3mag_m[..., None]**2 - k2mag_m[None, None, :]**2) / denom_m, -1., 1.)
-                    mu13_hi = jnp.clip((hi_a[None, None, :]**2 - k3mag_m[..., None]**2 - k2mag_m[None, None, :]**2) / denom_m, -1., 1.)
-                    valid_m = mu13_hi > mu13_lo                                                     # (nu, nbinsp, nbins)
-                    half_m = 0.5 * (mu13_hi - mu13_lo)
-                    mu13_nodes = mu13_lo[..., None] + (jnp.asarray(xi_c)[None, None, None, :] + 1.) * half_m[..., None]   # (nu, nbinsp, nbins, nxc)
-
-                    wcphi_m = (half_m[..., None, None] * jnp.asarray(w_xi_c)[None, None, None, :, None]
-                                * jnp.asarray(w_phi_free)[None, None, None, None, :])               # (nu, nbinsp, nbins, nxc, nphif)
-                    ok_m = valid_m[..., None, None] & jnp.ones((nxc, nphif), dtype=bool)
-                    S_p_out = Sellp(hat_p[0], hat_p[1])                                             # (nu, nbinsp)
-
-                    for (s, family) in ((1., 'bb'), (-1., 'pt')):
-                        if family == 'bb':
-                            Bu_f = get_theory((f[2], f[0], f[1]))
-                            Bp_f = get_theory((fp[2], fp[0], fp[1]))
-                            if Bu_f is None or Bp_f is None:
-                                continue
-                            Au = Bu_f(kv_u[2], kv_u[0], kv_u[1])                                # (nu, nbins)
-                            Ap_m = Bp_f(kv_p[2], kv_p[0], kv_p[1])                              # (nu, nbinsp)
-                        else:
-                            Pu_f = get_theory((f[2], fp[2]))
-                            Pp_f = get_theory((fp[2], f[2]))
-                            T_f = get_theory((f[0], f[1], fp[0], fp[1]))
-                            T_f_m = get_theory((fp[0], fp[1], f[0], f[1]))
-                            if Pu_f is None or Pp_f is None or T_f is None or T_f_m is None:
-                                continue
-                            Au = Pu_f(kv_u[2])                                                  # (nu, nbins)
-                            Ap_m = Pp_f(kv_p[2])                                                # (nu, nbinsp)
-                        wA = w_u[:, None] * S_u * Au                                            # (nu, nbins)
-                        wA_m = w_u[:, None] * S_p_out * Ap_m                                    # (nu, nbinsp)
-                        block_t = 0.
-                        for sl in [slice(c, c + (nu + nchunk - 1) // nchunk) for c in range(0, nu, (nu + nchunk - 1) // nchunk)]:
-                            nc = len(range(*sl.indices(nu)))
-                            shp = (nc, nbins, nbinsp, nxc, nphif)
-                            mu23_s, s23_s = mu23_nodes[sl], jnp.sqrt(jnp.clip(1. - mu23_nodes[sl]**2, 0., None))
-                            zhat_s = jnp.broadcast_to(zhat_c[sl][:, :, None, None, None, :], shp + (3,))
-                            e1_s = jnp.broadcast_to(e1c[sl][:, :, None, None, None, :], shp + (3,))
-                            e2_s = jnp.broadcast_to(e2c[sl][:, :, None, None, None, :], shp + (3,))
-                            mu23_b = jnp.broadcast_to(mu23_s[..., None], shp)
-                            cph_b = jnp.broadcast_to(cosphi_f[None, None, None, None, :], shp)
-                            sph_b = jnp.broadcast_to(sinphi_f[None, None, None, None, :], shp)
-                            s23_b = jnp.broadcast_to(s23_s[..., None], shp)
-                            k2phat = mu23_b[..., None] * zhat_s + (s23_b * cph_b)[..., None] * e1_s + (s23_b * sph_b)[..., None] * e2_s
-                            k2pvec = k2pmag_c[None, None, :, None, None, None] * k2phat            # (nc, nbins, nbinsp, nxc, nphif, 3)
-                            k3pvec_b = jnp.broadcast_to((s * kv_u[2][sl])[:, :, None, None, None, :], shp + (3,))
-                            k1pvec = -(k3pvec_b + k2pvec)
-                            kamag = jnp.sqrt(jnp.sum(k1pvec**2, axis=-1))
-                            kasafe = jnp.where(kamag == 0., 1., kamag)
-                            ntilde = 4. * np.pi * kasafe * coordsp[0][None, None, :, None, None] * dk_b[None, None, :, None, None] * volume / (2. * np.pi)**3
-                            D = jnp.asarray(ok_c[sl]) / ntilde
-                            hal = k1pvec / kasafe[..., None]
-                            Sp_g = Sellp(hal, k2phat)                                            # (nc, nbins, nbinsp, nxc, nphif)
-                            if family == 'bb':
-                                Bp = Bp_f(k3pvec_b, k1pvec, k2pvec)
-                            else:
-                                Ta1 = jnp.broadcast_to(kv_u[0][sl][:, :, None, None, None, :], shp + (3,))
-                                Ta2 = jnp.broadcast_to(kv_u[1][sl][:, :, None, None, None, :], shp + (3,))
-                                Bp = T_f(Ta1, Ta2, k1pvec, k2pvec) * _pt_qmask(Ta1, Ta2, k1pvec, k2pvec)
-                            integrand = wcphi[sl] * Sp_g * D * Bp
-                            block_t = block_t + jnp.einsum('ua,uabnp->ab', wA[sl], integrand)
-
-                        block_t_m = 0.
-                        for sl in [slice(c, c + (nu + nchunk - 1) // nchunk) for c in range(0, nu, (nu + nchunk - 1) // nchunk)]:
-                            nc = len(range(*sl.indices(nu)))
-                            shpm = (nc, nbinsp, nbins, nxc, nphif)
-                            mu13_s, s13_s = mu13_nodes[sl], jnp.sqrt(jnp.clip(1. - mu13_nodes[sl]**2, 0., None))
-                            zhat_sm = jnp.broadcast_to(zhat_m[sl][:, :, None, None, None, :], shpm + (3,))
-                            e1_sm = jnp.broadcast_to(e1m[sl][:, :, None, None, None, :], shpm + (3,))
-                            e2_sm = jnp.broadcast_to(e2m[sl][:, :, None, None, None, :], shpm + (3,))
-                            mu13_b = jnp.broadcast_to(mu13_s[..., None], shpm)
-                            cph_bm = jnp.broadcast_to(cosphi_f[None, None, None, None, :], shpm)
-                            sph_bm = jnp.broadcast_to(sinphi_f[None, None, None, None, :], shpm)
-                            s13_b = jnp.broadcast_to(s13_s[..., None], shpm)
-                            k2hat_m = mu13_b[..., None] * zhat_sm + (s13_b * cph_bm)[..., None] * e1_sm + (s13_b * sph_bm)[..., None] * e2_sm
-                            k2vec_m = k2mag_m[None, None, :, None, None, None] * k2hat_m           # (nc, nbinsp, nbins, nxc, nphif, 3)
-                            k3vec_tied_m = jnp.broadcast_to((s * kv_p[2][sl])[:, :, None, None, None, :], shpm + (3,))
-                            k1vec_m = -(k3vec_tied_m + k2vec_m)
-                            kmag_m = jnp.sqrt(jnp.sum(k1vec_m**2, axis=-1))
-                            ksafe_m = jnp.where(kmag_m == 0., 1., kmag_m)
-                            ntilde_m = 4. * np.pi * ksafe_m * coords[0][None, None, :, None, None] * dk_a[None, None, :, None, None] * volume / (2. * np.pi)**3
-                            Dm = jnp.asarray(ok_m[sl]) / ntilde_m
-                            hal_m = k1vec_m / ksafe_m[..., None]
-                            S_here_m = Sell(hal_m, k2hat_m)                                       # (nc, nbinsp, nbins, nxc, nphif)
-                            if family == 'bb':
-                                Au_m = Bu_f(k3vec_tied_m, k1vec_m, k2vec_m)
-                            else:
-                                Tb1 = jnp.broadcast_to(kv_p[0][sl][:, :, None, None, None, :], shpm + (3,))
-                                Tb2 = jnp.broadcast_to(kv_p[1][sl][:, :, None, None, None, :], shpm + (3,))
-                                Au_m = T_f_m(Tb1, Tb2, k1vec_m, k2vec_m) * _pt_qmask(Tb1, Tb2, k1vec_m, k2vec_m)
-                            integrand_m = wcphi_m[sl] * S_here_m * Dm * Au_m
-                            block_t_m = block_t_m + jnp.einsum('ub,ubanp->ab', wA_m[sl], integrand_m)
-
-                        if os.environ.get('COV3_BOX_DEBUG'):
-                            print(f"box33 (c) mu23 {family}: max|term(unprimed-anchored)| = {np.abs(np.asarray(norm_tie * block_t)).max():.3e} "
-                                  f"max|term(primed-anchored)| = {np.abs(np.asarray(norm_tie * block_t_m)).max():.3e}")
-                        parts[family] = parts[family] + norm_tie * 0.5 * (block_t + block_t_m)
+                    # (c) double-closure tie (li = lj = 2): exact local-frame
+                    # angular substitution, shared with the windowed path --
+                    # see _c22_closure_tie.
+                    _c22 = _c22_closure_tie(Sell, Sellp, f, fp, coords, coordsp, edges, edgesp,
+                                            kv_u, kv_p, k3n_u, k3n_p, hat_u, hat_p, w_u, volume,
+                                            norm_tie=norm_tie, debug_label='box33')
+                    for _fam, _bl in _c22.items():
+                        parts[_fam] = parts[_fam] + _bl
 
                     if os.environ.get('COV3_BOX_DEBUG'):
                         for _nm in ('ppp', 'bb', 'pt'):
-                            _v = np.asarray(parts[_nm])
+                            _v = np.atleast_2d(np.asarray(parts[_nm]))
                             print(f"box33 {_nm.upper()} ell={ell} ellp={ellp}: max|.| = {np.abs(_v).max():.3e} diag head = {np.diag(_v)[:4]}")
                     block = parts['ppp'] + parts['bb'] + parts['pt']
                     if ip == i:
@@ -2423,6 +2684,13 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # k1hat/k2hat per node, for the per-block S weights.
                     pre['k1h_u'], pre['k2h_u'] = k1h_u, k2h_u
                     pre['k1h_p'], pre['k2h_p'] = k1h_p, k2h_p
+                    # Per-node closure-sweep measure operators: window
+                    # tables are cell-averaged with the exact phi measure
+                    # instead of point-sampled at the node k3 magnitudes
+                    # (see closure_measure) -- used by both the PPP closure
+                    # axis and the BB/PT leg tables below.
+                    k3msr_u = closure_measure(coords)      # rows: (nside * nbins)
+                    k3msr_p = closure_measure(coordsp)     # rows: (nside * nbinsp)
 
                     # Per-leg khat . n, shape (nside, nbins): legs 1, 2 are
                     # bin-independent, the closure leg 3 is not.
@@ -2514,6 +2782,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         # box path's exact substitution).
                         _paxes = (s1, s2)
                         _kp_points = k3n_p if 2 in _paxes else None
+                        _kp_measure = k3msr_p if 2 in _paxes else None
                         for ell_w3 in w3_ells:
                             for ellp_w3 in w3_ells:
                                 bkey = (tuple(np.ravel(edges)), tuple(np.ravel(edgesp)), ell_w3, ellp_w3, p1, p2, p3, _paxes)
@@ -2522,7 +2791,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                                         window3, edges, edgesp, ell_w3, ellp_w3,
                                         fields1=p1, fields2=p2, fields3=p3,
                                         cache=cache, batch_size=batch_size,
-                                        paxes=_paxes, kp_points=_kp_points)).real
+                                        paxes=_paxes, kp_points=_kp_points,
+                                        kp_measure=_kp_measure)).real
                                 blk = ppp_block_cache[bkey]
                                 if not np.any(blk):
                                     continue
@@ -2586,7 +2856,9 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                             rows_shape=(nside, nbins) if li == 2 else None,
                             cols_shape=(nside, nbinsp) if lj == 2 else None,
                             F_u={e: F_u[e][li] for e in qw_ells} if li == 2 else None,
-                            F_p={e: F_p[e][lj] for e in qw_ells} if lj == 2 else None)
+                            F_p={e: F_p[e][lj] for e in qw_ells} if lj == 2 else None,
+                            rows_measure=k3msr_u if li == 2 else None,
+                            cols_measure=k3msr_p if lj == 2 else None)
 
                     # BB: (window2, window2) symmetrization pair (same-size
                     # field groups), Legendre x B factors absorbed; None when
@@ -2632,6 +2904,24 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         for lj in range(3):
                             if P_lu[li][lj] is None or T_terms[li][lj] is None:
                                 continue
+                            # Skip the doubly-derived (2, 2) tie: see the BB
+                            # loop -- the double-Legendre channels cannot
+                            # represent the vector tie between two derived
+                            # closure directions.
+                            if li == 2 and lj == 2 and not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
+                                continue
+                            # Debug knob, mirroring COV3_BB_TERMS: restrict to
+                            # arm-only or closure-involving tie pairs. NOTE the
+                            # precomputed pt_F is cached per (fields, binning):
+                            # use a fresh cache when changing this knob.
+                            _sel = os.environ.get('COV3_PT_TERMS')
+                            if _sel:
+                                if _sel.startswith('pair:'):
+                                    _pairs = {tuple(map(int, t.split(','))) for t in _sel[5:].split(';')}
+                                    if (li, lj) not in _pairs:
+                                        continue
+                                elif ('closure' in _sel) != (2 in (li, lj)):
+                                    continue
                             key = (f[r1[li]], f[r2[li]], fp[r1[lj]], fp[r2[lj]])
                             T_groups.setdefault(key, []).append((li, lj))
 
@@ -2740,6 +3030,28 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                               f"at (u, p, a, b) = {np.unravel_index(np.argmax(np.abs(_Fv)), _Fv.shape)}; "
                               f"median|F| = {np.median(np.abs(_Fv)):.3e}")
 
+                    # (2, 2) double-closure tie: the double-Legendre channel
+                    # representation is invalid for two derived directions (it
+                    # only enforces |k3| = |k3'|; mode-sum-refuted) and is
+                    # skipped in the loops below. Instead the exact
+                    # local-frame substitution (_c22_closure_tie, shared with
+                    # the box path) is used, with the tie strength set by the
+                    # window's zero-lag (triple)(triple) monopole,
+                    # V_eff = 1 / Q_W^{(abc)(a'b'c')}(s -> 0).
+                    pre['c22'] = None
+                    if not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
+                        try:
+                            _t_u, _t_p = tuple(sorted((a, b, c))), tuple(sorted((ap, bp, cp)))
+                            _inv = 0.5 * (np.real(window2.get(fields1=_t_u, fields2=_t_p, ells=0).value()[0])
+                                          + np.real(window2.get(fields1=_t_p, fields2=_t_u, ells=0).value()[0]))
+                            pre['c22'] = (kv_u, kv_p, jnp.asarray(k3n_u), jnp.asarray(k3n_p),
+                                          hat_u, hat_p, float(1. / _inv))
+                        except Exception:
+                            # No (3)(3) window group available: leave the
+                            # (2, 2) tie out entirely (its true size is ~ one
+                            # single-closure tie).
+                            pre['c22'] = None
+
                     pre_cache[pre_key] = pre
 
                 pre = pre_cache[pre_key]
@@ -2783,6 +3095,30 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         tab = pre['bb_K'][li][lj]
                         if tab is None:
                             continue
+                        # The doubly-derived (li = lj = 2) tie cannot be
+                        # represented by the m = 0, ell <= 4 double-Legendre
+                        # channels: they enforce only |k3| = |k3'|, not the
+                        # vector tie, overcounting by the number of
+                        # directions per shell (x10-30, mode-sum-refuted).
+                        # Skip it (its true size is ~ one single-closure tie,
+                        # exactly computed by the box-limit (c) family) until
+                        # a (c)-style exact angular substitution is ported to
+                        # the windowed path. COV3_WIN_DOUBLE_CLOSURE=1
+                        # re-enables it for A/B checks.
+                        if li == 2 and lj == 2 and not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
+                            continue
+                        # Debug knob, mirroring COV3_PPP_TERMS: restrict to
+                        # arm-only (li, lj < 2) or closure-involving
+                        # (2 in (li, lj)) tie pairs, or explicit pairs
+                        # 'pair:li,lj[;li,lj...]'.
+                        _sel = os.environ.get('COV3_BB_TERMS')
+                        if _sel:
+                            if _sel.startswith('pair:'):
+                                _pairs = {tuple(map(int, t.split(','))) for t in _sel[5:].split(';')}
+                                if (li, lj) not in _pairs:
+                                    continue
+                            elif ('closure' in _sel) != (2 in (li, lj)):
+                                continue
                         if li == 2 and lj == 2:
                             term = jnp.einsum('uapb,u,p->ab', tab[None], wS_u, wSp_p)
                         elif li == 2:
@@ -2796,10 +3132,21 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 block_BB = norm33 * block_BB
 
                 block_PT = 0. if pre['pt_F'] is None else norm33 * jnp.einsum('u,p,upab->ab', wS_u, wSp_p, pre['pt_F'])
+                if pre.get('c22') is not None:
+                    # Exact-substitution (2, 2) double-closure tie (see the
+                    # precompute note): shared machinery with the box path,
+                    # windowed integrated tie strength.
+                    _g = pre['c22']
+                    _c22 = _c22_closure_tie(S, Sp, fields, fieldsp, coords, coordsp, edges, edgesp,
+                                            _g[0], _g[1], _g[2], _g[3], _g[4], _g[5],
+                                            jnp.asarray(pre['w_side']), _g[6],
+                                            norm_tie=M / (32. * np.pi**2), debug_label='win33')
+                    block_BB = block_BB + _c22.get('bb', 0.)
+                    block_PT = block_PT + _c22.get('pt', 0.)
                 if os.environ.get('COV3_BOX_DEBUG'):
                     for _nm, _bl in (('PPP', block_PPP), ('BB', block_BB), ('PT', block_PT)):
                         _v = np.atleast_2d(np.asarray(_bl))
-                        print(f"win33 {_nm} ell={ell} ellp={ellp}: max|.| = {np.abs(_v).max():.3e} diag head = {np.diag(_v)[:4]}")
+                        print(f"win33 {_nm} ell={ell} ellp={ellp}: max|.| = {np.abs(_v).max():.3e} diag = {np.array2string(np.diag(_v), precision=3, max_line_width=10000)}")
                 block = block_PPP + block_BB + block_PT
                 if ip == i:
                     # Same fix as the box-limit path's (c) double-closure term: the
