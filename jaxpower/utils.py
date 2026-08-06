@@ -641,10 +641,66 @@ def wigner_3j(*ells):
     return _wigner_3j(*map(int, ells))
 
 
+def _delta_log_6j(a, b, c):
+    """log of the Racah triangle coefficient Delta(abc); -inf if the triangle fails."""
+    from scipy.special import gammaln
+    if a + b - c < 0 or a - b + c < 0 or -a + b + c < 0:
+        return -np.inf
+    lf = lambda n: gammaln(n + 1.)
+    return 0.5 * (lf(a + b - c) + lf(a - b + c) + lf(-a + b + c) - lf(a + b + c + 1))
+
+
+@lru_cache(maxsize=None)
+def _wigner_6j(a, b, c, d, e, f):
+    """Racah formula for the 6j in floating point, via log-factorials."""
+    from scipy.special import gammaln
+    lf = lambda n: gammaln(n + 1.)
+    dl = (_delta_log_6j(a, b, c) + _delta_log_6j(a, e, f)
+          + _delta_log_6j(d, b, f) + _delta_log_6j(d, e, c))
+    if not np.isfinite(dl):
+        return 0.
+    a1, a2, a3, a4 = a + b + c, a + e + f, d + b + f, d + e + c
+    b1, b2, b3 = a + b + d + e, b + c + e + f, a + c + d + f
+    lo, hi = int(max(a1, a2, a3, a4)), int(min(b1, b2, b3))
+    if lo > hi:
+        return 0.
+    tot = 0.
+    for t in range(lo, hi + 1):
+        tot += (-1)**t * np.exp(dl + lf(t + 1) - lf(t - a1) - lf(t - a2) - lf(t - a3) - lf(t - a4)
+                                - lf(b1 - t) - lf(b2 - t) - lf(b3 - t))
+    return float(tot)
+
+
 @lru_cache(maxsize=None)
 def _wigner_9j(*ells):
-    from sympy.physics.wigner import wigner_9j
-    return float(wigner_9j(*ells))
+    """9j via the Racah single sum over 6j.
+
+    sympy's exact-rational wigner_9j costs 20-200 ms per DISTINCT symbol at the orders the
+    scoccimarro window matrix needs (and these calls are already lru_cached, so memoisation cannot
+    help further) -- which is what made ellmax >= 16 impractical. The identity
+
+        {a b c; d e f; g h i} = sum_x (-1)^(2x) (2x+1) {a b c; f i x}{d e f; b x h}{g h i; x a d}
+
+    with the 6j evaluated in FLOATING point gives 20-58x, growing with ell, and agrees with sympy to
+    ~1e-16. NOTE the float 6j is essential: using sympy's exact 6j inside this sum is SLOWER than one
+    exact 9j (~0.6x), since it trades one exact symbol for ~30 of them.
+    """
+    a, b, c, d, e, f, g, h, i = ells
+    for (x, y, z) in ((a, b, c), (d, e, f), (g, h, i), (a, d, g), (b, e, h), (c, f, i)):
+        if not (abs(x - y) <= z <= x + y):
+            return 0.
+    lo = max(abs(a - i), abs(d - h), abs(b - f))
+    hi = min(a + i, d + h, b + f)
+    tot = 0.
+    for x in range(int(lo), int(hi) + 1):
+        t = _wigner_6j(a, b, c, f, i, x)
+        if t == 0.: continue
+        u = _wigner_6j(d, e, f, b, x, h)
+        if u == 0.: continue
+        v = _wigner_6j(g, h, i, x, a, d)
+        if v == 0.: continue
+        tot += (-1)**(2 * x) * (2 * x + 1) * t * u * v
+    return float(tot)
 
 
 def wigner_9j(*ells):

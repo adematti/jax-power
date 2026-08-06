@@ -1,3 +1,4 @@
+import functools
 import itertools
 import os
 
@@ -7,11 +8,66 @@ from jax import numpy as jnp
 
 from .mesh import MeshAttrs, split_particles
 from .mesh2 import get_smooth2_window_bin_attrs
-from .mesh3 import BinMesh3CorrelationPoles, compute_mesh3, FKPField, get_sugiyama_window_convolution_coeffs, get_sugiyama_covariance_window_convolution_coeffs, get_smooth3_window_bin_attrs
+from .mesh3 import BinMesh3CorrelationPoles, compute_mesh3, FKPField, get_sugiyama_window_convolution_coeffs, get_smooth3_window_bin_attrs
 from .types import CovarianceMatrix, ObservableTree
-from .utils import wigner_3j, get_legendre, legendre_product
+from .utils import wigner_3j, wigner_9j, get_legendre, legendre_product
 from .pt import integration, IntegralND, get_S
 from .cov2 import Correlation2Spectrum, compute_spectrum2_covariance_window_block, matrix_rebin
+
+
+@functools.lru_cache(maxsize=None)
+def get_sugiyama_covariance_window_convolution_coeffs(ell, ellin):
+    r"""Window-multipole coefficients for the *covariance* 4-point kernel.
+
+    ``ell`` = (L1, L2, J) indexes the unprimed-side S-basis channel and
+    ``ellin`` = (L1', L2', J') the primed-side one (both z3, M = 0). Returns
+    the list of (q, coeff) such that the 4-point angular window kernel is
+
+    .. math::
+        Q_W(k_1, k_1', k_2, k_2')
+        = \sum_{\ell,\ell'} \Big[\sum_q c_q\, \mathrm{Hankel}_{L_1 L_1' L_2 L_2'}[Q_{W,q}]\Big]
+          S_\ell(\hat k_1, \hat k_2)\, S_{\ell'}(\hat k_1', \hat k_2'),
+
+    following the :math:`\mathcal C^{\lambda_1\lambda_2\Lambda}_{L_1L_1'L_2L_2'}`
+    kernel of ``_cov3_math.tex``, keeping only its N = 0 term (the N != 0
+    azimuthal channels vanish identically under the estimators' independent
+    per-side orientation averages). This differs from
+    :func:`get_sugiyama_window_convolution_coeffs` (the *mean* bispectrum
+    window convolution, eq. 63 of arXiv:1803.02132): here the monopole
+    window feeds each diagonal channel with the Parseval weight
+    :math:`(2L_1+1)(2L_2+1)(2J+1) H_{L_1L_2J}^2 = 1 / \| S_\ell \|^2`.
+
+    The relative phase :math:`(-i)^{L_1+L_2} i^{L_1'+L_2'}` is real
+    (:math:`\pm 1`) for every allowed q: the two triangle conditions with
+    even-sum q force :math:`(L_1'-L_1)+(L_2'-L_2)` even. It is included here
+    because the covariance Hankel matrices drop the transforms'
+    :math:`i^\ell` prefactors. Normalization is anchored so that the
+    ((0,0,0), (0,0,0)) channel has coeff((0,0,0)) = 1, matching the box
+    limit.
+    """
+    L1, L2, J = ell
+    L1p, L2p, Jp = ellin
+    HJ = wigner_3j(L1, L2, J, 0, 0, 0)
+    HJp = wigner_3j(L1p, L2p, Jp, 0, 0, 0)
+    if abs(HJ) < 1e-12 or abs(HJp) < 1e-12:
+        return []
+    coeffs = []
+    for q in itertools.product(range(L1 + L1p + 1), range(L2 + L2p + 1), range(abs(J - Jp), J + Jp + 1)):
+        if sum(q) % 2 or q[2] % 2:
+            continue
+        Hq = wigner_3j(*q, 0, 0, 0)
+        if abs(Hq) < 1e-12:
+            continue
+        coeff = (2 * L1 + 1) * (2 * L1p + 1) * (2 * L2 + 1) * (2 * L2p + 1)
+        coeff *= wigner_3j(q[0], L1, L1p, 0, 0, 0) * wigner_3j(q[1], L2, L2p, 0, 0, 0) / Hq
+        coeff *= (2 * J + 1) * (2 * Jp + 1) * HJ * HJp
+        coeff *= wigner_9j(L1, L2, J, L1p, L2p, Jp, *q)
+        coeff *= wigner_3j(J, Jp, q[2], 0, 0, 0)
+        if abs(coeff) < 1e-10:
+            continue
+        coeff *= (-1) ** (((L1p - L1 + L2p - L2) // 2) % 2)
+        coeffs.append((tuple(q), coeff))
+    return coeffs
 
 
 def unitvec(mu, phi):

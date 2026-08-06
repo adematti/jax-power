@@ -830,7 +830,8 @@ def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
 
 
 
-def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('rect',), batch_size=None) -> WindowMatrix:
+def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('rect',),
+                                    ninsub: int=1, noutsub: int=1, batch_size=None) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) power spectrum window matrix.
 
@@ -844,6 +845,23 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         Input multipole orders. Optional when ``edgesin`` is provided.
     bin : BinMesh2SpectrumPoles
         Output binning.
+    ninsub : int, default=1
+        Theory-side sub-binning, ``'fftlog'`` path only (the ``'rect'`` path already integrates the
+        theory over the input bin edges analytically, via ``BesselIntegral(..., edges=True)``).
+        With ``ninsub = 1`` the theory bin is represented by one spline basis function centred on
+        the bin; with ``ninsub > 1`` the spline nodes are refined to ``ninsub`` Gauss-Legendre
+        points per bin and combined with :math:`k^2` weights, i.e. the basis is averaged over the
+        bin rather than sampled at its centre. This matters when the theory binning is comparable to the output binning:
+        the cubic basis functions have negative side lobes, and with few nodes (and a bin close to the range
+        boundary) a sharply peaked theory can drive the prediction negative.
+        Prefer a theory binning finer than the output one, e.g. :math:`\\Delta k_{\\rm th} = 0.001` against :math:`\\Delta k_{\\rm obs} = 0.005` -- and use
+        ``ninsub`` when that is not possible.
+    noutsub : int, default=1
+        Output-side sub-binning, both paths: average the prediction over each output bin using
+        ``noutsub`` Gauss-Legendre points weighted by :math:`k^2`, instead of evaluating at the
+        bin's representative :math:`k`. The ``'fftlog'`` path already applies a :math:`k^2`-weighted
+        bin average through ``matrix_rebin``, so this mainly refines it; the ``'rect'`` path
+        evaluates at bin centres, so it is the more useful knob there.
     batch_size : int, optional
         Size of the batch for each step to execute in parallel.
 
@@ -852,6 +870,25 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     wmat : WindowMatrix
     """
     from .utils import BesselIntegral
+
+    def _sub_nodes(edges, nsub, k2=True):
+        """Gauss-Legendre nodes and measure inside each bin: (nbin, nsub) each.
+
+        ``k2`` includes the :math:`k^2` measure. That belongs to the OUTPUT side, where the
+        estimator averages over the modes in a shell and the mode density goes as :math:`k^2`.
+        It does NOT belong to the theory side: there the sub-nodes only refine a basis that must
+        stay a partition of unity, so that a theory constant across the bin is represented
+        exactly. Weighting those by :math:`k^2` would tilt the basis within each bin and break
+        that, biasing wide or steeply varying bins.
+        """
+        edges = np.asarray(edges)
+        if edges.ndim == 1: edges = np.column_stack([edges[:-1], edges[1:]])
+        u, wu = np.polynomial.legendre.leggauss(nsub)
+        lo, hi = edges[:, 0][:, None], edges[:, 1][:, None]
+        k = 0.5 * (hi - lo) * (u[None, :] + 1.) + lo
+        w = 0.5 * (hi - lo) * wu[None, :]
+        if k2: w = w * k**2
+        return k, w
     ells = bin.ells
 
     if isinstance(edgesin, ObservableTree):
@@ -868,6 +905,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     kout = bin.xavg
 
     wmat_tmp = {}
+    interp_order = 1
 
     for ellin, wain in ellsin:
         wmat_tmp[ellin, wain] = []
@@ -897,12 +935,20 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
 
                 def f(edgein):
                     tophat_Qs = BesselIntegral(edgein, savg, ell=ellin, edges=True, method='rect', mode='backward').w[..., 0] * Qs * savg**wain
-                    def f2(kout):
-                        integ = BesselIntegral(savg, kout, ell=ell, method='rect', mode='forward', edges=False, volume=False)
+                    def f2(kk):
+                        integ = BesselIntegral(savg, kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
                         return integ(snmodes * tophat_Qs)
                     #    return (-1)**(ell // 2) * jnp.sum(snmodes * spherical_jn[ell](kout * savg) * tophat_Qs)
-                    batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
-                    spectrum = jax.lax.map(f2, kout, batch_size=batch_size)
+                    if noutsub > 1:
+                        # k^2-weighted average over each output bin, instead of the bin's centre
+                        _ks, _ws = _sub_nodes(bin.edges, noutsub)
+                        batch_size = int(min(max(1e7 / savg.size, 1), _ks.size))
+                        _sub = jax.lax.map(f2, jnp.asarray(_ks.ravel()), batch_size=batch_size)
+                        _w = jnp.asarray(_ws)
+                        spectrum = jnp.sum(_w * _sub.reshape(_ks.shape), axis=-1) / jnp.sum(_w, axis=-1)
+                    else:
+                        batch_size = int(min(max(1e7 / savg.size, 1), kout.size))
+                        spectrum = jax.lax.map(f2, kout, batch_size=batch_size)
                     #spectrum = jnp.zeros_like(spectrum, shape=(len(ells), spectrum.size)).at[ill].set(spectrum)
                     return spectrum#.ravel()
 
@@ -920,23 +966,48 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 # input bin -- a bin can even catch zero fftlog nodes), use
                 # the same spline-basis-function construction matrix_rebin
                 # uses internally (interpolate a unit spike at each input
-                # bin's center, smoothly extended to to_spectrum.k via cubic
-                # spline -- Min[:, idx] is that bin's smooth basis function).
+                # bin's center, extended to to_spectrum.k by a LINEAR spline
+                # -- Min[:, idx] is that bin's basis function).
                 # out: instead of jnp.interp at kout's bin centers, properly
                 # bin-average (weighted by k^2) onto kout's actual edges via
                 # matrix_rebin, as done throughout cov2.py/cov3.py.
-                kin_centers = jnp.mean(edgesin, axis=-1)
-                Min = matrix_spline_interp(kin_centers, to_spectrum.k, interp_order=3)
+                #
+                # interp_order=1, not 3. A cubic spline basis rings.
+                if ninsub > 1:
+                    # Refine the spline nodes to ninsub Gauss-Legendre points per input bin: the
+                    # basis is then the BIN AVERAGE rather than a single function centred on the
+                    # bin. This was introduced to suppress the cubic basis's negative side lobes
+                    # for a sharply peaked theory; with the linear basis there are no side lobes
+                    # to suppress, so it now only supplies the bin average itself.
+                    # k2=False: no k^2 measure on the THEORY side -- the sub-nodes refine a basis
+                    # that has to stay a partition of unity (see _sub_nodes), unlike the output
+                    # side where the k^2 mode density is physical.
+                    _kin, _ = _sub_nodes(edgesin, ninsub, k2=False)
+                    _M = matrix_spline_interp(jnp.asarray(_kin.ravel()), to_spectrum.k, interp_order=interp_order)
+                    # SUM the refined basis functions of each bin, do not average them: the spline
+                    # basis on the refined node set is a partition of unity over ALL nodes
+                    # (sum_nodes M = 1) . Summing keeps sum_j Min[:, j] = 1,
+                    # and a theory constant across the bin is then represented exactly.
+                    Min = jnp.sum(_M.reshape(_M.shape[0], *_kin.shape), axis=-1)
+                    kin_centers = jnp.mean(edgesin, axis=-1)
+                else:
+                    kin_centers = jnp.mean(edgesin, axis=-1)
+                    Min = matrix_spline_interp(kin_centers, to_spectrum.k, interp_order=interp_order)
                 # matrix_spline_interp extrapolates via the spline's own
                 # boundary polynomial pieces outside [kin_centers.min(),
                 # kin_centers.max()] -- to_spectrum.k typically spans a much
                 # wider (log-spaced) range than the input bins, and cubic
-                # extrapolation over that gap explodes (observed up to
-                # ~1e15). Zero it outside the input bins' own range, matching
-                # the implicit zero of the boolean mask it replaces.
+                # extrapolation over that gap explodes.
                 in_range = (to_spectrum.k >= edgesin.min()) & (to_spectrum.k <= edgesin.max())
                 Min = Min * in_range[:, None]
-                Mout = matrix_rebin(bin.edges, to_spectrum.k, wt=to_spectrum.k**2, interp_order=3)
+                if noutsub > 1:
+                    # explicit k^2-weighted Gauss-Legendre average over each output bin
+                    _kout, _wout = _sub_nodes(bin.edges, noutsub)
+                    _I = matrix_spline_interp(to_spectrum.k, jnp.asarray(_kout.ravel()), interp_order=interp_order)
+                    _w = jnp.asarray(_wout / _wout.sum(axis=-1, keepdims=True))
+                    Mout = jnp.einsum('bs,bsk->bk', _w, _I.reshape(*_kout.shape, _I.shape[-1]))
+                else:
+                    Mout = matrix_rebin(bin.edges, to_spectrum.k, wt=to_spectrum.k**2, interp_order=interp_order)
 
                 def convolve(idx):
                     theory = Min[:, idx]

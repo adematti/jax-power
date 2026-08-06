@@ -487,7 +487,7 @@ def compute_mesh3(*meshes: RealMeshField | ComplexMeshField, bin: BinMesh3Spectr
         Line-of-sight specification.
         If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+        Else, a 3-vector. In case of the sugiyama basis, 'local' and 'z' only are supported.
 
     Note
     ----
@@ -520,7 +520,7 @@ def compute_mesh3_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         Line-of-sight specification.
         If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+        Else, a 3-vector. In case of the sugiyama basis, 'local' and 'z' only are supported.
 
     Note
     ----
@@ -647,7 +647,7 @@ def compute_mesh3_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         Line-of-sight specification.
         If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+        Else, a 3-vector. In case of the sugiyama basis, 'local' and 'z' only are supported.
 
     Note
     ----
@@ -1028,7 +1028,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
         Line-of-sight specification.
         If ``los`` is 'local', use local (varying) line-of-sight.
         Else, global line-of-sight: may be 'x', 'y' or 'z', for one of the Cartesian axes.
-        Else, a 3-vector. In case of the sugiyama basis, 'z' only is supported.
+        Else, a 3-vector. In case of the sugiyama basis, 'local' and 'z' only are supported.
     resampler : str, Callable
         Resampler to read particule weights from mesh.
         One of ['ngp', 'cic', 'tsc', 'pcs'].
@@ -1218,61 +1218,6 @@ def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory 
         if abs(coeff) < 1e-7: continue
         coeff /= wigner_3j(*ellin, 0, 0, 0) * Hw
         coeffs.append((ellw, coeff))
-    return coeffs
-
-
-@functools.lru_cache(maxsize=None)
-def get_sugiyama_covariance_window_convolution_coeffs(ell, ellin):
-    r"""Window-multipole coefficients for the *covariance* 4-point kernel.
-
-    ``ell`` = (L1, L2, J) indexes the unprimed-side S-basis channel and
-    ``ellin`` = (L1', L2', J') the primed-side one (both z3, M = 0). Returns
-    the list of (q, coeff) such that the 4-point angular window kernel is
-
-    .. math::
-        Q_W(k_1, k_1', k_2, k_2')
-        = \sum_{\ell,\ell'} \Big[\sum_q c_q\, \mathrm{Hankel}_{L_1 L_1' L_2 L_2'}[Q_{W,q}]\Big]
-          S_\ell(\hat k_1, \hat k_2)\, S_{\ell'}(\hat k_1', \hat k_2'),
-
-    following the :math:`\mathcal C^{\lambda_1\lambda_2\Lambda}_{L_1L_1'L_2L_2'}`
-    kernel of ``_cov3_math.tex``, keeping only its N = 0 term (the N != 0
-    azimuthal channels vanish identically under the estimators' independent
-    per-side orientation averages). This differs from
-    :func:`get_sugiyama_window_convolution_coeffs` (the *mean* bispectrum
-    window convolution, eq. 63 of arXiv:1803.02132): here the monopole
-    window feeds each diagonal channel with the Parseval weight
-    :math:`(2L_1+1)(2L_2+1)(2J+1) H_{L_1L_2J}^2 = 1 / \| S_\ell \|^2`.
-
-    The relative phase :math:`(-i)^{L_1+L_2} i^{L_1'+L_2'}` is real
-    (:math:`\pm 1`) for every allowed q: the two triangle conditions with
-    even-sum q force :math:`(L_1'-L_1)+(L_2'-L_2)` even. It is included here
-    because the covariance Hankel matrices drop the transforms'
-    :math:`i^\ell` prefactors. Normalization is anchored so that the
-    ((0,0,0), (0,0,0)) channel has coeff((0,0,0)) = 1, matching the box
-    limit.
-    """
-    L1, L2, J = ell
-    L1p, L2p, Jp = ellin
-    HJ = wigner_3j(L1, L2, J, 0, 0, 0)
-    HJp = wigner_3j(L1p, L2p, Jp, 0, 0, 0)
-    if abs(HJ) < 1e-12 or abs(HJp) < 1e-12:
-        return []
-    coeffs = []
-    for q in itertools.product(range(L1 + L1p + 1), range(L2 + L2p + 1), range(abs(J - Jp), J + Jp + 1)):
-        if sum(q) % 2 or q[2] % 2:
-            continue
-        Hq = wigner_3j(*q, 0, 0, 0)
-        if abs(Hq) < 1e-12:
-            continue
-        coeff = (2 * L1 + 1) * (2 * L1p + 1) * (2 * L2 + 1) * (2 * L2p + 1)
-        coeff *= wigner_3j(q[0], L1, L1p, 0, 0, 0) * wigner_3j(q[1], L2, L2p, 0, 0, 0) / Hq
-        coeff *= (2 * J + 1) * (2 * Jp + 1) * HJ * HJp
-        coeff *= wigner_9j(L1, L2, J, L1p, L2p, Jp, *q)
-        coeff *= wigner_3j(J, Jp, q[2], 0, 0, 0)
-        if abs(coeff) < 1e-10:
-            continue
-        coeff *= (-1) ** (((L1p - L1 + L2p - L2) // 2) % 2)
-        coeffs.append((tuple(q), coeff))
     return coeffs
 
 
@@ -1545,8 +1490,8 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
 
 
 def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None,
-                                    flags: tuple=None, batch_size: int=None, ellmax: int=8,
-                                    ninsub: int=16, noutsub: int=2) -> WindowMatrix:
+                                    flags: tuple=None, batch_size: int=None, ellmax: int=16,
+                                    ninsub: int=16, noutsub: int=8) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 
@@ -1562,28 +1507,46 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         or tuples :math:`(L', M')`, see :func:`get_scoccimarro_window_convolution_coeffs`.
     bin : BinMesh2SpectrumPoles
         Output binning.
-    ellmax : int, default=8
+    ellmax : int, default=16
         For the scoccimarro basis: truncation of the TripoSH multipole sums resolving
         the internal (opening-angle) dependence, see
         :func:`get_scoccimarro_window_convolution_coeffs`. Use the same value as passed to
         :func:`get_smooth3_window_bin_attrs` (window multipoles missing from ``window``
-        are silently treated as zero). Convergence should be checked, especially for
-        squeezed configurations.
+        are silently treated as zero).
+        **``ellmax`` does not converge on its own -- it converges jointly with the radial (Bessel)
+        resolution of ``window``.** The high-order Bessel content has to be resolved
+        before the extra multipoles mean anything. Do not scan the two axes separately.
+        Cost is linear here -- the surviving term count is exactly ``4 * ellmax - 1`` -- and
+        quadratic in the window's grid size, so 16 is deliberately chosen as the point where the
+        pipeline reaches the analytic rather than as margin.
     ninsub : int, default=16
-        Theory-side sub-binning of the :math:`k_3^{\\prime}` measure integral. Not optional: the
-        point value breaks the box-limit sum rule by tens of per cent (16% at ``ninsub = 1``,
-        1.9% at 16). Measured on the injected-bispectrum test, ``ninsub = 1`` gives
-        :math:`\\chi^2/n = 4.41` against 3.25 for 4, 16 and 64 (identical), so 4 already
-        converges and 16 is margin.
-    noutsub : int, default=2
-        Output-side sub-binning: the full 3-D bin average of the rapidly varying angular factor
+        Theory-side sub-binning, so the theory basis represents the bin rather than its midpoint.
+        Scoccimarro basis: sub-binning of the :math:`k_3^{\\prime}` measure integral. Not optional:
+        the point value breaks the box-limit sum rule by tens of per cent (~16% at ``ninsub = 1``,
+        1.9% at 16).
+        Sugiyama basis: number of Gauss-Legendre sub-nodes per theory bin per axis used to build
+        the (separable) theory basis, summed so the bins keep tiling. There is no
+        :math:`k_3^{\\prime}` leg to integrate here, but the midpoint spline basis is truncated at
+        the range ends by its own extrapolation cut-off, which loses weight there; increasing
+        ``ninsub`` tends to an exactly tiling tophat instead. ``ninsub = 1`` places the single node
+        at the bin centre and so reproduces the plain midpoint spline basis exactly.
+    noutsub : int, default=8
+        Output-side sub-binning.
+        Scoccimarro basis: the full 3-D bin average of the rapidly varying angular factor
         :math:`\\mathcal{L}_{\\ell_2}(\\cos\\theta_{12})`, all three legs sub-binned and weighted
         by :math:`k_1^2k_2^2k_3^2` times the triangle measure. Setting it to 1 evaluates that
         factor at the bin's representative triangle, which is 20-40% wrong on squeezed
-        configurations; measured, ``noutsub = 1`` shifts individual bins by up to 47% and the
-        fitted amplitude from 0.971 to 1.055. Converged at 2 (2, 4, 6 agree to 3 digits).
+        configurations.
+        Cost grows as ``noutsub**3`` in the number of sub-triangles, but only ``noutsub**2`` of
+        them reach the interpolation (the gather sees the :math:`k_1, k_2` legs only), so the
+        practical scaling is milder than the node count suggests.
+        Sugiyama basis: sub-node refinement of the :math:`k^2`-weighted output-bin average. Expect
+        little effect and use it as a cross-check rather than a correction -- these multipoles bin
+        only two legs and carry no angular factor, so the output measure :math:`k_1^2k_2^2`
+        factorizes and the separable ``matrix_rebin`` is already the exact 2-D bin average.
     batch_size : int, optional
         Size of the batch for each step to execute in parallel.
+
     Returns
     -------
     wmat : WindowMatrix
@@ -1594,12 +1557,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         if 'wa_orders' in edgesin.labels(return_type='keys'):
             ellsin = [(ell, wa) for ell, wa in zip(edgesin.ells, edgesin.wa_orders)]
         pole = next(iter(edgesin))
-        # kin is used by the scoccimarro branch below (the compute_I weight) but was
-        # only ever assigned in the raw-edges branch, so passing an ObservableTree --
-        # the natural way to feed a MEASURED spectrum as theory -- raised NameError.
-        # Read it from the pole itself, i.e. whatever representative k the theory
-        # values are tabulated at (typically the mode-weighted bin.xavg), so the
-        # angle/thin-shell weight is evaluated at the same k the values belong to.
         kin = pole.coords('k')
         edgesin = pole.edges('k')
 
@@ -1652,6 +1609,9 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     from .fftlog import SpectrumToCorrelation, CorrelationToSpectrum
     from .cov2 import matrix_spline_interp, matrix_rebin
 
+    # interp_order=1, not 3. A cubic spline basis rings. Defined here, before the nested helpers that close over it.
+    interp_order = 1
+
     def get_w_rect(q, wain):
         transpose = False
         if q not in window.ells:
@@ -1676,7 +1636,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             masks.append((kk >= edge[0]) & (kk < edge[1]))
         return prod(jnp.meshgrid(*masks, indexing='ij', sparse=True)) * value
 
-    def axis_basis_matrices(edges, k_axes, kind):
+    def axis_basis_matrices(edges, k_axes, kind, nsub=1):
         """Per-axis (separable) replacement for the sharp tophat/read: build,
         for each axis independently, a SMALL matrix of shape (n_k_axis,
         n_unique_axis) ('spline', input/theory side: a smooth spline basis
@@ -1687,6 +1647,13 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         tensor (edges may be a masked/paired list, e.g. sugiyama-diagonal's
         k1=k2, not a full product grid; this stays correct and small either
         way). Returns (index_per_bin (nbins, ndim), matrices list).
+
+        ``nsub`` > 1 replaces each bin's single representative midpoint by
+        ``nsub`` Gauss-Legendre sub-nodes spanning the bin, so the basis
+        represents the BIN rather than its centre (``nsub = 1`` puts the single
+        node at the centre and reproduces the midpoint construction exactly,
+        which is why it is the default here and leaves the scoccimarro callers
+        below untouched).
         """
         edges_np = np.asarray(edges)
         centers = edges_np.mean(axis=-1)
@@ -1698,20 +1665,44 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             index_per_bin[:, d] = inv
             kk = np.asarray(k_axes[d])
             unique_edges = edges_np[first_idx, d, :]
-            if kind == 'spline':
-                M = matrix_spline_interp(u, kk, interp_order=3)
+            if nsub > 1:
+                # Sub-node construction, shared by both kinds. 'spline' SUMS the sub-node
+                # interpolation weights and never averages them: the sum over all bins of a
+                # partition-of-unity interpolant must stay 1 at every k. As nsub
+                # grows the summed basis tends to the sharp tophat indicator that tiles the bins
+                # exactly, i.e. the scoccimarro branch's theory-side primitive, so nsub
+                # interpolates monotonically between the midpoint spline (nsub = 1) and that
+                # tophat. 'rebin' instead AVERAGES, weighted by the k^2 measure, matching
+                # matrix_rebin's definition.
+                from .pt import integration
+                _integ_sub = integration(-1., 1., size=nsub)
+                _u_sub, _w_sub = np.asarray(_integ_sub.x()), np.asarray(_integ_sub.w)
+                lo, hi = unique_edges[:, 0], unique_edges[:, 1]
+                ksub = 0.5 * (hi - lo)[:, None] * (_u_sub[None, :] + 1.) + lo[:, None]   # (n_unique, nsub)
+                if kind == 'spline':
+                    # theory known AT the sub-nodes, evaluated ON the fftlog grid
+                    Msub = matrix_spline_interp(jnp.asarray(ksub.ravel()), kk, interp_order=interp_order)
+                    M = jnp.sum(Msub.reshape(Msub.shape[0], *ksub.shape), axis=-1)       # (n_k, n_unique)
+                    _lo, _hi = unique_edges.min(), unique_edges.max()
+                    M = M * ((kk >= _lo) & (kk <= _hi))[:, None]
+                else:
+                    # opposite direction: the transformed spectrum is known ON the fftlog grid and
+                    # is READ at the sub-nodes, then averaged over the bin with the k^2 measure
+                    Msub = matrix_spline_interp(kk, jnp.asarray(ksub.ravel()), interp_order=interp_order)
+                    Msub = Msub.reshape(*ksub.shape, Msub.shape[-1])                     # (n_unique, nsub, n_k)
+                    wsub = jnp.asarray((0.5 * (hi - lo)[:, None] * _w_sub[None, :]) * ksub**2)
+                    M = jnp.sum(wsub[..., None] * Msub, axis=1) / jnp.sum(wsub, axis=-1)[:, None]
+            elif kind == 'spline':
+                M = matrix_spline_interp(u, kk, interp_order=interp_order)
                 # matrix_spline_interp extrapolates via the spline's own boundary
                 # polynomial outside [u.min(), u.max()], and kk (the fftlog k-grid) spans a
                 # far wider range than the input bins, where cubic extrapolation explodes --
-                # so it must be cut off. Cut at the bin EDGES, not the bin centres: the
-                # centres lose half a bin at each end (11% of the edge-to-edge range for a
-                # typical binning), and the box-limit sum rule needs the theory basis to tile
-                # the whole range.
+                # so it must be cut off.
                 lo, hi = unique_edges.min(), unique_edges.max()
                 in_range = (kk >= lo) & (kk <= hi)
                 M = M * in_range[:, None]
             else:
-                M = matrix_rebin(unique_edges, kk, wt=kk**2, interp_order=3)
+                M = matrix_rebin(unique_edges, kk, wt=kk**2, interp_order=interp_order)
             matrices.append(M)
         return jnp.asarray(index_per_bin), matrices
 
@@ -1776,8 +1767,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # equal-but-short legs -- is exactly the pattern of the box-limit residual.
         # The bin average is the ratio of bin-integrated measures, all three legs sub-binned.
         # Theory-side primitive is the sharp tophat: it tiles the bins exactly, which the
-        # box-limit sum rule requires, and it measured BETTER than the smooth spline basis on the
-        # injected-bispectrum test (weighted pred/meas 0.971, chi2/n 3.25, versus 0.945 and 3.76).
+        # box-limit sum rule requires, and it measured BETTER than the smooth spline basis
         # The output side is the noutsub bin average below. `rebin` -- a k^2-weighted average over
         # (k1, k2) only, leaving the angular factor at the bin's representative triangle --
         # survives solely as the noutsub = 1 fallback, and is why noutsub = 1 is not recommended.
@@ -1799,6 +1789,33 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             nout_sub = _g.shape[0]
             kout_sub = jnp.asarray(_ksub.reshape(-1, 3))
             kout_weight = jnp.asarray(_wsub)
+            # `read` below is called with `to_spectrum.k`, a 2-tuple, so its `zip(k, kout)`
+            # consumes the k1 and k2 columns ONLY -- the k3 sub-index never reaches the gather.
+            # Of the noutsub^3 sub-points, only noutsub^2 are therefore distinct as far as the
+            # interpolation is concerned, and gathering all of them repeats identical work
+            # noutsub times. `_g` orders (i1, i2, i3) with i3 fastest, so the i3 = 0 slice
+            # ::noutsub enumerates the distinct (k1, k2) pairs. Measured end-to-end (scoccimarro,
+            # wcoords=256, ellmax=2): 1.26x at noutsub=16 and ~1.03x at noutsub=8, the gain
+            # growing with noutsub.
+            kout_sub12 = jnp.asarray(_ksub[:, ::noutsub, :2].reshape(-1, 2))   # (nout * noutsub^2, 2)
+            n_sub12 = noutsub**2
+
+            # These weights are pure setup, but they run OUTSIDE jax.lax.map, i.e. eagerly, where
+            # every primitive pays its own XLA compilation. compute_I alone is ~25 primitives, so
+            # left bare this costs ~25 compilations per term and the term count grows as
+            # 4 * ellmax - 1. Under a single jit it is one compilation each instead.
+            @partial(jax.jit, static_argnames=['ell2'])
+            def _out_weights(ell2, kout_sub, kout_weight):
+                num = kout_weight * compute_I(ell2, kout_sub.T).reshape(-1, nout_sub) * (-1)**ell2
+                return num.reshape(-1, n_sub12, noutsub).sum(axis=-1)
+
+            @jax.jit
+            def _out_den(kout_sub, kout_weight):
+                den = jnp.sum(kout_weight * compute_I(0, kout_sub.T).reshape(-1, nout_sub), axis=-1)
+                return jnp.where(den == 0., 1., den)
+
+            # denominator is independent of BOTH the theory bin and the term: hoist it entirely
+            _den_out = _out_den(kout_sub, kout_weight)
 
         for ellin, wain in ellsin:  # ellin = L' or (L', M'), wain wide-angle order
             wmat_tmp[ellin, wain] = []
@@ -1819,6 +1836,13 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     # Absent multipoles are already treated as zero downstream, so this changes no
                     # result -- only the runtime, from O(ellmax^2) to O(ellmax).
                     if np.ndim(Qs) == 0: continue
+                    if noutsub > 1:
+                        # numerator weight depends on the term (through ell2) but NOT on the
+                        # theory bin, so build it once here rather than once per bin. Summing it
+                        # over the k3 sub-axis now is what lets `read` run on the (k1, k2)
+                        # sub-grid alone: sum_{i3} w I is contracted against a `sub` that is
+                        # constant along i3.
+                        _wI_out = _out_weights(sugiyama_ell[1], kout_sub, kout_weight)
                     # fftlog
                     to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=sugiyama_ell, check_level=1, minfolds=0)
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sugiyama_ellt, minfolds=0)
@@ -1858,14 +1882,13 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                         # representative triangle. This branch used to sit AFTER an early return
                         # from 'rebin', so noutsub was silently inert for interp in
                         # ('spline', 'tophat-rebin') -- noutsub = 1, 2, 4 gave bit-identical
-                        # results -- and the 20-40% midpoint error of L_{ell2} on squeezed
-                        # triangles was never corrected on that path.
+                        # results.
                         if noutsub > 1:
-                            # bin average = sum_sub w k^2 I_{ell2} read  /  sum_sub w k^2 I_0
-                            sub = read(kout_sub.T, to_spectrum.k, to_spectrum(correlation)[1])
-                            num = jnp.sum(kout_weight * (sub * compute_I(ell2, kout_sub.T) * (-1)**ell2).reshape(-1, nout_sub), axis=-1)
-                            den = jnp.sum(kout_weight * compute_I(0, kout_sub.T).reshape(-1, nout_sub), axis=-1)
-                            spectrum = num / jnp.where(den == 0., 1., den)
+                            # bin average = sum_sub w k^2 I_{ell2} read  /  sum_sub w k^2 I_0,
+                            # with the gather done on the distinct (k1, k2) sub-points only
+                            sub = read(kout_sub12.T, to_spectrum.k, to_spectrum(correlation)[1])
+                            num = jnp.sum(_wI_out * sub.reshape(-1, n_sub12), axis=-1)
+                            spectrum = num / _den_out
                         elif _sc_spline is not None:
                             _Mo, _io = _sc_spline[2], _sc_spline[3]
                             _rb = _Mo[0] @ to_spectrum(correlation)[1] @ _Mo[1].T
@@ -1877,7 +1900,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                         # compute_I(0, kout) = pi^2/(k1 k2 k3) * Theta vanishes on output
                         # bins whose representative triangle violates the triangle
                         # inequality, so this division is 0/0 there and leaves NaN in
-                        # those rows (measured: 252 of 729 rows, ALL triangle-invalid).
+                        # those rows.
                         # Harmless in itself -- those bins are unphysical -- but a NaN
                         # in the matrix poisons any downstream dot product for a caller
                         # who does not mask, so return 0 as the grid branch does.
@@ -1913,9 +1936,16 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 tmp = jnp.zeros(shape=(len(kout), len(edgesin)))
                 # fftlog
                 to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1, minfolds=0)
-                index_in, Min_axes = axis_basis_matrices(edgesin, to_spectrum.k, kind='spline')
+                # ninsub / noutsub apply here too, via the sub-node construction in
+                # axis_basis_matrices. Their scoccimarro-side machinery does NOT carry over
+                # literally: the sugiyama multipoles B_{l1 l2 L}(k1, k2) bin only two legs, so
+                # there is no third-leg measure for ninsub to integrate and no rapidly varying
+                # L_{ell2}(cos theta12) for noutsub to bin-average -- and because the output
+                # measure k1^2 k2^2 then factorizes, the separable `rebin` already IS the exact
+                # 2-D output-bin average.
+                index_in, Min_axes = axis_basis_matrices(edgesin, to_spectrum.k, kind='spline', nsub=ninsub)
                 index_in_swap = index_in[:, ::-1]
-                index_out, Mout_axes = axis_basis_matrices(bin.edges, to_spectrum.k, kind='rebin')
+                index_out, Mout_axes = axis_basis_matrices(bin.edges, to_spectrum.k, kind='rebin', nsub=noutsub)
 
                 wcoeffs = get_sugiyama_window_convolution_coeffs(ell, ellin)
                 Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)

@@ -425,6 +425,40 @@ def test_inject_spectrum3(nmocks=100):
     print('test_inject_spectrum3 OK')
 
 
+def test_angular2_rebin():
+    # The estimator stores a (2l+1)-weighted average of C_ell over each band, keeping N_b = sum(2l+1)
+    # as nmodes, so merging adjacent bands loses nothing: rebinning a fine measurement must reproduce
+    # one measured directly with the wider bands, exactly.
+    from jaxpower import generate_spectrum2_alm
+
+    attrs = AngularAttrs(ellmax=32, nside=64)
+    # a steeply falling C_ell, so the (2l+1) weighting within a band actually matters
+    alm = generate_spectrum2_alm(attrs, cl=lambda ell: 1e-3 / (1. + (np.asarray(ell) / 4.)**2), seed=42)
+
+    def measure(step):
+        bin = BinAngular2Spectrum(attrs, edges={'min': 1, 'step': step})
+        spectrum = compute_angular2_spectrum(alm, bin=bin)
+        # a non-trivial normalization and a flat shot noise, to check they survive the merge
+        return spectrum.clone(norm=3., num_shotnoise=1e-5 * np.ones(len(spectrum.coords('ell'))))
+
+    for step, factor in [(1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (4, 2)]:
+        fine, coarse = measure(step), measure(step * factor)
+        rebin = fine.select(ell=slice(0, None, factor))
+        assert len(rebin.coords('ell')) == len(coarse.coords('ell')), (step, factor)
+        for name in ['nmodes', 'norm', 'num_shotnoise']:
+            assert np.allclose(rebin.values(name), coarse.values(name)), (step, factor, name)
+        assert np.allclose(rebin.coords('ell'), coarse.coords('ell'), rtol=1e-11), (step, factor)
+        assert np.allclose(rebin.edges('ell'), coarse.edges('ell')), (step, factor)
+        assert np.allclose(rebin.value(), coarse.value(), rtol=1e-11), (step, factor)
+        # nmodes must add up, not average
+        assert np.allclose(np.asarray(coarse.values('nmodes')),
+                           np.asarray(fine.values('nmodes')).reshape(-1, factor).sum(axis=-1))
+        # and the weighting is essential: a plain mean of the fine bands does not reproduce it
+        naive = np.mean(np.asarray(fine.value()).reshape(-1, factor), axis=-1)
+        assert not np.allclose(naive, coarse.value(), rtol=1e-3), (step, factor)
+    print('test_angular2_rebin OK')
+
+
 def test_angular3_gaunt():
     # The filtered-map estimator must reproduce the exact Gaunt sum
     #   num_ijk = sum_{l in bands} sum_{m1m2m3} G^{m1m2m3}_{l1l2l3} a a a,
@@ -647,6 +681,7 @@ if __name__ == '__main__':
     test_generate_spectrum2_alm()
     test_generate_spectrum3()
     test_inject_spectrum3()
+    test_angular2_rebin()
     test_angular3_gaunt()
     test_angular3_shotnoise()
     test_angular3_window()

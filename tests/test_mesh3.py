@@ -889,7 +889,13 @@ def test_smooth_window(plot=False):
         zeta2.write(fn)
 
     zeta2 = read(fn)
-    wmatrix = compute_smooth3_spectrum_window(zeta2, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    # ellmax/noutsub pinned at the pre-2026-08-06 library defaults, so this test keeps
+    # exercising fixed settings rather than tracking a default chosen for production
+    # accuracy (now 16, 8). NOTE the dominant cost here is NOT these: it is the 2048-point
+    # window s-grid above, and the 2-D FFTlog goes as its SQUARE -- 64x the 256-point case.
+    # test_window_nsub uses 512 for exactly that reason.
+    wmatrix = compute_smooth3_spectrum_window(zeta2, edgesin=edgesin, ellsin=ellsin, bin=bin,
+                                             ellmax=8, noutsub=2)
     wpoles = wmatrix.dot(np.concatenate([p.ravel() for p in poles]), return_type=None)
     if plot:
         ax = plt.gca()
@@ -969,7 +975,13 @@ def test_smooth_window_sugiyama_synthetic(plot=False):
     if plot:
         plot_zeta(zeta, s=1., show=True)
 
-    wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    # ellmax/noutsub pinned at the pre-2026-08-06 library defaults, so this test keeps
+    # exercising fixed settings rather than tracking a default chosen for production
+    # accuracy (now 16, 8). NOTE the dominant cost here is NOT these: it is the 2048-point
+    # window s-grid above, and the 2-D FFTlog goes as its SQUARE -- 64x the 256-point case.
+    # test_window_nsub uses 512 for exactly that reason.
+    wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin,
+                                             ellmax=8, noutsub=2)
     wpoles = wmatrix.dot(np.concatenate([tt.ravel() for tt in theory]), return_type=None)
     if plot:
         ax = plt.gca()
@@ -1044,7 +1056,13 @@ def test_smooth_window_scoccimarro_synthetic(plot=False):
     if False: #plot:
         plot_zeta(zeta, s=1., show=True)
 
-    wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin)
+    # ellmax/noutsub pinned at the pre-2026-08-06 library defaults, so this test keeps
+    # exercising fixed settings rather than tracking a default chosen for production
+    # accuracy (now 16, 8). NOTE the dominant cost here is NOT these: it is the 2048-point
+    # window s-grid above, and the 2-D FFTlog goes as its SQUARE -- 64x the 256-point case.
+    # test_window_nsub uses 512 for exactly that reason.
+    wmatrix = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin,
+                                             ellmax=8, noutsub=2)
     kin = wmatrix.theory.get(ells=0).coords('k')
     bk = pk(kin[:, 0]) * pk(kin[:, 1]) * pk(kin[:, 2])
     theory = [1. / (1 + ell) * bk for ell in ellsin]
@@ -1097,7 +1115,7 @@ def test_smooth_window_scoccimarro_per_ell_norm():
 
     for kw, tag in [(dict(), 'discrete')]:
         wmat = compute_smooth3_spectrum_window(window, edgesin=(edges3, edges3, edges3),
-                                               ellsin=ellsin, bin=bin, ellmax=2, **kw)
+                                               ellsin=ellsin, bin=bin, ellmax=2, noutsub=2, **kw)
         value = np.asarray(wmat.value())
         nin = np.asarray(wmat.theory.get(ells=0).coords('k')).shape[0]
         nout = len(kout)
@@ -1422,7 +1440,13 @@ def test_smooth_window_scoccimarro_inject(nmocks=20, plot=False):
     edgesin = ObservableTree([Mesh3SpectrumPole(k=jnp.asarray(k_un), k_edges=jnp.asarray(e_un),
                                                 num_raw=jnp.zeros(len(k_un)), basis='sugiyama')],
                              ells=[0], wa_orders=[(0, 0)])
-    wmat = compute_smooth3_spectrum_window(Q, edgesin=edgesin, ellsin=[0], bin=bin3)
+    # ellmax/noutsub pinned at the pre-2026-08-06 library defaults, so this test keeps
+    # exercising fixed settings rather than tracking a default chosen for production
+    # accuracy (now 16, 8). NOTE the dominant cost here is NOT these: it is the 2048-point
+    # window s-grid above, and the 2-D FFTlog goes as its SQUARE -- 64x the 256-point case.
+    # test_window_nsub uses 512 for exactly that reason.
+    wmat = compute_smooth3_spectrum_window(Q, edgesin=edgesin, ellsin=[0], bin=bin3,
+                                          ellmax=8, noutsub=2)
     pred = np.asarray(wmat.dot(jnp.asarray(theory), return_type=None).get(ells=0).value())
 
     # Judge on the bins the window actually populates, selected from the PREDICTION: a cut on the
@@ -1466,3 +1490,80 @@ if __name__ == '__main__':
     test_scoccimarro_symmetrization_matrix()
     test_smooth_window_scoccimarro_inject()
     #test_mesh3_spectrum_soccimarro_shotnoise()
+
+def test_window_nsub(verbose=True):
+    """ninsub / noutsub on the sugiyama window path.
+
+    Guards three structural properties that no other test covers -- these parameters were previously
+    read ONLY by the scoccimarro branch, so on the sugiyama path every value gave bit-identical
+    matrices, and the silent inertness is exactly what this test exists to catch:
+
+      (a) noutsub is INERT here, for a reason: the sugiyama multipoles bin only two legs and carry no
+          angular factor, so the output measure k1^2 k2^2 factorizes and the separable matrix_rebin is
+          already the exact 2-D bin average.
+      (b) ninsub is LIVE: the midpoint spline basis (ninsub = 1) is truncated at the range ends by its
+          own extrapolation cut-off, whereas the sub-node sum tends to an exactly tiling tophat.
+      (c) neither knob disturbs the box-limit row sums.
+    """
+    import numpy as np, jax.numpy as jnp
+    from lsstypes import ObservableLeaf, ObservableTree
+    from jaxpower import get_smooth3_window_bin_attrs
+
+    mattrs = MeshAttrs(boxsize=2000., meshsize=64, boxcenter=800.)
+    ells = [(0, 0, 0), (2, 0, 2)]
+    bin = BinMesh3SpectrumPoles(mattrs, edges={'step': 0.03}, basis='sugiyama-diagonal', ells=ells, mask_edges='')
+    edges1d = np.arange(0., 1.2 * mattrs.knyq.max(), 0.02)
+    kin1d = (edges1d[:-1] + edges1d[1:]) / 2.
+    edgesin, kin = (edges1d, edges1d), (kin1d, kin1d)
+    kw, ellsin = get_smooth3_window_bin_attrs(ells, ellsin=2, return_ellsin=True)
+    theory = np.concatenate([(1. / (1 + sum(ell)) * (1. / (1. + (kin1d[:, None] / 0.05)**2)
+                                                    * 1. / (1. + (kin1d[None, :] / 0.05)**2))).ravel()
+                            for ell in ellsin])
+    # 512 points, not the 2048 the neighbouring tests use: the window here is a smooth Gaussian, and
+    # the 2-D FFTlog cost goes as the SQUARE of the s-grid, which a unit test should not pay.
+    coords = [jnp.logspace(-2, 4, 512)] * 2
+    s1, s2 = np.meshgrid(*coords, indexing='ij')
+    kw['ells'] = [(0, 0, 0)]
+    zeta = ObservableTree([ObservableLeaf(s1=coords[0], s2=coords[1], coords=['s1', 's2'],
+                                         value=np.exp(-(s1**2 + s2**2) / 100.**2), meta={'ell': (0, 0, 0)})],
+                          ells=kw['ells'])
+
+    _cache = {}
+
+    def build(ninsub, noutsub):
+        if (ninsub, noutsub) not in _cache:   # the checks below share combos; build each once
+            wm = compute_smooth3_spectrum_window(zeta, edgesin=edgesin, ellsin=ellsin, bin=bin,
+                                                ellmax=8, ninsub=ninsub, noutsub=noutsub)
+            M = np.asarray(wm.value()).real
+            _cache[ninsub, noutsub] = (M, M @ theory)
+        return _cache[ninsub, noutsub]
+
+    ref, ref_pred = build(16, 2)
+    scale = np.abs(ref).max()
+    nout = len(np.asarray(bin.xavg))
+    rowsum = lambda M: M.reshape(len(ells), nout, -1).sum(axis=-1)[0]
+
+    # (a) noutsub inert: the predictions must agree, even though individual entries may not
+    for noutsub in [1, 3, 4]:
+        M, pred = build(16, noutsub)
+        rel = np.abs(pred - ref_pred).max() / np.abs(ref_pred).max()
+        if verbose: print(f'  noutsub={noutsub}: max rel prediction change {rel:.2e}')
+        assert rel < 1e-2, f'noutsub={noutsub} changed the sugiyama prediction by {rel:.2e}'
+
+    # (b) ninsub live and converging
+    rels = {}
+    for ninsub in [1, 8, 32]:
+        M, pred = build(ninsub, 2)
+        rels[ninsub] = np.abs(M - ref).max() / scale
+        if verbose: print(f'  ninsub={ninsub}: max|M - M(16)|/max|M| = {rels[ninsub]:.2e}')
+    assert rels[1] > 1e-3, ('ninsub is INERT on the sugiyama path -- it is being read only by the '
+                            'scoccimarro branch again')
+    assert rels[32] < rels[1], 'ninsub is not converging towards the tophat limit'
+
+    # (c) row sums untouched by either knob
+    r0 = rowsum(ref)
+    for ninsub, noutsub in [(1, 2), (32, 2), (16, 1), (16, 4)]:
+        M, _ = build(ninsub, noutsub)
+        drs = np.abs(rowsum(M) - r0).max() / np.abs(r0).max()
+        if verbose: print(f'  (ninsub, noutsub)=({ninsub}, {noutsub}): max rel row-sum change {drs:.2e}')
+        assert drs < 1e-2, f'row sums moved by {drs:.2e} at (ninsub, noutsub)=({ninsub}, {noutsub})'
