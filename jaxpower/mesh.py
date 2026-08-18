@@ -2196,11 +2196,11 @@ class ComplexMeshField(BaseMeshField):
         return self.clone(value=value)
 
 
-def _get_extent(*positions):
+def _get_extent(*positions, mpicomm=None):
     """Return minimum physical extent (min, max) corresponding to input positions."""
     if not positions:
         raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
-    backend, kw = _get_distributed_backend(positions[0])
+    backend, _ = _get_distributed_backend(positions[0], mpicomm=mpicomm)
     # Find bounding coordinates
     nonempty_positions = [pos for pos in positions if pos.size]
     if backend == 'jax':
@@ -2214,7 +2214,6 @@ def _get_extent(*positions):
         if nonempty_positions:
             pos_min = np.array([np.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
             pos_max = np.array([np.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
-        mpicomm = kw['mpicomm']
         pos_min, pos_max = mpicomm.allgather(pos_min), mpicomm.allgather(pos_max)
         pos_min, pos_max = [p for p in pos_min if p is not None], [p for p in pos_max if p is not None]
         if not pos_min or not pos_max:
@@ -2272,7 +2271,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
                    boxsize: np.ndarray | float=None, boxcenter: np.ndarray | float=None,
                    cellsize: np.ndarray | float=None, boxpad: np.ndarray | float=2.,
                    check: bool=False, approximate: bool=False, dtype=None, primes=None, divisors=None,
-                   sharding_mesh=None, **kwargs):
+                   sharding_mesh=None, mpicomm=None, **kwargs):
     """
     Compute enclosing box.
     Differentiable if ``meshsize`` is provided.
@@ -2300,6 +2299,9 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         When ``boxsize`` is determined from ``positions``, take ``boxpad`` times the smallest box enclosing ``positions`` as ``boxsize``.
     check : bool, default=False
         If ``True``, and input ``positions`` (if provided) are not contained in the box, raise a :class:`ValueError`.
+    mpicomm : MPI communicator, default=None
+        MPI communicator, used to reduce the extent of input ``positions`` over all processes,
+        if the MPI backend is used. Defaults to ``MPI.COMM_WORLD``.
     primes : tuple, default=None
         For more efficient FFTs, tuple of prime numbers to construct ``meshsize``.
         Typically: (2, 3, 5, 7).
@@ -2334,7 +2336,7 @@ def get_mesh_attrs(*positions: np.ndarray, meshsize: np.ndarray | int=None,
         if not positions:
             raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
         # Find bounding coordinates
-        pos_min, pos_max = _get_extent(*positions)
+        pos_min, pos_max = _get_extent(*positions, mpicomm=mpicomm)
         delta = jnp.abs(pos_max - pos_min)
         if boxcenter is None: boxcenter = 0.5 * (pos_min + pos_max)
         if boxsize is None:
