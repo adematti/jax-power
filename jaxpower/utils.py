@@ -188,7 +188,8 @@ class MemoryMonitor(object):
 
 
 @lru_cache(maxsize=32, typed=False)
-def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
+@lru_cache(maxsize=None)
+def _get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
     """
     Return a function that computes the real spherical harmonic of order (ell, m).
     Adapted from https://github.com/bccp/nbodykit/blob/master/nbodykit/algorithms/convpower/fkp.py.
@@ -334,6 +335,16 @@ def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
     return Ylm
 
 
+def get_Ylm(ell, m, modules=None, reduced=False, real=False, conj=False):
+    # Cached: building the harmonic lambdifies a sympy expression, which costs ~0.1 s per (ell, m)
+    # and grows with ell -- ~30 s for every order up to ell = 16, as the bispectrum window's
+    # reference-leg shape factor needs. The returned closure is read-only, so sharing it is safe.
+    if isinstance(modules, list): modules = tuple(modules)
+    return _get_Ylm(int(ell), int(m), modules=modules, reduced=bool(reduced), real=bool(real), conj=bool(conj))
+
+
+get_Ylm.__doc__ = _get_Ylm.__doc__
+
 # Store in cache
 [[get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in (0, 2, 4)]
 
@@ -353,9 +364,98 @@ _registered_legendre[10] = lambda x: 46189*x**10/256 - 109395*x**8/256 + 45045*x
 
 
 def get_legendre(ell):
+    """
+    Return a function evaluating the Legendre polynomial of order ``ell``.
+
+    ``ell`` may be traced, but must lie within the tabulated range (0 to
+    ``len(_registered_legendre) - 1``): :func:`jax.lax.switch` *clamps* an out-of-range index
+    rather than raising, which would silently return the highest tabulated order instead.
+    A static ``ell`` is checked here; a traced one cannot be, so use
+    :func:`get_legendre_recurrence` when the order may exceed the table.
+    """
+    if np.ndim(ell) == 0 and not isinstance(ell, jax.core.Tracer):
+        if not 0 <= int(ell) < len(_registered_legendre):
+            raise ValueError(f'Legendre order ell = {ell} outside the tabulated range '
+                             f'[0, {len(_registered_legendre) - 1}]; use get_legendre_recurrence instead')
 
     def legendre(x):
         return jax.lax.switch(ell, _registered_legendre, x)
+
+    return legendre
+
+
+def get_legendre_recurrence(ell, ellmax: int=None):
+    r"""
+    Return a function evaluating the Legendre polynomial of order ``ell``, using Bonnet's
+    three-term recurrence :math:`(n + 1) P_{n + 1}(x) = (2n + 1) x P_n(x) - n P_{n - 1}(x)`.
+
+    Unlike :func:`get_legendre` this has no tabulated upper bound, and accepts a **traced**
+    ``ell`` without emitting one branch per order --- :func:`jax.lax.switch` would lower every
+    tabulated branch into the graph. That is what lets callers that sum over many orders (e.g. the
+    TripoSH sums of :func:`~jaxpower.mesh3.compute_smooth3_spectrum_window`) share one compilation
+    instead of one per order.
+
+    The recurrence is also numerically stable at high order, where evaluating the monomial form
+    would suffer cancellation: :math:`P_{16}` has coefficients of order :math:`10^5` with
+    alternating signs.
+
+    The recurrence is UNROLLED whenever its length is known statically -- exactly when ``ell`` is a
+    Python integer, and to ``ellmax`` steps followed by a select when it is traced. This matters a
+    great deal: a dynamic :func:`jax.lax.fori_loop` lowers to a while loop, whose iterations XLA
+    cannot fuse, so each of the ``ell`` steps becomes its own pass over the (potentially large)
+    input. Measured on an A100 over a 1.7e7-element array, the dynamic form costs 10.6 ms at
+    ``ell = 16`` against 0.3 ms at ``ell = 2``, while the unrolled form is a single fused pass.
+
+    Parameters
+    ----------
+    ell : int, array
+        Legendre order, possibly traced. Must be >= 0.
+    ellmax : int, optional
+        Maximum order ``ell`` can take, used to unroll the recurrence when ``ell`` is traced.
+        **Must be a true upper bound**: orders above it would silently return a lower-order
+        polynomial. Ignored when ``ell`` is static. If ``None`` and ``ell`` is traced, falls back to
+        the dynamic (unfused, much slower) loop.
+
+    Returns
+    -------
+    legendre : callable
+        Function of ``x``, returning :math:`P_{\ell}(x)`.
+    """
+    static_ell = None
+    if np.ndim(ell) == 0 and not isinstance(ell, jax.core.Tracer):
+        static_ell = int(ell)
+        if static_ell < 0:
+            raise ValueError(f'Legendre order must be >= 0, got {static_ell}')
+
+    def step(n, x, pm1, p):
+        # (n + 1) P_{n + 1} = (2n + 1) x P_n - n P_{n - 1}
+        return p, ((2 * n + 1) * x * p - n * pm1) / (n + 1)
+
+    def legendre(x):
+        x = jnp.asarray(x)
+        # carry = (P_{n - 1}, P_n), starting at n = 1
+        p0 = jnp.ones_like(x)
+        p1 = x * jnp.ones_like(x)
+
+        if static_ell is not None:  # fully unrolled, no select and no wasted step
+            if static_ell == 0: return p0
+            pm1, p = p0, p1
+            for n in range(1, static_ell):
+                pm1, p = step(n, x, pm1, p)
+            return p
+
+        n_ell = jnp.asarray(ell)
+        if ellmax is None:  # correct, but the iterations do not fuse
+            _, toret = jax.lax.fori_loop(1, n_ell, lambda n, c: step(n, x, *c), (p0, p1))
+            return jnp.where(n_ell == 0, p0, toret)
+
+        # unrolled to a static length; every step is elementwise, so the whole chain fuses
+        toret = jnp.where(n_ell == 0, p0, p1)  # covers ell = 0 and ell = 1
+        pm1, p = p0, p1
+        for n in range(1, int(ellmax)):
+            pm1, p = step(n, x, pm1, p)
+            toret = jnp.where(n_ell == n + 1, p, toret)
+        return toret
 
     return legendre
 
@@ -440,14 +540,152 @@ _registered_bessel[10] = (lambda x: (-55/x**2 + 25740/x**4 - 2837835/x**6 + 9189
                           lambda x: x**10/13749310575)
 
 
+def _spherical_jn_series(ell, nterms=32):
+    r"""
+    Power series :math:`j_\ell(x) = \frac{x^\ell}{(2\ell+1)!!} \sum_k
+    \frac{(-x^2/2)^k}{k! (2\ell+3)(2\ell+5)\cdots(2\ell+2k+1)}`.
+
+    Entire, so it converges everywhere; ``nterms`` sets how far out in :math:`x` it stays at
+    machine precision. 24 terms carry it well past the crossover used by :func:`get_spherical_jn`.
+    """
+    dfact = 1.
+    for n in range(1, int(ell) + 1): dfact *= 2 * n + 1
+
+    def ser(x):
+        corr = term = jnp.ones_like(x)
+        for k in range(1, nterms + 1):
+            term = term * -x**2 / (2. * k * (2 * ell + 2 * k + 1))
+            corr = corr + term
+        return x**ell / dfact * corr
+
+    return ser
+
+
 def get_spherical_jn(ell):
+    r"""
+    Return a function evaluating the spherical Bessel function of order ``ell`` (a static integer).
+
+    The tabulated closed forms carry coefficients of order :math:`(2\ell+1)!!` divided by powers of
+    :math:`x` --- :math:`6.5 \times 10^8 / x^{11}` already at :math:`\ell = 10` --- which cancel to
+    give an :math:`O(1)` result. Below :math:`x \sim \ell/2` that cancellation destroys the answer:
+    measured against :mod:`scipy`, the previous unconditional use of the closed form above
+    :math:`x = 0.1` was wrong by 1.9e-6 at :math:`\ell = 6`, 3.1e-2 at :math:`\ell = 8` and 1.0e+3
+    at :math:`\ell = 10`, over a region reaching up to :math:`x \approx 0.42 \ell - 1.4`.
+    The series is used there instead, and orders beyond the table fall back to the stable
+    recurrence of :func:`get_spherical_jn_all`.
+    """
+    ell = int(ell)
+    if ell not in _registered_bessel:
+        jn_all = get_spherical_jn_all(ell)
+        return lambda x: jn_all(x)[ell]
+
+    closed = _registered_bessel[ell][0]
+    # The cancellation region measured against scipy reaches ~0.42 * ell - 1.4, but the closed
+    # form only becomes FULLY accurate somewhat beyond it (the surviving cancellation still costs
+    # ~1e-13 at ell = 10 in float64, and ~1e-4 in float32, if the crossover is placed too early).
+    xswitch = max(1.5, 0.7 * ell)
+    ser = _spherical_jn_series(ell)
 
     def jn(x):
-        mask = x > 0.1
-        bessel = _registered_bessel[ell]
-        return jnp.where(mask, bessel[0](x), bessel[1](x))
+        x = jnp.asarray(x)
+        # hold the closed form away from small x, where its 1/x**(ell+1) terms overflow: the value
+        # is discarded there anyway, but inf - inf would poison the result with NaN
+        return jnp.where(x > xswitch, closed(jnp.where(x > xswitch, x, 1.)), ser(x))
 
     return jn
+
+
+def get_spherical_jn_all(ellmax: int, n_iter: int=None, xmin: float=0.1):
+    r"""
+    Return a function evaluating :math:`j_0` to :math:`j_{\ell_{\mathrm{max}}}` at once, stacked
+    along a leading axis.
+
+    :func:`get_spherical_jn` stops at :math:`\ell = 10` and evaluates the explicit closed form,
+    whose coefficients grow like :math:`(2\ell + 1)!!` --- already :math:`10^{17}` at
+    :math:`\ell = 16`, where they cancel catastrophically at moderate argument. This uses the
+    standard stable combination instead, and returns every order in one pass, which is what a
+    TRACED-order gather needs (indexing a Python table requires a static order).
+
+    Regimes, each valid where the others are not:
+
+    - :math:`x < x_{\mathrm{min}}`: power series
+      :math:`j_n(x) = \frac{x^n}{(2n+1)!!} \left(1 - \frac{x^2}{2(2n+3)} + \ldots\right)`;
+    - :math:`x > \ell`: upward recurrence
+      :math:`j_{n+1} = \frac{2n+1}{x} j_n - j_{n-1}`, stable only in this regime;
+    - otherwise: Miller's downward recurrence from ``n_iter``, seeded arbitrarily and rescaled at
+      the end onto the known :math:`j_0` (or :math:`j_1`, whichever is larger there --- their zeros
+      interlace, so they never vanish together and the normalization never degenerates).
+
+    Parameters
+    ----------
+    ellmax : int
+        Largest order returned.
+    n_iter : int, optional
+        Starting order of the downward recurrence. Defaults to ``ellmax + 40``. Only the
+        :math:`x \leq \ell` regime uses it, so it need not exceed the argument.
+    xmin : float, default=0.1
+        Below this the series is used, which also keeps the recurrences away from :math:`x = 0`.
+
+    Returns
+    -------
+    jn_all : callable
+        Function of ``x``, returning an array of shape ``(ellmax + 1,) + x.shape``.
+    """
+    ellmax = int(ellmax)
+    if n_iter is None: n_iter = ellmax + 40
+    if n_iter <= ellmax:
+        raise ValueError(f'n_iter = {n_iter} must exceed ellmax = {ellmax}')
+
+    def jn_all(x):
+        x = jnp.asarray(x)
+        # the recurrences divide by x; the series branch covers whatever is masked out here
+        safe = jnp.where(x < xmin, 1., x)
+        j0 = jnp.sin(safe) / safe
+        j1 = jnp.sin(safe) / safe**2 - jnp.cos(safe) / safe
+
+        # upward: stable for x > ell, garbage (but finite) below, and masked out there
+        ups = [j0] + ([j1] if ellmax >= 1 else [])
+        for n in range(1, ellmax):
+            ups.append((2 * n + 1) / safe * ups[n] - ups[n - 1])
+        up = jnp.stack(ups)
+
+        # Miller downward: the seed is arbitrary (the normalization below fixes the scale), but the
+        # recurrence GROWS by ~(2n+1)/x per step -- some 1e130 over the whole sweep at x = xmin --
+        # so it must be renormalized as it goes. A fixed small seed instead of renormalizing works
+        # in float64 but silently flushes to zero (hence 0/0 = NaN) in float32.
+        cap = jnp.asarray(np.sqrt(np.finfo(jnp.result_type(safe)).max), dtype=safe.dtype)
+        jp1, jcur = jnp.zeros_like(safe), jnp.ones_like(safe)
+        store = [None] * (ellmax + 1)
+        for n in range(n_iter, 0, -1):
+            jp1, jcur = jcur, (2 * n + 1) / safe * jcur - jp1
+            scale = jnp.where(jnp.abs(jcur) > cap, 1. / cap, jnp.ones_like(cap))
+            jcur, jp1 = jcur * scale, jp1 * scale
+            for k in range(ellmax + 1):  # orders already stored share the rescaling
+                if store[k] is not None: store[k] = store[k] * scale
+            if n - 1 <= ellmax: store[n - 1] = jcur
+        down = jnp.stack(store)
+        # normalize on whichever of j0, j1 is larger: sin(x)/x vanishes at multiples of pi
+        use0 = jnp.abs(j0) >= jnp.abs(j1)
+        down = down * jnp.where(use0, j0 / store[0], j1 / store[1])
+
+        # small-x series
+        xs = jnp.where(x < xmin, x, 0.)
+        ser, dfact = [], 1.
+        for n in range(ellmax + 1):
+            if n: dfact *= 2 * n + 1
+            # sum_k (-x^2 / 2)^k / (k! (2n+3)(2n+5)...(2n+2k+1)); 4 terms leave a relative
+            # truncation ~ x^10 / (2^5 5! 11!!) at worst, i.e. ~1e-16 at x = xmin = 0.1
+            corr = term = 1.
+            for k in range(1, 5):
+                term = term * -xs**2 / (2. * k * (2 * n + 2 * k + 1))
+                corr = corr + term
+            ser.append(xs**n / dfact * corr)
+        ser = jnp.stack(ser)
+
+        ell = jnp.arange(ellmax + 1).reshape((-1,) + (1,) * x.ndim)
+        return jnp.where(x < xmin, ser, jnp.where(x > jnp.maximum(ell, 1.), up, down))
+
+    return jn_all
 
 
 def get_spherical_jn_tophat_integral(ell):
@@ -740,12 +978,15 @@ def get_S(ells, z3=False):
         return lambda *args: 0.
 
     def _Ylm(ell, m, xhat):
-        # get_Ylm's non-real convention carries an extra (-1)**m for m < 0 only
-        # (none for m >= 0) relative to the plain amp * lpmv(|m|, ell, mu) *
-        # exp(i m phi) used to derive the Gaunt coefficients below; compensate
-        # so Sell is unchanged.
-        sign = (-1) ** m if m < 0 else 1
-        out = sign * get_Ylm(ell, m, reduced=True)(xhat[..., 0], xhat[..., 1], xhat[..., 2])
+        # NO sign compensation. This used to multiply by (-1)**m for m < 0, on the grounds that
+        # get_Ylm's non-real convention carries an extra such factor relative to the plain
+        # amp * lpmv(|m|, ell, mu) * exp(i m phi) the Gaunt coefficients were derived in. Measured,
+        # it does not: get_Ylm(ell, m, reduced=True) IS sqrt(4 pi / (2 ell + 1)) Y_ell^m to 1e-16
+        # for every m tested. The compensation was therefore spurious and broke the addition
+        # theorem -- the convention-free identity S_(l l 0)(x1, x2, x3) = L_l(x1.x2) failed by
+        # O(1) with it (l = 1 gave +0.269 against the correct -0.644) and holds to 1e-15 without.
+        # Guarded by test_utils.py::test_S.
+        out = get_Ylm(ell, m, reduced=True)(xhat[..., 0], xhat[..., 1], xhat[..., 2])
         # For e.g. ell = m = 0, get_Ylm's (lambdified) expression does not
         # depend on xhat at all, so it returns a bare scalar that doesn't
         # carry xhat's shape; broadcast explicitly.

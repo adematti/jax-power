@@ -96,6 +96,42 @@ def get_kvec3(k1norm, k2norm, mu1, mu2, phi2):
     return (k1norm, k2norm, k3norm), (k1hat, k2hat, k3hat), (k1vec, k2vec, k3vec)
 
 
+def get_kvec3_x(k1norm, k2norm, mu1, x, phi):
+    """Triangle from (mu1, x, phi) instead of (mu1, mu2, phi2).
+
+    `x = k1hat . k2hat` is the triangle SHAPE, carried here as a direct integration variable;
+    `phi` is the azimuth of k2hat about k1hat. The solid-angle element is unchanged,
+    `dmu2 dphi2 = dx dphi`, so the quadrature weights and the normalization are identical to
+    :func:`get_kvec3` -- only the node placement differs.
+
+    Why it matters: the integrand's sharp structure lives in `k3 = |k1 + k2|`, which depends on
+    the shape *only* through `x` (`k3^2 = k1^2 + k2^2 + 2 k1 k2 x`), and is most singular at the
+    folded configuration `k1 ~ -k2`. Sampling `x` directly resolves it; deriving it as
+    `x = mu1 mu2 + sqrt(1-mu1^2) sqrt(1-mu2^2) cos(phi2)` smears that structure across all three
+    variables and is what limits convergence. This is the parameterization
+    :class:`jaxpower.pt.ProjectToSell` already uses (and FOLPS's `Sugiyama_Bell`), where the
+    same substitution was measured to be worth 10% on B000 and 11% on B202 at size 6.
+    """
+    smu = jnp.sqrt(jnp.clip(1. - mu1**2, 0., None))
+    zero, one = jnp.zeros_like(mu1), jnp.ones_like(mu1)
+    k1hat = jnp.stack([smu, zero, mu1], axis=-1)
+    # Orthonormal frame about k1hat, with e3 perpendicular to the line of sight.
+    e2 = jnp.stack([-mu1, zero, smu], axis=-1)
+    e3 = jnp.stack([zero, -one, zero], axis=-1)
+    sx = jnp.sqrt(jnp.clip(1. - x**2, 0., None))
+    # Explicit trailing axes: under vmap (the grid path) x and phi are scalars and plain
+    # products broadcast, but called directly on (..., ) arrays against (..., 3) vectors they
+    # must be lifted -- the exact-x path does exactly that.
+    k2hat = (x[..., None] * k1hat
+             + sx[..., None] * (jnp.cos(phi)[..., None] * e2 + jnp.sin(phi)[..., None] * e3))
+    k1vec = k1norm[..., None] * k1hat
+    k2vec = k2norm[..., None] * k2hat
+    k3vec = -k1vec - k2vec
+    k3norm = jnp.sqrt(jnp.sum(k3vec**2, axis=-1))
+    k3hat = k3vec / jnp.where(k3norm == 0., 1., k3norm)[..., None]
+    return (k1norm, k2norm, k3norm), (k1hat, k2hat, k3hat), (k1vec, k2vec, k3vec)
+
+
 def get_kvec5(k1norm, k2norm, k2pnorm, mu1, mu2, phi2, mu2p, phi2p):
     k1hat = unitvec(mu1, jnp.zeros_like(mu1))
     k2hat = unitvec(mu2, phi2)
@@ -726,6 +762,45 @@ def _cell_average(x, table, intervals, axis=0):
     return jnp.where(small.reshape(shape), point, (Ihi - Ilo) / davg.reshape(shape))
 
 
+class _QWSpectrum(object):
+    """The (k1, k2) covariance-window table of one (ell1, ell2) pair, kept lazy.
+
+    Every consumer of this table either sandwiches it between two matrices
+    (``A @ T @ B.T`` -- bin rebinning, closure-cell measures) or interpolates it at traced
+    points. The first form never needs the dense ``T``: both FFTlog transforms are linear, so
+    the left matrix can be pushed through them (:meth:`Correlation2Spectrum.contracted`),
+    touching only ``(nrow, n_s)`` arrays. At the ``n_s = 8192`` the window must be resampled to
+    for the FFTlog to be accurate, dense is 537 MB against 27 MB contracted -- and it is what
+    made the Zel'dovich P+B covariance OOM an 80 GB device. Only the interpax path, which
+    genuinely interpolates the table, materializes ``.dense`` (once, cached).
+    """
+    def __init__(self, fftlog, w):
+        self._fftlog, self._w, self._dense = fftlog, w, None
+
+    @property
+    def k(self):
+        return self._fftlog.k
+
+    @property
+    def dense(self):
+        if self._dense is None:
+            self._dense = self._fftlog(self._w)[1]
+        return self._dense
+
+    def contract(self, A, B):
+        if self._dense is not None:  # already paid for; reuse
+            return jnp.asarray(A) @ self._dense @ jnp.asarray(B).T
+        # The contraction is a win only when the left operand has FEW rows: it costs
+        # O(nrow * n_s log n_s) against the dense table's one-off O(n_s^2 log n_s) plus a
+        # matmul. Binned rows (~400) against a resampled n_s = 8192 grid: contract. Closure
+        # measures (nside * nbins rows, ~9k at q = 6 and ~21k at q = 8) against the stored
+        # n_s = 1024 grid: the dense table is far cheaper and only 8 MB.
+        nrow = np.shape(A)[0]
+        if int(os.environ.get('COV3_WINDOW_DENSE', '0')) or nrow > len(self.k) // 4:
+            return jnp.asarray(A) @ self.dense @ jnp.asarray(B).T
+        return self._fftlog.contracted(self._w, A, B)
+
+
 def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, ell2,
                                               fields1=None, fields2=None, cache=None,
                                               k1_is_points=False, k2_is_points=False,
@@ -798,7 +873,7 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
             tmpw = next(iter(window2_field))
             s = tmpw.coords('s')
             fftlog = Correlation2Spectrum(s, (ell1, ell2), check_level=1)
-            spectrum_cache[spectrum_key] = (fftlog.k, fftlog(w)[1])
+            spectrum_cache[spectrum_key] = (fftlog.k, _QWSpectrum(fftlog, w))
 
     cached = spectrum_cache[spectrum_key]
     if cached is None:
@@ -818,12 +893,12 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
         if k1_measure is not None and k2_measure is not None:
             W1 = jnp.asarray(k1_measure(fk))
             W2 = jnp.asarray(k2_measure(fk))
-            return (W1 @ spectrum) @ W2.T
+            return spectrum.contract(W1, W2)
         if k1_measure is not None:
             My = matrix_rebin(k2edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
-            return jnp.asarray(k1_measure(fk)) @ (spectrum @ My.T)
+            return spectrum.contract(jnp.asarray(k1_measure(fk)), My)
         Mx = matrix_rebin(k1edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
-        return (Mx @ spectrum) @ jnp.asarray(k2_measure(fk)).T
+        return spectrum.contract(Mx, jnp.asarray(k2_measure(fk)))
 
     try:
         import interpax
@@ -842,7 +917,7 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
             My = matrix_spline_interp(fk, k2points, interp_order=interp_order, cache=spline_cache)
         else:
             My = matrix_rebin(k2edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
-        return Mx @ spectrum @ My.T
+        return spectrum.contract(Mx, My)
 
     # At least one traced-points leg: interpolate *values* of the cached
     # spectrum directly instead of building an (npoints, n_fftlog)
@@ -862,7 +937,7 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
         # of the (concrete, cached) spectrum are precomputed once.
         key = spectrum_key + ('interp2d',)
         if key not in contracted_cache:
-            contracted_cache[key] = interpax.Interpolator2D(fk, fk, spectrum, method=method)
+            contracted_cache[key] = interpax.Interpolator2D(fk, fk, spectrum.dense, method=method)
         interp = contracted_cache[key]
         n1, n2 = k1points.shape[0], k2points.shape[0]
         xq = jnp.repeat(k1points, n2)
@@ -875,7 +950,7 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
         key = spectrum_key + ('right', tuple(np.ravel(k2edges)))
         if key not in contracted_cache:
             My = matrix_rebin(k2edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
-            contracted_cache[key] = spectrum @ My.T  # (n_fftlog, n2)
+            contracted_cache[key] = spectrum.dense @ My.T  # (n_fftlog, n2)
         table = contracted_cache[key]
         return interpax.interp1d(k1points, fk, table, method=method)  # (n1, n2)
 
@@ -883,7 +958,7 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
     key = spectrum_key + ('left', tuple(np.ravel(k1edges)))
     if key not in contracted_cache:
         Mx = matrix_rebin(k1edges, fk, wt=fk**2, interp_order=interp_order, cache=rebin_cache)
-        contracted_cache[key] = (Mx @ spectrum).T  # (n_fftlog, n1)
+        contracted_cache[key] = (Mx @ spectrum.dense).T  # (n_fftlog, n1)
     table = contracted_cache[key]
     return interpax.interp1d(k2points, fk, table, method=method).T  # (n1, n2)
 
@@ -1013,8 +1088,91 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
     cov = [[None for _ in observable.items(level=None)] for _ in observable.items(level=None)]
     # Angular quadrature order (per axis); overridable for convergence
     # checks via the COV3_QUAD_SIZE environment variable.
-    _qsize = int(os.environ.get('COV3_QUAD_SIZE', 6))
+    #
+    # Default 8 (was 6, briefly 10). Measured against 1000 periodic-box Gaussian mocks
+    # (2.2% noise on sigma), sigma_analytic / sigma_mock at k < 0.2:
+    #
+    #   q     P0     P2     P4    B000   B202
+    #   6   1.001  0.998  0.979  0.965  0.976
+    #   8   1.001  0.998  0.998  0.967  0.980     <- default
+    #  10   1.001  0.998  0.998  0.980  0.985
+    #  14   1.001  0.998  0.998  0.995  0.991
+    #  16   1.001  0.998  0.998  0.996  0.995
+    #  20   1.001  0.998  0.998  0.995  0.994
+    #
+    # P0/P2 are converged at 6; P4 needs >= 8; the bispectrum is still moving at
+    # 12 and only settles by ~14.
+    #
+    # The same scan on the *windowed* (cutsky) path, vs 100 zero-shot-noise mesh
+    # mocks (7.1% noise on sigma), for reference -- it converges by 16 too:
+    #
+    #   q     P0     P2     P4    B000   B202
+    #   8   1.011  1.007  1.068  0.976  1.062
+    #  10   1.011  1.007  1.068  0.992  1.064
+    #  14   1.011  1.007  1.068  0.995  1.072
+    #  16   1.011  1.007  1.068  0.999  1.072
+    #  20   1.011  1.007  1.068  0.999  1.072
+    #
+    # (P4's 1.068 and B202's 1.072 are quadrature-INDEPENDENT: a genuine
+    # window-path excess on the anisotropic blocks, tracked separately.)
+    #
+    # THE q^6 MEMORY CEILING IS GONE (both of them).
+    #
+    # There used to be two. The first was in the Q_W leg tables, which built a
+    # (q^3 nbins)^2 node x node array for the (2, 2) tie that the assembly then
+    # discarded; _tie_pair_used now stops them being built at all. The second was
+    # the P x T term's pt_F, shape (q^3, q^3, nbins, nbinsp) -- 13 GB of float64 at
+    # q = 10 and 101 GB at q = 14 -- built whenever the theory supplies a
+    # trispectrum, directly or via the shot-noise renormalized T^(N), i.e. any run
+    # with shotnoise != 0. At q = 14 XLA aborted with "byte size of input/output
+    # arguments exceeds the base limit"; worse, once a *connected* T was supplied
+    # (several surviving T groups rather than one) even q = 10 stopped fitting, and
+    # it did not raise -- it sat in the GPU allocator's retry loop at 0%
+    # utilisation indefinitely.
+    #
+    # That array is now never materialized: the (ell, ellp) blocks sharing a given
+    # precompute are collected up front and their weights contracted inside the
+    # scan carry, so the stored object is (npairs, nbins, nbinsp) instead of
+    # (q^3, q^3, nbins, nbinsp) -- under a megabyte instead of 13 GB -- while the
+    # expensive part, the T evaluations, is still paid once for all of them. See
+    # the note at the `pt_pairs` construction in the (3)(3) windowed precompute.
+    #
+    # The default is 8: q^6 scaling makes 10 about 2.5x the cost of 8, and the
+    # accuracy tables above price that at ~1.3% on B000 in the box and ~1.6% on the
+    # windowed path -- small against the residuals these covariances are compared to.
+    # P0/P2 are converged by 6 and P4 by 8, so only the bispectrum blocks pay.
+    # Raise it with COV3_QUAD_SIZE when the B covariance is the limiting term.
+    _qsize = int(os.environ.get('COV3_QUAD_SIZE', 8))
+    # Angular parameterization of the triangle quadrature; see get_kvec3_x.
+    _quad_param = os.environ.get('COV3_QUAD_PARAM', 'mu1mu2phi2')
+    assert _quad_param in ('mu1mu2phi2', 'mu1xphi', 'mu1xphi_exact'), _quad_param
+    # 'mu1xphi_exact': the shared grid is the mu1xphi one, and in addition the box PPP term's
+    # closure-tied permutations integrate x PIECEWISE-EXACTLY over the k3 bin windows -- see
+    # the block guarded by _x_exact in the box (3, 3) branch.
+    _x_exact = _quad_param == 'mu1xphi_exact'
+    if _qsize % 2:
+        # Odd sizes are catastrophically broken (diagonals ~1e36): an odd phi grid
+        # (uniform midpoint and Gauss-Legendre alike) places a node exactly at
+        # phi2 = pi, where the closure leg k3 = |k1 + k2| -> 0 for equal-magnitude
+        # legs (e.g. sugiyama-diagonal bins at a mu1 = mu2 = 0 node) -- a
+        # measure-zero folded triangle that then carries finite quadrature weight
+        # through 1 / k3-singular factors.
+        raise ValueError(
+            f'COV3_QUAD_SIZE = {_qsize} is odd: odd phi grids put a node at '
+            'phi2 = pi where the closure leg k3 -> 0 for equal-magnitude legs, '
+            'blowing up the covariance; use an even size.')
     integ_mu = integration(-1., 1., size=_qsize)
+    # Separate order for the triangle-shape axis x = k1hat.k2hat, used ONLY by the (3)(3)
+    # triangle grid under COV3_QUAD_PARAM='mu1xphi' (every other quadrature here keeps
+    # integ_mu, so this cannot perturb them). The point of an anisotropic order: the
+    # integrand's hard structure -- the k3 bin-edge step, since
+    # k3^2 = k1^2 + k2^2 + 2 k1 k2 x -- lives on the x axis ALONE, while mu1 and phi carry only
+    # smooth Legendre/azimuth dependence. Refining all three together costs q^3; refining x
+    # alone costs q^2 * qx. FOLPS exposes the same per-axis choice (precision=[Nphi, Nx, Nmu]).
+    _qxsize = int(os.environ.get('COV3_QUAD_SIZE_X', _qsize))
+    if _qxsize % 2:
+        raise ValueError(f'COV3_QUAD_SIZE_X = {_qxsize} is odd; use an even order')
+    integ_x = integration(-1., 1., size=_qxsize)
     # Azimuthal axes: uniform midpoint rule (spectrally accurate for the
     # smooth 2 pi-periodic integrands here, and each node owns the cell
     # [phi_i - h/2, phi_i + h/2] exactly -- the closure-leg interval
@@ -1285,12 +1443,93 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
             return ok
         return _pt_qmask
 
+    def _tie_pair_used(li, lj, env='COV3_BB_TERMS'):
+        """Whether the (unprimed leg ``li``, primed leg ``lj``) window tie enters
+        the windowed (3, 3) assembly.
+
+        Single source of truth for the BB and P x T skip rules, applied at
+        *precompute* time as well as in the assembly loops. That is what lifts
+        the q^6 memory ceiling: (2, 2) is the only pair whose Q_W table carries
+        quadrature-node axes on BOTH sides, so its size is (q^3 nbins)^2 --
+        40 GB of float64 at COV3_QUAD_SIZE = 12, 225 GB at 16 -- and it is
+        discarded unconditionally by both assembly loops unless
+        COV3_WIN_DOUBLE_CLOSURE is set. Building the tables the assembly throws
+        away was the whole ceiling; nothing here changes what is summed.
+        """
+        if li == 2 and lj == 2 and not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
+            # The doubly-derived tie cannot be represented by the m = 0,
+            # ell <= 4 double-Legendre channels (they enforce only
+            # |k3| = |k3'|, not the vector tie); handled instead by the exact
+            # substitution _c22_closure_tie. See the BB assembly loop.
+            return False
+        # Debug knobs: restrict to arm-only (li, lj < 2) or closure-involving
+        # (2 in (li, lj)) tie pairs, or explicit pairs 'pair:li,lj[;li,lj...]'.
+        # NOTE the precomputed tables are cached per (fields, binning): use a
+        # fresh cache when changing these.
+        _sel = os.environ.get(env)
+        if _sel:
+            if _sel.startswith('pair:'):
+                return (li, lj) in {tuple(map(int, t.split(','))) for t in _sel[5:].split(';')}
+            return ('closure' in _sel) == (2 in (li, lj))
+        return True
+
+    # --- Shot-noise MOMENTS -------------------------------------------------------------
+    # For a weighted point set the coincidence ("contact") terms of the discretized
+    # correlators carry the weight moments
+    #     sn2 = V sum(w^2) / (sum w)^2      (= P_shot; pair coincidences)
+    #     sn3 = V^2 sum(w^3) / (sum w)^3    (triple coincidences)
+    #     sn4 = V^3 sum(w^4) / (sum w)^4    (quadruple coincidences)
+    # and these are NOT powers of one another unless the weights are trivial: a scalar
+    # `shotnoise` implicitly asserts the Poisson relation sn3 = sn2^2, sn4 = sn2^3, which a
+    # Gaussian weight distribution violates by at most ~25% but a skewed one violates freely
+    # (DESI LRG FKP x completeness weights: sn3 / sn2^2 = 1.28, sn4 / sn2^3 = 2.25; a
+    # lognormal test weight: e and e^3, which was measured to collapse the B covariance to
+    # 0.46 while leaving P untouched). Pass a dict {2: sn2, 3: sn3, 4: sn4} to supply the
+    # measured moments; a scalar keeps the Poisson relation and is exactly backward
+    # compatible for unweighted tracers.
+    _sn_moments = None
+    if isinstance(shotnoise, dict) and shotnoise and all(isinstance(k, (int, np.integer)) for k in shotnoise):
+        _sn_moments = {int(k): float(v) for k, v in shotnoise.items()}
+        shotnoise = _sn_moments.get(2, 0.)
+    # The contact terms below exist for FFT estimators, which do not exclude self-pairs /
+    # self-triples WITHIN an estimator; Sugiyama's i != j != k estimators do exclude them, and
+    # the original formulas implement exactly that convention.
+    #
+    # DEFAULT 0, i.e. the original formulas. What decides it is not whether the estimator is an
+    # FFT one, but whether the bispectrum has already had its contact terms SUBTRACTED per
+    # realization -- and the production pipeline does exactly that (`compute_fkp3_shotnoise`
+    # evaluated on each catalog, stored as `num_shotnoise` and removed by `.value()`; for DESI
+    # LRG z0.4-0.6 it removes 2.4e8 against a 7.3e7 signal at k ~ 0.25). Subtracting per
+    # realization removes not just the mean shot noise but its realization-to-realization
+    # fluctuation, which makes the FFT estimator equivalent to the i != j != k one, so the
+    # covariance must revert to the original formulas. That equivalence was verified directly
+    # on a box mock set with deliberately extreme (lognormal) weights: subtracted mocks +
+    # original formulas gave B000 = 1.05 / 1.04 / 1.01 / 1.03 across four k bands, against 0.46
+    # for the same mocks left unsubtracted with the same formulas.
+    #
+    # Set COV3_FFT_CONTACT=1 for the other convention -- a bispectrum whose shot noise has NOT
+    # been subtracted from the estimator. Then also pass the measured weight moments as
+    # `shotnoise={2: sn2, 3: sn3, 4: sn4}`: with skewed weights a scalar is not enough (see the
+    # note just above).
+    _fft_contact = bool(int(os.environ.get('COV3_FFT_CONTACT', '0')))
+
     def get_shotnoise(a, b):
         if callable(shotnoise):
             return shotnoise(a, b)
         if isinstance(shotnoise, dict):
             return shotnoise.get((a, b), shotnoise.get((b, a), 0.))
         return shotnoise if a == b else 0.
+
+    def get_sn_moment(fields, order):
+        # Coincidence of `order` points, all of which must be the SAME tracer (a contact
+        # term across distinct tracers vanishes). Falls back to the Poisson relation
+        # sn_m = sn2^(m-1) when explicit moments were not supplied.
+        a = fields[0]
+        if any(f != a for f in fields[1:]):
+            return 0.
+        if _sn_moments is not None and order in _sn_moments:
+            return _sn_moments[order]
+        return get_shotnoise(a, a) ** (order - 1)
 
     def get_zero(kvec):
         return jnp.zeros_like(jnp.asarray(kvec)[..., 0])
@@ -1329,16 +1568,26 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
 
         # B^(N)_abc(k1,k2,k3)
         # Eq. (24): B(k1,k2,k3) + 1/nbar [P(k2) + P(k3)]
-        # generalized to fields: contractions of leg 1 with legs 2 and 3
+        # generalized to fields: contractions of leg 1 with legs 2 and 3.
+        # CONVENTION (why only two pair terms): in the covariance skeletons this trio is one
+        # CROSS leg (slot 1) plus a SAME-ESTIMATOR pair (slots 2, 3). Sugiyama's i != j
+        # estimators exclude coincidences within an estimator, so only the cross pairs
+        # (1,2) -> P(k3) and (1,3) -> P(k2) survive -- that is Eq. (24), and it is why the
+        # "normal" bispectrum shot noise (all three pairs + a constant) does NOT appear.
+        # FFT estimators keep the within-pair terms too: the (2,3) pair -> P(k1), and the
+        # full triple coincidence -> the constant sn3.
         if ndim == 3:
             a, b, c = fields
             B = get_base(fields)
             sn_ab = get_shotnoise(a, b)
             sn_ac = get_shotnoise(a, c)
+            sn_bc = get_shotnoise(b, c) if _fft_contact else 0.
+            sn3 = get_sn_moment((a, b, c), 3) if _fft_contact else 0.
             P_ac = get_base((a, c))
             P_ab = get_base((a, b))
 
-            if B is None and (sn_ab == 0 or P_ac is None) and (sn_ac == 0 or P_ab is None):
+            if (B is None and (sn_ab == 0 or P_ac is None) and (sn_ac == 0 or P_ab is None)
+                    and (sn_bc == 0 or P_ab is None) and sn3 == 0):
                 return None
 
             def B_N(k1, k2, k3):
@@ -1350,20 +1599,43 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     out = out + sn_ab * P_ac(k3)
                 if sn_ac != 0 and P_ab is not None:
                     out = out + sn_ac * P_ab(k2)
+                if sn_bc != 0 and P_ab is not None:
+                    # within-pair (2,3) contact correlated with the cross leg (FFT only)
+                    out = out + sn_bc * P_ab(k1)
+                if sn3 != 0:
+                    # full triple coincidence (FFT only); the moment, NOT sn2^2
+                    out = out + sn3
                 return out.reshape(orig_shape)
 
             return B_N
 
-        # T^(N), Eq. (14), generalized to cross-field shot-noise
-        # Only contractions between the two estimator pairs are included.
+        # T^(N), Eq. (14), generalized to cross-field shot-noise.
+        # CONVENTION: (k1, k2) are the two legs of ONE estimator's pair and (k3, k4) the
+        # other's -- exactly how the PT assembly calls this. Sugiyama's i != j estimators
+        # allow only CROSS coincidences, giving the sn2 B terms (single cross pair) and the
+        # sn2^2 P(k+k') terms (two disjoint cross pairs); any triple would contain a
+        # within-estimator pair and is excluded -- which is why Eq. (14) carries no sn3 or
+        # sn4. FFT estimators keep the within-pair coincidences, adding:
+        #   * sn2 * B(k1+k2, k3, k4)          one within-pair contact + two free legs;
+        #   * sn3 * P(k_leftover)  (x4)       a within pair + one cross leg coincide;
+        #   * sn2 * sn2 * P(k1+k2)            both within pairs contact separately;
+        #   * sn4                             all four coincide -- the moment, NOT sn2^3.
+        # These are the pieces measured missing on the lognormal-weight box set (B000 -> 0.46
+        # with everything else exact) and the sn4 one is the most moment-sensitive of all.
         if ndim == 4:
             a, b, c, d = fields
             T = get_base(fields)
 
             pairs = [(0, 2, get_shotnoise(a, c)), (0, 3, get_shotnoise(a, d)),
                      (1, 2, get_shotnoise(b, c)), (1, 3, get_shotnoise(b, d))]
+            sn_ab_w = get_shotnoise(a, b) if _fft_contact else 0.
+            sn_cd_w = get_shotnoise(c, d) if _fft_contact else 0.
+            trios = ([(0, 1, 2, 3), (0, 1, 3, 2), (2, 3, 0, 1), (2, 3, 1, 0)]
+                     if _fft_contact else [])
+            sn4 = get_sn_moment((a, b, c, d), 4) if _fft_contact else 0.
 
-            if T is None and all(sn == 0 for (_, _, sn) in pairs):
+            if (T is None and all(sn == 0 for (_, _, sn) in pairs)
+                    and sn_ab_w == 0 and sn_cd_w == 0 and sn4 == 0):
                 return None
 
             def T_N(k1, k2, k3, k4):
@@ -1394,6 +1666,41 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 P_ad = get_base((a, d))
                 if sn_ad != 0 and sn_bc != 0 and P_ad is not None:
                     out = out + sn_ad * sn_bc * P_ad(k1 + k4)
+
+                # ---- FFT-estimator (within-pair) contact terms ----
+                # GUARD: these exist only where the within-pair momentum sum is NONZERO. In
+                # the PP block T^(N) is called at (k1, -k1, k1', -k1'), where the pair sum
+                # vanishes IDENTICALLY -- and there the contact Sum_i w_i^2 e^{-i(k1+k2) x_i}
+                # is a deterministic constant (no x dependence), contributing nothing to the
+                # covariance; the FFT P estimator's subtracted mean removes it exactly.
+                # Without this guard the sn3 P and sn4 constants leak into Cov[P, P] and were
+                # measured to inflate the P0 prediction by 14% on the lognormal set. The
+                # relative threshold separates the exact arithmetic zero of the PP context
+                # from genuinely small (squeezed) B-context sums, which are physical.
+                def _alive(ka, kb):
+                    q2 = jnp.sum((ka + kb)**2, axis=-1)
+                    ref = jnp.sum(ka**2, axis=-1) + jnp.sum(kb**2, axis=-1)
+                    return (q2 > 1e-12 * ref).astype(out.dtype)
+
+                alive12 = _alive(k1, k2)
+                alive34 = _alive(k3, k4)
+                if sn_ab_w != 0:
+                    Bw = get_base((a, c, d))
+                    if Bw is not None:
+                        out = out + sn_ab_w * alive12 * Bw(k1 + k2, k3, k4)
+                if sn_cd_w != 0:
+                    Bw = get_base((c, a, b))
+                    if Bw is not None:
+                        out = out + sn_cd_w * alive34 * Bw(k3 + k4, k1, k2)
+                for i, j, l, r in trios:
+                    sn3 = get_sn_moment((fs[i], fs[j], fs[l]), 3)
+                    Pr = get_base((fs[r], fs[l]))
+                    if sn3 != 0 and Pr is not None:
+                        out = out + sn3 * (alive12 if i == 0 else alive34) * Pr(ks[r])
+                if sn_ab_w != 0 and sn_cd_w != 0 and P_ac is not None:
+                    out = out + sn_ab_w * sn_cd_w * alive12 * alive34 * P_ac(k1 + k2)
+                if sn4 != 0:
+                    out = out + sn4 * alive12 * alive34
 
                 return out.reshape(orig_shape)
 
@@ -1586,10 +1893,36 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
         return out
 
     _observable = observable
+    # COV3_TIMING=1: per-(i, ip) block wall time. The blocks differ by orders of magnitude
+    # (PP is a 2D quadrature, BB a 6D one), and knowing which dominates is the difference
+    # between optimizing the window machinery -- 4.6% of a Zel'dovich run, measured -- and
+    # optimizing what actually costs.
+    _timing = int(os.environ.get('COV3_TIMING', '0'))
+    _tblocks = []
+    _tmark = [0.]
+
+    def _mark(label, obj=None):
+        # Phase timer for the (3,3) precompute. Blocks on the phase's output, without which
+        # JAX's async dispatch would attribute every phase's cost to whichever one is forced
+        # first. Only active under COV3_TIMING.
+        if not _timing:
+            return
+        import time as _t
+        if obj is not None:
+            try: jax.block_until_ready(obj)
+            except Exception: pass
+        now = _t.time()
+        if _tmark[0]:
+            print('[cov3]   precompute %s: %.1fs' % (label, now - _tmark[0]), flush=True)
+        _tmark[0] = now
+
     for i, (label, observable) in enumerate(_observable.items(level=None)):
         for ip, (labelp, observablep) in enumerate(_observable.items(level=None)):
             if ip < i:
                 continue
+            if _timing:
+                import time as _time
+                _tblock = _time.time()
 
             fields, fieldsp = tuple(label['fields']), tuple(labelp['fields'])
             nfields, nfieldsp = len(fields), len(fieldsp)
@@ -1824,8 +2157,22 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         ntilde = 4. * np.pi * kk[:, None, None] * qn_safe[None, ...] * dk[:, None, None] * volume / (2. * np.pi)**3
                         invn = mask / ntilde                            # (nbins, ntri, nbinsp)
                         block = block + pref_box * jnp.einsum('u,ub,aub->ab', wS, Lq * PB_u, invn)
+                    # To host as soon as it exists. Leaving blocks as device arrays makes
+                    # the final np.block do every device->host copy at once, at the moment
+                    # the GPU is fullest (precompute caches still resident) -- measured: a
+                    # box q = 10 run completed the whole computation and then died in
+                    # np.block asking for 168 MB. Converting here also frees each block's
+                    # device buffer immediately.
+                    block = np.asarray(block)
                     cov[i][ip] = block
                     cov[ip][i] = block.T
+                    if _timing:
+                        dt = _time.time() - _tblock
+                        _tblocks.append((dt, i, ip, tuple(label['fields']), label['ells'],
+                                         tuple(labelp['fields']), labelp['ells'], block.shape))
+                        print(f'[cov3] block ({i},{ip}) '
+                              f'{len(label["fields"])}x{len(labelp["fields"])} ells '
+                              f'{label["ells"]}/{labelp["ells"]} {block.shape}: {dt:.1f}s', flush=True)
                     continue
 
                 # Everything below except the final assembly is independent
@@ -2050,8 +2397,22 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         ntilde = 4. * np.pi * kk[None, None, :] * qn_safe[..., None] * dk[None, None, :] * volume / (2. * np.pi)**3
                         invn = mask / ntilde                            # (ntri, nbins, nbinsp)
                         block = block + pref_box * jnp.einsum('u,ua,uab->ab', wS, Lq * PB_u, invn)
+                    # To host as soon as it exists. Leaving blocks as device arrays makes
+                    # the final np.block do every device->host copy at once, at the moment
+                    # the GPU is fullest (precompute caches still resident) -- measured: a
+                    # box q = 10 run completed the whole computation and then died in
+                    # np.block asking for 168 MB. Converting here also frees each block's
+                    # device buffer immediately.
+                    block = np.asarray(block)
                     cov[i][ip] = block
                     cov[ip][i] = block.T
+                    if _timing:
+                        dt = _time.time() - _tblock
+                        _tblocks.append((dt, i, ip, tuple(label['fields']), label['ells'],
+                                         tuple(labelp['fields']), labelp['ells'], block.shape))
+                        print(f'[cov3] block ({i},{ip}) '
+                              f'{len(label["fields"])}x{len(labelp["fields"])} ells '
+                              f'{label["ells"]}/{labelp["ells"]} {block.shape}: {dt:.1f}s', flush=True)
                     continue
 
                 # Symmetric PB case: the bispectrum is the FIRST observable
@@ -2199,18 +2560,28 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     P_bap, P_bbp, P_bcp = get_theory((b, ap)), get_theory((b, bp)), get_theory((b, cp))
                     P_cap, P_cbp, P_ccp = get_theory((c, ap)), get_theory((c, bp)), get_theory((c, cp))
 
-                    integ_tri = IntegralND(mu1=integ_mu, mu2=integ_mu, phi2=integ_phi)
-                    _tri = integ_tri.x(['mu1', 'mu2', 'phi2'], sparse=False)
+                    # Angular quadrature parameterization. COV3_QUAD_PARAM='mu1xphi' carries the triangle
+                    # shape x = k1hat.k2hat as a DIRECT integration variable (see get_kvec3_x); the default
+                    # 'mu1mu2phi2' derives it from all three angles, which smears the sharp 1/k3 structure at
+                    # the folded configuration and is what limits B convergence in q.
+                    if _quad_param in ('mu1xphi', 'mu1xphi_exact'):
+                        integ_tri = IntegralND(mu1=integ_mu, x=integ_x, phi=integ_phi)
+                        _tri = integ_tri.x(['mu1', 'x', 'phi'], sparse=False)
+                        _kvec3 = get_kvec3_x
+                    else:
+                        integ_tri = IntegralND(mu1=integ_mu, mu2=integ_mu, phi2=integ_phi)
+                        _tri = integ_tri.x(['mu1', 'mu2', 'phi2'], sparse=False)
+                        _kvec3 = get_kvec3
                     mu1_s, mu2_s, phi2_s = (np.ravel(arr) for arr in _tri)
                     w_side = np.ravel(integ_tri.w)
 
-                    _fn = lambda m1, m2, p2: get_kvec3(coords[0], coords[1], m1, m2, p2)
+                    _fn = lambda m1, m2, p2: _kvec3(coords[0], coords[1], m1, m2, p2)
                     (k1n_u, k2n_u, k3n_u), (k1h_u, k2h_u, k3h_u), kv_u = jax.vmap(_fn)(jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
                     # Primed triangle on its own grid: closure magnitudes for
                     # the deltas that tie an unprimed leg to the primed
                     # closure leg k'_3, and the full legs/hats for the BB/PT
                     # terms anchored on the primed side.
-                    _fnp = lambda m1, m2, p2: get_kvec3(coordsp[0], coordsp[1], m1, m2, p2)
+                    _fnp = lambda m1, m2, p2: _kvec3(coordsp[0], coordsp[1], m1, m2, p2)
                     (k1n_p, k2n_p, k3n_p), (k1h_p, k2h_p, k3h_p), kv_p = jax.vmap(_fnp)(jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
                     hat_p = (jnp.broadcast_to(k1h_p[:, None, :], k3h_p.shape),
                              jnp.broadcast_to(k2h_p[:, None, :], k3h_p.shape),
@@ -2247,6 +2618,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # end; kept separate for the COV3_BOX_DEBUG breakdown.
                     parts = {'ppp': 0., 'bb': 0., 'pt': 0.}
                     block = 0.
+                    _xsub_cache = {}
                     for (Ps, (s1, s2)) in ppp_terms:
                         # As for the BB / PT families: skip when the theory
                         # provides no power spectrum (e.g. B-only theory).
@@ -2264,6 +2636,78 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         # is tied to.
                         sigma = {0: s1, 1: s2, 2: 3 - s1 - s2}
                         siginv = {v: m for m, v in sigma.items()}
+                        if _x_exact and 2 in (s1, s2):
+                            # ---- PIECEWISE-EXACT x integration for the closure-tied perms ----
+                            # The x-dependence of this perm's radial delta is a STEP: the tied
+                            # primed closure magnitude k3'(x) = sqrt(k1'^2 + k2'^2 + 2 k1' k2' x)
+                            # is masked against the unprimed leg-m0 bin edges, and sampling that
+                            # step with a global Gauss-Legendre x grid is what makes B000
+                            # converge non-monotonically (measured: 0.982, 0.980, 1.015, 0.989
+                            # at qx = 16, 24, 32, 48). Since k3'(x) is monotone in x, the edges
+                            # invert to explicit breakpoints
+                            #     x* = (k3_edge^2 - k1'^2 - k2'^2) / (2 k1' k2'),
+                            # and for a FIXED primed bin b those breakpoints partition [-1, 1]
+                            # into sub-intervals on each of which exactly one unprimed bin a is
+                            # selected -- the mask is constant there, i.e. EXACT. Gauss-Legendre
+                            # is then applied per sub-interval to the remaining smooth integrand
+                            # (S weights, P's, 1/Ntilde), and the result scattered into (a, b).
+                            # Everything else (mu1, phi axes; the two non-closure perms; the
+                            # BB / PT tie families) keeps the shared grid.
+                            m0 = 0 if s1 == 2 else 1
+                            m1 = 1 - m0
+                            sprim = sigma[m1]
+                            if m0 not in _xsub_cache:
+                                _edg = np.asarray(edges)[:, m0, :]
+                                _k1p = np.asarray(coordsp[0]); _k2p = np.asarray(coordsp[1])
+                                _den = (2. * _k1p * _k2p)[:, None, None]
+                                _xed = (_edg[None, :, :]**2 - _k1p[:, None, None]**2 - _k2p[:, None, None]**2) / _den
+                                _xlo = np.clip(_xed[..., 0], -1., 1.); _xhi = np.clip(_xed[..., 1], -1., 1.)
+                                _ok = _xhi > _xlo + 1e-12
+                                _nbp = len(_k1p)
+                                _smax = max(int(_ok.sum(axis=1).max()), 1)
+                                _ai = np.zeros((_nbp, _smax), int)
+                                _lo = np.zeros((_nbp, _smax)); _hi = np.zeros((_nbp, _smax)); _vv = np.zeros((_nbp, _smax))
+                                for _b in range(_nbp):
+                                    _aa = np.where(_ok[_b])[0]
+                                    _ai[_b, :len(_aa)] = _aa; _lo[_b, :len(_aa)] = _xlo[_b, _aa]
+                                    _hi[_b, :len(_aa)] = _xhi[_b, _aa]; _vv[_b, :len(_aa)] = 1.
+                                _uj, _wj = np.polynomial.legendre.leggauss(int(os.environ.get('COV3_X_SUB', 6)))
+                                _xn = 0.5 * (_hi - _lo)[..., None] * _uj + 0.5 * (_hi + _lo)[..., None]
+                                _wx = 0.5 * (_hi - _lo)[..., None] * _wj * _vv[..., None]
+                                _xsub_cache[m0] = (jnp.asarray(_ai), jnp.asarray(_xn), jnp.asarray(_wx))
+                            a_i, xn, wx = _xsub_cache[m0]
+                            nbp, smax, jx = xn.shape
+                            nbins_u = coords.shape[-1]
+                            mu1g, wmu1g = jnp.asarray(integ_mu.x()), jnp.asarray(integ_mu.w)
+                            phig, wphig = jnp.asarray(integ_phi.x()), jnp.asarray(integ_phi.w)
+                            k1u_a = jnp.asarray(coords[0])[a_i]; k2u_a = jnp.asarray(coords[1])[a_i]
+                            shp = (len(mu1g), len(phig), nbp, smax, jx)
+                            mu1B = jnp.broadcast_to(mu1g[:, None, None, None, None], shp)
+                            phiB = jnp.broadcast_to(phig[None, :, None, None, None], shp)
+                            xB = jnp.broadcast_to(xn[None, None], shp)
+                            k1B = jnp.broadcast_to(k1u_a[None, None, :, :, None], shp)
+                            k2B = jnp.broadcast_to(k2u_a[None, None, :, :, None], shp)
+                            _, hh, vh = get_kvec3_x(k1B, k2B, mu1B, xB, phiB)
+                            F = S(hh[0], hh[1]) * get_S(ellp, z3=True)(hh[siginv[0]], hh[siginv[1]])
+                            for m in range(3):
+                                F = F * Ps[m](vh[m])
+                            k1pj = jnp.asarray(coordsp[0])[:, None, None]; k2pj = jnp.asarray(coordsp[1])[:, None, None]
+                            k3p = jnp.sqrt(k1pj**2 + k2pj**2 + 2. * k1pj * k2pj * xn)                 # (nbp, smax, jx)
+                            nt0 = (4. * np.pi * jnp.asarray(coords[m0])[a_i][..., None] * k3p
+                                   * jnp.asarray(dk_u[m0])[a_i][..., None] * volume / (2. * np.pi)**3)
+                            core = jnp.einsum('i,k,bsj,ikbsj->bs', wmu1g, wphig, wx, F / nt0[None, None])
+                            kpv1 = jnp.asarray(coordsp[sprim])[:, None]
+                            m1ed = jnp.asarray(lo_u[m1])[a_i]                                          # (nbp, smax, 2)
+                            mask1 = (kpv1 >= m1ed[..., 0]) & (kpv1 <= m1ed[..., 1])
+                            nt1 = (4. * np.pi * jnp.asarray(coords[m1])[a_i] * kpv1
+                                   * jnp.asarray(dk_u[m1])[a_i] * volume / (2. * np.pi)**3)
+                            core = core * mask1 / nt1
+                            flat = (a_i * nbp + jnp.arange(nbp)[:, None]).ravel()
+                            contrib = jnp.zeros(nbins_u * nbp).at[flat].add(core.ravel()).reshape(nbins_u, nbp)
+                            if os.environ.get('COV3_BOX_DEBUG'):
+                                print(f"box33 ppp exact-x perm ({s1},{s2}): max = {np.abs(np.asarray(norm_box * contrib)).max():.3e}")
+                            parts['ppp'] = parts['ppp'] + norm_box * contrib
+                            continue
                         Sp_u = get_S(ellp, z3=True)(hat_u[siginv[0]], hat_u[siginv[1]])   # (nside, nbins)
                         # Reference: P^N(k1) P^N(k2) P^N(k3), all evaluated
                         # on the unprimed triangle's own legs (the deltas tie
@@ -2683,8 +3127,22 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         # differently-anchored quadratures; symmetrize away
                         # the quadrature-level mismatch on diagonal blocks.
                         block = (block + block.T) / 2.
+                    # To host as soon as it exists. Leaving blocks as device arrays makes
+                    # the final np.block do every device->host copy at once, at the moment
+                    # the GPU is fullest (precompute caches still resident) -- measured: a
+                    # box q = 10 run completed the whole computation and then died in
+                    # np.block asking for 168 MB. Converting here also frees each block's
+                    # device buffer immediately.
+                    block = np.asarray(block)
                     cov[i][ip] = block
                     cov[ip][i] = block.T
+                    if _timing:
+                        dt = _time.time() - _tblock
+                        _tblocks.append((dt, i, ip, tuple(label['fields']), label['ells'],
+                                         tuple(labelp['fields']), labelp['ells'], block.shape))
+                        print(f'[cov3] block ({i},{ip}) '
+                              f'{len(label["fields"])}x{len(labelp["fields"])} ells '
+                              f'{label["ells"]}/{labelp["ells"]} {block.shape}: {dt:.1f}s', flush=True)
                     continue
 
                 # Everything below except the final assembly is independent
@@ -2783,6 +3241,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         ((P_acp, P_bap, P_cbp), ((a, cp), (b, ap), (c, bp)), (2, 0)),
                         ((P_acp, P_bbp, P_cap), ((a, cp), (b, bp), (c, ap)), (2, 1)),
                     ]
+                    _mark('start')
                     pre['ppp'] = []
                     # Blocks depend only on (edges, channel pair, sorted
                     # fields), not on the permutation entry: cache across the
@@ -2891,6 +3350,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # Legendre x bispectrum per-side factors for BB.
                     LBu = {e: [None if B_u[li] is None else Lu[e][li] * B_u[li] for li in range(3)] for e in qw_ells}
                     LBp = {e: [None if Bp_p[lj] is None else Lp[e][lj] * Bp_p[lj] for lj in range(3)] for e in qw_ells}
+                    _mark('ppp', pre['ppp'])
+                    _mark('bb_LB (B theory)', (LBu, LBp))
                     pre['bb_LBu'], pre['bb_LBp'] = LBu, LBp
                     pre['pt_Lu'], pre['pt_Lp'] = Lu, Lp
 
@@ -2919,8 +3380,23 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # BB: (window2, window2) symmetrization pair (same-size
                     # field groups), Legendre x B factors absorbed; None when
                     # either bispectrum factor is unavailable.
-                    pre['bb_K'] = [[None if (B_u[li] is None or Bp_p[lj] is None)
-                                    else _leg_tables(wpair, li, lj,
+                    # _tie_pair_used: do not build the tables the assembly
+                    # loop below discards -- in particular the (2, 2)
+                    # doubly-derived tie, the only node x node table.
+                    def _leg_tables_t(win, li, lj, *a, **kw):
+                        if not _timing:
+                            return _leg_tables(win, li, lj, *a, **kw)
+                        import time as _t
+                        _t0 = _t.time()
+                        _o = _leg_tables(win, li, lj, *a, **kw)
+                        try: jax.block_until_ready(_o)
+                        except Exception: pass
+                        print('[cov3]     bb_K leg pair (%d,%d): %.1fs' % (li, lj, _t.time() - _t0),
+                              flush=True)
+                        return _o
+
+                    pre['bb_K'] = [[None if (B_u[li] is None or Bp_p[lj] is None or not _tie_pair_used(li, lj))
+                                    else _leg_tables_t(wpair, li, lj,
                                                      (f[li], f[r1[li]], f[r2[li]]), (fp[lj], fp[r1[lj]], fp[r2[lj]]),
                                                      LBu, LBp) for lj in range(3)] for li in range(3)]
 
@@ -2944,10 +3420,6 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     P_lu = [[None if P is None else P(kv_u[li]) for lj, P in enumerate(row)] for li, row in enumerate(P_lu)]  # (nside, nbins)
                     T_terms = [[get_theory((f[r1[li]], f[r2[li]], fp[r1[lj]], fp[r2[lj]])) for lj in range(3)] for li in range(3)]
 
-                    QTs = [[_leg_tables(window2, li, lj,
-                                        (f[li], fp[lj]), (f[r1[li]], f[r2[li]], fp[r1[lj]], fp[r2[lj]]),
-                                        Lu, Lp) for lj in range(3)] for li in range(3)]
-
                     # Group the (li, lj) pairs by their trispectrum field
                     # tuple so each *distinct* kernel is staged ONCE,
                     # evaluated on inputs stacked over its pairs: unrolling 9
@@ -2960,26 +3432,29 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         for lj in range(3):
                             if P_lu[li][lj] is None or T_terms[li][lj] is None:
                                 continue
-                            # Skip the doubly-derived (2, 2) tie: see the BB
-                            # loop -- the double-Legendre channels cannot
-                            # represent the vector tie between two derived
-                            # closure directions.
-                            if li == 2 and lj == 2 and not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
+                            # Skips the doubly-derived (2, 2) tie (see the BB
+                            # loop) and honours COV3_PT_TERMS.
+                            if not _tie_pair_used(li, lj, env='COV3_PT_TERMS'):
                                 continue
-                            # Debug knob, mirroring COV3_BB_TERMS: restrict to
-                            # arm-only or closure-involving tie pairs. NOTE the
-                            # precomputed pt_F is cached per (fields, binning):
-                            # use a fresh cache when changing this knob.
-                            _sel = os.environ.get('COV3_PT_TERMS')
-                            if _sel:
-                                if _sel.startswith('pair:'):
-                                    _pairs = {tuple(map(int, t.split(','))) for t in _sel[5:].split(';')}
-                                    if (li, lj) not in _pairs:
-                                        continue
-                                elif ('closure' in _sel) != (2 in (li, lj)):
-                                    continue
                             key = (f[r1[li]], f[r2[li]], fp[r1[lj]], fp[r2[lj]])
                             T_groups.setdefault(key, []).append((li, lj))
+
+                    # Window tables for the P x T ties, built ONLY for the
+                    # pairs that survived above -- _pt_point never touches any
+                    # other entry. Building all 9 unconditionally was the
+                    # actual q^6 ceiling on the windowed path: with a theory
+                    # that has no trispectrum (T_groups empty, e.g. a Gaussian
+                    # field with no shot noise) every one of them was built and
+                    # then discarded, and the (2, 2) entry alone is a
+                    # (q^3 nbins)^2 float64 array -- 101 GB at
+                    # COV3_QUAD_SIZE = 14, where XLA aborts with "byte size of
+                    # input/output arguments exceeds the base limit".
+                    QTs = [[None] * 3 for _ in range(3)]
+                    for _pairs in T_groups.values():
+                        for li, lj in _pairs:
+                            QTs[li][lj] = _leg_tables(window2, li, lj,
+                                                      (f[li], fp[lj]), (f[r1[li]], f[r2[li]], fp[r1[lj]], fp[r2[lj]]),
+                                                      Lu, Lp)
 
                     # Relative azimuth between the two triangles: only ONE
                     # overall azimuth is a symmetry -- the trispectrum
@@ -2993,7 +3468,17 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # phases). So the phi average happens entirely inside
                     # the scanned body, applied to T only, and the stored F
                     # table keeps its (u, p) shape.
-                    phi_rel, wphi_rel = np.asarray(integ_phi.x()), np.asarray(integ_phi.w)
+                    # Relative-azimuth grid. It is a SEPARATE axis from the triangle
+                    # quadrature: the integrand's dependence on it comes only through the
+                    # trispectrum's dependence on the angle between the two triangle planes,
+                    # which is smooth and low-order, whereas q is set by the much harder
+                    # triangle-shape structure. Tying it to q makes the dominant cost of the
+                    # whole covariance (the P x T scan: 95 s of a 144 s (3,3) block at q = 6)
+                    # scale with an order it does not need. COV3_PT_PHI sets it independently.
+                    _ptphi = int(os.environ.get('COV3_PT_PHI', '0')) or _qsize
+                    _integ_ptphi = (integ_phi if _ptphi == _qsize
+                                    else integration(0., 2. * np.pi, size=_ptphi, method=_phi_rule))
+                    phi_rel, wphi_rel = np.asarray(_integ_ptphi.x()), np.asarray(_integ_ptphi.w)
                     # Offset the relative-azimuth grid (valid for a 2 pi-periodic integrand):
                     # as in the box-limit tie terms, unoffset nodes rotate primed legs exactly
                     # (anti-)parallel to unprimed ones at equal bin magnitudes, making internal
@@ -3057,34 +3542,98 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # Joint quadrature as index pairs into the per-side
                     # grids, chunked for the scan; the tail is padded (with
                     # clamped indices) and the padded per-point values are
-                    # dropped after.
+                    # zeroed by `valid` before they reach the accumulator.
                     npts = nside * nside
-                    chunk = 256
+                    # Scan chunk over the joint (u, p) quadrature. This is the dominant cost
+                    # of a windowed P+B covariance -- measured at q = 6: 100 s of a 147 s
+                    # (3,3) block, against 3.6 s for all eight BB leg tables -- so it is worth
+                    # tuning per device. COV3_PT_CHUNK overrides.
+                    chunk = int(os.environ.get('COV3_PT_CHUNK', '256'))
                     npad = (-npts) % chunk
                     joint = np.arange(npts + npad)
                     u_idx, p_idx = np.divmod(joint, nside)
                     u_idx, p_idx = np.minimum(u_idx, nside - 1), np.minimum(p_idx, nside - 1)
+                    valid = (joint < npts).astype(float)
                     xs = (jnp.asarray(u_idx.reshape(-1, chunk), dtype=jnp.int32),
-                          jnp.asarray(p_idx.reshape(-1, chunk), dtype=jnp.int32))
+                          jnp.asarray(p_idx.reshape(-1, chunk), dtype=jnp.int32),
+                          jnp.asarray(valid.reshape(-1, chunk)))
+
+                    # THE (ell, ellp) CONTRACTION HAPPENS INSIDE THE SCAN.
+                    #
+                    # The integrand F(u, p)[a, b] is (ell, ellp)-independent, so the obvious
+                    # thing is to store it and let each multipole block contract it later:
+                    # `einsum('u,p,upab->ab', wS_u, wSp_p, F)`. But that array is
+                    # (q^3, q^3, nbins, nbinsp) -- 13.4 GB at q = 10 for 41 bins, 101 GB at
+                    # q = 14 -- and with a *connected* trispectrum (rather than only the
+                    # shot-noise renormalized one) several T groups survive, so q = 10 stopped
+                    # fitting at all: the run did not raise, it sat in the GPU allocator's
+                    # retry loop at 0% utilisation indefinitely.
+                    #
+                    # Nothing downstream ever wants F itself, only its contractions against a
+                    # handful of weight pairs. So the (ell, ellp) blocks that share this
+                    # precompute are collected here and accumulated in the scan carry: memory
+                    # drops from q^6 * nbins * nbinsp to npairs * nbins * nbinsp, i.e. from
+                    # 13.4 GB to under a megabyte, while the expensive part -- the T
+                    # evaluations -- is still paid exactly once for all of them.
+                    #
+                    # The pairs are recovered by re-deriving each observable pair's precompute
+                    # key and keeping those that match this one, so this list is by
+                    # construction exactly the set of blocks that would have used `pre`.
+                    pt_pairs = []
+                    for _i, (_lab, _obs) in enumerate(_observable.items(level=None)):
+                        for _ip, (_labp, _obsp) in enumerate(_observable.items(level=None)):
+                            if _ip < _i:
+                                continue
+                            if (tuple(_lab['fields']), tuple(_labp['fields'])) != (fields, fieldsp):
+                                continue
+                            _e = [np.asarray(o.edges('k')) for o in (_obs, _obsp)]
+                            _c = [o.coords('k', center=center).T for o in (_obs, _obsp)]
+                            if (np.asarray(_c[0]).tobytes(), np.asarray(_c[1]).tobytes(),
+                                    _e[0].tobytes(), _e[1].tobytes()) != pre_key[2:]:
+                                continue
+                            pt_pairs.append((tuple(_lab['ells']), tuple(_labp['ells'])))
+
+                    _wsd = jnp.asarray(w_side)
+                    wS_u_g = jnp.stack([_wsd * get_S(_e, z3=True)(k1h_u, k2h_u)
+                                        for _e, _ep in pt_pairs]) if pt_pairs else None
+                    wS_p_g = jnp.stack([_wsd * get_S(_ep, z3=True)(k1h_p, k2h_p)
+                                        for _e, _ep in pt_pairs]) if pt_pairs else None
 
                     def _pt_scan(xs):
                         def body(carry, x):
-                            return carry, jax.vmap(_pt_point)(*x)
-                        return jax.lax.scan(body, 0., xs)[1]
+                            u, p, v = x
+                            Fc = jax.vmap(_pt_point)(u, p)                 # (chunk, nbins, nbinsp)
+                            wu = wS_u_g[:, u] * v[None, :]                 # (npairs, chunk)
+                            wp = wS_p_g[:, p]                              # (npairs, chunk)
+                            return carry, jnp.einsum('gc,gc,cab->gab', wu, wp, Fc)
+                        # The partial sums are RETURNED, not accumulated in the carry.
+                        # Accumulating is the obvious thing, and is what the first version of
+                        # this did -- but it makes every scan iteration depend on the previous
+                        # one, and XLA then serializes a loop whose iterations are otherwise
+                        # independent: measured 1119 s against 616 s for the same q = 8 cutsky
+                        # covariance. Stacking (nchunks, npairs, nbins, nbinsp) partials and
+                        # summing at the end keeps the original dependency structure at
+                        # negligible cost -- 43 MB at q = 8, against the 3.5 GB of the (u, p)
+                        # grid it replaces.
+                        _mark('pt setup')
+                        _out = jax.lax.scan(body, 0., xs)[1].sum(axis=0)
+                        _mark('PT SCAN', _out)
+                        return _out
 
-                    if T_groups:
-                        F = jax.jit(_pt_scan)(xs)  # (nchunks, chunk, nbins, nbinsp)
-                        pre['pt_F'] = F.reshape(-1, nbins, nbinsp)[:npts].reshape(nside, nside, nbins, nbinsp)
+                    if T_groups and pt_pairs:
+                        _PT = jax.jit(_pt_scan)(xs)                        # (npairs, nbins, nbinsp)
+                        _mark('bb_K', pre['bb_K'])
+                        pre['pt_PT'] = {pair: _PT[g] for g, pair in enumerate(pt_pairs)}
                     else:
                         # No trispectrum contribution (e.g. P-only theory
                         # with no shot noise).
-                        pre['pt_F'] = None
+                        pre['pt_PT'] = None
 
-                    if pre['pt_F'] is not None and os.environ.get('COV3_BOX_DEBUG'):
-                        _Fv = np.asarray(pre['pt_F'])
-                        print(f"win33 pt_F: max|F| = {np.abs(_Fv).max():.3e} "
-                              f"at (u, p, a, b) = {np.unravel_index(np.argmax(np.abs(_Fv)), _Fv.shape)}; "
-                              f"median|F| = {np.median(np.abs(_Fv)):.3e}")
+                    if pre['pt_PT'] is not None and os.environ.get('COV3_BOX_DEBUG'):
+                        for _pair, _v in pre['pt_PT'].items():
+                            _v = np.asarray(_v)
+                            print(f"win33 pt_PT {_pair}: max|.| = {np.abs(_v).max():.3e}, "
+                                  f"median|.| = {np.median(np.abs(_v)):.3e}")
 
                     # (2, 2) double-closure tie: the double-Legendre channel
                     # representation is invalid for two derived directions (it
@@ -3094,6 +3643,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # the box path) is used, with the tie strength set by the
                     # window's zero-lag (triple)(triple) monopole,
                     # V_eff = 1 / Q_W^{(abc)(a'b'c')}(s -> 0).
+                    _mark('pt_PT', pre.get('pt_PT'))
                     pre['c22'] = None
                     if not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
                         try:
@@ -3160,21 +3710,12 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         # exactly computed by the box-limit (c) family) until
                         # a (c)-style exact angular substitution is ported to
                         # the windowed path. COV3_WIN_DOUBLE_CLOSURE=1
-                        # re-enables it for A/B checks.
-                        if li == 2 and lj == 2 and not os.environ.get('COV3_WIN_DOUBLE_CLOSURE'):
+                        # re-enables it for A/B checks. Also honours the
+                        # COV3_BB_TERMS debug knob (arm-only / closure-only /
+                        # explicit pairs); the same predicate already kept the
+                        # corresponding table from being built at all.
+                        if not _tie_pair_used(li, lj):
                             continue
-                        # Debug knob, mirroring COV3_PPP_TERMS: restrict to
-                        # arm-only (li, lj < 2) or closure-involving
-                        # (2 in (li, lj)) tie pairs, or explicit pairs
-                        # 'pair:li,lj[;li,lj...]'.
-                        _sel = os.environ.get('COV3_BB_TERMS')
-                        if _sel:
-                            if _sel.startswith('pair:'):
-                                _pairs = {tuple(map(int, t.split(','))) for t in _sel[5:].split(';')}
-                                if (li, lj) not in _pairs:
-                                    continue
-                            elif ('closure' in _sel) != (2 in (li, lj)):
-                                continue
                         if li == 2 and lj == 2:
                             term = jnp.einsum('uapb,u,p->ab', tab[None], wS_u, wSp_p)
                         elif li == 2:
@@ -3187,7 +3728,10 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         block_BB = block_BB + term
                 block_BB = norm33 * block_BB
 
-                block_PT = 0. if pre['pt_F'] is None else norm33 * jnp.einsum('u,p,upab->ab', wS_u, wSp_p, pre['pt_F'])
+                # Already contracted against this block's (ell, ellp) weights inside the
+                # precompute's scan -- see the note there on why F is never materialized.
+                block_PT = (0. if pre['pt_PT'] is None
+                            else norm33 * pre['pt_PT'][tuple(ell), tuple(ellp)])
                 if pre.get('c22') is not None:
                     # Exact-substitution (2, 2) double-closure tie (see the
                     # precompute note): shared machinery with the box path,
@@ -3215,8 +3759,32 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
             else:
                 continue
 
+            if np.ndim(block) == 0:
+                # Every contribution to this pair vanished, leaving the bare scalar the
+                # accumulators start from. This is not a degenerate case: the P-B cross
+                # block of a Gaussian field with no shot noise is *exactly* zero (the
+                # connected 5-point correlator vanishes), and every term there is
+                # proportional to B or to the shot noise. Give it its shape back so the
+                # transpose below and the np.block assembly work.
+                block = jnp.full((len(observable.value()), len(observablep.value())), block)
+
+            # To host as soon as it exists -- see the note at the other assignment sites.
+            block = np.asarray(block)
             cov[i][ip] = block
             cov[ip][i] = block.T
+            if _timing:
+                dt = _time.time() - _tblock
+                _tblocks.append((dt, i, ip, tuple(label['fields']), label['ells'],
+                                 tuple(labelp['fields']), labelp['ells'], block.shape))
+                print(f'[cov3] block ({i},{ip}) fields {len(label["fields"])}x{len(labelp["fields"])} '
+                      f'ells {label["ells"]}/{labelp["ells"]} shape {block.shape}: {dt:.1f}s', flush=True)
+
+    if _timing and _tblocks:
+        tot = sum(t[0] for t in _tblocks)
+        print(f'[cov3] {len(_tblocks)} blocks, {tot:.0f}s total; slowest:', flush=True)
+        for dt, i, ip, f1, e1, f2, e2, shape in sorted(_tblocks, reverse=True)[:8]:
+            print(f'[cov3]   ({i},{ip}) {len(f1)}x{len(f2)} ells {e1}/{e2} {shape}: '
+                  f'{dt:.1f}s ({100 * dt / tot:.0f}%)', flush=True)
 
     # Assemble into one 2D array (as compute_spectrum2_covariance's finalize
     # does with np.block): CovarianceMatrix consumers (plot_diag, etc.) index
