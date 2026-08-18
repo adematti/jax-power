@@ -1,4 +1,5 @@
 import itertools
+import os
 
 import numpy as np
 import jax
@@ -23,12 +24,25 @@ class Correlation2Spectrum(object):
     """
     def __init__(self, s, ells, check_level=0):
         from .fftlog import CorrelationToSpectrum
-        fftlog = CorrelationToSpectrum(s, ell=ells[0], lowring=False, minfolds=False, check_level=check_level).fftlog
-        self._H = jax.jacfwd(lambda fun: fftlog(fun, extrap=False, ignore_prepostfactor=True)[1])(jnp.zeros_like(s))
+        self._fftlog1 = CorrelationToSpectrum(s, ell=ells[0], lowring=False, minfolds=False, check_level=check_level).fftlog
         self._fftlog = CorrelationToSpectrum(s, ell=ells[1], lowring=False, minfolds=False).fftlog
+        self._s = jnp.asarray(s)
         k = self.k
-        dlnk = jnp.diff(jnp.log(k)).mean()
-        self._postfactor = 2 * np.pi**2 / dlnk / (k[..., None] * k)**1.5
+        self._dlnk = jnp.diff(jnp.log(k)).mean()
+
+    def _f1(self, x):
+        return self._fftlog1(x, extrap=False, ignore_prepostfactor=True)[1]
+
+    @property
+    def _H(self):
+        # (n_k, n_s) dense Jacobian of the first transform. Only the __call__ path needs it;
+        # it is 537 MB at n_s = 8192, so it is built on demand rather than in __init__.
+        return jax.jacfwd(self._f1)(jnp.zeros_like(self._s))
+
+    @property
+    def _postfactor(self):
+        k = self.k
+        return 2 * np.pi**2 / self._dlnk / (k[..., None] * k)**1.5
 
     @property
     def k(self):
@@ -57,6 +71,29 @@ class Correlation2Spectrum(object):
         fun = self._H * fun
         _, fun = self._fftlog(fun, extrap=False, ignore_prepostfactor=True)
         return self.k, self._postfactor * fun
+
+    def contracted(self, fun, M1, M2):
+        r"""
+        Return ``M1 @ T @ M2.T`` without ever forming the dense ``T`` of :meth:`__call__`.
+
+        ``T[i, j] = post(k_i, k_j) F_2(H[i] fun)[j]``, and the caller only ever wants it
+        rebinned onto a handful of :math:`k` bins. Both transforms are linear, so the row
+        rebin can be pushed through them:
+
+            R[a] = sum_i M1[a, i] k_i^{-3/2} H[i]        (a vector-Jacobian product)
+            out  = c (F_2(R fun) k^{-3/2}) @ M2.T
+
+        which touches only ``(nbin, n_s)`` arrays. At ``n_s = 8192`` and 418 bins that is
+        27 MB instead of 537 MB, and 418 transforms instead of 8192 -- the dense form is what
+        made `compute_spectrum3_covariance` OOM an 80 GB device once the window is resampled
+        finely enough for the FFTlog to be accurate (see `interpolate_window_function`).
+        """
+        k = self.k
+        cotangent = jnp.asarray(M1) * k**-1.5
+        _, vjp = jax.vjp(self._f1, jnp.zeros_like(self._s))
+        rows = jax.vmap(lambda c: vjp(c)[0])(cotangent)       # (nbin, n_s)
+        _, out = self._fftlog(rows * fun, extrap=False, ignore_prepostfactor=True)
+        return 2 * np.pi**2 / self._dlnk * (out * k**-1.5) @ jnp.asarray(M2).T
 
 
 def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, split=None, **kwargs):
@@ -325,6 +362,12 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
         if method == 'fftlog':
             s = tmpw.coords('s')
             fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
+            if not int(os.environ.get('COV3_WINDOW_DENSE', '0')):
+                # Contract the rebin through the transforms instead of forming the dense
+                # (n_k, n_k) kernel; COV3_WINDOW_DENSE=1 restores the old path.
+                M1 = matrix_rebin(k1edges, fftlog.k, wt=fftlog.k**2, interp_order=3, cache=cache)
+                M2 = matrix_rebin(k2edges, fftlog.k, wt=fftlog.k**2, interp_order=3, cache=cache)
+                return fftlog.contracted(w, M1, M2)
             tmp = fftlog(w)[1]
             #from scipy.interpolate import RectBivariateSpline
             #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
@@ -360,6 +403,19 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
             toret.flat[kmask] = tmp
             return toret
 
+    # COV3_WINDOW_ON_CPU=1: run this projection on the host.
+    #
+    # With `method='fftlog'` the transform materializes a dense (n_s, n_s) k-space kernel --
+    # 537 MB of float64 at the n_s = 8192 the window must be resampled to (see
+    # `interpolate_window_function`; under-resampling loses ~20% of the P0 covariance by
+    # k ~ 0.4) -- and immediately rebins it down to (nbins, nbinsp), typically (418, 418) =
+    # 1.4 MB. That transient is pure waste on the device, and in `compute_spectrum3_covariance`
+    # it lands on top of the theory tables: the Zel'dovich P+B covariance at q = 8 OOMs an
+    # 80 GB A100 asking for exactly this allocation. The result is small and cached, so paying
+    # host-transfer once per (fields, ell1, ell2) block costs little.
+    if int(os.environ.get('COV3_WINDOW_ON_CPU', '0')):
+        with jax.default_device(jax.devices('cpu')[0]):
+            return np.asarray(get_wij(window2, ell1, ell2))
     return get_wij(window2, ell1, ell2)
 
 
@@ -673,16 +729,37 @@ def matrix_spline_interp(xt, xo, deriv: int=0, interp_order: int=3):
     if xo.ndim != 1:
         raise ValueError("xo must be 1D")
 
-    I = np.eye(len(xt), dtype=float)
-    spl = make_interp_spline(xt, I, k=interp_order, axis=0)
-    if deriv == -1:
-        spl = spl.antiderivative()
-    elif deriv == 1:
-        spl = spl.derivative()
-    elif deriv != 0:
-        raise NotImplementedError(f"deriv={deriv} not implemented")
+    # Column-blocked identity. The spline is fitted through eye(nt) to obtain the interpolation
+    # operator, so the naive form allocates an (nt, nt) dense identity plus an (nt, nt)
+    # coefficient array -- 2 x 537 MB at the nt = 8192 a resampled covariance window needs, and
+    # measured at 6.65 s per call (25% of a Gaussian cutsky covariance run). Blocking the
+    # right-hand sides keeps the arithmetic identical (each column is independent) while
+    # holding only (nt, block) at a time. The banded LU is refactorized per block, which is
+    # O(nt) and negligible against the O(nt * nrhs) solve.
+    nt = len(xt)
+    block = max(int(2**24 // max(nt, 1)), 64)  # ~128 MB of float64 per block
+    if block >= nt:
+        cols = [np.eye(nt, dtype=float)]
+    else:
+        cols = []
+        for start in range(0, nt, block):
+            stop = min(start + block, nt)
+            e = np.zeros((nt, stop - start), dtype=float)
+            e[np.arange(start, stop), np.arange(stop - start)] = 1.
+            cols.append(e)
 
-    return jnp.asarray(spl(xo))
+    out = []
+    for e in cols:
+        spl = make_interp_spline(xt, e, k=interp_order, axis=0)
+        if deriv == -1:
+            spl = spl.antiderivative()
+        elif deriv == 1:
+            spl = spl.derivative()
+        elif deriv != 0:
+            raise NotImplementedError(f"deriv={deriv} not implemented")
+        out.append(np.asarray(spl(xo)))
+
+    return jnp.asarray(out[0] if len(out) == 1 else np.concatenate(out, axis=1))
 
 
 def matrix_rebin(xedges, xt, wt=None, interp_order=3, cache=None):
@@ -740,7 +817,19 @@ def matrix_rebin(xedges, xt, wt=None, interp_order=3, cache=None):
     if np.any(bins[:, 1] <= bins[:, 0]):
         raise ValueError("Each bin must satisfy xmax > xmin")
 
-    for (_bins, _xt, _wt, M) in cache:
+    # Cheap discriminating key first: the full np.allclose scan below is O(len(cache) * nt) per
+    # lookup, and this is called hundreds of times per covariance with nt = 8192 (measured:
+    # 7.7 ms per cache HIT, 1.5 s of pure overhead in a 53 s run). Shapes plus a few sampled
+    # values reject non-matches immediately; the exact comparison still decides.
+    def _sig(a):
+        a = np.asarray(a)
+        return (a.shape, float(a.flat[0]), float(a.flat[-1]), float(a.sum()))
+
+    sig = (_sig(bins), _sig(xt), _sig(wt))
+    for entry in cache:
+        _bins, _xt, _wt, M = entry[:4]
+        if len(entry) > 4 and entry[4] != sig:
+            continue
         if (
             _bins.shape == bins.shape
             and np.allclose(_bins, bins)
@@ -762,7 +851,7 @@ def matrix_rebin(xedges, xt, wt=None, interp_order=3, cache=None):
     W = B @ wt                 # shape (nbins,)
     M = (B * wt[None, :]) / W[:, None]
 
-    cache.append((bins.copy(), xt.copy(), wt.copy(), M))
+    cache.append((bins.copy(), xt.copy(), wt.copy(), M, sig))
     return M
 
 

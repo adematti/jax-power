@@ -544,12 +544,44 @@ def compute_tns_A_B_terms(k, Pdd, Pdt=None, Ptt=None,
 # Kaiser + A + D + EFT
 
 def fog_damping(*kmu_X, f=1., sigma2v=1., damping='lor'):
+    r"""
+    Finger-of-God damping kernel W.
+
+    Parameters
+    ----------
+    kmu_X : tuples
+        One ``(k * mu, X_FoG)`` pair per power spectrum leg: two (identical) pairs
+        for the auto power spectrum, three for the bispectrum.
+    f : float
+        Growth rate :math:`f_0` (each ``k * mu`` is multiplied by ``f``).
+    sigma2v : float
+        Velocity dispersion :math:`\sigma_v^2`.
+    damping : {None, 'exp', 'lor', 'vdg'}
+        ``None`` returns 1 (no damping).
+
+    Notes
+    -----
+    With :math:`\lambda_X^2 = \frac{f^2}{2} \sum_i (k_i \mu_i X_i)^2` and
+    :math:`\lambda^2 = \frac{f^2}{2} \sum_i (k_i \mu_i)^2`:
+    'exp' returns :math:`e^{-\lambda_X^2 \sigma_v^2}`, 'lor' returns
+    :math:`1 / (1 + \lambda_X^2 \sigma_v^2)`, and 'vdg' returns
+    :math:`e^{-\lambda^2 \sigma_v^2 / (1 + \lambda_X^2)} / (1 + \lambda_X^2)^{n - 3/2}`
+    with :math:`n` the number of legs (2 for the power spectrum, 3 for the bispectrum).
+
+    Matches FOLPS's ``fog_damping`` (folps.py).
+    """
+    if damping is None:
+        return 1.
     lX2 = 0.5 * f**2 * sum((kmu * X)**2 for kmu, X in kmu_X)
     if damping == 'lor':
         return 1. / (1. + lX2 * sigma2v)
-    elif damping == 'exp':
+    if damping == 'exp':
         return jnp.exp(-lX2 * sigma2v)
-    raise NotImplementedError(f'damping {damping} is not implemented')
+    if damping == 'vdg':
+        l2 = 0.5 * f**2 * sum(kmu**2 for kmu, _ in kmu_X)
+        denom = 1. + lX2
+        return jnp.exp(-l2 * sigma2v / denom) / denom**(len(kmu_X) - 1.5)
+    raise ValueError(f"damping must be None, 'exp', 'lor' or 'vdg', got {damping!r}")
 
 
 def spectrum2_redshift_tracer_eft(matter, bias, A_B, sigma2v, mu, f,
@@ -679,13 +711,22 @@ class ProjectToPoles:
 
 class ProjectToSell:
 
-    """Helper class to compute multipoles using Legendre polynomials."""
+    """Helper class to compute Sugiyama multipoles using Legendre polynomials."""
 
     def __init__(self, ells=((0, 0, 0), (2, 0, 2)), size=6):
         self.ells = [tuple(ell) for ell in ells]
-        integ_mu = integration(-1., 1., size=size)
-        integ_phi = integration(0., 2. * np.pi, size=size)
-        integ = IntegralND(mu1=integ_mu, mu2=integ_mu, phi2=integ_phi)
+        # Integrate over (mu, x, phi): mu the line-of-sight cosine of k1hat, x = k1hat . k2hat the
+        # triangle shape, and phi the azimuth of k2hat about k1hat. Since the solid angle element
+        # is unchanged, dOmega2 = dmu2 dphi2 = dx dphi, this is the same measure (and the same
+        # normalization) as parameterizing k2hat by its own line-of-sight angles -- but carrying x
+        # as a *direct* integration variable resolves the 1 / k3 structure at the folded
+        # configuration k1 ~ -k2 far better, and that is what limits convergence. Deriving x from
+        # (mu1, mu2, phi2) instead smears it over all three variables: at size=6 that costs 10%
+        # on B000 and 11% on B202 by k = 0.2. This is FOLPS's parameterization
+        # (folps.py, Sugiyama_Bell, precision=[Nphi, Nx, Nmu]).
+        integ = IntegralND(mu=integration(-1., 1., size=size),
+                           x=integration(-1., 1., size=size),
+                           phi=integration(0., 2. * np.pi, size=size))
 
         def get_N(ell1, ell2, ell3):
             return (2 * ell1 + 1) * (2 * ell2 + 1) * (2 * ell3 + 1)
@@ -693,15 +734,17 @@ class ProjectToSell:
         def get_H(ell1, ell2, ell3):
             return wigner_3j(ell1, ell2, ell3, 0, 0, 0)
 
-        def unitvec(mu, phi):
-            s = np.sqrt(np.clip(1. - mu**2, 0., None))
-            return np.stack([s * np.cos(phi), s * np.sin(phi), mu], axis=-1)
+        mu, x, phi = (a.ravel() for a in integ.x(['mu', 'x', 'phi'], sparse=False))
+        zero, one = np.zeros_like(mu), np.ones_like(mu)
+        smu = np.sqrt(np.clip(1. - mu**2, 0., None))
+        k1hat = np.stack([smu, zero, mu], axis=-1)
+        # Orthonormal frame about k1hat, with e3 perpendicular to the line of sight
+        e2 = np.stack([-mu, zero, smu], axis=-1)
+        e3 = np.stack([zero, -one, zero], axis=-1)
+        sx = np.sqrt(np.clip(1. - x**2, 0., None))
+        k2hat = x[:, None] * k1hat + sx[:, None] * (np.cos(phi)[:, None] * e2 + np.sin(phi)[:, None] * e3)
 
-        mu1, mu2, phi2 = integ.x(['mu1', 'mu2', 'phi2'], sparse=False)
-        k1hat = unitvec(mu1, np.zeros_like(mu1)).reshape(-1, 3)
-        k2hat = unitvec(mu2, phi2).reshape(-1, 3)
-
-        # Normalized angular measure dmu1 / 2 * dmu2 / 2 * dphi2 / (2 pi), so that a constant
+        # Normalized angular measure dmu / 2 * dx / 2 * dphi / (2 pi), so that a constant
         # bispectrum projects to itself in the (0, 0, 0) multipole (raw integ.w sums to 8 pi)
         w = integ.w.ravel() / (8. * np.pi)
         self.k1hat, self.k2hat = k1hat, k2hat
@@ -783,6 +826,10 @@ def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias
         return b1 + f * mu**2
 
     def _Z1eft(field, k, mu):
+        # Bispectrum EFT counterterms, on the linear kernel: matches FOLPS
+        # (folps.py, Z1eft1/2/3), which uses this same (c1 mu^2 + c2 mu^4) k^2 basis and sign.
+        # These are *independent* of the power spectrum counterterms alpha0 / alpha2 / alpha4
+        # (see spectrum2_redshift_tracer_eft), again as in FOLPS: P and B carry their own sets.
         c1, c2 = _get_bias_params(field, ['c1', 'c2'])
         return _Z1(field, mu) - (c1 * mu**2 + c2 * mu**4) * k**2
 
@@ -908,7 +955,8 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         b1 = _get_bias_params(field, 'b1')
         return b1 + f * mu**2
 
-    def _Z1eff(field, k, mu):
+    def _Z1eft(field, k, mu):
+        # Same counterterm basis as spectrum3_redshift_tracer's _Z1eft; see the note there.
         c1, c2 = _get_bias_params(field, ['c1', 'c2'])
         return _Z1(field, mu) - (c1 * mu**2 + c2 * mu**4) * k**2
 
@@ -1052,8 +1100,8 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         muq = _mu(qvec, q)
         x_iq = _xcos(-kivec, qvec, ki, q)
         x_jmq = _xcos(-kjvec, -qvec, kj, q)
-        Zi = _Z1eff(fi, ki, mui)
-        Zj = _Z1eff(fj, kj, muj)
+        Zi = _Z1eft(fi, ki, mui)
+        Zj = _Z1eft(fj, kj, muj)
         Z2k = _Z2(fk, ki, q, x_iq, -mui, muq)
         Z2l = _Z2(fl, kj, q, x_jmq, -muj, -muq)
         Pki = _IR_pk(ki, mui)
@@ -1064,7 +1112,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     def _t3111_term(fi, fj, fk, fl, kivec, kjvec, kkvec):
         ki, kj, kk = _norm(kivec), _norm(kjvec), _norm(kkvec)
         mui, muj, muk = _mu(kivec, ki), _mu(kjvec, kj), _mu(kkvec, kk)
-        Zi, Zj, Zk = _Z1eff(fi, ki, mui), _Z1eff(fj, kj, muj), _Z1eff(fk, kk, muk)
+        Zi, Zj, Zk = _Z1eft(fi, ki, mui), _Z1eft(fj, kj, muj), _Z1eft(fk, kk, muk)
         Z3l = _Z3(fl, kivec, kjvec, kkvec)
         Pki = _IR_pk(ki, mui)
         Pkj = _IR_pk(kj, muj)
@@ -1124,10 +1172,10 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         Pr = _IR_pk(r, mur)
         Pq = _IR_pk(q, muq)
 
-        Z1_k = _Z1eff(a, k1, mu1)
-        Z1_mk = _Z1eff(b, k2, mu2)
-        Z1_r = _Z1eff(fr, r, mur)
-        Z1_mr = _Z1eff(fmr, r, -mur)
+        Z1_k = _Z1eft(a, k1, mu1)
+        Z1_mk = _Z1eft(b, k2, mu2)
+        Z1_r = _Z1eft(fr, r, mur)
+        Z1_mr = _Z1eft(fmr, r, -mur)
 
         x_mk_q = _xcos(-k1vec, qvec, k1, q)
         x_mr_q = _xcos(mrvec, qvec, r, q)
@@ -1165,10 +1213,10 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         b1, snb0, sn0 = _get_bias_params(field, ['b1', 'snb0', 'sn0'])
         return (b1 * snb0 + 2. * sn0 * f * mu**2) * Z1eft * pkIR
 
-    leg1 = _shot_leg(a, k1, mu1, _Z1eff(a, k1, mu1), _IR_pk(k1, mu1))
-    leg2 = _shot_leg(b, k2, mu2, _Z1eff(b, k2, mu2), _IR_pk(k2, mu2))
-    leg3 = _shot_leg(c, k3, mu3, _Z1eff(c, k3, mu3), _IR_pk(k3, mu3))
-    leg4 = _shot_leg(d, k4, mu4, _Z1eff(d, k4, mu4), _IR_pk(k4, mu4))
+    leg1 = _shot_leg(a, k1, mu1, _Z1eft(a, k1, mu1), _IR_pk(k1, mu1))
+    leg2 = _shot_leg(b, k2, mu2, _Z1eft(b, k2, mu2), _IR_pk(k2, mu2))
+    leg3 = _shot_leg(c, k3, mu3, _Z1eft(c, k3, mu3), _IR_pk(k3, mu3))
+    leg4 = _shot_leg(d, k4, mu4, _Z1eft(d, k4, mu4), _IR_pk(k4, mu4))
 
     sn0_1, sn0_2, sn0_3, sn0_4 = [_get_bias_params(field, 'sn0') for field in fields]
     shot = 0.25 * (leg1 * leg2 + leg1 * leg3 + leg1 * leg4 + leg2 * leg3 + leg2 * leg4 + leg3 * leg4)\

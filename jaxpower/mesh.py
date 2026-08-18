@@ -756,6 +756,14 @@ def _exchange_inverse_jax(array, indices):
 
 @default_sharding_mesh
 def _get_device_origin(shape, sharding_mesh=None):
+    # Plain tuple of Python ints, never a staticarray (callers pass attrs.meshsize).
+    # jax's Sharding.shard_shape is LRU-cached and, for a *replicated* sharding (which is
+    # what a degenerate 1-device mesh gives), returns its global_shape argument verbatim.
+    # staticarray hashes and compares equal to the equivalent tuple, so a staticarray
+    # passed here poisons the cache entry that every later tuple lookup hits, and the
+    # array that comes back out makes `db.shape != expected_shape` an ambiguous
+    # elementwise comparison inside jax.make_array_from_callback.
+    shape = tuple(int(s) for s in shape)
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
     mapping = sharding.devices_indices_map(shape)
     ordered_devices = sharding_mesh.devices.ravel().tolist()

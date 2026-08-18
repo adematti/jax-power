@@ -111,3 +111,58 @@ if __name__ == '__main__':
     test_wigner_9j()
     test_wigner_9j_selection_rules()
     test_wigner_9j_symmetry()
+
+
+def test_S():
+    """:func:`get_S` against identities that hold in ANY harmonic convention.
+
+    The regression this guards: ``_Ylm`` used to apply a ``(-1)**m`` factor for ``m < 0``, meant to
+    undo a convention difference in ``get_Ylm`` that does not exist. Nothing tested ``get_S``, so it
+    went unnoticed; it is wrong by O(1) for every ``ell > 0``.
+
+    Both checks below are convention-free, which is the point -- a test that compared against
+    another of our own expressions could be satisfied by two errors cancelling.
+
+    (i) Addition theorem. For ``L = 0`` the third leg drops out (``y_00 = 1``) and the 3j collapses
+        the m-sum onto ``sum_m Y_lm(x1) Y*_lm(x2) = (2l+1)/4pi L_l(x1.x2)``, so exactly
+
+            S_(l l 0)(x1, x2, x3) = L_l(x1 . x2)
+
+        independently of x3 and of any phase convention for the harmonics.
+    (ii) Rotational invariance. S is a scalar built from a 3j contraction, so rotating all three
+         arguments together must leave it unchanged -- which no phase convention can fake either.
+    """
+    from jax import numpy as jnp
+    from jaxpower.utils import get_S, get_legendre
+
+    rng = np.random.RandomState(42)
+    def unit(n):
+        v = rng.normal(size=(n, 3))
+        return v / np.linalg.norm(v, axis=-1, keepdims=True)
+    x1, x2, x3 = unit(6), unit(6), unit(6)
+    mu = np.sum(x1 * x2, axis=-1)
+
+    for ell in range(0, 5):
+        S = np.asarray(get_S((ell, ell, 0))(jnp.asarray(x1), jnp.asarray(x2), jnp.asarray(x3)))
+        ref = np.asarray(get_legendre(ell)(mu))
+        assert np.allclose(S, ref, atol=1e-9), (ell, S, ref)
+        # the z3=True branch fixes the third leg to z; S_(l l 0) does not depend on it at all
+        Sz = np.asarray(get_S((ell, ell, 0), z3=True)(jnp.asarray(x1), jnp.asarray(x2)))
+        assert np.allclose(Sz, ref, atol=1e-9), (ell, Sz, ref)
+
+    # rotational invariance, on a few ells with L != 0 where the third leg genuinely enters
+    def rotation():
+        q = rng.normal(size=4); q /= np.linalg.norm(q)
+        w, x, y, z = q
+        return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+    for ells in [(1, 1, 2), (2, 2, 2), (0, 2, 2), (2, 4, 2)]:
+        Sfun = get_S(ells)
+        R = rotation()
+        a = np.asarray(Sfun(jnp.asarray(x1), jnp.asarray(x2), jnp.asarray(x3)))
+        b = np.asarray(Sfun(jnp.asarray(x1 @ R.T), jnp.asarray(x2 @ R.T), jnp.asarray(x3 @ R.T)))
+        assert np.allclose(a, b, atol=1e-9), (ells, a, b)
+
+    print('test_S OK')

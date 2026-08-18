@@ -495,7 +495,10 @@ class CorrelationToSpectrum(object):
     __getattr__ = SpectrumToCorrelation.__getattr__
     __call__ = SpectrumToCorrelation.__call__
     tree_flatten = SpectrumToCorrelation.tree_flatten
-    tree_unflatten = SpectrumToCorrelation.tree_unflatten
+    # NOT `tree_unflatten = SpectrumToCorrelation.tree_unflatten`: that attribute is a classmethod
+    # ALREADY BOUND to SpectrumToCorrelation, so copying it makes cls -- and hence cls.__new__(cls)
+    # -- SpectrumToCorrelation whatever class it is reached through.
+    tree_unflatten = classmethod(SpectrumToCorrelation.tree_unflatten.__func__)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -657,6 +660,21 @@ class BaseFFTEngine(object):
         if nthreads is not None:
             os.environ['OMP_NUM_THREADS'] = str(nthreads)
         self.nthreads = int(os.environ.get('OMP_NUM_THREADS', 1))
+
+    # The engine is stateless beyond these three numbers, but it travels in the aux_data of
+    # :meth:`FFTlog.tree_flatten`, where JAX compares it to decide whether two pytrees have the
+    # same structure. With the default identity comparison, two FFTlog built on the same grid but
+    # different Bessel orders get unequal treedefs, so passing them as arguments to the same jitted
+    # function retraces every time --- which is precisely what makes a sum over many orders (see
+    # :func:`~jaxpower.mesh3.compute_smooth3_spectrum_window`) compile once per order.
+    # Value equality lets those share a single compilation; it can only turn cache misses into
+    # hits, never the reverse, since engines that compare equal are interchangeable.
+    def __eq__(self, other):
+        return (type(other) is type(self) and other.size == self.size
+                and other.nparallel == self.nparallel and other.nthreads == self.nthreads)
+
+    def __hash__(self):
+        return hash((type(self).__name__, self.size, self.nparallel, self.nthreads))
 
 
 class JAXFFTEngine(BaseFFTEngine):
