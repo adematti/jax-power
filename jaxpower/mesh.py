@@ -757,12 +757,7 @@ def _exchange_inverse_jax(array, indices):
 @default_sharding_mesh
 def _get_device_origin(shape, sharding_mesh=None):
     # Plain tuple of Python ints, never a staticarray (callers pass attrs.meshsize).
-    # jax's Sharding.shard_shape is LRU-cached and, for a *replicated* sharding (which is
-    # what a degenerate 1-device mesh gives), returns its global_shape argument verbatim.
-    # staticarray hashes and compares equal to the equivalent tuple, so a staticarray
-    # passed here poisons the cache entry that every later tuple lookup hits, and the
-    # array that comes back out makes `db.shape != expected_shape` an ambiguous
-    # elementwise comparison inside jax.make_array_from_callback.
+    # jax's Sharding.shard_shape is LRU-cached
     shape = tuple(int(s) for s in shape)
     sharding = jax.sharding.NamedSharding(sharding_mesh, P(*sharding_mesh.axis_names))
     mapping = sharding.devices_indices_map(shape)
@@ -2219,7 +2214,7 @@ def _get_extent(*positions, mpicomm=None):
     """Return minimum physical extent (min, max) corresponding to input positions."""
     if not positions:
         raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
-    backend, kw = _get_distributed_backend(positions[0], mpicomm=mpicomm)
+    backend, _ = _get_distributed_backend(positions[0], mpicomm=mpicomm)
     # Find bounding coordinates
     nonempty_positions = [pos for pos in positions if pos.size]
     if backend == 'jax':
@@ -2233,7 +2228,6 @@ def _get_extent(*positions, mpicomm=None):
         if nonempty_positions:
             pos_min = np.array([np.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
             pos_max = np.array([np.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
-        mpicomm = kw['mpicomm']  # resolved communicator, defaults to MPI.COMM_WORLD
         pos_min, pos_max = mpicomm.allgather(pos_min), mpicomm.allgather(pos_max)
         pos_min, pos_max = [p for p in pos_min if p is not None], [p for p in pos_max if p is not None]
         if not pos_min or not pos_max:

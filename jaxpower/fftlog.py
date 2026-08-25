@@ -661,14 +661,9 @@ class BaseFFTEngine(object):
             os.environ['OMP_NUM_THREADS'] = str(nthreads)
         self.nthreads = int(os.environ.get('OMP_NUM_THREADS', 1))
 
-    # The engine is stateless beyond these three numbers, but it travels in the aux_data of
-    # :meth:`FFTlog.tree_flatten`, where JAX compares it to decide whether two pytrees have the
-    # same structure. With the default identity comparison, two FFTlog built on the same grid but
-    # different Bessel orders get unequal treedefs, so passing them as arguments to the same jitted
-    # function retraces every time --- which is precisely what makes a sum over many orders (see
-    # :func:`~jaxpower.mesh3.compute_smooth3_spectrum_window`) compile once per order.
-    # Value equality lets those share a single compilation; it can only turn cache misses into
-    # hits, never the reverse, since engines that compare equal are interchangeable.
+    # The engine travels in the aux_data of :meth:`FFTlog.tree_flatten`, which JAX compares to decide
+    # whether two pytrees share a treedef: value equality (the engine is stateless beyond these three
+    # numbers) lets FFTlog differing only by Bessel order reuse a single jit compilation.
     def __eq__(self, other):
         return (type(other) is type(self) and other.size == self.size
                 and other.nparallel == self.nparallel and other.nthreads == self.nthreads)

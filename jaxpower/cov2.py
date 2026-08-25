@@ -1,5 +1,4 @@
 import itertools
-import os
 
 import numpy as np
 import jax
@@ -24,20 +23,14 @@ class Correlation2Spectrum(object):
     """
     def __init__(self, s, ells, check_level=0):
         from .fftlog import CorrelationToSpectrum
-        self._fftlog1 = CorrelationToSpectrum(s, ell=ells[0], lowring=False, minfolds=False, check_level=check_level).fftlog
-        self._fftlog = CorrelationToSpectrum(s, ell=ells[1], lowring=False, minfolds=False).fftlog
+        self._fftlogs = [CorrelationToSpectrum(s, ell=ells[0], lowring=False, minfolds=False, check_level=check_level).fftlog,
+                         CorrelationToSpectrum(s, ell=ells[1], lowring=False, minfolds=False).fftlog]
         self._s = jnp.asarray(s)
         k = self.k
         self._dlnk = jnp.diff(jnp.log(k)).mean()
 
     def _f1(self, x):
-        return self._fftlog1(x, extrap=False, ignore_prepostfactor=True)[1]
-
-    @property
-    def _H(self):
-        # (n_k, n_s) dense Jacobian of the first transform. Only the __call__ path needs it;
-        # it is 537 MB at n_s = 8192, so it is built on demand rather than in __init__.
-        return jax.jacfwd(self._f1)(jnp.zeros_like(self._s))
+        return self._fftlogs[0](x, extrap=False, ignore_prepostfactor=True)[1]
 
     @property
     def _postfactor(self):
@@ -46,11 +39,11 @@ class Correlation2Spectrum(object):
 
     @property
     def k(self):
-        return self._fftlog.y
+        return self._fftlogs[1].y
 
     @property
     def s(self):
-        return self._fftlog.x
+        return self._fftlogs[1].x
 
     def __call__(self, fun):
         """
@@ -68,8 +61,10 @@ class Correlation2Spectrum(object):
         transformed : array-like, 2D
             Transformed function in k-space.
         """
-        fun = self._H * fun
-        _, fun = self._fftlog(fun, extrap=False, ignore_prepostfactor=True)
+        # (n_k, n_s) dense Jacobian of the first transform. Only this path needs it;
+        # it is 537 MB at n_s = 8192, so it is built on demand rather than in __init__.
+        H = jax.jacfwd(self._f1)(jnp.zeros_like(self._s))
+        _, fun = self._fftlogs[1](H * fun, extrap=False, ignore_prepostfactor=True)
         return self.k, self._postfactor * fun
 
     def contracted(self, fun, M1, M2):
@@ -92,7 +87,7 @@ class Correlation2Spectrum(object):
         cotangent = jnp.asarray(M1) * k**-1.5
         _, vjp = jax.vjp(self._f1, jnp.zeros_like(self._s))
         rows = jax.vmap(lambda c: vjp(c)[0])(cotangent)       # (nbin, n_s)
-        _, out = self._fftlog(rows * fun, extrap=False, ignore_prepostfactor=True)
+        _, out = self._fftlogs[1](rows * fun, extrap=False, ignore_prepostfactor=True)
         return 2 * np.pi**2 / self._dlnk * (out * k**-1.5) @ jnp.asarray(M2).T
 
 
@@ -352,30 +347,12 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
         tmpw = next(iter(ww))
         s = tmpw.coords('s')
 
-        def rebin2d(xedges, yedges, xp, yp, fp, cache=cache):
-            """Rebin fp sampled on (xp, yp) to bins centered on (x, y)."""
-            interp_order = 3
-            Mx = matrix_rebin(xedges, xp, wt=xp**2, interp_order=interp_order, cache=cache)
-            My = matrix_rebin(yedges, yp, wt=yp**2, interp_order=interp_order, cache=cache)
-            return Mx @ fp @ My.T
-
         if method == 'fftlog':
-            s = tmpw.coords('s')
             fftlog = Correlation2Spectrum(s, (q1, q2), check_level=1)
-            if not int(os.environ.get('COV3_WINDOW_DENSE', '0')):
-                # Contract the rebin through the transforms instead of forming the dense
-                # (n_k, n_k) kernel; COV3_WINDOW_DENSE=1 restores the old path.
-                M1 = matrix_rebin(k1edges, fftlog.k, wt=fftlog.k**2, interp_order=3, cache=cache)
-                M2 = matrix_rebin(k2edges, fftlog.k, wt=fftlog.k**2, interp_order=3, cache=cache)
-                return fftlog.contracted(w, M1, M2)
-            tmp = fftlog(w)[1]
-            #from scipy.interpolate import RectBivariateSpline
-            #toret = RectBivariateSpline(fftlog.k, fftlog.k, tmp, kx=1, ky=1)(k, k, grid=True)
-            #print(ell1, ell2, q1, q2, np.diag(tmp)[:4], np.diag(toret)[:4])
-            toret = rebin2d(k1edges, k2edges, fftlog.k, fftlog.k, tmp)
-            #toret = toret.at[(k <= 0.)[:, None] * (k <= 0.)[None, :]].set(0.)
-            #toret[(k <= 0.)[:, None] * (k <= 0.)[None, :]] = 0.
-            return toret
+            # Contract the rebin through the transforms rather than forming the dense (n_k, n_k) kernel.
+            M1 = matrix_rebin(k1edges, fftlog.k, wt=fftlog.k**2, interp_order=3, cache=cache)
+            M2 = matrix_rebin(k2edges, fftlog.k, wt=fftlog.k**2, interp_order=3, cache=cache)
+            return fftlog.contracted(w, M1, M2)
 
         else:
 
@@ -403,19 +380,6 @@ def compute_spectrum2_covariance_window_block(window2, k1edges, k2edges, ell1, e
             toret.flat[kmask] = tmp
             return toret
 
-    # COV3_WINDOW_ON_CPU=1: run this projection on the host.
-    #
-    # With `method='fftlog'` the transform materializes a dense (n_s, n_s) k-space kernel --
-    # 537 MB of float64 at the n_s = 8192 the window must be resampled to (see
-    # `interpolate_window_function`; under-resampling loses ~20% of the P0 covariance by
-    # k ~ 0.4) -- and immediately rebins it down to (nbins, nbinsp), typically (418, 418) =
-    # 1.4 MB. That transient is pure waste on the device, and in `compute_spectrum3_covariance`
-    # it lands on top of the theory tables: the Zel'dovich P+B covariance at q = 8 OOMs an
-    # 80 GB A100 asking for exactly this allocation. The result is small and cached, so paying
-    # host-transfer once per (fields, ell1, ell2) block costs little.
-    if int(os.environ.get('COV3_WINDOW_ON_CPU', '0')):
-        with jax.default_device(jax.devices('cpu')[0]):
-            return np.asarray(get_wij(window2, ell1, ell2))
     return get_wij(window2, ell1, ell2)
 
 

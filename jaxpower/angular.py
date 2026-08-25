@@ -38,7 +38,7 @@ from jax import numpy as jnp
 
 from .mesh import staticarray, ParticleField, FKPField, _make_input_tuple, split_particles, __format_meshes
 from .mesh2 import _format_meshes
-from .utils import register_pytree_dataclass
+from .utils import register_pytree_dataclass, _legendre_recurrence_coeffs
 from .types import Angular2Spectrum, Angular3Spectrum, WindowMatrix
 
 
@@ -440,27 +440,6 @@ def _vec2pix_healpy(positions: jax.Array, nside: int) -> jax.Array:
 
     out_type = jax.ShapeDtypeStruct(jnp.shape(positions)[:-1], jnp.zeros(0, dtype=np.int64).dtype)
     return jax.pure_callback(host, out_type, positions, vmap_method='broadcast_all')
-
-
-@lru_cache(maxsize=None)
-def _legendre_recurrence_coeffs(ellmax: int):
-    r"""
-    Coefficients for the normalized associated Legendre recurrence
-    :math:`\lambda_{\ell m} = a_{\ell m} (x \lambda_{\ell-1, m} - b_{\ell m} \lambda_{\ell-2, m})`,
-    with :math:`Y_{\ell m} = \lambda_{\ell m}(\cos\theta) e^{i m \phi}` (Condon-Shortley phase included).
-    """
-    ls = np.arange(ellmax + 1)[:, None]
-    ms = np.arange(ellmax + 1)[None, :]
-    mask = ms < ls
-    with np.errstate(divide='ignore', invalid='ignore'):
-        a = np.where(mask, np.sqrt((4. * ls**2 - 1.) / np.where(mask, ls**2 - ms**2, 1.)), 0.)
-        b = np.where(mask, np.sqrt(np.abs(((ls - 1.)**2 - ms**2)) / (4. * (ls - 1.)**2 - 1.)), 0.)
-    ab = a * b
-    # diagonal: lambda_{ll} = -sqrt((2l+1)/(2l)) sin(theta) lambda_{l-1,l-1}
-    d = np.zeros(ellmax + 1)
-    d[1:] = -np.sqrt((2. * ls[1:, 0] + 1.) / (2. * ls[1:, 0]))
-    onehot = np.eye(ellmax + 1)
-    return a, ab, d, onehot
 
 
 def _compute_alm_direct(positions: jax.Array, weights: jax.Array, ellmax: int, batch_size: int=None) -> jax.Array:
