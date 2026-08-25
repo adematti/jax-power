@@ -21,8 +21,8 @@ def export_sympy():
     from jaxpower.utils import export_legendre_product, compute_sympy_bessel_tophat_integral, compute_sympy_bessel, compute_sympy_legendre
 
     #print(export_sympy_legendre_product(ellmax=8, n=3))
-    for ell in range(6): print('_registered_bessel_tophat_integral[{:d}] = (lambda x: {},\nlambda x: {})'.format(ell, *compute_sympy_bessel_tophat_integral(ell)))
-    #for ell in range(11): print('_registered_bessel[{:d}] = (lambda x: {},\nlambda x: {})'.format(ell, *compute_sympy_bessel(ell)))
+    for ell in range(6): print('_registered_bessel_tophat_integral[{:d}] = lambda x: {}'.format(ell, compute_sympy_bessel_tophat_integral(ell)))
+    #for ell in range(11): print('_registered_bessel[{:d}] = lambda x: {}'.format(ell, compute_sympy_bessel(ell)))
     #for ell in range(11): print('_registered_legendre[{:d}] = lambda x: {}'.format(ell, compute_sympy_legendre(ell)))
 
 

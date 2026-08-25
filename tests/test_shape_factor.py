@@ -184,7 +184,7 @@ def test_quadrupole_differs():
 
 def test_library_coeffs_match(ellmax=4):
     """jaxpower's host-side coefficients reproduce the closed forms above."""
-    from jaxpower.mesh3 import get_reference_leg_shape_coeffs
+    from jaxpower.mesh3 import get_scoccimarro_los_coeffs
 
     def evaluate(coeffs, ell1, ell2, k1, k2, k3):
         t31 = np.arccos(np.clip(cos_theta(k3, k1, k2), -1., 1.))
@@ -195,10 +195,10 @@ def test_library_coeffs_match(ellmax=4):
     for (k1, k2, k3) in TRIANGLES:
         for ell1, ell2, L in itertools.product(range(ellmax + 1), repeat=3):
             if abs(wigner_3j(ell1, ell2, L, 0, 0, 0)) < 1e-10: continue
-            got = evaluate(get_reference_leg_shape_coeffs((ell1, ell2, L)), ell1, ell2, k1, k2, k3)
+            got = evaluate(get_scoccimarro_los_coeffs((ell1, ell2, L)), ell1, ell2, k1, k2, k3)
             worst_out = max(worst_out, abs(got - shape_factor_leg3(ell1, ell2, L, k1, k2, k3)))
             for M in range(-L, L + 1):
-                got = evaluate(get_reference_leg_shape_coeffs((ell1, ell2, L), m=M, normalize=False),
+                got = evaluate(get_scoccimarro_los_coeffs((ell1, ell2, L), m=M, normalize=False),
                                ell1, ell2, k1, k2, k3)
                 worst_in = max(worst_in, abs(got - theory_factor_leg3(ell1, ell2, L, M, k1, k2, k3)))
     print(f'library coeffs vs closed form: output {worst_out:.2e}, theory {worst_in:.2e}')

@@ -14,7 +14,7 @@ from .mesh import (BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, Pa
 compute_normalization, compute_box_normalization, split_particles, __format_meshes)
 from .mesh2 import _get_los_vector
 from .types import Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles, ObservableLeaf, ObservableTree, WindowMatrix
-from .utils import real_gaunt, get_legendre, get_legendre_recurrence, get_spherical_jn, get_spherical_jn_all, get_Ylm, wigner_3j, wigner_9j, register_pytree_dataclass
+from .utils import real_gaunt, get_legendre, get_legendre_recurrence, get_spherical_jn, get_spherical_jn_all, get_Ylm, get_Ylm_all, wigner_3j, wigner_9j, register_pytree_dataclass
 
 
 prod = partial(functools.reduce, operator.mul)
@@ -1068,13 +1068,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
         return tuple(shotnoise)
 
     # Take the meshes as _format_meshes returned them. It has ALREADY resolved every repeated
-    # field (`if mesh is None: meshes[imesh] = meshes[fields.index(field)]`), so the previous
-    # `particles.append(particles[s])` was at best redundant and at worst wrong: it indexed
-    # `particles` -- a per-LEG list -- with `s`, a FIELD id, and the two coincide only when a
-    # field first occurs at that leg index. With fields=(0, 0, 1) it handed leg 2 `particles[1]`,
-    # i.e. field 0, instead of field 1. It also made per-leg weights on shared positions
-    # inexpressible: fields=(0, 0, 0) is the only value switching on all of S111/S122/S121/S113,
-    # and it collapsed all three legs onto the first object.
+    # field (`if mesh is None: meshes[imesh] = meshes[fields.index(field)]`).
     particles = []
     for fkp in fkps:
         if isinstance(fkp, FKPField):
@@ -1110,12 +1104,6 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
                 s0 = jnp.sum(particles[0].weights * particles[1].weights * particles[2].weights)
                 s111_ellm = {(ell, m): s0 if (ell, m) == (0, 0) else 0. for ell, m in ellms}
             else:
-                # The TRIPLE PRODUCT, as the ellms == [(0, 0)] branch above already uses -- not
-                # particles[0].weights**3, which silently assumes the three legs carry the same
-                # weights. They need not: legs may share positions and differ in weights (three
-                # disjoint random subsamples multiplying one common tracer field, say), and then
-                # the cube is a different quantity. Identical whenever the legs really are the
-                # same object.
                 weights = particles[0].weights * particles[1].weights * particles[2].weights
                 rmesh = particles[0].clone(weights=weights).paint(**kwargs, out='real')
                 xvec = mattrs.rcoords(sparse=True)
@@ -1235,7 +1223,7 @@ def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory 
 
 
 @functools.lru_cache(maxsize=None)
-def get_reference_leg_shape_coeffs(ell, m=0, normalize=True):
+def get_scoccimarro_los_coeffs(ell, m=0, normalize=True):
     r"""
     Host-side coefficients of the TripoSH *shape factor* in the :math:`\hat{k}_3` reference-leg
     convention (desi-gqc-notes, sec. "The reference leg").
@@ -1287,7 +1275,8 @@ def get_reference_leg_shape_coeffs(ell, m=0, normalize=True):
     Returns
     -------
     coeffs : tuple of (mu1, mu2, coeff)
-        Terms of the :math:`\mu` sum; the harmonics are evaluated by :func:`_compute_shape_factor`.
+        Terms of the :math:`\mu` sum; the harmonics themselves come from
+        :func:`~jaxpower.utils.get_Ylm_all`.
     """
     ell1, ell2, L = ell
     H = wigner_3j(ell1, ell2, L, 0, 0, 0)
@@ -1315,7 +1304,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
         \tilde{B}_{\ell_1 \ell_2 L}(k_1, k_2),
 
     with :math:`\mathcal{S}^{(3)}` the reference-leg shape factor of
-    :func:`get_reference_leg_shape_coeffs` -- the estimator's line-of-sight Legendre refers to the
+    :func:`get_scoccimarro_los_coeffs` -- the estimator's line-of-sight Legendre refers to the
     leg that closes the triangle, :math:`\hat{k}_3`, so this is NOT the single Legendre
     :math:`\mathcal{L}_{\ell_2}(\cos\theta_{12})` that the :math:`\hat{k}_1` convention would give
     (the two agree at :math:`L = 0` and differ by :math:`\mathcal{O}(1)` beyond) --
@@ -1361,7 +1350,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
         resummed with weight :math:`\mathcal{S}^{(3)}_{\ell_1\ell_2L}`),
         ``sugiyama_ellt = (ell_1', ell_2', L')`` the theory-side one (to be projected with weight
         :math:`I_{000}\, \Sigma^{(3)}_{\ell_1'\ell_2'L'M'}`); both angular factors come from
-        :func:`get_reference_leg_shape_coeffs`. The projection prefactor
+        :func:`get_scoccimarro_los_coeffs`. The projection prefactor
         :math:`N' H' / \sqrt{4\pi(2L'+1)}` is folded into the window coefficients ``coeff`` -- but
         NOT the :math:`3j`, which now lives inside :math:`\Sigma^{(3)}`.
     """
@@ -1382,7 +1371,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
             # Theory-side projection (Scoccimarro to TripoSH), eq. 25 of arXiv:1803.02132.
             # The 3j (l1', l2', L'; 0, -M', M') that used to sit here has moved INTO the theory-side
             # angular factor: in the k_3 reference-leg convention the 3j and the harmonic no longer
-            # factorize, the pair being replaced by Sigma^(3) (get_reference_leg_shape_coeffs with
+            # factorize, the pair being replaced by Sigma^(3) (get_scoccimarro_los_coeffs with
             # normalize=False), whose mu = 0 term is exactly this 3j times y_{l2'}^{-M'}.
             scoccimarro_to_sugiyama = prod((2 * ell_ + 1) for ell_ in sugiyama_ellt) * H
             if min is None:  # Legendre-multipole input: B_{L'0} = sqrt(4 pi / (2 L' + 1)) B_{L'}, M' = 0
@@ -1476,13 +1465,12 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
     convolution runs over all of :math:`k'`-space, so the matrix must be given the unordered
     grid (pass ``edgesin`` as raw per-axis edges and it builds one). Filling that grid requires
     knowing :math:`B_{L'}` at each ordering, which is a THEORY-side question and is only a
-    relabelling when the multipole is invariant under the permutation -- hence this is a helper
-    the caller opts into, not something the window matrix assumes.
+    relabelling when the multipole is invariant under the permutation.
 
-    Validity, per multipole:
+    Validity, per multipole, if the three :math:`\delta`-fields are the same:
 
-    - ``fix_legs=(2,)``: exact for EVERY :math:`L'`. The scoccimarro :math:`B_{L'}` is referred
-      to :math:`\hat{k}_3 \cdot \hat{z}` (the estimator applies the output Legendre to the
+    - ``fix_legs=(2,)``: exact for EVERY :math:`L'`.
+      The scoccimarro :math:`B_{L'}` is referred to :math:`\hat{k}_3 \cdot \hat{z}` (the estimator applies the output Legendre to the
       third leg), and swapping :math:`k_1 \leftrightarrow k_2` leaves that leg alone, so
       :math:`B_{L'}(k_1,k_2,k_3) = B_{L'}(k_2,k_1,k_3)` identically.
     - ``fix_legs=None`` (all permutations): exact for :math:`L' = 0` only, since :math:`B_0` is
@@ -1521,7 +1509,8 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
         Leg positions the permutation must leave in place, e.g. ``(2,)`` to keep the third leg
         third. ``None`` allows every permutation.
     atol : float, default=1e-9
-        Tolerance for matching a sorted triple to a row of ``kin_ordered``.
+        Tolerance of the fixed-leg check. Matching a sorted triple to a row of ``kin_ordered``
+        is exact: both grids are expected to come from the same edges, hence bitwise equal.
 
     Returns
     -------
@@ -1538,53 +1527,44 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
     """
     if kin is None and kin_ordered is None:
         raise ValueError('provide at least one of kin, kin_ordered')
-    rnd = lambda t: tuple(np.round(np.asarray(t).ravel(), 12))
     edges = None
     if kin_ordered is None:
         kin = np.asarray(kin, dtype='f8')
-        seen, rows = set(), []
-        for t in kin:
-            key = rnd(np.sort(t))
-            if key in seen: continue
-            seen.add(key); rows.append(np.sort(t))
-        kin_ordered = np.array(rows)
+        sorted_kin = np.sort(kin, axis=-1)
+        # unique returns first occurrences; re-sorting the indices restores input order
+        index = np.unique(sorted_kin, axis=0, return_index=True)[1]
+        kin_ordered = sorted_kin[np.sort(index)]
     elif kin is None:
         kin_ordered = np.asarray(kin_ordered, dtype='f8')
         eo = None if edges_ordered is None else np.asarray(edges_ordered, dtype='f8')
-        seen, rows, erows = set(), [], []
-        for j, t in enumerate(kin_ordered):
-            for pm in itertools.permutations(range(3)):
-                pl = list(pm)
-                # dedupe on the BOX when edges are known (degenerate legs give identical boxes),
-                # else on the triple
-                key = rnd(eo[j][pl]) if eo is not None else rnd(t[pl])
-                if key in seen: continue
-                seen.add(key); rows.append(t[pl])
-                if eo is not None: erows.append(eo[j][pl])
-        kin = np.array(rows)
-        if eo is not None: edges = np.array(erows)
+        # every permutation of every ordered row, ordered-row-major as the nested loop was
+        perms = np.array(list(itertools.permutations(range(3))))
+        rows = kin_ordered[:, perms].reshape(-1, 3)
+        erows = None if eo is None else eo[:, perms].reshape(-1, 3, eo.shape[-1])
+        # dedupe on the BOX when edges are known (degenerate legs give identical boxes),
+        # else on the triple
+        keys = rows if erows is None else erows
+        index = np.unique(keys.reshape(len(rows), -1), axis=0, return_index=True)[1]
+        index = np.sort(index)
+        kin = rows[index]
+        if erows is not None: edges = erows[index]
     kin, kin_ordered = np.asarray(kin, dtype='f8'), np.asarray(kin_ordered, dtype='f8')
-    fix = () if fix_legs is None else tuple(int(l) for l in np.atleast_1d(fix_legs))
-    lookup = {}
-    for j, t in enumerate(kin_ordered):
-        lookup.setdefault(rnd(np.sort(t)), j)
+    fix = () if fix_legs is None else tuple(int(leg) for leg in np.atleast_1d(fix_legs))
+    sorted_kin = np.sort(kin, axis=-1)
+    # group both grids by their sorted triple: rows sharing a group are permutations of each other
+    keys = np.concatenate([np.sort(kin_ordered, axis=-1), sorted_kin])
+    groups, index_1d = np.unique(keys, axis=0, return_inverse=True)
+    index_1d = index_1d.ravel()
+    inv_ordered, inv_kin = index_1d[:len(kin_ordered)], index_1d[len(kin_ordered):]
+    # column of each group, -1 where the group has none; reversed so the FIRST ordered row wins
+    column = np.full(len(groups), -1)
+    column[inv_ordered[::-1]] = np.arange(len(kin_ordered))[::-1]
+    # admissible only if sorting leaves every fixed leg where it already is
+    admissible = np.all(np.abs(kin[:, fix] - sorted_kin[:, fix]) <= atol, axis=-1)
     S = np.zeros((len(kin), len(kin_ordered)))
-    for i, t in enumerate(kin):
-        ts = np.sort(t)
-        # admissible only if sorting leaves every fixed leg where it already is
-        if any(abs(t[l] - ts[l]) > atol for l in fix): continue
-        j = lookup.get(rnd(ts))
-        if j is not None: S[i, j] = 1.
+    rows = np.flatnonzero(admissible & (column[inv_kin] >= 0))
+    S[rows, column[inv_kin][rows]] = 1.
     return S, kin, kin_ordered, edges
-
-
-
-# Defaults for the automatic ``batch_size`` of :func:`compute_smooth3_spectrum_window`.
-# The batched 2D FFTlog holds a few (batch_size, n1, n2) complex intermediates at a time; the target
-# below sizes the batch against ONE of them, leaving room for the others. The cap keeps the batch
-# from growing without bound on small grids, where the launch overhead is already amortized.
-BATCH_MEMORY_TARGET = 1024**3  # bytes
-BATCH_SIZE_MAX = 64
 
 
 def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None,
@@ -1606,14 +1586,14 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     bin : BinMesh2SpectrumPoles
         Output binning.
     ellmax : int, default=16
-        For the scoccimarro basis: truncation of the TripoSH multipole sums resolving
+        For the scoccimarro basis. Truncation of the TripoSH multipole sums resolving
         the internal (opening-angle) dependence, see
         :func:`get_scoccimarro_window_convolution_coeffs`. Use the same value as passed to
         :func:`get_smooth3_window_bin_attrs` (window multipoles missing from ``window``
         are silently treated as zero).
         **``ellmax`` does not converge on its own -- it converges jointly with the radial (Bessel)
         resolution of ``window``.** The high-order Bessel content has to be resolved
-        before the extra multipoles mean anything. Do not scan the two axes separately.
+        before the extra multipoles mean anything.
         Cost is linear here -- the surviving term count is exactly ``4 * ellmax - 1`` -- and
         quadratic in the window's grid size, so 16 is deliberately chosen as the point where the
         pipeline reaches the analytic rather than as margin.
@@ -1623,7 +1603,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         the point value breaks the box-limit sum rule by tens of per cent (~16% at ``ninsub = 1``,
         1.9% at 16).
         Sugiyama basis: number of Gauss-Legendre sub-nodes per theory bin per axis used to build
-        the (separable) theory basis, summed so the bins keep tiling. There is no
+        the theory basis, summed so the bins keep tiling. There is no
         :math:`k_3^{\\prime}` leg to integrate here, but the midpoint spline basis is truncated at
         the range ends by its own extrapolation cut-off, which loses weight there; increasing
         ``ninsub`` tends to an exactly tiling tophat instead. ``ninsub = 1`` places the single node
@@ -1632,9 +1612,9 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         Output-side sub-binning.
         Scoccimarro basis: the full 3-D bin average of the rapidly varying angular factor
         :math:`\\mathcal{L}_{\\ell_2}(\\cos\\theta_{12})`, all three legs sub-binned and weighted
-        by :math:`k_1^2k_2^2k_3^2` times the triangle measure. Setting it to 1 evaluates that
-        factor at the bin's representative triangle, which is 20-40% wrong on squeezed
-        configurations.
+        by :math:`k_1^2k_2^2k_3^2` times the triangle measure. Must be >= 2 here: taking that
+        factor at the bin's representative triangle instead is 20-40% wrong on squeezed
+        configurations, so that path is gone and ``noutsub < 2`` raises.
         Cost grows as ``noutsub**3`` in the number of sub-triangles, but only ``noutsub**2`` of
         them reach the interpolation (the gather sees the :math:`k_1, k_2` legs only), so the
         practical scaling is milder than the node count suggests.
@@ -1648,7 +1628,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         handful of length-``n`` FFTs, far too little to fill a GPU on its own, so the run is
         launch-latency bound at small batches. Results do not depend on it.
         ``None`` (default) picks the largest batch whose dominant ``(batch_size, n1, n2)`` complex
-        intermediate stays within ``BATCH_MEMORY_TARGET``, capped at ``BATCH_SIZE_MAX``.
+        intermediate stays within 1 GB, capped at 64.
         Raise it if memory allows, lower it on out-of-memory.
     pbar : bool, default=False
         Whether to show a progress bar over the terms of the multipole sums. Note the granularity is
@@ -1666,7 +1646,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         if 'wa_orders' in edgesin.labels(return_type='keys'):
             ellsin = [(ell, wa) for ell, wa in zip(edgesin.ells, edgesin.wa_orders)]
         pole = next(iter(edgesin))
-        kin = jnp.asarray(pole.coords('k'))
         edgesin = jnp.asarray(pole.edges('k'))
 
     else:
@@ -1678,19 +1657,12 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         for edge in edgesin:
             if edge.ndim == 1: edge = jnp.column_stack([edge[:-1], edge[1:]])
             grid_edgesin.append(edge)
-        grid_kin = tuple(jnp.mean(edge, axis=-1) for edge in grid_edgesin)
-
-        def _cproduct(arrays, swap=False):
-            if swap: arrays = arrays[::-1]
+        def _cproduct(arrays):
             grid = jnp.meshgrid(*arrays, sparse=False, indexing='ij')
             return jnp.column_stack([tmp.ravel() for tmp in grid])
 
         # of shape (nbins, ndim, 2)
-        def _get_edgesin(grid_edgesin, swap=False):
-            return jnp.concatenate([_cproduct([edge[..., 0] for edge in grid_edgesin], swap=swap)[..., None],
-                                    _cproduct([edge[..., 1] for edge in grid_edgesin], swap=swap)[..., None]], axis=-1)
-        edgesin, edgesin_swap = (_get_edgesin(grid_edgesin, swap=swap) for swap in [False, True])
-        kin = _cproduct(grid_kin)
+        edgesin = jnp.stack([_cproduct([edge[..., iedge] for edge in grid_edgesin]) for iedge in range(2)], axis=-1)
         if 'scoccimarro' in bin.basis:
             # Bin-level triangle-overlap test: keep every bin whose (k1, k2, k3)
             # theory intersects the triangle region, not only those whose single
@@ -1702,7 +1674,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             k3lo, k3hi = edgesin[:, 2, 0], edgesin[:, 2, 1]
             gap12 = jnp.maximum(jnp.maximum(k1lo - k2hi, k2lo - k1hi), 0.)
             mask = (k3hi >= gap12) & (k3lo <= k1hi + k2hi)
-            edgesin, kin = edgesin[mask], kin[mask]
+            edgesin = edgesin[mask]
 
     if 'sugiyama' in bin.basis:
         ellsin = [(ellin[0], tuple(ellin[1])) if isinstance(ellin[0], tuple) else (ellin, (0, 0)) for ellin in ellsin]
@@ -1725,9 +1697,11 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     # None) the run is dominated by launch latency rather than arithmetic -- most of all on a GPU.
     # Size the batch against the dominant (batch_size, n1, n2) complex intermediate instead.
     if batch_size is None:
+        memory_target = 1024**3  # bytes
+        batch_size_max = 64
         _wshape = [len(c) for c in next(iter(window)).coords().values()]
         _nbytes = int(np.prod(_wshape)) * 16  # complex128
-        batch_size = int(np.clip(BATCH_MEMORY_TARGET // max(_nbytes, 1), 1, BATCH_SIZE_MAX))
+        batch_size = int(np.clip(memory_target // max(_nbytes, 1), 1, batch_size_max))
     batch_size = max(int(batch_size), 1)
 
     def get_w_rect_label(q, wain):
@@ -1765,17 +1739,10 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             return value
         return jnp.zeros(())
 
-    def tophat(k, edgein, value):
-        # k tuple defining the k-grid, edgein tuple of (min, max), value flattened values
-        masks = []
-        for kk, edge in zip(k, edgein):
-            masks.append((kk >= edge[0]) & (kk < edge[1]))
-        return prod(jnp.meshgrid(*masks, indexing='ij', sparse=True)) * value
-
     def axis_basis_matrices(edges, k_axes, kind, nsub=1):
         """Per-axis (separable) replacement for the sharp tophat/read: build,
         for each axis independently, a SMALL matrix of shape (n_k_axis,
-        n_unique_axis) ('spline', input/theory side: a smooth spline basis
+        n_unique_axis) (kind='spline', input/theory side: a smooth spline basis
         function per distinct bin center, matrix_spline_interp) or
         (n_unique_axis, n_k_axis) ('rebin', output side: a proper k^2-weighted
         bin average, matrix_rebin), keyed by the axis's DISTINCT bin
@@ -1791,8 +1758,8 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         which is why it is the default here and leaves the scoccimarro callers
         below untouched).
         """
-        edges_np = np.asarray(edges)
-        centers = edges_np.mean(axis=-1)
+        edges = np.asarray(edges)
+        centers = edges.mean(axis=-1)
         ndim = centers.shape[-1]
         index_per_bin = np.empty(centers.shape, dtype=np.int64)
         matrices = []
@@ -1800,7 +1767,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             u, first_idx, inv = np.unique(centers[:, d], return_index=True, return_inverse=True)
             index_per_bin[:, d] = inv
             kk = np.asarray(k_axes[d])
-            unique_edges = edges_np[first_idx, d, :]
+            unique_edges = edges[first_idx, d, :]
             if nsub > 1:
                 # Sub-node construction, shared by both kinds. 'spline' SUMS the sub-node
                 # interpolation weights and never averages them: the sum over all bins of a
@@ -1811,10 +1778,10 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 # tophat. 'rebin' instead AVERAGES, weighted by the k^2 measure, matching
                 # matrix_rebin's definition.
                 from .pt import integration
-                _integ_sub = integration(-1., 1., size=nsub)
-                _u_sub, _w_sub = np.asarray(_integ_sub.x()), np.asarray(_integ_sub.w)
-                lo, hi = unique_edges[:, 0], unique_edges[:, 1]
-                ksub = 0.5 * (hi - lo)[:, None] * (_u_sub[None, :] + 1.) + lo[:, None]   # (n_unique, nsub)
+                # bounds are per unique bin, so the nodes come out (n_unique, nsub) directly,
+                # with weights already carrying the bin width
+                integ_sub = integration(unique_edges[:, :1], unique_edges[:, 1:], size=nsub)
+                ksub, wsub_bin = np.asarray(integ_sub.x()), np.asarray(integ_sub.w)
                 if kind == 'spline':
                     # theory known AT the sub-nodes, evaluated ON the fftlog grid
                     Msub = matrix_spline_interp(jnp.asarray(ksub.ravel()), kk, interp_order=interp_order)
@@ -1826,7 +1793,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     # is READ at the sub-nodes, then averaged over the bin with the k^2 measure
                     Msub = matrix_spline_interp(kk, jnp.asarray(ksub.ravel()), interp_order=interp_order)
                     Msub = Msub.reshape(*ksub.shape, Msub.shape[-1])                     # (n_unique, nsub, n_k)
-                    wsub = jnp.asarray((0.5 * (hi - lo)[:, None] * _w_sub[None, :]) * ksub**2)
+                    wsub = jnp.asarray(wsub_bin * ksub**2)
                     M = jnp.sum(wsub[..., None] * Msub, axis=1) / jnp.sum(wsub, axis=-1)[:, None]
             elif kind == 'spline':
                 M = matrix_spline_interp(u, kk, interp_order=interp_order)
@@ -1873,10 +1840,6 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         toret = jnp.zeros_like(value, shape=id0.shape[0])
         return jax.lax.scan(step, toret, ishifts)[0]
 
-    def read(kout, k, value):
-        # kout tuple of flattened output k's, k tuple defining the k-grid, value is grid
-        return read_apply(read_index(kout, k), value)
-
     wmat_tmp = {}
 
     def make_pbar(total):
@@ -1895,118 +1858,104 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # Upper bound on the Bessel orders reached below, so the spherical-Bessel table covers them.
         # Enumerated rather than assumed to equal ellmax: an order ABOVE the bound would be silently
         # CLAMPED by jnp.take into a lower-order Bessel -- the same failure mode as the tabulated
-        # get_legendre. Taken over ALL of se[0], se[1], st[0], st[1]: the Bessel gather uses the
-        # first component as well as the second.
-        ellmax_legendre = max([0] + [max(se[:2] + st[:2])
-                                     for ellin_, wain_ in ellsin for ell_ in ells
-                                     for se, st, _ in get_scoccimarro_window_convolution_coeffs(ell_, ellin_, ellmax=ellmax)])
-        _jn_all_tab = get_spherical_jn_all(ellmax_legendre)
+        # get_legendre. Taken over ALL FOUR leg orders, output and theory: the Bessel gather uses
+        # the first component of each key as well as the second.
+        ellmax_legendre = max([0] + [max(ell_out_key[:2] + ell_theory_key[:2])
+                                     for ellin_key, wain_key in ellsin for ell_key in ells
+                                     for ell_out_key, ell_theory_key, _ in get_scoccimarro_window_convolution_coeffs(ell_key, ellin_key, ellmax=ellmax)])
+        spherical_jn_all = get_spherical_jn_all(ellmax_legendre)
 
-        def _cos_safe(num, den):
-            # Bin centers can fall (slightly) outside the triangle inequality
-            # for coarse binning even though the bin itself has partial valid
-            # overlap; the tophat below already zeroes the contribution there,
-            # but an unclipped cos blows up sqrt(1 - cos**2) into NaN, and
-            # NaN * 0 = NaN propagates through the whole matrix. Clip only for
-            # the harmonic evaluation, not for the tophat mask itself.
-            return jnp.clip(num / den, -1., 1.)
+        def cos31_cos32(triangle):
+            """Interior angles measured FROM leg 3: (3, 1) opposite leg 2, and (3, 2) opposite 1."""
 
-        def compute_measure(qs):
+            def cos_clipped(numerator, denominator):
+                # Bin centers can fall (slightly) outside the triangle inequality
+                # for coarse binning even though the bin itself has partial valid
+                # overlap; the tophat below already zeroes the contribution there,
+                # but an unclipped cos blows up sqrt(1 - cos**2) into NaN, and
+                # NaN * 0 = NaN propagates through the whole matrix. Clip only for
+                # the harmonic evaluation, not for the tophat mask itself.
+                return jnp.clip(numerator / denominator, -1., 1.)
+
+            return (cos_clipped(triangle[1]**2 - triangle[2]**2 - triangle[0]**2, 2 * triangle[2] * triangle[0]),
+                    cos_clipped(triangle[0]**2 - triangle[1]**2 - triangle[2]**2, 2 * triangle[1] * triangle[2]))
+
+        def compute_measure(triangle):
             """The thin-shell measure I_000 = pi^2 Theta(triangle) / (k1 k2 k3)."""
-            cos = (qs[2]**2 - qs[1]**2 - qs[0]**2) / (2 * qs[0] * qs[1])
+            cos = (triangle[2]**2 - triangle[1]**2 - triangle[0]**2) / (2 * triangle[0] * triangle[1])
             tophat = (jnp.abs(cos) < 1.) + 1. / 2. * (jnp.abs(cos) == 1.)
-            return np.pi**2 / prod(qs) * tophat
-
-        def compute_shape(ell, coeffs, qs):
-            r"""Reference-leg shape factor at the triangle ``qs``.
-
-            :math:`\sum_\mu c_\mu\, y_{\ell_1\mu}(\theta_{31}, 0)\, y_{\ell_2\mu_2}(\theta_{32}, 0)`
-            with ``coeffs`` from :func:`get_reference_leg_shape_coeffs`. Both interior angles are
-            measured FROM leg 3, the leg the estimator's Legendre refers to. Reduces to
-            :math:`\mathcal{L}_{\ell_2}(\cos\theta_{12})` only when :math:`L = 0`.
-
-            ``ell`` must be STATIC: get_Ylm casts its order to a Python int. Both call sites
-            (the output weight and the theory volume) therefore sit outside the per-term runner,
-            which keeps its single compilation.
-            """
-            ell1, ell2 = ell[0], ell[1]
-            # cos of the angle between legs (3, 1) -- opposite leg 2 -- and legs (3, 2), opposite leg 1
-            cos31 = _cos_safe(qs[1]**2 - qs[2]**2 - qs[0]**2, 2 * qs[2] * qs[0])
-            cos32 = _cos_safe(qs[0]**2 - qs[1]**2 - qs[2]**2, 2 * qs[1] * qs[2])
-            sin31, sin32 = jnp.sqrt(1. - cos31**2), jnp.sqrt(1. - cos32**2)
-            zero31, zero32 = jnp.zeros_like(cos31), jnp.zeros_like(cos32)
-            toret = 0.
-            for mu1, mu2, coeff in coeffs:
-                # Reduced COMPLEX harmonic at azimuth 0 is real and equals
-                # sqrt((l - m)! / (l + m)!) P_l^m -- the notes' y_lm. The real-harmonic variant is a
-                # different object (a sqrt(2) and cos/sin(m phi), the latter killing every m < 0).
-                y1 = get_Ylm(ell1, mu1, reduced=True)(sin31, zero31, cos31).real
-                y2 = get_Ylm(ell2, mu2, reduced=True)(sin32, zero32, cos32).real
-                toret = toret + coeff * y1 * y2
-            return toret
+            return np.pi**2 / prod(triangle) * tophat
 
         # ---- table-driven shape factors: ONE compilation for every term ----
-        # compute_shape above needs a STATIC (ell1, ell2, L), so using it directly costs one XLA
-        # compilation per surviving term -- 2 x 63 = 126 at ellmax = 16, which DOMINATES the run
-        # (the arithmetic itself is ~16 min for the Q000 window, the compilations far more).
-        # The fix: the shape factor is separable, sum_mu c_mu y_{l1 mu}(t31) y_{l2 mu2}(t32), and
-        # across ALL terms only (ellmax + 1)^2 distinct (ell, mu) harmonics ever appear -- 289 at
-        # ellmax = 16 against 129150 requested evaluations, a 447x redundancy. So tabulate the
-        # harmonics once per batch of evaluation points and turn each term into a traced GATHER
-        # plus a weighted sum. Orders become data, nothing is static, and one graph serves
-        # every term.
-        nharm = (ellmax_legendre + 1)**2
+        # The reference-leg shape factor sum_mu c_mu y_{l1 mu}(theta31) y_{l2 mu2}(theta32) -- both
+        # angles measured FROM leg 3, the leg the estimator's Legendre refers to -- is what the two
+        # angular factors below evaluate. Written directly it needs a STATIC (ell1, ell2, L), since
+        # get_Ylm casts its order to a Python int, and so costs one XLA compilation per surviving
+        # term -- 2 x 63 = 126 at ellmax = 16, which DOMINATES the run (the arithmetic itself is
+        # ~16 min for the Q000 window, the compilations far more).
+        # The fix: the shape factor is separable, and across ALL terms only (ellmax + 1)^2 distinct
+        # (ell, mu) harmonics ever appear -- 289 at ellmax = 16 against 129150 requested evaluations,
+        # a 447x redundancy. So tabulate the harmonics once per batch of evaluation points and turn
+        # each term into a traced GATHER plus a weighted sum. Orders become data, nothing is static,
+        # and one graph serves every term.
+        # The table comes from the recurrence rather than get_Ylm's closed forms: same values, but
+        # one scan instead of (ellmax + 1)^2 lambdified expressions unrolled into this jit (1223 vs
+        # 43033 jaxpr equations at ellmax = 16), and no high-order cancellation. Flat-indexed
+        # exactly as harmonic_index, at azimuth 0 where the reduced COMPLEX harmonic is real.
+        harmonic_table = get_Ylm_all(ellmax_legendre, reduced=True)
 
-        def _iy(ell, m):
-            """Flat index of the reduced harmonic y_{ell m} in the table below."""
-            return ell * ell + ell + m
+        def pack_shape_keys(keys):
+            r"""Pack ``[((ell1, ell2, L), [(mu1, mu2, coeff), ...]), ...]`` into rectangular arrays.
 
-        def _harm_table(cos):
-            """All y_{ell m}(theta, 0) up to ellmax_legendre, stacked on a leading axis.
+            Returns ``(index1, index2, weight)``, each ``(nkeys, nmu)``: ``index1[k, i]`` and
+            ``index2[k, i]`` are the rows of the harmonic table holding :math:`y_{\ell_1 \mu_1}`
+            and :math:`y_{\ell_2 \mu_2}` for the i-th term of the k-th key, and ``weight[k, i]``
+            is that term's coefficient.
 
-            Evaluated at azimuth 0, where the reduced COMPLEX harmonic is real and equals
-            sqrt((l - m)! / (l + m)!) P_l^m. The Python loop is unrolled ONCE into the single
-            enclosing jit -- it is not per-term work.
+            The mu-sums are ragged (1 to 2 ellmax + 1 terms, median 17 at ellmax = 16), so shorter
+            ones are padded with weight 0. That is what makes the contraction below a static loop
+            of the same length for every key -- one traced graph for the whole matrix -- at the
+            cost of gathering on padding, which is about half the rows.
             """
-            sin, zero = jnp.sqrt(1. - cos**2), jnp.zeros_like(cos)
-            # `+ zero` broadcasts: a constant harmonic (ell = 0, and any order whose lambdified
-            # expression collapses) comes back as a SCALAR, which jnp.stack rejects.
-            return jnp.stack([get_Ylm(ell, m, reduced=True)(sin, zero, cos).real + zero
-                              for ell in range(ellmax_legendre + 1) for m in range(-ell, ell + 1)])
+            def harmonic_index(ell, m):
+                """Flat index of the reduced harmonic y_{ell m} in the table below."""
+                return ell * ell + ell + m
 
-        def _pack_keys(keys):
-            """Pad a list of (ell_triple, coeffs) into (i1, i2, w) index/weight arrays.
-
-            Rows are padded with weight 0 to the longest mu-sum, so every key costs the same and
-            the contraction below is a fixed-length static loop.
-            """
             maxlen = max([1] + [len(coeffs) for _, coeffs in keys])
-            i1 = np.zeros((len(keys), maxlen), dtype=np.int32)
-            i2 = np.zeros_like(i1)
-            w = np.zeros((len(keys), maxlen))
-            for k, (ell, coeffs) in enumerate(keys):
-                for j, (mu1, mu2, coeff) in enumerate(coeffs):
-                    i1[k, j], i2[k, j], w[k, j] = _iy(ell[0], mu1), _iy(ell[1], mu2), coeff
-            return jnp.asarray(i1), jnp.asarray(i2), jnp.asarray(w)
+            index1 = np.zeros((len(keys), maxlen), dtype=np.int32)
+            index2 = np.zeros_like(index1)
+            weight = np.zeros((len(keys), maxlen))
+            for ikey, (ell, coeffs) in enumerate(keys):
+                for imu, (mu1, mu2, coeff) in enumerate(coeffs):
+                    index1[ikey, imu] = harmonic_index(ell[0], mu1)
+                    index2[ikey, imu] = harmonic_index(ell[1], mu2)
+                    weight[ikey, imu] = coeff
+            return jnp.asarray(index1), jnp.asarray(index2), jnp.asarray(weight)
 
-        def _shape_from_table(t1, t2, i1, i2, w):
-            """Shape factors for EVERY key at once: (nkeys, ...) from tables (nharm, ...)."""
+        def shape_from_tables(table1, table2, index1, index2, weight):
+            r"""Shape factor of every packed key at once.
+
+            Evaluates :math:`\sum_\mu c_\mu y_{\ell_1 \mu_1}(\theta_{31}) y_{\ell_2 \mu_2}(\theta_{32})`
+            for each key, by reading the two harmonic tables -- ``(nharm,) + point_shape``, from
+            :func:`~jaxpower.utils.get_Ylm_all`, one evaluated at each of the two angles
+            -- at the rows :func:`pack_shape_keys` recorded. Returns ``(nkeys,) + point_shape``.
+
+            Accumulated one mu-term at a time rather than as a single ``(nkeys, nmu) + point_shape``
+            tensor summed over mu: the tables are already the largest arrays here (why the
+            theory-side factor is chunked over bins at all), and this way nothing bigger than one
+            term's worth of them is ever live.
+            """
+            expand = (slice(None),) + (None,) * (table1.ndim - 1)   # weight broadcasts over the points
             toret = 0.
-            for j in range(i1.shape[1]):   # static, = longest mu-sum; each step is a gather
-                ex = (slice(None),) + (None,) * (t1.ndim - 1)
-                toret = toret + w[:, j][ex] * t1[i1[:, j]] * t2[i2[:, j]]
+            for imu in range(index1.shape[1]):   # static, = longest mu-sum; each step is a gather
+                toret = toret + weight[:, imu][expand] * table1[index1[:, imu]] * table2[index2[:, imu]]
             return toret
-
-        def _cos31_cos32(qs):
-            """Interior angles measured FROM leg 3: (3, 1) opposite leg 2, and (3, 2) opposite 1."""
-            return (_cos_safe(qs[1]**2 - qs[2]**2 - qs[0]**2, 2 * qs[2] * qs[0]),
-                    _cos_safe(qs[0]**2 - qs[1]**2 - qs[2]**2, 2 * qs[1] * qs[2]))
 
         # Theory-side quadrature nodes. Built unconditionally: the k1', k2' legs are now integrated
         # by the same rule (see the quadrature block below), so ninsub = 1 must still give a node.
         from .pt import integration
-        _integ_in = integration(-1., 1., size=max(int(ninsub), 1))
-        _u_in, _wu_in = jnp.asarray(_integ_in.x()), jnp.asarray(_integ_in.w)
+        integ_in = integration(-1., 1., size=max(int(ninsub), 1))
+        nodes_in, weights_in = jnp.asarray(integ_in.x()), jnp.asarray(integ_in.w)
 
         # OUTPUT-side bin averaging (ms.tex caveat (ii) on eq:scoccimarro_window_matrix_explicit:
         # "average the (k1, k2, k3) dependence over the bin"). The theory side does this via
@@ -2015,354 +1964,271 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # single representative triangle bin.xavg is NOT the bin average. Since
         # d cos(theta12) / d k3 = k3 / (k1 k2), a SHORT leg makes cos(theta12) sweep the bin:
         # measured, L_2 at the midpoint is +20% off its bin average for (0.033, 0.071, 0.071)
-        # and +40% for (0.033, 0.033, 0.033), but only ~1% for (0.110, 0.071, 0.071). That
-        # shape dependence -- large for squeezed ISOSCELES, small for squeezed scalene or for
-        # equal-but-short legs -- is exactly the pattern of the box-limit residual.
-        # The bin average is the ratio of bin-integrated measures, all three legs sub-binned.
+        # and +40% for (0.033, 0.033, 0.033), but only ~1% for (0.110, 0.071, 0.071).
+        # Shape dependence -- large for squeezed ISOSCELES, small for squeezed scalene or for
+        # equal-but-short legs.
         # Theory-side primitive is the sharp tophat: it tiles the bins exactly, which the
         # box-limit sum rule requires, and it measured BETTER than the smooth spline basis
-        # The output side is the noutsub bin average below. `rebin` -- a k^2-weighted average over
-        # (k1, k2) only, leaving the angular factor at the bin's representative triangle --
-        # survives solely as the noutsub = 1 fallback, and is why noutsub = 1 is not recommended.
-        _sc_spline = None
+        # The output side is the noutsub bin average below, and it is not optional here: leaving
+        # the angular factor at the bin's representative triangle is what noutsub exists to fix.
+        if noutsub < 2:
+            raise ValueError('the scoccimarro basis requires noutsub >= 2: its output-side angular '
+                             'factor varies too fast across a bin to be taken at the bin centre')
+        edges_out = np.asarray(bin.edges)                                   # (nout, 3, 2)
+        # per-leg bounds, so the rule comes back mapped onto each bin: (nout, 3, noutsub)
+        integ_out = integration(edges_out[..., :1], edges_out[..., 1:], size=noutsub)
+        nodes_out, weights_out = np.asarray(integ_out.x()), np.asarray(integ_out.w)
+        # every (i1, i2, i3) combination of the three legs' sub-nodes
+        subindex = np.stack(np.meshgrid(*[np.arange(noutsub)] * 3, indexing='ij'), axis=-1).reshape(-1, 3)
+        ksub_out = np.stack([nodes_out[:, leg, subindex[:, leg]] for leg in range(3)], axis=-1)   # (nout, nsub, 3)
+        wsub_out = np.prod(np.stack([weights_out[:, leg, subindex[:, leg]] for leg in range(3)], axis=-1), axis=-1)
+        # measure weight ~ k1^2 k2^2 k3^2 (the Theta triangle factor comes from compute_measure)
+        wsub_out = wsub_out * np.prod(ksub_out**2, axis=-1)                      # (nout, nsub)
+        nsub_out = subindex.shape[0]
+        kout_sub = jnp.asarray(ksub_out.reshape(-1, 3))
+        kout_weight = jnp.asarray(wsub_out)
+        # `read` below is called with `to_spectrum.k`, a 2-tuple, so its `zip(k, kout)`
+        # consumes the k1 and k2 columns ONLY -- the k3 sub-index never reaches the gather.
+        # Of the noutsub^3 sub-points, only noutsub^2 are therefore distinct as far as the
+        # interpolation is concerned, and gathering all of them repeats identical work
+        # noutsub times. `subindex` orders the (k1, k2, k3) sub-indices with the k3 one fastest, so the i3 = 0 slice
+        # ::noutsub enumerates the distinct (k1, k2) pairs. Measured end-to-end (scoccimarro,
+        # wcoords=256, ellmax=2): 1.26x at noutsub=16 and ~1.03x at noutsub=8, the gain
+        # growing with noutsub.
+        kout_sub12 = jnp.asarray(ksub_out[:, ::noutsub, :2].reshape(-1, 2))   # (nout * noutsub^2, 2)
+        nsub12 = noutsub**2
 
-        if noutsub > 1:
-            from .pt import integration as _integration_out
-            _integ_out = _integration_out(-1., 1., size=noutsub)
-            _u_out, _wu_out = np.asarray(_integ_out.x()), np.asarray(_integ_out.w)
-            _oe = np.asarray(bin.edges)                                     # (nout, 3, 2)
-            _lo, _hi = _oe[..., 0], _oe[..., 1]                             # (nout, 3)
-            _mid = 0.5 * (_hi - _lo)[..., None] * (_u_out[None, None] + 1.) + _lo[..., None]
-            _jac = 0.5 * (_hi - _lo)[..., None] * _wu_out[None, None]
-            _g = np.stack(np.meshgrid(*[np.arange(noutsub)] * 3, indexing='ij'), axis=-1).reshape(-1, 3)
-            _ksub = np.stack([_mid[:, j, _g[:, j]] for j in range(3)], axis=-1)   # (nout, nsub, 3)
-            _wsub = np.prod(np.stack([_jac[:, j, _g[:, j]] for j in range(3)], axis=-1), axis=-1)
-            # measure weight ~ k1^2 k2^2 k3^2 (the Theta triangle factor comes from compute_measure)
-            _wsub = _wsub * np.prod(_ksub**2, axis=-1)                      # (nout, nsub)
-            nout_sub = _g.shape[0]
-            kout_sub = jnp.asarray(_ksub.reshape(-1, 3))
-            kout_weight = jnp.asarray(_wsub)
-            # `read` below is called with `to_spectrum.k`, a 2-tuple, so its `zip(k, kout)`
-            # consumes the k1 and k2 columns ONLY -- the k3 sub-index never reaches the gather.
-            # Of the noutsub^3 sub-points, only noutsub^2 are therefore distinct as far as the
-            # interpolation is concerned, and gathering all of them repeats identical work
-            # noutsub times. `_g` orders (i1, i2, i3) with i3 fastest, so the i3 = 0 slice
-            # ::noutsub enumerates the distinct (k1, k2) pairs. Measured end-to-end (scoccimarro,
-            # wcoords=256, ellmax=2): 1.26x at noutsub=16 and ~1.03x at noutsub=8, the gain
-            # growing with noutsub.
-            kout_sub12 = jnp.asarray(_ksub[:, ::noutsub, :2].reshape(-1, 2))   # (nout * noutsub^2, 2)
-            n_sub12 = noutsub**2
+        # These weights are pure setup, but they run OUTSIDE jax.lax.map, i.e. eagerly, where
+        # every primitive pays its own XLA compilation. The measure and shape factor together
+        # are ~25 primitives, so left bare this costs ~25 compilations per term and the term
+        # count grows as 4 * ellmax - 1. Under a single jit it is one compilation each instead.
+        # Table-driven and computed for EVERY term at once, so this is a single compilation
+        # rather than one per term (see harmonic_table above).
+        @jax.jit
+        def compute_out_weights(index1, index2, weight):
+            triangle = kout_sub.T
+            cos31, cos32 = cos31_cos32(triangle)
+            shape = shape_from_tables(harmonic_table(cos31), harmonic_table(cos32), index1, index2, weight)
+            numerator = kout_weight[None] * (compute_measure(triangle)[None] * shape).reshape(len(index1), -1, nsub_out)
+            return numerator.reshape(len(index1), -1, nsub12, noutsub).sum(axis=-1)
 
-            # These weights are pure setup, but they run OUTSIDE jax.lax.map, i.e. eagerly, where
-            # every primitive pays its own XLA compilation. The measure and shape factor together
-            # are ~25 primitives, so left bare this costs ~25 compilations per term and the term
-            # count grows as 4 * ellmax - 1. Under a single jit it is one compilation each instead.
-            # Table-driven and computed for EVERY term at once, so this is a single compilation
-            # rather than one per term (see _harm_table above).
-            @jax.jit
-            def _out_weights_all(i1, i2, w):
-                qs = kout_sub.T
-                cos31, cos32 = _cos31_cos32(qs)
-                shape = _shape_from_table(_harm_table(cos31), _harm_table(cos32), i1, i2, w)
-                num = kout_weight[None] * (compute_measure(qs)[None] * shape).reshape(len(i1), -1, nout_sub)
-                return num.reshape(len(i1), -1, n_sub12, noutsub).sum(axis=-1)
+        # The denominator is independent of BOTH the theory bin and the term, so it is built once
+        # here. Left eager, unlike the weights above: it is a handful of primitives, not the ~25
+        # per term that make the eager compilation worth avoiding.
+        out_denominator = jnp.sum(kout_weight * compute_measure(kout_sub.T).reshape(-1, nsub_out), axis=-1)
+        out_denominator = jnp.where(out_denominator == 0., 1., out_denominator)
 
-            @jax.jit
-            def _out_den(kout_sub, kout_weight):
-                den = jnp.sum(kout_weight * compute_measure(kout_sub.T).reshape(-1, nout_sub), axis=-1)
-                return jnp.where(den == 0., 1., den)
+        # Theory-side quadrature nodes on the k1', k2' legs, mirroring the k3' ones. The theory
+        # bin's contribution is
+        #   int_bin dk1' k1'^2 j_{l1'}(k1' r1) int_bin dk2' k2'^2 j_{l2'}(k2' r2) volume(k1', k2')
+        # which for ONE bin is just the (bin-integrated) Bessel functions -- there is no need to
+        # build a tophat on the full FFTlog k-grid and transform it. Evaluating it directly is
+        # both far cheaper (`volume` costs ninsub^3 points instead of the whole n1 x n2 x ninsub
+        # grid, of which the tophat discards all but a handful) and MORE accurate: the tophat
+        # snaps the bin edges onto the log k-grid, so the integral it performs is over a
+        # quantized bin. Measured against Gauss-Legendre quadrature, the snapped bin agrees to
+        # ~0.1% but the TRUE bin differs by 2-20%, and refining the grid does not converge it
+        # smoothly -- the effective bin width jitters with where the edges land.
+        s_window = tuple(next(iter(window)).coords().values())
 
-            # denominator is independent of BOTH the theory bin and the term: hoist it entirely
-            _den_out = _out_den(kout_sub, kout_weight)
+        # Spherical Bessel table, PRECOMPUTED over the distinct 1D theory bins.
+        # Evaluating get_spherical_jn_all inside the per-bin map recomputed an IDENTICAL table for each of the
+        # 4 * ellmax - 1 terms (it depends on the bin's nodes and the fixed r grid, not on the
+        # term), and recomputed it per theory bin although the axis-d nodes depend only on that
+        # axis's 1D bin -- of which there are ~n^(1/3) as many. Both redundancies are removed by
+        # tabulating the distinct 1D bins up front and gathering (order, bin) below.
+        bessel_index, bessel_table = [], []
+        for leg in range(2):
+            edges_1d, index_1d = np.unique(np.asarray(edgesin)[:, leg, :], axis=0, return_inverse=True)
+            k_lo, k_hi = jnp.asarray(edges_1d[:, 0]), jnp.asarray(edges_1d[:, 1])
+            k_nodes = k_lo[:, None] + 0.5 * (k_hi - k_lo)[:, None] * (nodes_in[None, :] + 1.)   # (nbin1d, nquad)
+            # (ellmax + 1, nbin1d, nquad, n_r)
+            bessel_table.append(spherical_jn_all(k_nodes[..., None] * s_window[leg][None, None, :]))
+            bessel_index.append(jnp.asarray(index_1d.ravel()))
 
-            # Theory-side quadrature nodes on the k1', k2' legs, mirroring the k3' ones. The theory
-            # bin's contribution is
-            #   int_bin dk1' k1'^2 j_{l1'}(k1' r1) int_bin dk2' k2'^2 j_{l2'}(k2' r2) volume(k1', k2')
-            # which for ONE bin is just the (bin-integrated) Bessel functions -- there is no need to
-            # build a tophat on the full FFTlog k-grid and transform it. Evaluating it directly is
-            # both far cheaper (`volume` costs ninsub^3 points instead of the whole n1 x n2 x ninsub
-            # grid, of which the tophat discards all but a handful) and MORE accurate: the tophat
-            # snaps the bin edges onto the log k-grid, so the integral it performs is over a
-            # quantized bin. Measured against Gauss-Legendre quadrature, the snapped bin agrees to
-            # ~0.1% but the TRUE bin differs by 2-20%, and refining the grid does not converge it
-            # smoothly -- the effective bin width jitters with where the edges land.
-            _u_q, _wu_q = _u_in, _wu_in
+        def bessel_row(ell, table, index_bin):
+            """j_ell at the bin's quadrature nodes, gathered from the precomputed table."""
+            return table[ell, index_bin]
 
-            _rwin = tuple(next(iter(window)).coords().values())
+        def in_nodes(index_bin, leg, nodes_unit, weights_unit):
+            """Gauss-Legendre nodes and weights on ``leg`` of theory bin ``index_bin``."""
+            k_lo, k_hi = edgesin[index_bin, leg, 0], edgesin[index_bin, leg, 1]
+            return k_lo + 0.5 * (k_hi - k_lo) * (nodes_unit + 1.), 0.5 * (k_hi - k_lo) * weights_unit
 
-            # Spherical Bessel table, PRECOMPUTED over the distinct 1D theory bins.
-            # get_spherical_jn indexes a Python dict (static order) and only reaches ell = 10, where
-            # its closed form has already lost all precision to cancellation; get_spherical_jn_all
-            # returns every order in one stable pass, so the order can stay traced.
-            # Evaluating it inside the per-bin map recomputed an IDENTICAL table for each of the
-            # 4 * ellmax - 1 terms (it depends on the bin's nodes and the fixed r grid, not on the
-            # term), and recomputed it per theory bin although the axis-d nodes depend only on that
-            # axis's 1D bin -- of which there are ~n^(1/3) as many. Both redundancies are removed by
-            # tabulating the distinct 1D bins up front and gathering (order, bin) below.
-            _bessel_index, _bessel_table = [], []
-            for d in range(2):
-                edges1d, inv = np.unique(np.asarray(edgesin)[:, d, :], axis=0, return_inverse=True)
-                lo, hi = jnp.asarray(edges1d[:, 0]), jnp.asarray(edges1d[:, 1])
-                kq = lo[:, None] + 0.5 * (hi - lo)[:, None] * (_u_in[None, :] + 1.)   # (nbin1d, nquad)
-                # (ellmax + 1, nbin1d, nquad, n_r)
-                _bessel_table.append(_jn_all_tab(kq[..., None] * _rwin[d][None, None, :]))
-                _bessel_index.append(jnp.asarray(inv.ravel()))
+        # Theory-side angular factor, for ALL theory bins AND all terms at once. Chunked over
+        # bins by lax.map: the harmonic table is (nharm, nquad, nquad, ninsub) per bin, so
+        # materializing it for every bin at once would be ~12 GB at ellmax = 16, while a batch
+        # of it is tens of MB. The result is (nbin, nkeys, nquad, nquad) -- 274 MB at 8511 bins,
+        # 63 keys and ninsub = 8 -- and replaces one jitted graph per term with exactly one.
+        @jax.jit
+        def compute_in_volume(index1, index2, weight):
+            def volume_one_bin(index_bin):
+                # Gauss-Legendre nodes on all three theory legs. The k3' integral is the
+                # measure factor (I ~ (k1 k2 k3)^-1 Theta Sigma is rapidly varying AND
+                # discontinuous, so its point value is not the bin average -- that breaks
+                # the box-limit sum rule by tens of per cent); the k1', k2' ones replace
+                # the tophat, which quantized the bin onto the log k-grid.
+                k1_nodes, _ = in_nodes(index_bin, 0, nodes_in, weights_in)
+                k2_nodes, _ = in_nodes(index_bin, 1, nodes_in, weights_in)
+                k3_nodes, k3_weights = in_nodes(index_bin, 2, nodes_in, weights_in)
+                triangle = (k1_nodes[:, None, None], k2_nodes[None, :, None], k3_nodes[None, None, :])
+                cos31, cos32 = cos31_cos32(triangle)
+                shape = shape_from_tables(harmonic_table(cos31), harmonic_table(cos32), index1, index2, weight)
+                measure = k3_weights * triangle[2]**2 / (2. * jnp.pi**2) * compute_measure(triangle)
+                # (nkeys, nquad, nquad): the measure integrated over k3', at the k1', k2' nodes
+                return jnp.sum(measure[None] * shape, axis=-1)
 
-            def _bessel_row(ell, table, ibin):
-                """j_ell at the bin's quadrature nodes, gathered from the precomputed table."""
-                return table[ell, ibin]
+            return jax.lax.map(volume_one_bin, jnp.arange(edgesin.shape[0]), batch_size=batch_size)
 
-            def _in_nodes(idx, d, u, wu):
-                """Gauss-Legendre nodes and weights on leg ``d`` of theory bin ``idx``."""
-                lo, hi = edgesin[idx, d, 0], edgesin[idx, d, 1]
-                return lo + 0.5 * (hi - lo) * (u + 1.), 0.5 * (hi - lo) * wu
+        # ONE compilation for all 4 * ellmax - 1 TripoSH terms. Everything that varies between
+        # terms -- the two FFTlog transforms, the window combination Qs, the output weights, the
+        # theory volume and the multipole orders -- is passed as a TRACED argument. Captured as
+        # closure constants instead (as this used to be), each term's FFTlog kernels are baked
+        # into the graph as literals, so every term lowers to a different HLO module and
+        # recompiles: at ellmax = 16 that is 63 compilations of a 2D-FFTlog scan body.
+        # Note this relies on FFTlog treedefs comparing EQUAL across orders, i.e. on the value
+        # equality of BaseFFTEngine -- with identity comparison jit retraces regardless.
+        # `wain` is the only thing that must stay static -- it is an exponent of the separations --
+        # so it is jit's static argument and jit's own cache holds one compilation per wide-angle
+        # order. (Both angular factors, the only users of the static-order get_Ylm, are precomputed
+        # above, so m_in no longer reaches the runner and the orders are always traced.)
+        @partial(jax.jit, static_argnums=(0,))
+        def run_term(wain, to_spectrum, Qs, out_weight, ell1_theory, ell2_theory, bessel_table1, bessel_table2, volume_in):
 
-            # Theory-side angular factor, for ALL theory bins AND all terms at once. Chunked over
-            # bins by lax.map: the harmonic table is (nharm, nquad, nquad, ninsub) per bin, so
-            # materializing it for every bin at once would be ~12 GB at ellmax = 16, while a batch
-            # of it is tens of MB. The result is (nbin, nkeys, nquad, nquad) -- 274 MB at 8511 bins,
-            # 63 keys and ninsub = 8 -- and replaces one jitted graph per term with exactly one.
-            @jax.jit
-            def _in_volume_all(i1, i2, w):
-                def one(idx):
-                    # Gauss-Legendre nodes on all three theory legs. The k3' integral is the
-                    # measure factor (I ~ (k1 k2 k3)^-1 Theta Sigma is rapidly varying AND
-                    # discontinuous, so its point value is not the bin average -- that breaks
-                    # the box-limit sum rule by tens of per cent); the k1', k2' ones replace
-                    # the tophat, which quantized the bin onto the log k-grid.
-                    ka, _ = _in_nodes(idx, 0, _u_q, _wu_q)
-                    kb, _ = _in_nodes(idx, 1, _u_q, _wu_q)
-                    k3n, w3n = _in_nodes(idx, 2, _u_in, _wu_in)
-                    qs = (ka[:, None, None], kb[None, :, None], k3n[None, None, :])
-                    cos31, cos32 = _cos31_cos32(qs)
-                    shape = _shape_from_table(_harm_table(cos31), _harm_table(cos32), i1, i2, w)
-                    meas = w3n * qs[2]**2 / (2. * jnp.pi**2) * compute_measure(qs)
-                    # (nkeys, nquad, nquad): the measure integrated over k3', at the k1', k2' nodes
-                    return jnp.sum(meas[None] * shape, axis=-1)
+            # depends on (kout_sub12, to_spectrum.k) -- constant across theory bins, so the
+            # searchsorted runs once per term here instead of once per (term, bin)
+            read_index_sub = read_index(kout_sub12.T, to_spectrum.k)
 
-                return jax.lax.map(one, jnp.arange(edgesin.shape[0]), batch_size=batch_size)
+            def convolve(index_bin):
+                k1_nodes, k1_weights = in_nodes(index_bin, 0, nodes_in, weights_in)
+                k2_nodes, k2_weights = in_nodes(index_bin, 1, nodes_in, weights_in)
+                # Theory side: \int_{bin} k_3'^2 dk_3' / (2 pi^2) x I_000(k') Sigma^(3)_{l1' l2' L' M'},
+                # precomputed for every bin by compute_in_volume above
+                theory_weight = ((k1_weights * k1_nodes**2)[:, None] * (k2_weights * k2_nodes**2)[None, :]
+                                 * volume_in[index_bin])
+                # Per-axis FFTlog convention: (-i)^ell / (2 pi^2), which for a real input is
+                # (-1)^(ell // 2) / (2 pi^2) at both parities (odd poles carry the imaginary part).
+                phase1 = (1 - 2 * ((ell1_theory // 2) % 2)) / (2. * jnp.pi**2)
+                phase2 = (1 - 2 * ((ell2_theory // 2) % 2)) / (2. * jnp.pi**2)
+                bessel1 = phase1 * bessel_row(ell1_theory, bessel_table1, bessel_index[0][index_bin])   # (nquad, n_r1)
+                bessel2 = phase2 * bessel_row(ell2_theory, bessel_table2, bessel_index[1][index_bin])   # (nquad, n_r2)
+                # sum_ab theory_weight[a, b] bessel1[a, r] bessel2[b, s], as two small GEMMs rather
+                # than a 2D FFTlog -- this is what the first transform used to do
+                correlation = bessel1.T @ (theory_weight @ bessel2)
+                correlation = correlation * Qs * s_window[0][:, None]**wain[0] * s_window[1][None, :]**wain[1]
+                # Estimator side: B_L(k1, k2, k3) = sum_{ell_1 ell_2} S^(3)_{ell_1 ell_2 L} B_{ell_1 ell_2 L}(k1, k2).
+                # The full 3-D output-bin average: all three legs sub-binned, weighted by
+                # k1^2 k2^2 k3^2 and the I_000 triangle measure. The (ell_1, ell_2, L)
+                # dependence is already folded into out_weight, hence no shape factor here.
+                # bin average = sum_sub w k^2 I_000 S^(3) read  /  sum_sub w k^2 I_000,
+                # with the gather done on the distinct (k1, k2) sub-points only
+                read_sub = read_apply(read_index_sub, to_spectrum(correlation)[1])
+                numerator = jnp.sum(out_weight * read_sub.reshape(-1, nsub12), axis=-1)
+                spectrum = numerator / out_denominator
+                # compute_measure(kout) = pi^2/(k1 k2 k3) * Theta vanishes on output
+                # bins whose representative triangle violates the triangle
+                # inequality, so this division is 0/0 there and leaves NaN in
+                # those rows.
+                # Harmless in itself -- those bins are unphysical -- but a NaN
+                # in the matrix poisons any downstream dot product for a caller
+                # who does not mask, so return 0 as the grid branch does.
+                return jnp.nan_to_num(spectrum)
 
-            # ONE compilation for all 4 * ellmax - 1 TripoSH terms. Everything that varies between
-            # terms -- the two FFTlog transforms, the window combination Qs, the output weights, the
-            # theory volume and the multipole orders -- is passed as a TRACED argument. Captured as
-            # closure constants instead (as this used to be), each term's FFTlog kernels are baked
-            # into the graph as literals, so every term lowers to a different HLO module and
-            # recompiles: at ellmax = 16 that is 63 compilations of a 2D-FFTlog scan body.
-            # Note this relies on FFTlog treedefs comparing EQUAL across orders, i.e. on the value
-            # equality of BaseFFTEngine -- with identity comparison jit retraces regardless.
-            # Runners are cached per wain, the only thing that must stay static. (Both angular
-            # factors, the only users of the static-order get_Ylm, are now precomputed above, so
-            # m_in no longer reaches the runner and the orders are always traced.)
-            _term_runners = {}
-
-            def _get_term_runner(wain):
-                key = wain
-                if key in _term_runners: return _term_runners[key]
-
-                @jax.jit
-                def run(to_spectrum, Qs, wI_out, ell1t, ell2t, tab1, tab2, volume_in):
-
-                    # depends on (kout_sub12, to_spectrum.k) -- constant across theory bins, so the
-                    # searchsorted runs once per term here instead of once per (term, bin)
-                    rindex = read_index(kout_sub12.T, to_spectrum.k)
-
-                    def convolve(idx):
-                        ka, wa = _in_nodes(idx, 0, _u_q, _wu_q)
-                        kb, wb = _in_nodes(idx, 1, _u_q, _wu_q)
-                        # Theory side: \int_{bin} k_3'^2 dk_3' / (2 pi^2) x I_000(k') Sigma^(3)_{l1' l2' L' M'},
-                        # precomputed for every bin by _in_volume above
-                        coef = (wa * ka**2)[:, None] * (wb * kb**2)[None, :] * volume_in[idx]
-                        # Per-axis FFTlog convention: (-i)^ell / (2 pi^2), which for a real input is
-                        # (-1)^(ell // 2) / (2 pi^2) at both parities (odd poles carry the imaginary part).
-                        c1 = (1 - 2 * ((ell1t // 2) % 2)) / (2. * jnp.pi**2)
-                        c2 = (1 - 2 * ((ell2t // 2) % 2)) / (2. * jnp.pi**2)
-                        j1 = c1 * _bessel_row(ell1t, tab1, _bessel_index[0][idx])   # (nquad, n_r1)
-                        j2 = c2 * _bessel_row(ell2t, tab2, _bessel_index[1][idx])   # (nquad, n_r2)
-                        # sum_ab coef[a, b] j1[a, r] j2[b, s], contracted as two small GEMMs rather
-                        # than a 2D FFTlog -- this is what the first transform used to do
-                        correlation = j1.T @ (coef @ j2)
-                        correlation = correlation * Qs * _rwin[0][:, None]**wain[0] * _rwin[1][None, :]**wain[1]
-                        # Estimator side: B_L(k1, k2, k3) = sum_{ell_1 ell_2} S^(3)_{ell_1 ell_2 L} B_{ell_1 ell_2 L}(k1, k2).
-                        # The full 3-D output-bin average: all three legs sub-binned, weighted by
-                        # k1^2 k2^2 k3^2 and the I_000 triangle measure. The (ell_1, ell_2, L)
-                        # dependence is already folded into wI_out, hence no shape factor here.
-                        # bin average = sum_sub w k^2 I_000 S^(3) read  /  sum_sub w k^2 I_000,
-                        # with the gather done on the distinct (k1, k2) sub-points only
-                        sub = read_apply(rindex, to_spectrum(correlation)[1])
-                        num = jnp.sum(wI_out * sub.reshape(-1, n_sub12), axis=-1)
-                        spectrum = num / _den_out
-                        # compute_measure(kout) = pi^2/(k1 k2 k3) * Theta vanishes on output
-                        # bins whose representative triangle violates the triangle
-                        # inequality, so this division is 0/0 there and leaves NaN in
-                        # those rows.
-                        # Harmless in itself -- those bins are unphysical -- but a NaN
-                        # in the matrix poisons any downstream dot product for a caller
-                        # who does not mask, so return 0 as the grid branch does.
-                        return jnp.nan_to_num(spectrum)
-
-                    return jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
-
-                _term_runners[key] = run
-                return run
+            return jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
         # Count the SURVIVING terms up front (a pure-Python label lookup, no device work), so the bar
         # measures what is actually run: of the (ellmax + 1)^2 terms per block only ~4 * ellmax - 1
         # read a multipole `window` carries, the rest contributing exactly zero.
-        _t = make_pbar(sum(any(has_w_rect(q, wain_) for q, _ in wc)
-                           for ellin_, wain_ in ellsin for ell_ in ells
-                           for _, _, wc in get_scoccimarro_window_convolution_coeffs(ell_, ellin_, ellmax=ellmax)))
+        progress = make_pbar(sum(any(has_w_rect(q, wain_key) for q, _ in wcoeffs_key)
+                                 for ellin_key, wain_key in ellsin for ell_key in ells
+                                 for _, _, wcoeffs_key in get_scoccimarro_window_convolution_coeffs(ell_key, ellin_key, ellmax=ellmax)))
 
         # Enumerate the DISTINCT angular keys over every surviving term, so both tables are built
         # once for the whole matrix instead of once per term. Many terms share a key: at ellmax = 16
         # the ellwmax = 2 window has 827 surviving terms but only 63 distinct theory-side keys.
-        if noutsub > 1:
-            _keys_out, _keys_in = {}, {}
-            for ellin_, wain_ in ellsin:
-                m_in_ = ellin_[1] if isinstance(ellin_, tuple) else 0
-                for ell_ in ells:
-                    for se, st, wc in get_scoccimarro_window_convolution_coeffs(ell_, ellin_, ellmax=ellmax):
-                        if not any(has_w_rect(q, wain_) for q, _ in wc): continue
-                        _keys_out.setdefault(se, get_reference_leg_shape_coeffs(se))
-                        # m = M', the third 3j slot: the mu = 0 term of Sigma^(3) is exactly the old
-                        # 3j (l1', l2', L'; 0, -M', M') times y_{l2'}^{-M'}
-                        _keys_in.setdefault((st, m_in_),
-                                            get_reference_leg_shape_coeffs(st, m=m_in_, normalize=False))
-            _iout = {k: i for i, k in enumerate(_keys_out)}
-            _iin = {k: i for i, k in enumerate(_keys_in)}
-            _wI_out_all = _out_weights_all(*_pack_keys([(k, v) for k, v in _keys_out.items()]))
-            _volume_in_all = _in_volume_all(*_pack_keys([(k[0], v) for k, v in _keys_in.items()]))
+        keys_out, keys_in = {}, {}
+        for ellin_key, wain_key in ellsin:
+            m_in_key = ellin_key[1] if isinstance(ellin_key, tuple) else 0
+            for ell_key in ells:
+                coeffs_key = get_scoccimarro_window_convolution_coeffs(ell_key, ellin_key, ellmax=ellmax)
+                for ell_out_key, ell_theory_key, wcoeffs_key in coeffs_key:
+                    if not any(has_w_rect(q, wain_key) for q, _ in wcoeffs_key): continue
+                    keys_out.setdefault(ell_out_key, get_scoccimarro_los_coeffs(ell_out_key))
+                    # m = M', the third 3j slot: the mu = 0 term of Sigma^(3) is exactly the old
+                    # 3j (l1', l2', L'; 0, -M', M') times y_{l2'}^{-M'}
+                    keys_in.setdefault((ell_theory_key, m_in_key),
+                                       get_scoccimarro_los_coeffs(ell_theory_key, m=m_in_key, normalize=False))
+        index_of_key_out = {k: i for i, k in enumerate(keys_out)}
+        index_of_key_in = {k: i for i, k in enumerate(keys_in)}
+        out_weights_all = compute_out_weights(*pack_shape_keys(list(keys_out.items())))
+        volume_in_all = compute_in_volume(*pack_shape_keys([(ell, coeffs) for (ell, m), coeffs in keys_in.items()]))
 
         for ellin, wain in ellsin:  # ellin = L' or (L', M'), wain wide-angle order
             wmat_tmp[ellin, wain] = []
             m_in = ellin[1] if isinstance(ellin, tuple) else 0  # M'
-            for ill, ell in enumerate(ells):  # ell = L
+            for ell in ells:  # ell = L
 
                 # Then sum over \ell_1, \ell_2, \ell_1', \ell_2', \ell_1'', \ell_2'', L''
-                tmp = jnp.zeros(shape=(len(kout), len(edgesin)))
+                block = jnp.zeros(shape=(len(kout), len(edgesin)))
 
-                for sugiyama_ell, sugiyama_ellt, wcoeffs in get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=ellmax):
+                coeffs = get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=ellmax)
+                for sugiyama_ell_out, sugiyama_ell_theory, wcoeffs in coeffs:
+                    # Skip terms whose window multipoles are ALL absent from `window`: they
+                    # contribute exactly nothing -- yet each would otherwise pay a full pass per
+                    # theory bin. This is the bulk of the cost at low ellwmax: the term count grows
+                    # as (ellmax + 1)^2 per (ell <- ellin) block while only ~(ellmax + 1) terms
+                    # have a non-zero window, so 67% (ellmax=2) to 89% (ellmax=8) of the work is
+                    # wasted. Absent multipoles are already treated as zero downstream, so this
+                    # changes no result -- only the runtime, from O(ellmax^2) to O(ellmax).
+                    # The SAME predicate feeds the progress bar and the key enumeration above, so
+                    # the three cannot disagree about which terms exist.
+                    if not any(has_w_rect(q, wain) for q, _ in wcoeffs): continue
                     Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
-                    # Skip terms whose window multipoles are ALL absent from `window`: get_w_rect
-                    # returns a 0-d zero for each, so Qs stays 0-d and the term contributes exactly
-                    # nothing -- yet it would otherwise pay a full 2D-FFTlog pair per theory bin.
-                    # This is the bulk of the cost at low ellwmax: the term count grows as
-                    # (ellmax + 1)^2 per (ell <- ellin) block while only ~(ellmax + 1) terms have a
-                    # non-zero window, so 67% (ellmax=2) to 89% (ellmax=8) of the work is wasted.
-                    # Absent multipoles are already treated as zero downstream, so this changes no
-                    # result -- only the runtime, from O(ellmax^2) to O(ellmax).
-                    if np.ndim(Qs) == 0: continue
                     # fftlog
                     # lowring=False, xy=1: align the two transforms' grids EXACTLY. With the
                     # default lowring=True each Bessel kernel picks its own low-ringing offset
-                    # lnxy, so whenever the forward (theory, sugiyama_ellt) and backward
-                    # (output, sugiyama_ell) orders differ -- most terms here -- the forward
+                    # lnxy, so whenever the forward (theory, sugiyama_ell_theory) and backward
+                    # (output, sugiyama_ell_out) orders differ -- most terms here -- the forward
                     # transform's output grid is shifted by up to one spacing from the grid the
-                    # window is multiplied on. Measured on the LRG window (1D isolation, vs
-                    # quadrature): 7-40% error on the mismatched-order terms at production
-                    # resolutions, converging only first order in the grid spacing; with the
-                    # grids aligned the error drops to the matched-pair level (0.1-1%) and
-                    # converges second order.
-                    to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=sugiyama_ell, check_level=1, minfolds=0, lowring=False, xy=1.)
-                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=sugiyama_ellt, minfolds=0, lowring=False, xy=1.)
+                    # window is multiplied on.
+                    to_spectrum = CorrelationToSpectrum(s=s_window, ell=sugiyama_ell_out, check_level=1,
+                                                        minfolds=0, lowring=False, xy=1.)
 
-                    if noutsub > 1:
-                        # Both angular factors depend on the term but NOT on the FFTlog chain, so
-                        # they are built once here rather than inside the runner. The output weight
-                        # is summed over the k3 sub-axis now, which is what lets `read` run on the
-                        # (k1, k2) sub-grid alone: sum_{i3} w I is contracted against a `sub` that
-                        # is constant along i3.
-                        # The key enumeration above uses has_w_rect, the same predicate the progress
-                        # bar counts with; the loop here skips on ndim(Qs) == 0. They agree, but a
-                        # miss would be a KeyError on a long run, so fall back to a one-key build.
-                        if sugiyama_ell in _iout:
-                            _wI_out = _wI_out_all[_iout[sugiyama_ell]]
-                        else:
-                            _wI_out = _out_weights_all(*_pack_keys([(sugiyama_ell, get_reference_leg_shape_coeffs(sugiyama_ell))]))[0]
-                        if (sugiyama_ellt, m_in) in _iin:
-                            _volume_in = _volume_in_all[:, _iin[sugiyama_ellt, m_in]]
-                        else:
-                            _volume_in = _in_volume_all(*_pack_keys([(sugiyama_ellt, get_reference_leg_shape_coeffs(sugiyama_ellt, m=m_in, normalize=False))]))[:, 0]
-                        # always traced now, so every term reuses the same compilation
-                        ell1t, ell2t = jnp.asarray(sugiyama_ellt[0]), jnp.asarray(sugiyama_ellt[1])
-                        term = _get_term_runner(wain)(to_spectrum, Qs, _wI_out, ell1t, ell2t,
-                                                      _bessel_table[0], _bessel_table[1], _volume_in)
-                        if pbar: jax.block_until_ready(term)  # otherwise the bar races ahead of the device
-                        tmp += term
-                        _t.update(1)
-                        continue
+                    # Both angular factors depend on the term but NOT on the FFTlog chain, so they
+                    # were built for every key at once above; this term just reads its row. The
+                    # output weight is summed over the k3 sub-axis there, which is what lets the
+                    # gather run on the (k1, k2) sub-grid alone: sum_{i3} w I is contracted against
+                    # a read that is constant along i3.
+                    out_weight = out_weights_all[index_of_key_out[sugiyama_ell_out]]
+                    volume_in = volume_in_all[:, index_of_key_in[sugiyama_ell_theory, m_in]]
+                    # always traced now, so every term reuses the same compilation
+                    ell1_theory, ell2_theory = jnp.asarray(sugiyama_ell_theory[0]), jnp.asarray(sugiyama_ell_theory[1])
+                    term = run_term(wain, to_spectrum, Qs, out_weight, ell1_theory, ell2_theory,
+                                    bessel_table[0], bessel_table[1], volume_in)
+                    if pbar: jax.block_until_ready(term)  # otherwise the bar races ahead of the device
+                    block += term
+                    progress.update(1)
 
-                    _coeffs_in = get_reference_leg_shape_coeffs(sugiyama_ellt, m=m_in, normalize=False)
-                    _coeffs_out = get_reference_leg_shape_coeffs(sugiyama_ell)
-
-                    def convolve(idx):
-                        # Theory side: \int_{bin} k_3'^2 dk_3' / (2 pi^2) x I_000(k') Sigma^(3)_{l1' l2' L' M'}
-                        if ninsub > 1:
-                            # Integrate the measure factor over the bin's k3 extent,
-                            # per (k1', k2') grid point, instead of evaluating it at the
-                            # single representative triangle kin[idx]: I ~ (k1 k2 k3)^-1
-                            # Theta Sigma is rapidly varying AND discontinuous, so the
-                            # point value is not the bin average (this breaks the
-                            # box-limit sum rule by tens of per cent otherwise).
-                            lo3, hi3 = edgesin[idx, 2, 0], edgesin[idx, 2, 1]
-                            k3n = lo3 + 0.5 * (hi3 - lo3) * (_u_in + 1.)
-                            w3n = 0.5 * (hi3 - lo3) * _wu_in
-                            qs = (to_spectrum.k[0][:, None, None], to_spectrum.k[1][None, :, None], k3n[None, None, :])
-                            volume = jnp.sum(w3n * qs[2]**2 / (2. * jnp.pi**2)
-                                             * compute_measure(qs) * compute_shape(sugiyama_ellt, _coeffs_in, qs), axis=-1)
-                        else:
-                            qs = kin[idx].T
-                            volume = ((edgesin[idx, 2, 1]**3 - edgesin[idx, 2, 0]**3) / (6. * jnp.pi**2)
-                                      * compute_measure(qs) * compute_shape(sugiyama_ellt, _coeffs_in, qs))
-                        if _sc_spline is not None:
-                            _Min, _ii = _sc_spline[0], _sc_spline[1][idx]
-                            spectrum = (_Min[0][:, _ii[0]][:, None] * _Min[1][:, _ii[1]][None, :]) * volume
-                        else:
-                            spectrum = tophat(to_spectrum.k, edgesin[idx, :2], volume)
-                        correlation = to_correlation(spectrum)[1]
-                        correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
-                        # Estimator side: B_L(k1, k2, k3) = sum_{ell_1 ell_2} S^(3)_{ell_1 ell_2 L} B_{ell_1 ell_2 L}(k1, k2)
-                        # This is the noutsub <= 1 fallback only: `rebin` averages just (k1, k2) and
-                        # then applies the rapidly varying angular factor S^(3) at the single
-                        # representative triangle. The full 3-D bin average (noutsub > 1,
-                        # recommended) is handled by the shared jitted runner above, which returns
-                        # before reaching here.
-                        if _sc_spline is not None:
-                            _Mo, _io = _sc_spline[2], _sc_spline[3]
-                            _rb = _Mo[0] @ to_spectrum(correlation)[1] @ _Mo[1].T
-                            spectrum = _rb[_io[:, 0], _io[:, 1]]
-                        else:
-                            spectrum = read(kout.T, to_spectrum.k, to_spectrum(correlation)[1])
-                        # compute_measure(kout) = pi^2/(k1 k2 k3) * Theta vanishes on output bins
-                        # whose representative triangle violates the triangle inequality. The
-                        # angular factor used to be applied as the ratio I_{ell2}/I_0, which zeroed
-                        # those rows through a 0/0 mopped up by nan_to_num; the shape factor carries
-                        # no measure, so mask them explicitly instead. They are unphysical, and a
-                        # non-zero (or NaN) entry there would poison any downstream dot product for
-                        # a caller who does not mask.
-                        spectrum = spectrum * compute_shape(sugiyama_ell, _coeffs_out, kout.T)
-                        spectrum = jnp.where(compute_measure(kout.T) == 0., 0., spectrum)
-                        return jnp.nan_to_num(spectrum)
-
-                    if _sc_spline is None:
-                        _i_in, _M_in = axis_basis_matrices(edgesin[:, :2], to_spectrum.k, kind='spline')
-                        _i_out, _M_out = axis_basis_matrices(np.asarray(bin.edges)[:, :2], to_spectrum.k, kind='rebin')
-                        _sc_spline = (_M_in, _i_in, _M_out, _i_out)
-                    term = jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
-                    if pbar: jax.block_until_ready(term)
-                    tmp += term
-                    _t.update(1)
-
-                wmat_tmp[ellin, wain].append(tmp)
+                wmat_tmp[ellin, wain].append(block)
 
             wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
-        _t.close()
+        progress.close()
     else:
 
-        # One term per (ellin, ell), plus one more wherever the k1 <-> k2 symmetry adds a swapped pass
-        _t = make_pbar(sum(bool(get_sugiyama_window_convolution_coeffs(ell_, ellin_))
-                           + bool(ellin_[1] != ellin_[0] and (tuple(ellin_[1::-1]) + ellin_[2:], wain_) not in ellsin
-                                  and get_sugiyama_window_convolution_coeffs(ell_, tuple(ellin_[1::-1]) + ellin_[2:]))
-                           for ellin_, wain_ in ellsin for ell_ in ells))
+        def get_passes(ellin, wain, ell):
+            # Theory multipoles contributing to the observed `ell`: `ellin` itself, plus its
+            # k1 <-> k2 swap wherever that swap is not already a requested theory multipole.
+            # Returned as (theory ell, swap, coeffs), coeff-less pairs dropped -- so the progress
+            # bar below counts exactly the passes the loop then runs.
+            ellin_swap = tuple(ellin[1::-1]) + ellin[2:]
+            toret = [(ellin, False)]
+            if ellin[1] != ellin[0] and (ellin_swap, wain) not in ellsin:
+                toret.append((ellin_swap, True))
+            return [(ellt, swap, coeffs) for ellt, swap in toret
+                    if (coeffs := get_sugiyama_window_convolution_coeffs(ell, ellt))]
+
+        passes = {(ellin, wain, ell): get_passes(ellin, wain, ell) for ellin, wain in ellsin for ell in ells}
+        progress = make_pbar(sum(map(len, passes.values())))
 
         for ellin, wain in ellsin:  # ellin 3-tuple, wain wide-angle order
             wmat_tmp[ellin, wain] = []
@@ -2399,31 +2265,18 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 index_in_swap = index_in[:, ::-1]
                 index_out, Mout_axes = axis_basis_matrices(bin.edges, to_spectrum.k, kind='rebin', nsub=noutsub)
 
-                wcoeffs = get_sugiyama_window_convolution_coeffs(ell, ellin)
-                Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
-                if wcoeffs:
-                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin, minfolds=0, lowring=False, xy=1.)
-                    term = jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
+                for ellt, swap, wcoeffs in passes[ellin, wain, ell]:
+                    Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
+                    to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellt, minfolds=0, lowring=False, xy=1.)
+                    term = jax.lax.map(partial(convolve, swap=swap), jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
                     if pbar: jax.block_until_ready(term)
                     tmp += term
-                    _t.update(1)
-
-                ellin_swap = tuple(ellin[1::-1]) + ellin[2:]
-                # Takes care of symmetry
-                if ellin[1] != ellin[0] and (ellin_swap, wain) not in ellsin:
-                    wcoeffs = get_sugiyama_window_convolution_coeffs(ell, ellin_swap)
-                    if wcoeffs:
-                        Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
-                        to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellin_swap, minfolds=0, lowring=False, xy=1.)
-                        term = jax.lax.map(partial(convolve, swap=True), jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
-                        if pbar: jax.block_until_ready(term)
-                        tmp += term
-                        _t.update(1)
+                    progress.update(1)
 
                 wmat_tmp[ellin, wain].append(tmp)
 
             wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
-        _t.close()
+        progress.close()
 
     wmat = jnp.concatenate(list(wmat_tmp.values()), axis=1)
 
