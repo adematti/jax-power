@@ -1,6 +1,7 @@
 import functools
 import itertools
 import os
+import warnings
 
 import numpy as np
 import jax
@@ -1071,7 +1072,38 @@ def compute_QW_ABC(window3, kedges, kpedges,
 
 
 def compute_spectrum3_covariance(window2, window3, observable, theory=None, shotnoise: float=0.,
-                                 cache=None, batch_size=None):
+                                 shotnoise_p=None, cache=None, batch_size=None):
+    r"""
+    Parameters
+    ----------
+    shotnoise : float, dict, callable
+        The **coincidence** amplitude: what a pair of points landing on top of one another
+        contributes. A scalar is sn2 and asserts the Poisson relation sn_m = sn2^(m-1) for the
+        higher coincidences; ``{2: sn2, 3: sn3, 4: sn4}`` supplies measured moments instead.
+        This is what ``B^(N)``, ``T^(N)`` and the Cov[B, B] families are built from.
+
+    shotnoise_p : float, dict, callable, optional
+        The constant added to the theory to make ``P^(N) = P + shotnoise_p``. Defaults to
+        ``shotnoise``, which is right whenever the tracer's discreteness is purely Poisson.
+
+        It is NOT right when the theory P already carries part of the discreteness. That
+        happens whenever P is a fitted EFT model of a halo-occupation tracer: the one-halo
+        power is absorbed by the broadband and by whatever constant the fit calls ``sn_res``,
+        so adding it again here double-counts, while the *coincidence* structures in ``B^(N)``
+        and ``T^(N)`` are absorbed nowhere and do need the full amplitude. Measured on 500
+        AbacusSummit LRG HOD mocks (``cosmodesi/claude_abacus_analytic_cov``), where the
+        Poisson amplitude is 1995 and the one-halo excess 1830: using 1995 everywhere gives
+        sigma_analytic/sigma_mock = 0.98 on P0 and 0.72 on B000, using 3825 everywhere gives
+        1.17 and 0.90. Neither is right; the two amplitudes belong to different terms.
+
+        Splitting the amplitude between this function and the theory's own stochastic
+        parameters is fine, and is in fact the *right* thing for a halo-occupation tracer: the
+        self-coincidences belong here, where the i != j estimator conventions apply to them,
+        and the one-halo part belongs in the theory, where it gets the full leg structure
+        because an i != j estimator does not exclude two distinct galaxies in one halo. The
+        cross terms are not lost by doing that -- ``T^(N)``'s ``sn_ij * B(...)`` term uses the
+        theory's B *including* its stochastic part, which is exactly ``sn_P x sn_1h x P``.
+    """
 
     if cache is None:
         cache = {}
@@ -1491,6 +1523,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
     if isinstance(shotnoise, dict) and shotnoise and all(isinstance(k, (int, np.integer)) for k in shotnoise):
         _sn_moments = {int(k): float(v) for k, v in shotnoise.items()}
         shotnoise = _sn_moments.get(2, 0.)
+    if isinstance(shotnoise_p, dict) and shotnoise_p and all(isinstance(k, (int, np.integer)) for k in shotnoise_p):
+        shotnoise_p = {int(k): float(v) for k, v in shotnoise_p.items()}.get(2, 0.)
     # The contact terms below exist for FFT estimators, which do not exclude self-pairs /
     # self-triples WITHIN an estimator; Sugiyama's i != j != k estimators do exclude them, and
     # the original formulas implement exactly that convention.
@@ -1513,12 +1547,21 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
     # note just above).
     _fft_contact = bool(int(os.environ.get('COV3_FFT_CONTACT', '0')))
 
+    def _get_sn(sn, a, b):
+        if callable(sn):
+            return sn(a, b)
+        if isinstance(sn, dict):
+            return sn.get((a, b), sn.get((b, a), 0.))
+        return sn if a == b else 0.
+
     def get_shotnoise(a, b):
-        if callable(shotnoise):
-            return shotnoise(a, b)
-        if isinstance(shotnoise, dict):
-            return shotnoise.get((a, b), shotnoise.get((b, a), 0.))
-        return shotnoise if a == b else 0.
+        # The COINCIDENCE amplitude: B^(N), T^(N) and the Cov[B, B] families.
+        return _get_sn(shotnoise, a, b)
+
+    def get_shotnoise_p(a, b):
+        # The constant added to P^(N). Same thing unless the caller says otherwise -- see the
+        # docstring for when it is not (a fitted EFT P already carries the one-halo power).
+        return _get_sn(shotnoise if shotnoise_p is None else shotnoise_p, a, b)
 
     def get_sn_moment(fields, order):
         # Coincidence of `order` points, all of which must be the SAME tracer (a contact
@@ -1550,7 +1593,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
         if ndim == 2:
             a, b = fields
             P = get_base(fields)
-            sn = get_shotnoise(a, b)
+            sn = get_shotnoise_p(a, b)      # P^(N) only; every other sn below is a coincidence
 
             if P is None and sn == 0:
                 return None
@@ -2157,6 +2200,131 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         ntilde = 4. * np.pi * kk[:, None, None] * qn_safe[None, ...] * dk[:, None, None] * volume / (2. * np.pi)**3
                         invn = mask / ntilde                            # (nbins, ntri, nbinsp)
                         block = block + pref_box * jnp.einsum('u,ub,aub->ab', wS, Lq * PB_u, invn)
+
+                    # ---- The P5 term, arXiv:1908.06234 Eq. (26)-(27) -----------------
+                    #
+                    #   Cov[P(k), B(k1,k2,k3)]_P5 = (1/V) P5^(N)(k, -k, k1, k2, k3)
+                    #
+                    #   P5^(N) = P5
+                    #     + (1/nbar)  [ T(k+k1, -k, k2, k3) + T(k+k2, -k, k1, k3)
+                    #                 + T(k+k3, -k, k1, k2) + T(-k+k1, k, k2, k3)
+                    #                 + T(-k+k2, k, k1, k3) + T(-k+k3, k, k1, k2) ]
+                    #     + (1/nbar^2)[ B(k+k1, k2-k, k3) + B(k+k1, k3-k, k2)
+                    #                 + B(k+k2, k3-k, k1) + B(-k+k1, k2+k, k3)
+                    #                 + B(-k+k1, k3+k, k2) + B(-k+k2, k3+k, k1) ]
+                    #
+                    # Unlike the PB family above this carries NO radial delta: the power
+                    # spectrum leg's direction and the triangle's orientation are integrated
+                    # independently. That is exactly why it, and not PB, populates the
+                    # OFF-DIAGONAL of the block -- as the reference says, "while the PB term
+                    # provides small contributions to the off-diagonal elements of the
+                    # covariance matrix, the P5 term dominates the off-diagonal elements".
+                    #
+                    # Measured against 500 AbacusSummit-small LRG HOD mocks
+                    # (cosmodesi/claude_abacus_analytic_cov): the PB family alone supplies a
+                    # median 0.138 of the mocks' off-diagonal Cov[P0, B000], and is EXACTLY
+                    # ZERO wherever the tie mask cannot fire; adding the two shot-noise lines
+                    # here takes that to 0.609, and from zero to 0.20-0.52 in the corner.
+                    # On the diagonal they are a small correction growing with k (P5/PB =
+                    # 0.016, 0.092, 0.196, 0.36 at k = 0.052, 0.111, 0.171, 0.250).
+                    #
+                    # The connected P5 is NOT built here -- its tree expression runs to
+                    # hundreds of permutations and needs a Z4 kernel (reference Appendix A).
+                    # It is picked up automatically if `theory` supplies a 5-point callable.
+                    # The two shot-noise lines need only T and B, which jaxpower.pt has.
+                    #
+                    # COV3_NO_P5=1 restores the previous behaviour (no P5 term at all).
+                    _p5_qk = int(os.environ.get('COV3_P5_QK', '6'))
+                    if not int(os.environ.get('COV3_NO_P5', '0')) and _p5_qk > 0:
+                        _T5 = get_base(fields + fieldsp[:2])       # connected T (4 legs)
+                        _B5 = get_base((a,) + fieldsp[:2])         # connected B (3 legs)
+                        _P5 = get_base(fields + fieldsp)           # connected P5, if supplied
+                        _sn5 = get_shotnoise(a, c)
+                        # One shared galaxy between the P and B estimators merges one leg of
+                        # each: a pair coincidence, order 2. Two shared galaxies -> order 3.
+                        # For a Poisson tracer get_sn_moment(m) = sn^(m-1) exactly, so this is
+                        # inert unless the caller supplies measured moments; for an HOD the
+                        # higher ones are far from Poisson (A_3 = 3.4, A_4 = 23).
+                        _sn5_1 = get_sn_moment((a, a), 2)
+                        _sn5_2 = get_sn_moment((a, a, a), 3)
+                        if not (_T5 is None and _B5 is None and _P5 is None):
+                            # The canonical primed triangle, on the same (mu1, mu2, phi2) grid
+                            # the PB family uses, so wS_tri (weights x S_ellp) is reused.
+                            _fnc = lambda m1, m2, p2: get_kvec3(coordsp[0], coordsp[1], m1, m2, p2)
+                            _, _, (t1, t2, t3) = jax.vmap(_fnc)(
+                                jnp.asarray(mu1_s), jnp.asarray(mu2_s), jnp.asarray(phi2_s))
+                            # Power-spectrum leg: its own 2-sphere grid, independent of the
+                            # triangle. Azimuth offset as in the BB branch, so that k + k_i
+                            # cannot vanish to machine zero against a triangle node.
+                            _mk, _wmk = np.asarray(integration(-1., 1., size=_p5_qk).x()), \
+                                        np.asarray(integration(-1., 1., size=_p5_qk).w)
+                            _pk = (np.arange(_p5_qk) + 0.5) * 2. * np.pi / _p5_qk + np.pi / 17.
+                            _wpk = np.full(_p5_qk, 2. * np.pi / _p5_qk)
+                            _MK, _PK = (g.ravel() for g in np.meshgrid(_mk, _pk, indexing='ij'))
+                            _WK = jnp.asarray(np.einsum('i,j->ij', _wmk, _wpk).ravel())
+                            _kdir = jax.vmap(unitvec)(jnp.asarray(_MK), jnp.asarray(_PK))
+                            _Lk = get_legendre(ell)(jnp.asarray(_MK))
+                            _kmag = jnp.asarray(coords)                       # (nbins,)
+
+                            # One (sphere node, unprimed bin) per scan step. Holding the
+                            # full (ntri, nbins, nbinsp) grid live instead costs nbins times
+                            # more, and a trispectrum evaluation carries a lot of
+                            # intermediates: at COV3_QUAD_SIZE = 10 that ran the 80 GB device
+                            # out of memory on a 14 x 14 block, on top of the q^6 quadrature
+                            # tables the rest of the function already holds. Stepping over the
+                            # bins keeps each evaluation at (ntri, nbinsp).
+                            _nba, _nbb, _ntri = coords.shape[-1], coordsp.shape[-1], len(w_tri)
+
+                            def _p5_step(carry, n):
+                                iv, ia = n // _nba, n % _nba
+                                kv = jnp.broadcast_to(_kmag[ia] * _kdir[iv], (_ntri, _nbb, 3))
+                                L = [t1, t2, t3]                       # each (ntri, nbinsp, 3)
+                                acc = jnp.zeros((_ntri, _nbb))
+                                # T legs (s k + k_i, -s k, k_j, k_l) sum to k_i+k_j+k_l = 0;
+                                # B legs (s k + k_i, k_j - s k, k_l) likewise. All callables
+                                # take every leg explicitly, as elsewhere in this function.
+                                if _T5 is not None and _sn5 != 0:
+                                    for i in range(3):
+                                        jj, ll = [m for m in range(3) if m != i]
+                                        for sg in (1., -1.):
+                                            acc = acc + _sn5_1 * _T5(sg * kv + L[i], -sg * kv,
+                                                                     L[jj], L[ll])
+                                if _B5 is not None and _sn5 != 0:
+                                    for (i, jj) in ((0, 1), (0, 2), (1, 2)):
+                                        ll = 3 - i - jj
+                                        for sg in (1., -1.):
+                                            acc = acc + _sn5_2 * _B5(sg * kv + L[i],
+                                                                     L[jj] - sg * kv, L[ll])
+                                if _P5 is not None:
+                                    acc = acc + _P5(kv, -kv, L[0], L[1], L[2])
+                                # Emit `acc` rather than contracting here: it depends only on
+                                # the two grids and the theory, NOT on (ell, ellp) -- only
+                                # `_Lk` (Legendre in ell) and `wS_tri` (S_ellp) do, and both are
+                                # cheap. Contracting inside would redo every pt call for each of
+                                # the 6 P x B pairs.
+                                return carry, acc
+
+                            _p5_cache = cache.setdefault('p5_ell_independent', {})
+                            _p5_key = (fields, fieldsp, _p5_qk,
+                                       float(_sn5_1), float(_sn5_2),
+                                       np.asarray(coords).tobytes(),
+                                       np.asarray(coordsp).tobytes())
+                            if _p5_key not in _p5_cache:
+                                # (nWK * nba, ntri, nbb); the scan keeps each pt evaluation at
+                                # (ntri, nbb), as before -- only the stacked output is new.
+                                _, _p5_cache[_p5_key] = jax.lax.scan(
+                                    _p5_step, 0., jnp.arange(len(_WK) * _nba))
+                            # wS_tri is the triangle measure x S_ellp already built for the PB
+                            # family above; the canonical (side 0) orientation.
+                            _acc5 = _p5_cache[_p5_key].reshape(len(_WK), _nba, _ntri, _nbb)
+                            _p5 = jnp.einsum('v,u,vaub->ab', _WK * _Lk, wS_tri, _acc5)
+                            norm_p5 = ((2 * ell + 1) * get_N(*ellp) * get_H(*ellp)**2
+                                       / (8. * np.pi) / (4. * np.pi) / volume)
+                            if os.environ.get('COV3_BOX_DEBUG'):
+                                print(f'boxPB p5: max = {np.abs(np.asarray(norm_p5 * _p5)).max():.3e}'
+                                      f'  vs PB max {np.abs(np.asarray(block)).max():.3e}')
+                            block = block + norm_p5 * _p5
+
                     # To host as soon as it exists. Leaving blocks as device arrays makes
                     # the final np.block do every device->host copy at once, at the moment
                     # the GPU is fullest (precompute caches still resident) -- measured: a
@@ -3120,7 +3288,116 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                         for _nm in ('ppp', 'bb', 'pt'):
                             _v = np.atleast_2d(np.asarray(parts[_nm]))
                             print(f"box33 {_nm.upper()} ell={ell} ellp={ellp}: max|.| = {np.abs(_v).max():.3e} diag head = {np.diag(_v)[:4]}")
-                    block = parts['ppp'] + parts['bb'] + parts['pt']
+                    # ---- The P6 term, arXiv:1908.06234 Eq. (33) with B4-B6 ----------
+                    #
+                    #  Cov[B,B]_P6 = (1/V) { P6
+                    #      + (1/nbar)  [ P5(k1+k1', k2, k3, k2', k3') + 8 perms ]
+                    #      + (1/nbar^2)[ T(k1+k1', k2+k2', k3, k3')   + 17 perms ]
+                    #      + (1/nbar^3)[ B(k1+k1', k2+k2', k3+k3')    + 5 perms ] }
+                    #
+                    # The T and B lines (Eq. B5, B6) need only what jaxpower.pt already has;
+                    # P6 and P5 need new perturbation theory and are omitted (P6 is picked up
+                    # automatically if `theory` supplies a 6-point callable). As for the PB
+                    # block's P5 term, there is NO radial delta -- both triangles' orientations
+                    # are integrated independently -- which is why this is the family that
+                    # populates the OFF-DIAGONAL. The reference: "for the off-diagonal
+                    # elements, the P6 term becomes dominant, and the PP, PT and BB terms are
+                    # small so that they can be ignored."
+                    #
+                    # COST. Two independent triangle grids make this (ntri x ntri' x nbins x
+                    # nbinsp) with 18 T and 6 B per node -- ~40x the PB block's P5 term at the
+                    # shared quadrature. It therefore uses its OWN order, COV3_P6_QTRI
+                    # (default 4), and scans over the primed nodes to bound memory. Raise it
+                    # if the P6 contribution matters at the per-cent level for your case.
+                    # COV3_NO_P6=1 switches the term off entirely.
+                    _p6_q = int(os.environ.get('COV3_P6_QTRI', '4'))
+                    if not int(os.environ.get('COV3_NO_P6', '0')) and _p6_q > 0:
+                        _T6 = get_base(fields + fieldsp[:1])            # connected T (4 legs)
+                        _B6 = get_base(fields)                          # connected B (3 legs)
+                        _sn6 = get_shotnoise(a, ap)
+                        # Two galaxies shared between the two B estimators -> order 3, three
+                        # shared -> order 4. Poisson fallback sn^(m-1) keeps this inert for a
+                        # scalar `shotnoise`.
+                        _sn6_2 = get_sn_moment((a, a, a), 3)
+                        _sn6_3 = get_sn_moment((a, a, a, a), 4)
+                        if _sn6 != 0 and not (_T6 is None and _B6 is None):
+                            _ig = IntegralND(mu1=integration(-1., 1., size=_p6_q),
+                                             mu2=integration(-1., 1., size=_p6_q),
+                                             phi2=integration(0., 2. * np.pi, size=_p6_q,
+                                                              method='midpoint'))
+                            _m1, _m2, _f2 = (np.ravel(x) for x in
+                                             _ig.x(['mu1', 'mu2', 'phi2'], sparse=False))
+                            _w6 = np.ravel(_ig.w)                        # raw sum 8 pi
+                            # A relative azimuth offset between the two grids: with identical
+                            # nodes and equal bin magnitudes, sums like k_i + k_j' collapse to
+                            # machine zero on a measure-zero set of node pairs and the T there
+                            # is an unguarded squeezed configuration (same trap the BB tie
+                            # family documents above).
+                            _fu = lambda x, y, z: get_kvec3(coords[0], coords[1], x, y, z)
+                            _fp = lambda x, y, z: get_kvec3(coordsp[0], coordsp[1], x, y, z)
+                            _, (uh1, uh2, _uh3), (u1, u2, u3) = jax.vmap(_fu)(
+                                jnp.asarray(_m1), jnp.asarray(_m2), jnp.asarray(_f2))
+                            _, (ph1, ph2, _ph3), (q1, q2, q3) = jax.vmap(_fp)(
+                                jnp.asarray(_m1), jnp.asarray(_m2),
+                                jnp.asarray(_f2 + np.pi / 17.))
+                            _wSu = jnp.asarray(_w6) * S(uh1, uh2)        # (nu,)
+                            _wSp = jnp.asarray(_w6) * Sp(ph1, ph2)       # (np,)
+                            U = [u1, u2, u3]                             # (nu, nbins, 3)
+                            Q = [q1, q2, q3]                             # (np, nbinsp, 3)
+                            _shp = (len(_w6), coords.shape[-1], coordsp.shape[-1])
+                            # Eq. (B5): T(u_i + q_j, u_k + q_l, u_m, q_n)
+                            _TP = [(0, 0, 1, 1, 2, 2), (0, 0, 1, 2, 2, 1), (0, 1, 1, 2, 2, 0),
+                                   (0, 1, 1, 0, 2, 2), (0, 2, 1, 0, 2, 1), (0, 2, 1, 1, 2, 0),
+                                   (0, 0, 2, 1, 1, 2), (0, 0, 2, 2, 1, 1), (0, 1, 2, 2, 1, 0),
+                                   (0, 1, 2, 0, 1, 2), (0, 2, 2, 0, 1, 1), (0, 2, 2, 1, 1, 0),
+                                   (1, 0, 2, 1, 0, 2), (1, 0, 2, 2, 0, 1), (1, 1, 2, 2, 0, 0),
+                                   (1, 1, 2, 0, 0, 2), (1, 2, 2, 0, 0, 1), (1, 2, 2, 1, 0, 0)]
+                            # Eq. (B6): B(u_i + q_j, u_k + q_l, u_m + q_n)
+                            _BP = [(0, 0, 1, 1, 2, 2), (0, 0, 1, 2, 2, 1), (0, 1, 1, 0, 2, 2),
+                                   (0, 1, 1, 2, 2, 0), (0, 2, 1, 0, 2, 1), (0, 2, 1, 1, 2, 0)]
+
+                            def _p6_node(carry, iv):
+                                def _u(x):    # (nu, nbins, 3) -> (nu, nbins, nbinsp, 3)
+                                    return jnp.broadcast_to(x[:, :, None, :], _shp + (3,))
+                                def _q(x):    # (nbinsp, 3) at node iv -> same
+                                    return jnp.broadcast_to(x[iv][None, None, :, :], _shp + (3,))
+                                acc = jnp.zeros(_shp)
+                                if _T6 is not None:
+                                    for (i, j, k, l, m, n) in _TP:
+                                        acc = acc + _sn6_2 * _T6(
+                                            _u(U[i]) + _q(Q[j]), _u(U[k]) + _q(Q[l]),
+                                            _u(U[m]), _q(Q[n]))
+                                if _B6 is not None:
+                                    for (i, j, k, l, m, n) in _BP:
+                                        acc = acc + _sn6_3 * _B6(
+                                            _u(U[i]) + _q(Q[j]), _u(U[k]) + _q(Q[l]),
+                                            _u(U[m]) + _q(Q[n]))
+                                # Emit `acc` instead of contracting here: it depends only on
+                                # the two triangle grids, NOT on (ell, ellp) -- only the S
+                                # weights do. Contracting inside would redo all 24 pt calls for
+                                # every (ell, ellp) pair, i.e. 3x for the B blocks.
+                                return carry, acc
+
+                            _p6_cache = cache.setdefault('p6_ell_independent', {})
+                            _p6_key = (fields, fieldsp, _p6_q,
+                                       float(_sn6_2), float(_sn6_3),
+                                       np.asarray(coords).tobytes(),
+                                       np.asarray(coordsp).tobytes())
+                            if _p6_key not in _p6_cache:
+                                # (np, nu, nbins, nbinsp); the scan keeps the per-step pt
+                                # intermediates at (nu, nbins, nbinsp), as before.
+                                _, _p6_cache[_p6_key] = jax.lax.scan(
+                                    _p6_node, 0., jnp.arange(len(_w6)))
+                            _acc_all = _p6_cache[_p6_key]
+                            _p6 = jnp.einsum('p,u,puab->ab', _wSp, _wSu, _acc_all)
+                            norm_p6 = M / (8. * np.pi)**2 / volume
+                            parts['p6'] = norm_p6 * _p6
+                            if os.environ.get('COV3_BOX_DEBUG'):
+                                print(f"box33 P6 ell={ell} ellp={ellp}: max|.| = "
+                                      f"{np.abs(np.asarray(parts['p6'])).max():.3e}")
+
+                    block = parts['ppp'] + parts['bb'] + parts['pt'] + parts.get('p6', 0.)
+
                     if ip == i:
                         # Transpose-partner tie terms (e.g. (li=0, lj=2) vs
                         # (li=2, lj=0)) are the same integral evaluated with
@@ -3134,6 +3411,24 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # np.block asking for 168 MB. Converting here also frees each block's
                     # device buffer immediately.
                     block = np.asarray(block)
+
+                    # VALIDITY GUARD for the P6 term. Its shot lines evaluate the theory T and B
+                    # at shifted momenta |k_i + k'_j|, reaching ~2 k_max -- outside the range the
+                    # EFT parameters were fitted over. With a large counterterm the model diverges
+                    # there and the term can swamp the block: on a Zel'dovich fit with c1 = -30 it
+                    # drove max|diag| from 5.7e21 to 2.4e25 and produced 37 NEGATIVE variances,
+                    # silently. Checked here, where `block` is already on the host, so it is free.
+                    if 'p6' in parts and ip == i and tuple(ell) == tuple(ellp):
+                        _bad = int(np.sum(np.diagonal(block) < 0.))
+                        if _bad:
+                            warnings.warn(
+                                f'cov3: {_bad} of {len(block)} variances are NEGATIVE in the '
+                                f'BB block ell={tuple(ell)} after adding the P6 term. Its shot '
+                                f"lines evaluate T and B at |k_i + k'_j| up to ~2 k_max, where "
+                                f'a large EFT counterterm (check c1, c2, X_FoG) diverges. '
+                                f'Re-run with COV3_NO_P6=1 to confirm, and restrict k_max or '
+                                f'refit the counterterms before trusting this block.',
+                                RuntimeWarning, stacklevel=2)
                     cov[i][ip] = block
                     cov[ip][i] = block.T
                     if _timing:

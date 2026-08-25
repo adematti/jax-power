@@ -1,3 +1,4 @@
+import os
 import functools
 import operator
 from functools import partial
@@ -934,6 +935,22 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
             return pars[names]
         return [pars[name] for name in names]
 
+    def _sn3(field):
+        """Third stochastic moment: the amplitude of a THREE-point coincidence.
+
+        Optional. Defaults to ``snb0**2``, the relation a Poisson process satisfies -- but
+        only a Poisson process does. For a halo-occupation tracer the second and third
+        factorial moments of N are independent numbers, and measuring them on the mock's own
+        halo catalog (see ``claude_abacus_analytic_cov/hod_moments.py``) gives
+        ``<N(N-1)(N-2)>/<N> / nbar^2`` for this and ``<N(N-1)>/<N> / nbar`` for ``snb0``;
+        for a DESI-like LRG HOD the two differ by ~50%, so the Poisson relation is not a
+        harmless default. Pass ``sn3`` in the bias dict to override it.
+        """
+        pars = bias_params[field]
+        if 'sn3' in pars:
+            return pars['sn3']
+        return pars['snb0']**2
+
     def _norm(kvec):
         return jnp.sqrt(jnp.sum(kvec**2, axis=-1))
 
@@ -972,21 +989,39 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     def _beta(ki, kj, xij):
         return _safe_div(xij * (ki**2 + kj**2 + 2. * ki * kj * xij), 2. * ki * kj)
 
+    def _branches3(ki, kj, kk, xij, xik, xjk):
+        """The two branches of the n = 3 SPT recursion.
+
+        F_n = sum_{m=1}^{n-1} [G_m/((2n+3)(n-1))] [(2n+1) alpha F_{n-m} + 2 beta G_{n-m}],
+        so n = 3 has BOTH m = 1 (single leg i through G_1 = 1, pair (j, k) through F_2/G_2)
+        and m = 2 (pair (i, j) through G_2, single leg k through F_1 = G_1 = 1). Only the
+        second was present before; symmetrising over the 6 orderings does not recover the
+        first, because `alpha` is not symmetric -- the m = 1 branch needs alpha(k_i, k_jk)
+        where a permuted m = 2 term can only supply alpha(k_jk, k_i). At three equal collinear
+        legs the analytic value is F3 = G3 = 4.5, which this reproduces and the previous form
+        undershot at 5/3.
+        """
+        # clamp: the folded configuration (x -> -1 with equal legs) drives the
+        # argument through zero and roundoff can take it negative -> NaN
+        q_ij = jnp.sqrt(jnp.maximum(ki**2 + kj**2 + 2. * ki * kj * xij, 0.))
+        x_ij_k = jnp.where(q_ij > 0., (ki * xik + kj * xjk) / jnp.where(q_ij > 0., q_ij, 1.), 0.)
+        q_jk = jnp.sqrt(jnp.maximum(kj**2 + kk**2 + 2. * kj * kk * xjk, 0.))
+        x_i_jk = jnp.where(q_jk > 0., (kj * xij + kk * xik) / jnp.where(q_jk > 0., q_jk, 1.), 0.)
+        return (_alpha(ki, q_jk, x_i_jk), _beta(ki, q_jk, x_i_jk),
+                _F2(kj, kk, xjk), _G2(kj, kk, xjk),
+                _alpha(q_ij, kk, x_ij_k), _beta(q_ij, kk, x_ij_k), _G2(ki, kj, xij))
+
     def _F3_unsym(ki, kj, kk, xij, xik, xjk):
-        q12sq = ki**2 + kj**2 + 2. * ki * kj * xij
-        q12 = jnp.sqrt(q12sq)
-        x_12_3 = jnp.where(q12 > 0., (ki * xik + kj * xjk) / q12, 0.)
-        F2_12 = _F2(ki, kj, xij)
-        G2_12 = _G2(ki, kj, xij)
-        return (7. * _alpha(q12, kk, x_12_3) * F2_12 + 2. * _beta(q12, kk, x_12_3) * G2_12) / 18.
+        a1, b1_, F2_jk, G2_jk, a2, b2_, G2_ij = _branches3(ki, kj, kk, xij, xik, xjk)
+        m1 = 7. * a1 * F2_jk + 2. * b1_ * G2_jk
+        m2 = G2_ij * (7. * a2 + 2. * b2_)
+        return (m1 + m2) / 18.
 
     def _G3_unsym(ki, kj, kk, xij, xik, xjk):
-        q12sq = ki**2 + kj**2 + 2. * ki * kj * xij
-        q12 = jnp.sqrt(q12sq)
-        x_12_3 = jnp.where(q12 > 0., (ki * xik + kj * xjk) / q12, 0.)
-        F2_12 = _F2(ki, kj, xij)
-        G2_12 = _G2(ki, kj, xij)
-        return (3. * _alpha(q12, kk, x_12_3) * F2_12 + 6. * _beta(q12, kk, x_12_3) * G2_12) / 18.
+        a1, b1_, F2_jk, G2_jk, a2, b2_, G2_ij = _branches3(ki, kj, kk, xij, xik, xjk)
+        m1 = 3. * a1 * F2_jk + 6. * b1_ * G2_jk
+        m2 = G2_ij * (3. * a2 + 6. * b2_)
+        return (m1 + m2) / 18.
 
     def _F3(ki, kj, kk, xij, xik, xjk):
         t1 = _F3_unsym(ki, kj, kk, xij, xik, xjk)
@@ -1124,6 +1159,43 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     k3vec = jnp.asarray(k3vec)
     k4vec = -k1vec - k2vec - k3vec
 
+    # --- The parallelogram configuration T(k, -k, k', -k') -------------------------------
+    #
+    # This is the configuration Cov[P, P] is built from, and it is a degenerate point of the
+    # generic permutation sum: four of the twelve (2, 2, 1, 1) terms carry the internal
+    # momentum q = k1 + k2, which vanishes there, and their individual 1/q^2 poles cancel
+    # only in the sum. Evaluated AT q = 0 the `_safe_div` guards return zero for those four
+    # terms, which is not their (finite) limit, so the sum comes out wrong.
+    #
+    # The limit itself is perfectly well behaved: shifting k2 -> k2 - eps k1 (so that
+    # q = -eps k1 and, since k4 is rebuilt from momentum conservation, k3 + k4 = +eps k1) the
+    # generic sum is flat to 6 significant figures over 1e-4 > eps > 1e-8 -- four decades --
+    # before round-off sets in. So the fix is simply to evaluate it just off the degenerate
+    # point rather than to write a special expression for it.
+    #
+    # There WAS such a special expression (`_para_channel`, reachable with
+    # JAXPOWER_PT_PARA_REDUCED=1). It returns EXACTLY twice the limit, in every configuration
+    # tested and in the pure matter limit (b1 = 1, f = 0, no counterterms), so this is not a
+    # bias- or RSD-modelling difference. It is a double count: its (3, 1, 1, 1) piece is added
+    # in both of the two channel calls, giving 12 x 2 x 2 = 48 units against the generic
+    # 6 x 4 = 24, and the same for its (2, 2, 1, 1) piece. `tests/test_pt_trispectrum.py`.
+    #
+    # REQUIREMENT ON THE CALLER: `pk_callable` must go to ZERO below its grid, not clamp to
+    # P(k_min) as `jnp.interp` does by default. The four collapsed terms carry P(q) with
+    # q -> 0 and are finite only because P(q) kills their 1/q^2 kernels; with a clamped
+    # constant they instead contribute a spurious O(1) piece -- 44% of T on one matter
+    # configuration -- and the limit acquires a 28% dependence on the direction of approach.
+    # With a physical P that direction dependence is 1e-5, i.e. the parallelogram value is
+    # perfectly well defined, and this regularization agrees with evaluating at q = 0 exactly
+    # to the same 1e-5. It is kept because it makes the limit explicit and costs nothing.
+    _use_reduced = bool(int(os.environ.get('JAXPOWER_PT_PARA_REDUCED', '0')))
+    _para_eps = float(os.environ.get('JAXPOWER_PT_PARA_EPS', '1e-5'))
+    if not _use_reduced:
+        _scale2 = jnp.sum(k1vec**2, axis=-1) + jnp.sum(k2vec**2, axis=-1)
+        _degen = jnp.sum((k1vec + k2vec)**2, axis=-1) < (1e-10)**2 * jnp.maximum(_scale2, 1e-300)
+        k2vec = k2vec - jnp.where(_degen, _para_eps, 0.)[..., None] * k1vec
+        k4vec = -k1vec - k2vec - k3vec
+
     k1, k2, k3, k4 = _norm(k1vec), _norm(k2vec), _norm(k3vec), _norm(k4vec)
     mu1, mu2, mu3, mu4 = _mu(k1vec, k1), _mu(k2vec, k2), _mu(k3vec, k3), _mu(k4vec, k4)
 
@@ -1149,14 +1221,11 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         _t3111_term(b, c, d, a, k2vec, k3vec, k4vec)
     )
 
-    # Dedicated covariance/parallelogram branch.  The generic permutation
-    # representation contains internal channels such as k1 + k2 = 0 when the
-    # requested configuration is T(k, -k, k', -k').  Evaluating those channels
-    # term-by-term creates spurious numerical 0/0 or large cancellations.  The
-    # reduced expression below keeps only the two physical exchanged momenta
-    # q_plus = k + k' and q_minus = k - k'.
+    # Legacy reduced expression for the parallelogram, kept only so the change above can be
+    # A/B'd: set JAXPOWER_PT_PARA_REDUCED=1. It is wrong (see the note at the regularization).
     para_tol = 1e-10
-    is_para = (_norm(k1vec + k2vec) < para_tol) & (_norm(k3vec + k4vec) < para_tol)
+    is_para = ((_norm(k1vec + k2vec) < para_tol) & (_norm(k3vec + k4vec) < para_tol)
+               if _use_reduced else False)
 
     def _para_channel(rvec, fr, fmr):
         # Channel q = k + r, with r either +k' or -k'.
@@ -1203,8 +1272,11 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         return t2211 + t3111
 
     # Both physical diagonals: q = k + k' and q = k - k'.
-    t_para = _para_channel(k3vec, c, d) + _para_channel(k4vec, d, c)
-    trispec_tree = jnp.where(is_para, t_para, 4. * t2211 + 6. * t3111)
+    trispec_tree = 4. * t2211 + 6. * t3111
+    if is_para is not False:
+        trispec_tree = jnp.where(is_para,
+                                 _para_channel(k3vec, c, d) + _para_channel(k4vec, d, c),
+                                 trispec_tree)
 
     X1, X2, X3, X4 = [_get_bias_params(field, 'X_FoG') for field in fields]
     W = fog_damping((k1 * mu1, X1), (k2 * mu2, X2), (k3 * mu3, X3), (k4 * mu4, X4), f=f, sigma2v=sigma2v, damping=damping)
@@ -1213,13 +1285,139 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         b1, snb0, sn0 = _get_bias_params(field, ['b1', 'snb0', 'sn0'])
         return (b1 * snb0 + 2. * sn0 * f * mu**2) * Z1eft * pkIR
 
-    leg1 = _shot_leg(a, k1, mu1, _Z1eft(a, k1, mu1), _IR_pk(k1, mu1))
-    leg2 = _shot_leg(b, k2, mu2, _Z1eft(b, k2, mu2), _IR_pk(k2, mu2))
-    leg3 = _shot_leg(c, k3, mu3, _Z1eft(c, k3, mu3), _IR_pk(k3, mu3))
-    leg4 = _shot_leg(d, k4, mu4, _Z1eft(d, k4, mu4), _IR_pk(k4, mu4))
+    # ---- Stochastic trispectrum ---------------------------------------------------------
+    #
+    # Structure, and why it is what it is. For a point process obtained by sampling a
+    # continuous field, the discrete n-point spectrum is a sum over set partitions of the n
+    # legs: each block B of size m contributes one coincidence factor (amplitude)^(m - 1) and
+    # the continuous connected spectrum of the *blocks*, evaluated at the block momenta
+    # K_B = sum_{i in B} k_i. For n = 2 and n = 3 this reproduces the familiar
+    #
+    #     P^(N)  = P + sn
+    #     B^(N)  = B + sn [P(k1) + P(k2) + P(k3)] + sn^2
+    #
+    # -- the latter being exactly what the legs below build for :func:`spectrum3_redshift_tracer`.
+    # For n = 4 the partitions are: one pair (6 ways), two disjoint pairs (3), a triple (4),
+    # and all four; giving
+    #
+    #     T^(N) = T
+    #           + sn   sum_{6 pairs (i,j)}     B(k_i + k_j, k_k, k_l)
+    #           + sn^2 sum_{3 pairings}        P(k_i + k_j)
+    #           + sn^2 sum_{4 legs}            P(k_l)
+    #           + sn^3
+    #
+    # EVERY term has total dimension L^9, as it must: with [P] = L^3, [B] = L^6 and
+    # [sn] = L^3, the powers (p, q) of (P, sn) satisfy p + q = 3 term by term.
+    #
+    # WHAT WAS HERE BEFORE, AND WHY IT WAS WRONG. The previous expression was
+    #
+    #     0.25 sum_{i<j} leg_i leg_j  +  0.5 sum_i leg_i sn0_i  +  shot
+    #
+    # with leg_i = (b1 snb0 + 2 sn0 f mu_i^2) Z1eft_i P_IR_i. `leg` is a *bispectrum*-sized
+    # object (sn x P, i.e. L^6), so `leg_i leg_j` is L^12 and cannot be a trispectrum
+    # contribution at all -- it is (p, q) = (2, 2). It appears in no partition of four legs.
+    # Numerically it dominated everything: at the stochastic amplitude fitted to an
+    # AbacusSummit LRG HOD mock set (snb0 = 1.2 / nbar) it was 174x the tree trispectrum at
+    # k = 0.03 and 14500x at k = 0.29, and pushed sigma_analytic / sigma_mock from ~1 to 7.0
+    # on P0 and 5.9 on B000. The `0.5 leg_i sn0_i` piece had the right dimensions but the
+    # wrong normalization (a factor 4 low against the partition expansion, which wants
+    # sn x leg_i); and the trailing `+ shot` was L^3 where L^9 is needed (`shot**3` now,
+    # matching `shot**2` in spectrum3). No caller in this repository passed `shot`.
+    #
+    # CONVENTIONS, all inherited from spectrum3_redshift_tracer so the two stay consistent:
+    #   * the pair-coincidence amplitude is `snb0` (which equals sn2 = 1/nbar in the Poisson
+    #     limit); the (snb0, sn0) split, i.e. the mu-dependence of the stochastic amplitude,
+    #     is kept only where it multiplies a leg, exactly as in the bispectrum's shot leg;
+    #   * the pure constant comes from the `shot` argument alone, not from snb0^3, again as
+    #     in spectrum3 where the 1/nbar^2 constant is `shot**2`;
+    #   * the stochastic sector is NOT FoG-damped, as in spectrum3;
+    #   * a coincidence between different tracers vanishes identically.
+    # With snb0 = shot = sn2, sn0 = sn2 / 2 and no counterterms this reproduces the Poisson
+    # expansion above term by term -- `tests/test_pt_stochastic.py` checks exactly that.
+    #
+    # THE ZERO-MOMENTUM GUARD. Terms carrying a pair momentum q = k_i + k_j are switched off
+    # where q vanishes identically. That is not a physical statement about the squeezed limit:
+    # it is that P and B are not defined at q = 0 by any tabulated theory, and the covariance
+    # calls this at (k, -k, k', -k'), where two of the six pairs have q == 0 exactly. It
+    # mirrors `cov3.compute_spectrum3_covariance`'s own `_alive` guard, and with it the six
+    # pair terms reduce in that configuration to precisely the four cross pairs, and the three
+    # pairings to the two, that cov3 builds for itself from `shotnoise` -- an independent check
+    # that the two derivations agree.
+    kvecs = (k1vec, k2vec, k3vec, k4vec)
+    knorms, munorms = (k1, k2, k3, k4), (mu1, mu2, mu3, mu4)
 
-    sn0_1, sn0_2, sn0_3, sn0_4 = [_get_bias_params(field, 'sn0') for field in fields]
-    shot = 0.25 * (leg1 * leg2 + leg1 * leg3 + leg1 * leg4 + leg2 * leg3 + leg2 * leg4 + leg3 * leg4)\
-    + 0.5 * (leg1 * sn0_1 + leg2 * sn0_2 + leg3 * sn0_3 + leg4 * sn0_4) + shot
+    def _sn_pair(fi, fj):
+        # A coincidence requires the two points to be the same tracer.
+        if fi != fj:
+            return None
+        return _get_bias_params(fi, 'snb0')
 
-    return W * trispec_tree + shot
+    def _Pg(field, kvec):
+        """The model galaxy power at an arbitrary momentum (a block momentum, in general)."""
+        k = _norm(kvec)
+        mu = _mu(kvec, k)
+        return _Z1eft(field, k, mu)**2 * _IR_pk(k, mu)
+
+    def _B_tree(fq, fk, fl, kqvec, kkvec):
+        """Tree-level B(kq, kk, kl), kl = -kq - kk; same kernels as spectrum3_redshift_tracer."""
+        klvec = -kqvec - kkvec
+        kq, kk, kl = _norm(kqvec), _norm(kkvec), _norm(klvec)
+        muq, muk, mul = _mu(kqvec, kq), _mu(kkvec, kk), _mu(klvec, kl)
+        xqk = _xcos(kqvec, kkvec, kq, kk)
+        xkl = _xcos(kkvec, klvec, kk, kl)
+        xlq = _xcos(klvec, kqvec, kl, kq)
+        Zq, Zk, Zl = _Z1eft(fq, kq, muq), _Z1eft(fk, kk, muk), _Z1eft(fl, kl, mul)
+        Pq, Pk, Pl = _IR_pk(kq, muq), _IR_pk(kk, muk), _IR_pk(kl, mul)
+        # The Z2 kernel carries the field of the leg NOT in the contracted pair, as in
+        # spectrum3_redshift_tracer's B12 / B23 / B31.
+        return 2. * (_Z2(fl, kq, kk, xqk, muq, muk) * Zq * Pq * Zk * Pk
+                     + _Z2(fq, kk, kl, xkl, muk, mul) * Zk * Pk * Zl * Pl
+                     + _Z2(fk, kl, kq, xlq, mul, muq) * Zl * Pl * Zq * Pq)
+
+    def _alive(qvec, kavec, kbvec):
+        # The threshold must sit ABOVE the parallelogram regularization, not below it.
+        # That regularization moves k1 + k2 from exactly 0 to -eps k1, i.e. q^2 / ref = eps^2 /
+        # 2 ~ 5e-11 at the default eps = 1e-5. A fixed 1e-12 threshold would let those legs
+        # through, and they would be evaluated at a q so small that P(q) and B(q, k, -k) are
+        # whatever the theory's k-grid extrapolates to at its lowest node -- typically a
+        # constant, where the true answer is zero (P(q) -> 0 as q -> 0, and the tree B in the
+        # squeezed limit goes with it). Measured on an LRG-like case that spurious term is
+        # ~0.6 of the whole tree trispectrum at k = 0.29. Tying the threshold to eps keeps
+        # genuine squeezed configurations (q / k >~ 1e-4) and rejects the regularized zero.
+        q2 = jnp.sum(qvec**2, axis=-1)
+        ref = jnp.sum(kavec**2, axis=-1) + jnp.sum(kbvec**2, axis=-1)
+        return jnp.where(q2 > (10. * _para_eps)**2 * ref, 1., 0.)
+
+    legs = [_shot_leg(fields[i], knorms[i], munorms[i],
+                      _Z1eft(fields[i], knorms[i], munorms[i]),
+                      _IR_pk(knorms[i], munorms[i])) for i in range(4)]
+
+    stoch = jnp.zeros_like(legs[0])
+
+    # (1) one pair coincides:  sn * B(k_i + k_j, k_k, k_l)
+    for i, j, kk_, ll_ in [(0, 1, 2, 3), (0, 2, 1, 3), (0, 3, 1, 2),
+                           (1, 2, 0, 3), (1, 3, 0, 2), (2, 3, 0, 1)]:
+        sn_ij = _sn_pair(fields[i], fields[j])
+        if sn_ij is None:
+            continue
+        qvec = kvecs[i] + kvecs[j]
+        stoch = stoch + sn_ij * _alive(qvec, kvecs[i], kvecs[j]) \
+            * _B_tree(fields[i], fields[kk_], fields[ll_], qvec, kvecs[kk_])
+
+    # (2) two disjoint pairs coincide:  sn^2 * P(k_i + k_j)
+    for (i, j), (kk_, ll_) in [((0, 1), (2, 3)), ((0, 2), (1, 3)), ((0, 3), (1, 2))]:
+        sn_ij, sn_kl = _sn_pair(fields[i], fields[j]), _sn_pair(fields[kk_], fields[ll_])
+        if sn_ij is None or sn_kl is None:
+            continue
+        qvec = kvecs[i] + kvecs[j]
+        stoch = stoch + sn_ij * sn_kl * _alive(qvec, kvecs[i], kvecs[j]) \
+            * _Pg(fields[i], qvec)
+
+    # (3) a triple coincides, one leg free:  sn3 * P(k_l).
+    for l_ in range(4):
+        stoch = stoch + _sn3(fields[l_]) * _Pg(fields[l_], kvecs[l_])
+
+    # (4) all four coincide.
+    stoch = stoch + shot**3
+
+    return W * trispec_tree + stoch
