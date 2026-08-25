@@ -70,6 +70,41 @@ _resampler_kernels = [
 ]
 
 
+# Same kernels, elementwise: they are applied one axis at a time, so that the (N, ndim) arrays of
+# separations and weights --- three quarters of the memory of painting and reading --- never exist.
+_resampler_kernels_1d = [
+    None,
+    lambda s: jnp.ones_like(s), # NGP
+    lambda s: 1 - s, # CIC
+    lambda s: (s <= 1/2) * (3/4 - s**2) + (1/2 < s) / 2 * (3/2 - s)**2, # TSC
+    lambda s: (s <= 1) / 6 * (4 - 6 * s**2 + 3 * s**3) + (1 < s) / 6 * (2 - s)**3, # PCS
+]
+
+
+def _index_weight(positions, id0, ishift, shape, order, idtype):
+    """
+    Return the flat (wrapped) mesh index and the resampling weight of each particle.
+
+    Both are built axis by axis: the weight accumulates in a single (N,) array, and the index in a
+    single (N,) integer, instead of the (N, ndim) separations, weights and indices that a
+    vectorized form would materialize.
+    """
+    index, weight = None, None
+    for axis in range(len(shape)):
+        idx = id0[..., axis] + ishift[axis]
+        s = jnp.abs(idx - positions[..., axis])
+        w = _resampler_kernels_1d[order](s)
+        weight = w if weight is None else weight * w
+        idx = jnp.astype(idx % shape[axis], idtype)
+        index = idx if index is None else index * jnp.astype(shape[axis], idtype) + idx
+    return index, weight
+
+
+def _get_index_dtype(size):
+    """Integer type able to address a mesh of that many cells."""
+    return 'int32' if size < 2**31 - 1 else 'int64'
+
+
 def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
     """
     Paint the positions onto the mesh.
@@ -80,50 +115,35 @@ def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
     else:
         mesh = jnp.asarray(mesh)
 
+    shape = np.asarray(mesh.shape, dtype='i8')
+    idtype = _get_index_dtype(np.prod(shape))
     dtype = 'int16' # int16 -> +/- 32_767, should be enough
-    shape = np.asarray(mesh.shape, dtype=dtype)
-
-    def wrap(idx):
-        return idx % shape
-
     id0 = (jnp.round if order % 2 else jnp.floor)(positions).astype(dtype)
     ishifts = np.arange(order) - (order - 1) // 2
     ishifts = np.array(list(product(* len(shape) * (ishifts,))), dtype=dtype)
 
     def step(carry, ishift):
-        idx = id0 + ishift
-        s = jnp.abs(idx - positions)
-        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(axis=-1)
+        index, weight = _index_weight(positions, id0, ishift, shape, order, idtype)
+        return carry.at[index].add(weights * weight), None
 
-        idx = jnp.unstack(idx, axis=-1)
-        carry = carry.at[idx].add(weights * ker)
-        return carry, None
-
-    mesh = jax.lax.scan(step, mesh, ishifts)[0]
-    return mesh
+    # painted flat, such that the scatter takes a single index array rather than one per dimension
+    mesh = jax.lax.scan(step, mesh.reshape(-1), ishifts)[0]
+    return mesh.reshape(tuple(shape))
 
 
 def read(mesh: jax.Array, positions, order: int=2, out=None):
     """Read the value at the positions from the mesh."""
+    shape = np.asarray(mesh.shape, dtype='i8')
+    idtype = _get_index_dtype(np.prod(shape))
     dtype = 'int16' # int16 -> +/- 32_767, should be enough
-    shape = np.asarray(mesh.shape, dtype=dtype)
-
-    def wrap(idx):
-        return idx % shape
-
     id0 = (jnp.round if order % 2 else jnp.floor)(positions).astype(dtype)
     ishifts = np.arange(order) - (order - 1) // 2
     ishifts = np.array(list(product(* len(shape) * (ishifts,))), dtype=dtype)
+    flat = mesh.reshape(-1)
 
     def step(carry, ishift):
-        idx = id0 + ishift
-        s = jnp.abs(idx - positions)
-        idx, ker = wrap(idx), _resampler_kernels[order](s).prod(axis=-1)
-
-        idx = jnp.unstack(idx, axis=-1)
-        # idx = tuple(jnp.moveaxis(idx, -1, 0)) # TODO: JAX >= 0.4.28 for unstack
-        carry += mesh[idx] * ker
-        return carry, None
+        index, weight = _index_weight(positions, id0, ishift, shape, order, idtype)
+        return carry + flat[index] * weight, None
 
     if out is None:
         out = jnp.zeros_like(positions, shape=positions.shape[:1])
