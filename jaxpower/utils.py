@@ -399,7 +399,7 @@ def get_legendre_recurrence(ell, ellmax: int=None):
     would suffer cancellation: :math:`P_{16}` has coefficients of order :math:`10^5` with
     alternating signs.
 
-    The recurrence is UNROLLED whenever its length is known statically -- exactly when ``ell`` is a
+    The recurrence is unrolled whenever its length is known statically -- exactly when ``ell`` is a
     Python integer, and to ``ellmax`` steps followed by a select when it is traced. This matters a
     great deal: a dynamic :func:`jax.lax.fori_loop` lowers to a while loop, whose iterations XLA
     cannot fuse, so each of the ``ell`` steps becomes its own pass over the (potentially large)
@@ -587,7 +587,7 @@ def get_spherical_jn(ell):
 
     closed = _registered_bessel[ell]
     # The cancellation region measured against scipy reaches ~0.42 * ell - 1.4, but the closed
-    # form only becomes FULLY accurate somewhat beyond it (the surviving cancellation still costs
+    # form only reaches full accuracy somewhat beyond it (the surviving cancellation still costs
     # ~1e-13 at ell = 10 in float64, and ~1e-4 in float32, if the crossover is placed too early).
     xswitch = max(1.5, 0.7 * ell)
     ser = _spherical_jn_series(ell)
@@ -624,7 +624,7 @@ def _legendre_recurrence_coeffs(ellmax: int):
 
 def get_Ylm_all(ellmax: int, reduced: bool=False):
     r"""
-    Return a function evaluating EVERY spherical harmonic up to ``ellmax`` at once, at azimuth 0
+    Return a function evaluating all spherical harmonics up to ``ellmax`` at once, at azimuth 0
     where they are real, stacked on a leading axis in the flat order :math:`\ell^2 + \ell + m`
     (so ``ell**2 + ell + m`` indexes the :math:`(\ell, m)` harmonic).
 
@@ -644,7 +644,7 @@ def get_Ylm_all(ellmax: int, reduced: bool=False):
     :func:`get_Ylm`'s other two flags have no counterpart here, because the azimuth is fixed at 0:
     the complex harmonic is real there (measured imaginary part exactly 0), so ``conj`` would be
     the identity, and the ``real`` convention degenerates -- it gives :math:`\pm\sqrt{2}` times
-    the complex harmonic for :math:`m > 0` but IDENTICALLY ZERO for every :math:`m < 0`, half the
+    the complex harmonic for :math:`m > 0` but vanishes identically for every :math:`m < 0`, half the
     table. Callers summing over signed :math:`m` (the TripoSH shape factor) need the complex one.
 
     Parameters
@@ -665,7 +665,7 @@ def get_Ylm_all(ellmax: int, reduced: bool=False):
     coeffs = _legendre_recurrence_coeffs(ellmax)
     ells = np.array([ell for ell in range(ellmax + 1) for m in range(-ell, ell + 1)])
     ms = np.array([m for ell in range(ellmax + 1) for m in range(-ell, ell + 1)])
-    # lambda_{ell m} IS Y_{ell m} at azimuth 0, and is defined for m >= 0 only: mirror m < 0 with
+    # lambda_{ell m} is exactly Y_{ell m} at azimuth 0, and is defined for m >= 0 only: mirror m < 0 with
     # y_{ell -m} = (-1)^m y_{ell m}, and strip sqrt((2 ell + 1) / 4 pi) if the reduced one is wanted
     factor = np.where(ms < 0, (-1.)**ms, 1.)
     if reduced: factor = factor * np.sqrt(4. * np.pi / (2. * ells + 1.))
@@ -676,7 +676,7 @@ def get_Ylm_all(ellmax: int, reduced: bool=False):
         a, ab, d, onehot = (jnp.asarray(tmp, dtype=dtype) for tmp in coeffs)
         sin = jnp.sqrt(1. - cos**2)
         c00 = 1. / np.sqrt(4. * np.pi)
-        # lam holds lambda_{ell m} for all m at fixed ell, m on the LAST axis
+        # lam holds lambda_{ell m} for all m at fixed ell, m on the last axis
         lam = jnp.zeros(cos.shape + (ellmax + 1,), dtype=dtype).at[..., 0].set(c00)
         diag = jnp.full(cos.shape, c00, dtype=dtype)
 
@@ -707,7 +707,7 @@ def get_spherical_jn_all(ellmax: int, n_iter: int=None, xmin: float=0.1):
     whose coefficients grow like :math:`(2\ell + 1)!!` --- already :math:`10^{17}` at
     :math:`\ell = 16`, where they cancel catastrophically at moderate argument. This uses the
     standard stable combination instead, and returns every order in one pass, which is what a
-    TRACED-order gather needs (indexing a Python table requires a static order).
+    traced-order gather needs (indexing a Python table requires a static order).
 
     Regimes, each valid where the others are not:
 
@@ -753,7 +753,7 @@ def get_spherical_jn_all(ellmax: int, n_iter: int=None, xmin: float=0.1):
         up = jnp.stack(ups)
 
         # Miller downward: the seed is arbitrary (the normalization below fixes the scale), but the
-        # recurrence GROWS by ~(2n+1)/x per step -- some 1e130 over the whole sweep at x = xmin --
+        # recurrence grows by ~(2n+1)/x per step -- some 1e130 over the whole sweep at x = xmin --
         # so it must be renormalized as it goes. A fixed small seed instead of renormalizing works
         # in float64 but silently flushes to zero (hence 0/0 = NaN) in float32.
         cap = jnp.asarray(np.sqrt(np.finfo(jnp.result_type(safe)).max), dtype=safe.dtype)
@@ -1029,14 +1029,14 @@ def _wigner_6j(a, b, c, d, e, f):
 def _wigner_9j(*ells):
     """9j via the Racah single sum over 6j.
 
-    sympy's exact-rational wigner_9j costs 20-200 ms per DISTINCT symbol at the orders the
+    sympy's exact-rational wigner_9j costs 20-200 ms for each distinct symbol at the orders the
     scoccimarro window matrix needs (and these calls are already lru_cached, so memoisation cannot
     help further) -- which is what made ellmax >= 16 impractical. The identity
 
         {a b c; d e f; g h i} = sum_x (-1)^(2x) (2x+1) {a b c; f i x}{d e f; b x h}{g h i; x a d}
 
-    with the 6j evaluated in FLOATING point gives 20-58x, growing with ell, and agrees with sympy to
-    ~1e-16. NOTE the float 6j is essential: using sympy's exact 6j inside this sum is SLOWER than one
+    with the 6j evaluated in floating point gives 20-58x, growing with ell, and agrees with sympy to
+    ~1e-16. The float 6j is essential here: using sympy's exact 6j inside this sum is slower than one
     exact 9j (~0.6x), since it trades one exact symbol for ~30 of them.
     """
     a, b, c, d, e, f, g, h, i = ells
@@ -1094,10 +1094,10 @@ def get_S(ells, z3=False):
         return lambda *args: 0.
 
     def _Ylm(ell, m, xhat):
-        # NO sign compensation. This used to multiply by (-1)**m for m < 0, on the grounds that
+        # No sign compensation is applied. This used to multiply by (-1)**m for m < 0, on the grounds that
         # get_Ylm's non-real convention carries an extra such factor relative to the plain
         # amp * lpmv(|m|, ell, mu) * exp(i m phi) the Gaunt coefficients were derived in. Measured,
-        # it does not: get_Ylm(ell, m, reduced=True) IS sqrt(4 pi / (2 ell + 1)) Y_ell^m to 1e-16
+        # it does not: get_Ylm(ell, m, reduced=True) equals sqrt(4 pi / (2 ell + 1)) Y_ell^m to 1e-16
         # for every m tested. The compensation was therefore spurious and broke the addition
         # theorem -- the convention-free identity S_(l l 0)(x1, x2, x3) = L_l(x1.x2) failed by
         # O(1) with it (l = 1 gave +0.269 against the correct -0.644) and holds to 1e-15 without.

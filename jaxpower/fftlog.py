@@ -495,9 +495,9 @@ class CorrelationToSpectrum(object):
     __getattr__ = SpectrumToCorrelation.__getattr__
     __call__ = SpectrumToCorrelation.__call__
     tree_flatten = SpectrumToCorrelation.tree_flatten
-    # NOT `tree_unflatten = SpectrumToCorrelation.tree_unflatten`: that attribute is a classmethod
-    # ALREADY BOUND to SpectrumToCorrelation, so copying it makes cls -- and hence cls.__new__(cls)
-    # -- SpectrumToCorrelation whatever class it is reached through.
+    # Do not write `tree_unflatten = SpectrumToCorrelation.tree_unflatten`: that attribute is a
+    # classmethod already bound to SpectrumToCorrelation, so copying it makes cls -- and hence
+    # cls.__new__(cls) -- SpectrumToCorrelation whatever class it is reached through.
     tree_unflatten = classmethod(SpectrumToCorrelation.tree_unflatten.__func__)
 
 

@@ -936,7 +936,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         return [pars[name] for name in names]
 
     def _sn3(field):
-        """Third stochastic moment: the amplitude of a THREE-point coincidence.
+        """Third stochastic moment: the amplitude of a three-point coincidence.
 
         Optional. Defaults to ``snb0**2``, the relation a Poisson process satisfies -- but
         only a Poisson process does. For a halo-occupation tracer the second and third
@@ -993,7 +993,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         """The two branches of the n = 3 SPT recursion.
 
         F_n = sum_{m=1}^{n-1} [G_m/((2n+3)(n-1))] [(2n+1) alpha F_{n-m} + 2 beta G_{n-m}],
-        so n = 3 has BOTH m = 1 (single leg i through G_1 = 1, pair (j, k) through F_2/G_2)
+        so n = 3 has two contributions, m = 1 (single leg i through G_1 = 1, pair (j, k) through F_2/G_2)
         and m = 2 (pair (i, j) through G_2, single leg k through F_1 = G_1 = 1). Only the
         second was present before; symmetrising over the 6 orderings does not recover the
         first, because `alpha` is not symmetric -- the m = 1 branch needs alpha(k_i, k_jk)
@@ -1187,7 +1187,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     # This is the configuration Cov[P, P] is built from, and it is a degenerate point of the
     # generic permutation sum: four of the twelve (2, 2, 1, 1) terms carry the internal
     # momentum q = k1 + k2, which vanishes there, and their individual 1/q^2 poles cancel
-    # only in the sum. Evaluated AT q = 0 the `_safe_div` guards return zero for those four
+    # only in the sum. Evaluated right at q = 0 the `_safe_div` guards return zero for those four
     # terms, which is not their (finite) limit, so the sum comes out wrong.
     #
     # The limit itself is perfectly well behaved: shifting k2 -> k2 - eps k1 (so that
@@ -1196,14 +1196,14 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     # before round-off sets in. So the fix is simply to evaluate it just off the degenerate
     # point rather than to write a special expression for it.
     #
-    # There WAS such a special expression (`_para_channel`, reachable with
-    # JAXPOWER_PT_PARA_REDUCED=1). It returns EXACTLY twice the limit, in every configuration
+    # Such a special expression did once exist (`_para_channel`, reachable with
+    # JAXPOWER_PT_PARA_REDUCED=1). It returns precisely twice the limit, in every configuration
     # tested and in the pure matter limit (b1 = 1, f = 0, no counterterms), so this is not a
     # bias- or RSD-modelling difference. It is a double count: its (3, 1, 1, 1) piece is added
     # in both of the two channel calls, giving 12 x 2 x 2 = 48 units against the generic
     # 6 x 4 = 24, and the same for its (2, 2, 1, 1) piece. `tests/test_pt_trispectrum.py`.
     #
-    # REQUIREMENT ON THE CALLER: `pk_callable` must go to ZERO below its grid, not clamp to
+    # One requirement falls on the caller: `pk_callable` must fall to zero below its grid, not clamp to
     # P(k_min) as `jnp.interp` does by default. The four collapsed terms carry P(q) with
     # q -> 0 and are finite only because P(q) kills their 1/q^2 kernels; with a clamped
     # constant they instead contribute a spurious O(1) piece -- 44% of T on one matter
@@ -1329,10 +1329,10 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     #           + sn^2 sum_{4 legs}            P(k_l)
     #           + sn^3
     #
-    # EVERY term has total dimension L^9, as it must: with [P] = L^3, [B] = L^6 and
+    # Each term has total dimension L^9, as it must: with [P] = L^3, [B] = L^6 and
     # [sn] = L^3, the powers (p, q) of (P, sn) satisfy p + q = 3 term by term.
     #
-    # WHAT WAS HERE BEFORE, AND WHY IT WAS WRONG. The previous expression was
+    # On the previous expression, and why it was wrong. It read
     #
     #     0.25 sum_{i<j} leg_i leg_j  +  0.5 sum_i leg_i sn0_i  +  shot
     #
@@ -1347,7 +1347,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     # sn x leg_i); and the trailing `+ shot` was L^3 where L^9 is needed (`shot**3` now,
     # matching `shot**2` in spectrum3). No caller in this repository passed `shot`.
     #
-    # CONVENTIONS, all inherited from spectrum3_redshift_tracer so the two stay consistent:
+    # Conventions, all inherited from spectrum3_redshift_tracer so the two stay consistent:
     #   * the pair-coincidence amplitude is `snb0` (which equals sn2 = 1/nbar in the Poisson
     #     limit); the (snb0, sn0) split, i.e. the mu-dependence of the stochastic amplitude,
     #     is kept only where it multiplies a leg, exactly as in the bispectrum's shot leg;
@@ -1358,7 +1358,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     # With snb0 = shot = sn2, sn0 = sn2 / 2 and no counterterms this reproduces the Poisson
     # expansion above term by term -- `tests/test_pt_stochastic.py` checks exactly that.
     #
-    # THE ZERO-MOMENTUM GUARD. Terms carrying a pair momentum q = k_i + k_j are switched off
+    # The zero-momentum guard. Terms carrying a pair momentum q = k_i + k_j are switched off
     # where q vanishes identically. That is not a physical statement about the squeezed limit:
     # it is that P and B are not defined at q = 0 by any tabulated theory, and the covariance
     # calls this at (k, -k, k', -k'), where two of the six pairs have q == 0 exactly. It
@@ -1391,14 +1391,14 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         xlq = _xcos(klvec, kqvec, kl, kq)
         Zq, Zk, Zl = _Z1eft(fq, kq, muq), _Z1eft(fk, kk, muk), _Z1eft(fl, kl, mul)
         Pq, Pk, Pl = _IR_pk(kq, muq), _IR_pk(kk, muk), _IR_pk(kl, mul)
-        # The Z2 kernel carries the field of the leg NOT in the contracted pair, as in
+        # The Z2 kernel carries the field of the leg outside the contracted pair, as in
         # spectrum3_redshift_tracer's B12 / B23 / B31.
         return 2. * (_Z2(fl, kq, kk, xqk, muq, muk) * Zq * Pq * Zk * Pk
                      + _Z2(fq, kk, kl, xkl, muk, mul) * Zk * Pk * Zl * Pl
                      + _Z2(fk, kl, kq, xlq, mul, muq) * Zl * Pl * Zq * Pq)
 
     def _alive(qvec, kavec, kbvec):
-        # The threshold must sit ABOVE the parallelogram regularization, not below it.
+        # The threshold must sit above the parallelogram regularization, never below it.
         # That regularization moves k1 + k2 from exactly 0 to -eps k1, i.e. q^2 / ref = eps^2 /
         # 2 ~ 5e-11 at the default eps = 1e-5. A fixed 1e-12 threshold would let those legs
         # through, and they would be evaluated at a q so small that P(q) and B(q, k, -k) are

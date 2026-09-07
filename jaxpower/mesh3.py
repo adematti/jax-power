@@ -1067,7 +1067,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
     if fields[2] == fields[1] + 1 == fields[0] + 2:
         return tuple(shotnoise)
 
-    # Take the meshes as _format_meshes returned them. It has ALREADY resolved every repeated
+    # Take the meshes as _format_meshes returned them. It has already resolved every repeated
     # field (`if mesh is None: meshes[imesh] = meshes[fields.index(field)]`).
     particles = []
     for fkp in fkps:
@@ -1228,7 +1228,7 @@ def get_scoccimarro_los_coeffs(ell, m=0, normalize=True):
     Host-side coefficients of the TripoSH *shape factor* in the :math:`\hat{k}_3` reference-leg
     convention (desi-gqc-notes, sec. "The reference leg").
 
-    The bispectrum estimator applies :math:`\mathcal{L}_L` to the leg that CLOSES the triangle,
+    The bispectrum estimator applies :math:`\mathcal{L}_L` to the leg that closes the triangle,
     :math:`\hat{k}_3` (see :func:`compute_mesh3_spectrum`: ``meshes[2] * get_legendre(ell3)(mu)``
     for a global line of sight, ``Ylms[2][...] * meshes[2]`` for a local one). The window-matrix
     derivation is naturally written in terms of the rotational scalar
@@ -1242,7 +1242,7 @@ def get_scoccimarro_los_coeffs(ell, m=0, normalize=True):
     which for :math:`r = 1` collapses to the single Legendre
     :math:`\mathcal{L}_{\ell_2}(\cos\theta_{12})`, but for :math:`r = 3` does not: evaluating it in
     the frame :math:`\hat{k}_3 = \hat{z}` forces :math:`M = 0` and puts the other two legs at
-    OPPOSITE azimuths (their transverse parts must cancel), leaving
+    opposite azimuths (their transverse parts must cancel), leaving
 
     .. math::
 
@@ -1250,7 +1250,7 @@ def get_scoccimarro_los_coeffs(ell, m=0, normalize=True):
         \begin{pmatrix}\ell_1&\ell_2&L\\\mu&\mu_2&0\end{pmatrix}
         y_{\ell_1 \mu}(\theta_{31}, 0)\, y_{\ell_2 \mu_2}(\theta_{32}, 0), \quad \mu_2 = -\mu,
 
-    a finite sum of associated Legendre values at the two interior angles measured FROM leg 3. The
+    a finite sum of associated Legendre values at the two interior angles measured from leg 3. The
     same expression with :math:`M' \neq 0` and without the :math:`1/H` (it cancels against the
     Sugiyama denominator) is the theory-side factor :math:`\Sigma^{(3)}`, which replaces
     ``3j(l1', l2', L'; 0, -M', M') y_{l2'}^{-M'}(cos theta_12', 0)``.
@@ -1305,7 +1305,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
 
     with :math:`\mathcal{S}^{(3)}` the reference-leg shape factor of
     :func:`get_scoccimarro_los_coeffs` -- the estimator's line-of-sight Legendre refers to the
-    leg that closes the triangle, :math:`\hat{k}_3`, so this is NOT the single Legendre
+    leg that closes the triangle, :math:`\hat{k}_3`, so this differs from the single Legendre
     :math:`\mathcal{L}_{\ell_2}(\cos\theta_{12})` that the :math:`\hat{k}_1` convention would give
     (the two agree at :math:`L = 0` and differ by :math:`\mathcal{O}(1)` beyond) --
     and :math:`\tilde{B}_{\ell_1\ell_2L}` the TripoSH window convolution
@@ -1352,7 +1352,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
         :math:`I_{000}\, \Sigma^{(3)}_{\ell_1'\ell_2'L'M'}`); both angular factors come from
         :func:`get_scoccimarro_los_coeffs`. The projection prefactor
         :math:`N' H' / \sqrt{4\pi(2L'+1)}` is folded into the window coefficients ``coeff`` -- but
-        NOT the :math:`3j`, which now lives inside :math:`\Sigma^{(3)}`.
+        though not the :math:`3j`, which now lives inside :math:`\Sigma^{(3)}`.
     """
     coeffs = []
     min = None
@@ -1369,7 +1369,7 @@ def get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=4):
             sugiyama_coeffs = get_sugiyama_window_convolution_coeffs(sugiyama_ell, sugiyama_ellt)
             if not sugiyama_coeffs: continue
             # Theory-side projection (Scoccimarro to TripoSH), eq. 25 of arXiv:1803.02132.
-            # The 3j (l1', l2', L'; 0, -M', M') that used to sit here has moved INTO the theory-side
+            # The 3j (l1', l2', L'; 0, -M', M') that used to sit here has moved into the theory-side
             # angular factor: in the k_3 reference-leg convention the 3j and the harmonic no longer
             # factorize, the pair being replaced by Sigma^(3) (get_scoccimarro_los_coeffs with
             # normalize=False), whose mu = 0 term is exactly this 3j times y_{l2'}^{-M'}.
@@ -1457,29 +1457,29 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: boo
 def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_ordered=None,
                                           fix_legs=None, atol=1e-9):
     r"""
-    Matrix :math:`S` scattering an ORDERED theory vector onto the UNORDERED
+    Matrix :math:`S` scattering an ordered theory vector onto the unordered
     :math:`(k_1', k_2', k_3')` grid that :func:`compute_smooth3_spectrum_window` integrates
     over: ``theory_unordered = S @ theory_ordered``.
 
-    The estimator bins ORDERED triangles :math:`k_1' \leq k_2' \leq k_3'`, but the window
+    The estimator bins ordered triangles :math:`k_1' \leq k_2' \leq k_3'`, but the window
     convolution runs over all of :math:`k'`-space, so the matrix must be given the unordered
     grid (pass ``edgesin`` as raw per-axis edges and it builds one). Filling that grid requires
-    knowing :math:`B_{L'}` at each ordering, which is a THEORY-side question and is only a
+    knowing :math:`B_{L'}` at each ordering, which is a theory-side question and is only a
     relabelling when the multipole is invariant under the permutation.
 
     Validity, per multipole, if the three :math:`\delta`-fields are the same:
 
-    - ``fix_legs=(2,)``: exact for EVERY :math:`L'`.
+    - ``fix_legs=(2,)``: exact for every :math:`L'`.
       The scoccimarro :math:`B_{L'}` is referred to :math:`\hat{k}_3 \cdot \hat{z}` (the estimator applies the output Legendre to the
       third leg), and swapping :math:`k_1 \leftrightarrow k_2` leaves that leg alone, so
       :math:`B_{L'}(k_1,k_2,k_3) = B_{L'}(k_2,k_1,k_3)` identically.
     - ``fix_legs=None`` (all permutations): exact for :math:`L' = 0` only, since :math:`B_0` is
       an orientation average of a rigid triangle and therefore symmetric. For :math:`L' > 0`
       a reordering moves the line-of-sight reference to a different leg, mixing :math:`L` and
-      involving the second angular coordinate this basis drops -- so it is NOT a relabelling,
+      involving the second angular coordinate this basis drops -- so it is something other than a relabelling,
       and the theory must supply those entries itself.
 
-    Rows with no admissible permutation are left ZERO, i.e. that part of :math:`k'`-space
+    Rows with no admissible permutation are left at zero, i.e. that part of :math:`k'`-space
     contributes nothing; the box-limit sum rule then falls short by the corresponding weight,
     which is the honest signal that the theory is incomplete there.
 
@@ -1541,7 +1541,7 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
         perms = np.array(list(itertools.permutations(range(3))))
         rows = kin_ordered[:, perms].reshape(-1, 3)
         erows = None if eo is None else eo[:, perms].reshape(-1, 3, eo.shape[-1])
-        # dedupe on the BOX when edges are known (degenerate legs give identical boxes),
+        # dedupe on the box when edges are known (degenerate legs give identical boxes),
         # else on the triple
         keys = rows if erows is None else erows
         index = np.unique(keys.reshape(len(rows), -1), axis=0, return_index=True)[1]
@@ -1556,7 +1556,7 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
     groups, index_1d = np.unique(keys, axis=0, return_inverse=True)
     index_1d = index_1d.ravel()
     inv_ordered, inv_kin = index_1d[:len(kin_ordered)], index_1d[len(kin_ordered):]
-    # column of each group, -1 where the group has none; reversed so the FIRST ordered row wins
+    # column of each group, -1 where the group has none; reversed so the first ordered row wins
     column = np.full(len(groups), -1)
     column[inv_ordered[::-1]] = np.arange(len(kin_ordered))[::-1]
     # admissible only if sorting leaves every fixed leg where it already is
@@ -1741,11 +1741,11 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
 
     def axis_basis_matrices(edges, k_axes, kind, nsub=1):
         """Per-axis (separable) replacement for the sharp tophat/read: build,
-        for each axis independently, a SMALL matrix of shape (n_k_axis,
+        for each axis independently, a small matrix of shape (n_k_axis,
         n_unique_axis) (kind='spline', input/theory side: a smooth spline basis
         function per distinct bin center, matrix_spline_interp) or
         (n_unique_axis, n_k_axis) ('rebin', output side: a proper k^2-weighted
-        bin average, matrix_rebin), keyed by the axis's DISTINCT bin
+        bin average, matrix_rebin), keyed by the axis's distinct bin
         centers/edges -- never the full (nbins1 x nbins2, n_k1 x n_k2) dense
         tensor (edges may be a masked/paired list, e.g. sugiyama-diagonal's
         k1=k2, not a full product grid; this stays correct and small either
@@ -1753,7 +1753,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
 
         ``nsub`` > 1 replaces each bin's single representative midpoint by
         ``nsub`` Gauss-Legendre sub-nodes spanning the bin, so the basis
-        represents the BIN rather than its centre (``nsub = 1`` puts the single
+        represents the bin rather than its centre (``nsub = 1`` puts the single
         node at the centre and reproduces the midpoint construction exactly,
         which is why it is the default here and leaves the scoccimarro callers
         below untouched).
@@ -1769,13 +1769,13 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             kk = np.asarray(k_axes[d])
             unique_edges = edges[first_idx, d, :]
             if nsub > 1:
-                # Sub-node construction, shared by both kinds. 'spline' SUMS the sub-node
+                # Sub-node construction, shared by both kinds. 'spline' sums the sub-node
                 # interpolation weights and never averages them: the sum over all bins of a
                 # partition-of-unity interpolant must stay 1 at every k. As nsub
                 # grows the summed basis tends to the sharp tophat indicator that tiles the bins
                 # exactly, i.e. the scoccimarro branch's theory-side primitive, so nsub
                 # interpolates monotonically between the midpoint spline (nsub = 1) and that
-                # tophat. 'rebin' instead AVERAGES, weighted by the k^2 measure, matching
+                # tophat. 'rebin' instead averages, weighted by the k^2 measure, matching
                 # matrix_rebin's definition.
                 from .pt import integration
                 # bounds are per unique bin, so the nodes come out (n_unique, nsub) directly,
@@ -1783,14 +1783,14 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 integ_sub = integration(unique_edges[:, :1], unique_edges[:, 1:], size=nsub)
                 ksub, wsub_bin = np.asarray(integ_sub.x()), np.asarray(integ_sub.w)
                 if kind == 'spline':
-                    # theory known AT the sub-nodes, evaluated ON the fftlog grid
+                    # theory known at the sub-nodes, evaluated on the fftlog grid
                     Msub = matrix_spline_interp(jnp.asarray(ksub.ravel()), kk, interp_order=interp_order)
                     M = jnp.sum(Msub.reshape(Msub.shape[0], *ksub.shape), axis=-1)       # (n_k, n_unique)
                     _lo, _hi = unique_edges.min(), unique_edges.max()
                     M = M * ((kk >= _lo) & (kk <= _hi))[:, None]
                 else:
-                    # opposite direction: the transformed spectrum is known ON the fftlog grid and
-                    # is READ at the sub-nodes, then averaged over the bin with the k^2 measure
+                    # opposite direction: the transformed spectrum is known on the fftlog grid and
+                    # is read at the sub-nodes, then averaged over the bin with the k^2 measure
                     Msub = matrix_spline_interp(kk, jnp.asarray(ksub.ravel()), interp_order=interp_order)
                     Msub = Msub.reshape(*ksub.shape, Msub.shape[-1])                     # (n_unique, nsub, n_k)
                     wsub = jnp.asarray(wsub_bin * ksub**2)
@@ -1856,9 +1856,9 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     if 'scoccimarro' in bin.basis:
 
         # Upper bound on the Bessel orders reached below, so the spherical-Bessel table covers them.
-        # Enumerated rather than assumed to equal ellmax: an order ABOVE the bound would be silently
-        # CLAMPED by jnp.take into a lower-order Bessel -- the same failure mode as the tabulated
-        # get_legendre. Taken over ALL FOUR leg orders, output and theory: the Bessel gather uses
+        # Enumerated rather than assumed to equal ellmax: an order above the bound would be silently
+        # clamped by jnp.take into a lower-order Bessel -- the same failure mode as the tabulated
+        # get_legendre. Taken over all four leg orders, output and theory: the Bessel gather uses
         # the first component of each key as well as the second.
         ellmax_legendre = max([0] + [max(ell_out_key[:2] + ell_theory_key[:2])
                                      for ellin_key, wain_key in ellsin for ell_key in ells
@@ -1866,7 +1866,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         spherical_jn_all = get_spherical_jn_all(ellmax_legendre)
 
         def cos31_cos32(triangle):
-            """Interior angles measured FROM leg 3: (3, 1) opposite leg 2, and (3, 2) opposite 1."""
+            """Interior angles measured from leg 3: (3, 1) opposite leg 2, and (3, 2) opposite 1."""
 
             def cos_clipped(numerator, denominator):
                 # Bin centers can fall (slightly) outside the triangle inequality
@@ -1886,22 +1886,22 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             tophat = (jnp.abs(cos) < 1.) + 1. / 2. * (jnp.abs(cos) == 1.)
             return np.pi**2 / prod(triangle) * tophat
 
-        # ---- table-driven shape factors: ONE compilation for every term ----
+        # ---- table-driven shape factors: a single compilation for every term ----
         # The reference-leg shape factor sum_mu c_mu y_{l1 mu}(theta31) y_{l2 mu2}(theta32) -- both
-        # angles measured FROM leg 3, the leg the estimator's Legendre refers to -- is what the two
-        # angular factors below evaluate. Written directly it needs a STATIC (ell1, ell2, L), since
+        # angles measured from leg 3, the leg the estimator's Legendre refers to -- is what the two
+        # angular factors below evaluate. Written directly it needs a static (ell1, ell2, L), since
         # get_Ylm casts its order to a Python int, and so costs one XLA compilation per surviving
-        # term -- 2 x 63 = 126 at ellmax = 16, which DOMINATES the run (the arithmetic itself is
+        # term -- 2 x 63 = 126 at ellmax = 16, which dominates the run (the arithmetic itself is
         # ~16 min for the Q000 window, the compilations far more).
-        # The fix: the shape factor is separable, and across ALL terms only (ellmax + 1)^2 distinct
+        # The fix: the shape factor is separable, and across all terms only (ellmax + 1)^2 distinct
         # (ell, mu) harmonics ever appear -- 289 at ellmax = 16 against 129150 requested evaluations,
         # a 447x redundancy. So tabulate the harmonics once per batch of evaluation points and turn
-        # each term into a traced GATHER plus a weighted sum. Orders become data, nothing is static,
+        # each term into a traced gather plus a weighted sum. Orders become data, nothing is static,
         # and one graph serves every term.
         # The table comes from the recurrence rather than get_Ylm's closed forms: same values, but
         # one scan instead of (ellmax + 1)^2 lambdified expressions unrolled into this jit (1223 vs
         # 43033 jaxpr equations at ellmax = 16), and no high-order cancellation. Flat-indexed
-        # exactly as harmonic_index, at azimuth 0 where the reduced COMPLEX harmonic is real.
+        # exactly as harmonic_index, at azimuth 0 where the reduced complex harmonic is real.
         harmonic_table = get_Ylm_all(ellmax_legendre, reduced=True)
 
         def pack_shape_keys(keys):
@@ -1957,18 +1957,18 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         integ_in = integration(-1., 1., size=max(int(ninsub), 1))
         nodes_in, weights_in = jnp.asarray(integ_in.x()), jnp.asarray(integ_in.w)
 
-        # OUTPUT-side bin averaging (ms.tex caveat (ii) on eq:scoccimarro_window_matrix_explicit:
+        # Output-side bin averaging (ms.tex caveat (ii) on eq:scoccimarro_window_matrix_explicit:
         # "average the (k1, k2, k3) dependence over the bin"). The theory side does this via
         # ninsub; the output side carries its own rapidly varying, discontinuous factor
         # L_{ell2}(cos theta12) = (-1)^ell2 I_{ell2 ell2 0} / I_000, and evaluating it at the
-        # single representative triangle bin.xavg is NOT the bin average. Since
-        # d cos(theta12) / d k3 = k3 / (k1 k2), a SHORT leg makes cos(theta12) sweep the bin:
+        # single representative triangle bin.xavg falls short of the bin average. Since
+        # d cos(theta12) / d k3 = k3 / (k1 k2), a short leg makes cos(theta12) sweep the bin:
         # measured, L_2 at the midpoint is +20% off its bin average for (0.033, 0.071, 0.071)
         # and +40% for (0.033, 0.033, 0.033), but only ~1% for (0.110, 0.071, 0.071).
-        # Shape dependence -- large for squeezed ISOSCELES, small for squeezed scalene or for
+        # Shape dependence -- large for squeezed isosceles, small for squeezed scalene or for
         # equal-but-short legs.
         # Theory-side primitive is the sharp tophat: it tiles the bins exactly, which the
-        # box-limit sum rule requires, and it measured BETTER than the smooth spline basis
+        # box-limit sum rule requires, and it measured better than the smooth spline basis
         # The output side is the noutsub bin average below, and it is not optional here: leaving
         # the angular factor at the bin's representative triangle is what noutsub exists to fix.
         if noutsub < 2:
@@ -1988,7 +1988,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         kout_sub = jnp.asarray(ksub_out.reshape(-1, 3))
         kout_weight = jnp.asarray(wsub_out)
         # `read` below is called with `to_spectrum.k`, a 2-tuple, so its `zip(k, kout)`
-        # consumes the k1 and k2 columns ONLY -- the k3 sub-index never reaches the gather.
+        # consumes the k1 and k2 columns alone -- the k3 sub-index never reaches the gather.
         # Of the noutsub^3 sub-points, only noutsub^2 are therefore distinct as far as the
         # interpolation is concerned, and gathering all of them repeats identical work
         # noutsub times. `subindex` orders the (k1, k2, k3) sub-indices with the k3 one fastest, so the i3 = 0 slice
@@ -1998,11 +1998,11 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         kout_sub12 = jnp.asarray(ksub_out[:, ::noutsub, :2].reshape(-1, 2))   # (nout * noutsub^2, 2)
         nsub12 = noutsub**2
 
-        # These weights are pure setup, but they run OUTSIDE jax.lax.map, i.e. eagerly, where
+        # These weights are pure setup, but they run outside jax.lax.map, i.e. eagerly, where
         # every primitive pays its own XLA compilation. The measure and shape factor together
         # are ~25 primitives, so left bare this costs ~25 compilations per term and the term
         # count grows as 4 * ellmax - 1. Under a single jit it is one compilation each instead.
-        # Table-driven and computed for EVERY term at once, so this is a single compilation
+        # Table-driven and computed for every term at once, so this is a single compilation
         # rather than one per term (see harmonic_table above).
         @jax.jit
         def compute_out_weights(index1, index2, weight):
@@ -2012,7 +2012,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             numerator = kout_weight[None] * (compute_measure(triangle)[None] * shape).reshape(len(index1), -1, nsub_out)
             return numerator.reshape(len(index1), -1, nsub12, noutsub).sum(axis=-1)
 
-        # The denominator is independent of BOTH the theory bin and the term, so it is built once
+        # The denominator is independent of the theory bin and of the term alike, so it is built once
         # here. Left eager, unlike the weights above: it is a handful of primitives, not the ~25
         # per term that make the eager compilation worth avoiding.
         out_denominator = jnp.sum(kout_weight * compute_measure(kout_sub.T).reshape(-1, nsub_out), axis=-1)
@@ -2021,18 +2021,18 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # Theory-side quadrature nodes on the k1', k2' legs, mirroring the k3' ones. The theory
         # bin's contribution is
         #   int_bin dk1' k1'^2 j_{l1'}(k1' r1) int_bin dk2' k2'^2 j_{l2'}(k2' r2) volume(k1', k2')
-        # which for ONE bin is just the (bin-integrated) Bessel functions -- there is no need to
+        # which for a single bin is just the (bin-integrated) Bessel functions -- there is no need to
         # build a tophat on the full FFTlog k-grid and transform it. Evaluating it directly is
         # both far cheaper (`volume` costs ninsub^3 points instead of the whole n1 x n2 x ninsub
-        # grid, of which the tophat discards all but a handful) and MORE accurate: the tophat
+        # grid, of which the tophat discards all but a handful) and more accurate: the tophat
         # snaps the bin edges onto the log k-grid, so the integral it performs is over a
         # quantized bin. Measured against Gauss-Legendre quadrature, the snapped bin agrees to
-        # ~0.1% but the TRUE bin differs by 2-20%, and refining the grid does not converge it
+        # ~0.1% but the true bin differs by 2-20%, and refining the grid does not converge it
         # smoothly -- the effective bin width jitters with where the edges land.
         s_window = tuple(next(iter(window)).coords().values())
 
-        # Spherical Bessel table, PRECOMPUTED over the distinct 1D theory bins.
-        # Evaluating get_spherical_jn_all inside the per-bin map recomputed an IDENTICAL table for each of the
+        # Spherical Bessel table, precomputed over the distinct 1D theory bins.
+        # Evaluating get_spherical_jn_all inside the per-bin map recomputed an identical table for each of the
         # 4 * ellmax - 1 terms (it depends on the bin's nodes and the fixed r grid, not on the
         # term), and recomputed it per theory bin although the axis-d nodes depend only on that
         # axis's 1D bin -- of which there are ~n^(1/3) as many. Both redundancies are removed by
@@ -2055,7 +2055,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             k_lo, k_hi = edgesin[index_bin, leg, 0], edgesin[index_bin, leg, 1]
             return k_lo + 0.5 * (k_hi - k_lo) * (nodes_unit + 1.), 0.5 * (k_hi - k_lo) * weights_unit
 
-        # Theory-side angular factor, for ALL theory bins AND all terms at once. Chunked over
+        # Theory-side angular factor, for all theory bins and all terms at once. Chunked over
         # bins by lax.map: the harmonic table is (nharm, nquad, nquad, ninsub) per bin, so
         # materializing it for every bin at once would be ~12 GB at ellmax = 16, while a batch
         # of it is tens of MB. The result is (nbin, nkeys, nquad, nquad) -- 274 MB at 8511 bins,
@@ -2064,7 +2064,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         def compute_in_volume(index1, index2, weight):
             def volume_one_bin(index_bin):
                 # Gauss-Legendre nodes on all three theory legs. The k3' integral is the
-                # measure factor (I ~ (k1 k2 k3)^-1 Theta Sigma is rapidly varying AND
+                # measure factor (I ~ (k1 k2 k3)^-1 Theta Sigma is rapidly varying and
                 # discontinuous, so its point value is not the bin average -- that breaks
                 # the box-limit sum rule by tens of per cent); the k1', k2' ones replace
                 # the tophat, which quantized the bin onto the log k-grid.
@@ -2080,13 +2080,13 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
 
             return jax.lax.map(volume_one_bin, jnp.arange(edgesin.shape[0]), batch_size=batch_size)
 
-        # ONE compilation for all 4 * ellmax - 1 TripoSH terms. Everything that varies between
+        # A single compilation for all 4 * ellmax - 1 TripoSH terms. Everything that varies between
         # terms -- the two FFTlog transforms, the window combination Qs, the output weights, the
-        # theory volume and the multipole orders -- is passed as a TRACED argument. Captured as
+        # theory volume and the multipole orders -- is passed as a traced argument. Captured as
         # closure constants instead (as this used to be), each term's FFTlog kernels are baked
         # into the graph as literals, so every term lowers to a different HLO module and
         # recompiles: at ellmax = 16 that is 63 compilations of a 2D-FFTlog scan body.
-        # Note this relies on FFTlog treedefs comparing EQUAL across orders, i.e. on the value
+        # Note this relies on FFTlog treedefs comparing equal across orders, i.e. on the value
         # equality of BaseFFTEngine -- with identity comparison jit retraces regardless.
         # `wain` is the only thing that must stay static -- it is an exponent of the separations --
         # so it is jit's static argument and jit's own cache holds one compilation per wide-angle
@@ -2136,14 +2136,14 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
 
             return jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
-        # Count the SURVIVING terms up front (a pure-Python label lookup, no device work), so the bar
+        # Count the surviving terms up front (a pure-Python label lookup, no device work), so the bar
         # measures what is actually run: of the (ellmax + 1)^2 terms per block only ~4 * ellmax - 1
         # read a multipole `window` carries, the rest contributing exactly zero.
         progress = make_pbar(sum(any(has_w_rect(q, wain_key) for q, _ in wcoeffs_key)
                                  for ellin_key, wain_key in ellsin for ell_key in ells
                                  for _, _, wcoeffs_key in get_scoccimarro_window_convolution_coeffs(ell_key, ellin_key, ellmax=ellmax)))
 
-        # Enumerate the DISTINCT angular keys over every surviving term, so both tables are built
+        # Enumerate the distinct angular keys over every surviving term, so both tables are built
         # once for the whole matrix instead of once per term. Many terms share a key: at ellmax = 16
         # the ellwmax = 2 window has 827 surviving terms but only 63 distinct theory-side keys.
         keys_out, keys_in = {}, {}
@@ -2173,19 +2173,19 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
 
                 coeffs = get_scoccimarro_window_convolution_coeffs(ell, ellin, ellmax=ellmax)
                 for sugiyama_ell_out, sugiyama_ell_theory, wcoeffs in coeffs:
-                    # Skip terms whose window multipoles are ALL absent from `window`: they
+                    # Skip terms none of whose window multipoles are present in `window`: they
                     # contribute exactly nothing -- yet each would otherwise pay a full pass per
                     # theory bin. This is the bulk of the cost at low ellwmax: the term count grows
                     # as (ellmax + 1)^2 per (ell <- ellin) block while only ~(ellmax + 1) terms
                     # have a non-zero window, so 67% (ellmax=2) to 89% (ellmax=8) of the work is
                     # wasted. Absent multipoles are already treated as zero downstream, so this
                     # changes no result -- only the runtime, from O(ellmax^2) to O(ellmax).
-                    # The SAME predicate feeds the progress bar and the key enumeration above, so
+                    # The very same predicate feeds the progress bar and the key enumeration above, so
                     # the three cannot disagree about which terms exist.
                     if not any(has_w_rect(q, wain) for q, _ in wcoeffs): continue
                     Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                     # fftlog
-                    # lowring=False, xy=1: align the two transforms' grids EXACTLY. With the
+                    # lowring=False, xy=1: align the two transforms' grids exactly. With the
                     # default lowring=True each Bessel kernel picks its own low-ringing offset
                     # lnxy, so whenever the forward (theory, sugiyama_ell_theory) and backward
                     # (output, sugiyama_ell_out) orders differ -- most terms here -- the forward
@@ -2194,7 +2194,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     to_spectrum = CorrelationToSpectrum(s=s_window, ell=sugiyama_ell_out, check_level=1,
                                                         minfolds=0, lowring=False, xy=1.)
 
-                    # Both angular factors depend on the term but NOT on the FFTlog chain, so they
+                    # Both angular factors depend on the term alone, never on the FFTlog chain, so they
                     # were built for every key at once above; this term just reads its row. The
                     # output weight is summed over the k3 sub-axis there, which is what lets the
                     # gather run on the (k1, k2) sub-grid alone: sum_{i3} w I is contracted against
@@ -2255,11 +2255,11 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 # the correlation actually lives.
                 to_spectrum = CorrelationToSpectrum(s=tuple(next(iter(window)).coords().values()), ell=ell, check_level=1, minfolds=0, lowring=False, xy=1.)
                 # ninsub / noutsub apply here too, via the sub-node construction in
-                # axis_basis_matrices. Their scoccimarro-side machinery does NOT carry over
+                # axis_basis_matrices. Their scoccimarro-side machinery fails to carry over
                 # literally: the sugiyama multipoles B_{l1 l2 L}(k1, k2) bin only two legs, so
                 # there is no third-leg measure for ninsub to integrate and no rapidly varying
                 # L_{ell2}(cos theta12) for noutsub to bin-average -- and because the output
-                # measure k1^2 k2^2 then factorizes, the separable `rebin` already IS the exact
+                # measure k1^2 k2^2 then factorizes, the separable `rebin` already gives the exact
                 # 2-D output-bin average.
                 index_in, Min_axes = axis_basis_matrices(edgesin, to_spectrum.k, kind='spline', nsub=ninsub)
                 index_in_swap = index_in[:, ::-1]

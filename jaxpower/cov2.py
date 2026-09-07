@@ -182,7 +182,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los='local', fields=None, spl
                       get_W(_fkps[2], mask=masks[2]) * get_W(_fkps[3], mask=masks[3])]
             # Normalization: int(n_{wfield0} n_{wfield2}) * int(n_{wfield1} n_{wfield3}),
             # the ac-bd Wick pairing entering Cov[P_{wfield0 wfield1}, P_{wfield2 wfield3}]
-            # -- NOT the naive product of each spectrum's own (ab)(cd)
+            # -- and not the naive product of each spectrum's own (ab)(cd)
             # normalization (W0.sum() * W1.sum()): that pairing only
             # coincides with ac-bd for a single, repeated field (the
             # single-tracer case), not generically for cross-covariances.
@@ -260,7 +260,7 @@ def compute_mesh2_covariance_window(meshes, bin=None, los='local', fields=None, 
                 ws.append(get_W(wfield[2]) * get_W(wfield[3]))
             # Normalization: int(n_{wfield0} n_{wfield2}) * int(n_{wfield1} n_{wfield3}),
             # the ac-bd Wick pairing entering Cov[P_{wfield0 wfield1}, P_{wfield2 wfield3}]
-            # -- NOT the naive product of each spectrum's own (ab)(cd)
+            # -- and not the naive product of each spectrum's own (ab)(cd)
             # normalization (that pairing degenerates to the same thing only
             # for a single, repeated field).
             norm = (get_W(wfield[0]) * get_W(wfield[2])).sum() * (get_W(wfield[1]) * get_W(wfield[3])).sum()
@@ -783,7 +783,7 @@ def matrix_rebin(xedges, xt, wt=None, interp_order=3, cache=None):
 
     # Cheap discriminating key first: the full np.allclose scan below is O(len(cache) * nt) per
     # lookup, and this is called hundreds of times per covariance with nt = 8192 (measured:
-    # 7.7 ms per cache HIT, 1.5 s of pure overhead in a 53 s run). Shapes plus a few sampled
+    # 7.7 ms per cache hit, 1.5 s of pure overhead in a 53 s run). Shapes plus a few sampled
     # values reject non-matches immediately; the exact comparison still decides.
     def _sig(a):
         a = np.asarray(a)

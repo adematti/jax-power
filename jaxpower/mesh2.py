@@ -767,7 +767,7 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
             spline = interpolate.RectBivariateSpline(*old_x, old_value, kx=order, ky=order, s=0)
             # RectBivariateSpline has no `ext` option, so -- unlike the 1-D
             # branch above, which deliberately uses UnivariateSpline(ext=3) to
-            # hold the boundary value -- it EXTRAPOLATES with its own boundary
+            # hold the boundary value -- it extrapolates with its own boundary
             # polynomials. get_new_coords extends the target range a full decade
             # past the data on each side, so that extrapolation covers most of
             # the output grid, and a cubic spline rings over it.
@@ -874,9 +874,9 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     def _sub_nodes(edges, nsub, k2=True):
         """Gauss-Legendre nodes and measure inside each bin: (nbin, nsub) each.
 
-        ``k2`` includes the :math:`k^2` measure. That belongs to the OUTPUT side, where the
+        ``k2`` includes the :math:`k^2` measure. That belongs to the output side alone, where the
         estimator averages over the modes in a shell and the mode density goes as :math:`k^2`.
-        It does NOT belong to the theory side: there the sub-nodes only refine a basis that must
+        It has no place on the theory side: there the sub-nodes only refine a basis that must
         stay a partition of unity, so that a theory constant across the bin is represented
         exactly. Weighting those by :math:`k^2` would tilt the basis within each bin and break
         that, biasing wide or steeply varying bins.
@@ -966,7 +966,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 # input bin -- a bin can even catch zero fftlog nodes), use
                 # the same spline-basis-function construction matrix_rebin
                 # uses internally (interpolate a unit spike at each input
-                # bin's center, extended to to_spectrum.k by a LINEAR spline
+                # bin's center, extended to to_spectrum.k by a linear spline
                 # -- Min[:, idx] is that bin's basis function).
                 # out: instead of jnp.interp at kout's bin centers, properly
                 # bin-average (weighted by k^2) onto kout's actual edges via
@@ -975,17 +975,17 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 # interp_order=1, not 3. A cubic spline basis rings.
                 if ninsub > 1:
                     # Refine the spline nodes to ninsub Gauss-Legendre points per input bin: the
-                    # basis is then the BIN AVERAGE rather than a single function centred on the
+                    # basis is then the bin average rather than a single function centred on the
                     # bin. This was introduced to suppress the cubic basis's negative side lobes
                     # for a sharply peaked theory; with the linear basis there are no side lobes
                     # to suppress, so it now only supplies the bin average itself.
-                    # k2=False: no k^2 measure on the THEORY side -- the sub-nodes refine a basis
+                    # k2=False: no k^2 measure on the theory side -- the sub-nodes refine a basis
                     # that has to stay a partition of unity (see _sub_nodes), unlike the output
                     # side where the k^2 mode density is physical.
                     _kin, _ = _sub_nodes(edgesin, ninsub, k2=False)
                     _M = matrix_spline_interp(jnp.asarray(_kin.ravel()), to_spectrum.k, interp_order=interp_order)
-                    # SUM the refined basis functions of each bin, do not average them: the spline
-                    # basis on the refined node set is a partition of unity over ALL nodes
+                    # Sum the refined basis functions of each bin, rather than averaging them: the
+                    # spline basis on the refined node set is a partition of unity over every node
                     # (sum_nodes M = 1) . Summing keeps sum_j Min[:, j] = 1,
                     # and a theory constant across the bin is then represented exactly.
                     Min = jnp.sum(_M.reshape(_M.shape[0], *_kin.shape), axis=-1)
