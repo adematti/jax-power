@@ -1059,67 +1059,90 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
         return b1 * _F2(ki, kj, xij) + b2 / 2. + bs / 2. * (xij**2 - 1. / 3.) + f * mu12**2 * _G2(ki, kj, xij)
 
     def _Z3(field, k1vec, k2vec, k3vec):
-        b1 = _get_bias_params(field, 'b1')
+        """Third-order redshift-space kernel, symmetrised over the 3! orderings.
 
-        k1 = _norm(k1vec)
-        k2 = _norm(k2vec)
-        k3 = _norm(k3vec)
-        k123vec = k1vec + k2vec + k3vec
-        k = _norm(k123vec)
+        The redshift-space map `e^{-i k_z u_z} (1 + delta)` organises each order into one
+        density block times p velocity blocks, with weight `(f mu k)^p / p!`:
 
-        mu = _mu(k123vec, k)
-        mu1 = _mu(k1vec, k1)
-        mu2 = _mu(k2vec, k2)
-        mu3 = _mu(k3vec, k3)
+            Z3 = K3 + f mu^2 G3
+               + (f mu k)     [ (mu12/k12) G2(1,2) K1 + (mu3/k3) K2(1,2) ]
+               + (f mu k)^2/2 [ 2 (mu12/k12)(mu3/k3) G2(1,2) + (mu1/k1)(mu2/k2) K1 ]
+               + (f mu k)^3/6 (mu1/k1)(mu2/k2)(mu3/k3)
 
+        with K1 = b1 and K2 the bias-only second-order kernel -- its `f mu^2 G2` piece is
+        already carried by the explicit `f mu^2 G3` term, and including it (as the previous
+        form did, via `_A2`) double counts. Only the first line is symmetric as written, hence
+        the average over the six orderings. The previous form also omitted the `(f mu k)^3`
+        term entirely.
+
+        Checked against two independent implementations that agree with each other to 1e-6 and
+        disagree with the previous form by factors of 2-3: arXiv:1705.02574 Eq. (A3), and
+        Kernels.nb of github.com/oliverphilcox/OneLoopBispectrum (whose
+        `perm123 = Permutations[{q1,q2,q3}]` and whose `Z3s` is likewise their mean).
+        """
+        b1, b2, bs = _get_bias_params(field, ['b1', 'b2', 'bs'])
+        # Philcox's Z3 omits K1 on this block where his Z4's analogue carries it;
+        # JAXPOWER_PT_Z3_K1=0 selects his literal form, for A/B at b1 != 1.
+        _k1fac = b1 if int(os.environ.get('JAXPOWER_PT_Z3_K1', '1')) else 1.
+
+        def _one(v1, v2, v3):
+            kvec = v1 + v2 + v3
+            k = _norm(kvec)
+            fmk = f * _mu(kvec, k) * k
+            k1, k2, k3 = _norm(v1), _norm(v2), _norm(v3)
+            mu1, mu2, mu3 = _mu(v1, k1), _mu(v2, k2), _mu(v3, k3)
+            v12 = v1 + v2
+            k12 = _norm(v12)
+            mu12 = _mu(v12, k12)
+            x12 = _xcos(v1, v2, k1, k2)
+            G2_12 = _G2(k1, k2, x12)
+            K2_12 = b1 * _F2(k1, k2, x12) + b2 / 2. + bs / 2. * (x12**2 - 1. / 3.)
+            return (fmk * (_safe_div(mu12, k12) * G2_12 * _k1fac + _safe_div(mu3, k3) * K2_12)
+                    + fmk**2 / 2. * (2. * _safe_div(mu12, k12) * _safe_div(mu3, k3) * G2_12
+                                     + _safe_div(mu1, k1) * _safe_div(mu2, k2) * b1)
+                    + fmk**3 / 6. * _safe_div(mu1, k1) * _safe_div(mu2, k2) * _safe_div(mu3, k3))
+
+        k1, k2, k3 = _norm(k1vec), _norm(k2vec), _norm(k3vec)
+        kvec = k1vec + k2vec + k3vec
+        mu = _mu(kvec, _norm(kvec))
         x12 = _xcos(k1vec, k2vec, k1, k2)
         x13 = _xcos(k1vec, k3vec, k1, k3)
         x23 = _xcos(k2vec, k3vec, k2, k3)
+        # Density block: the full third-order kernel, not b1 F3. Philcox's
+        #   K3 = (b3/6 + g2x angK + g3 angL + g21 angK angK)          <- no counterpart here
+        #      + (b2 Fn2{q1,q2} + 2 g2 angK[q1, q2+q3] Gn2{q2,q3}) + b1 Fn3
+        # with `g2 = bs/2` and `b2_P = b2 + (2/3) bs` (matching his `g2 (x^2 - 1)` onto the
+        # `bs/2 (x^2 - 1/3)` used by _A2/_Z2 here). The dropped block is the genuine third-order
+        # bias basis: only one combination of it survives at 1-loop in P(k), which is what b3nl
+        # is, but the trispectrum resolves the full angular structure, so there is no faithful
+        # mapping and it is set to zero. K3 is not symmetric, hence the average over orderings.
+        b2p, g2 = b2 + 2. / 3. * bs, bs / 2.
 
-        F3 = _F3(k1, k2, k3, x12, x13, x23)
-        G3 = _G3(k1, k2, k3, x12, x13, x23)
+        def _angK(via, vib):
+            kia, kib = _norm(via), _norm(vib)
+            return _xcos(via, vib, kia, kib)**2 - 1.
 
-        A1_1 = _Z1(field, mu1)
-        A1_2 = _Z1(field, mu2)
-        A1_3 = _Z1(field, mu3)
+        def _k3_one(v1, v2, v3):
+            ka, kb, kc = _norm(v1), _norm(v2), _norm(v3)
+            return (b2p * _F2(ka, kb, _xcos(v1, v2, ka, kb))
+                    + 2. * g2 * _angK(v1, v2 + v3) * _G2(kb, kc, _xcos(v2, v3, kb, kc)))
 
-        A2_12 = _A2(field, k1, k2, x12, mu1, mu2)
-        A2_23 = _A2(field, k2, k3, x23, mu2, mu3)
-        A2_31 = _A2(field, k3, k1, x13, mu3, mu1)
+        vs3 = [k1vec, k2vec, k3vec]
+        k3bias = 0.
+        for i3 in range(3):
+            for j3 in range(3):
+                if j3 != i3:
+                    k3bias = k3bias + _k3_one(vs3[i3], vs3[j3], vs3[3 - i3 - j3])
+        dens = (b1 * _F3(k1, k2, k3, x12, x13, x23) + k3bias / 6.
+                + f * mu**2 * _G3(k1, k2, k3, x12, x13, x23))
+        vs = [k1vec, k2vec, k3vec]
+        rsd = 0.
+        for i in range(3):
+            for j in range(3):
+                if j != i:
+                    rsd = rsd + _one(vs[i], vs[j], vs[3 - i - j])
+        return dens + rsd / 6.
 
-        k12vec = k1vec + k2vec
-        k23vec = k2vec + k3vec
-        k31vec = k3vec + k1vec
-
-        k12 = _norm(k12vec)
-        k23 = _norm(k23vec)
-        k31 = _norm(k31vec)
-
-        mu12 = _mu(k12vec, k12)
-        mu23 = _mu(k23vec, k23)
-        mu31 = _mu(k31vec, k31)
-
-        G2_12 = _G2(k1, k2, x12)
-        G2_23 = _G2(k2, k3, x23)
-        G2_31 = _G2(k3, k1, x13)
-
-        pref = f * mu * k
-
-        t12 = pref * A2_12 * _safe_div(mu3, k3)
-        t23 = pref * A2_23 * _safe_div(mu1, k1)
-        t31 = pref * A2_31 * _safe_div(mu2, k2)
-
-        # k12/k23/k31 are composite (sum-of-two-legs) momenta and can vanish
-        # at the genuine squeezed/folded configuration -- guard like q above.
-        u12 = pref * A1_1 * _safe_div(mu23, k23) * G2_23
-        u23 = pref * A1_2 * _safe_div(mu31, k31) * G2_31
-        u31 = pref * A1_3 * _safe_div(mu12, k12) * G2_12
-
-        v12 = 0.5 * pref**2 * A1_1 * _safe_div(mu2, k2) * _safe_div(mu3, k3)
-        v23 = 0.5 * pref**2 * A1_2 * _safe_div(mu3, k3) * _safe_div(mu1, k1)
-        v31 = 0.5 * pref**2 * A1_3 * _safe_div(mu1, k1) * _safe_div(mu2, k2)
-
-        return b1 * F3 + f * mu**2 * G3 + t12 + t23 + t31 + u12 + u23 + u31 + v12 + v23 + v31
 
     def _IR_pk(k, mu):
         pk = pk_callable(k)
@@ -1330,7 +1353,7 @@ def spectrum4_redshift_tracer(k1vec, k2vec, k3vec, pk_callable, pknow_callable, 
     #     is kept only where it multiplies a leg, exactly as in the bispectrum's shot leg;
     #   * the pure constant comes from the `shot` argument alone, not from snb0^3, again as
     #     in spectrum3 where the 1/nbar^2 constant is `shot**2`;
-    #   * the stochastic sector is NOT FoG-damped, as in spectrum3;
+    #   * the stochastic sector is left undamped by FoG, as in spectrum3;
     #   * a coincidence between different tracers vanishes identically.
     # With snb0 = shot = sn2, sn0 = sn2 / 2 and no counterterms this reproduces the Poisson
     # expansion above term by term -- `tests/test_pt_stochastic.py` checks exactly that.

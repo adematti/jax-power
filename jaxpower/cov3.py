@@ -100,7 +100,7 @@ def get_kvec3(k1norm, k2norm, mu1, mu2, phi2):
 def get_kvec3_x(k1norm, k2norm, mu1, x, phi):
     """Triangle from (mu1, x, phi) instead of (mu1, mu2, phi2).
 
-    `x = k1hat . k2hat` is the triangle SHAPE, carried here as a direct integration variable;
+    `x = k1hat . k2hat` is the triangle shape, carried here as a direct integration variable;
     `phi` is the azimuth of k2hat about k1hat. The solid-angle element is unchanged,
     `dmu2 dphi2 = dx dphi`, so the quadrature weights and the normalization are identical to
     :func:`get_kvec3` -- only the node placement differs.
@@ -1713,7 +1713,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                 # ---- FFT-estimator (within-pair) contact terms ----
                 # GUARD: these exist only where the within-pair momentum sum is NONZERO. In
                 # the PP block T^(N) is called at (k1, -k1, k1', -k1'), where the pair sum
-                # vanishes IDENTICALLY -- and there the contact Sum_i w_i^2 e^{-i(k1+k2) x_i}
+                # vanishes identically -- and there the contact Sum_i w_i^2 e^{-i(k1+k2) x_i}
                 # is a deterministic constant (no x dependence), contributing nothing to the
                 # covariance; the FFT P estimator's subtracted mean removes it exactly.
                 # Without this guard the sn3 P and sn4 constants leak into Cov[P, P] and were
@@ -3295,10 +3295,12 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     #      + (1/nbar^2)[ T(k1+k1', k2+k2', k3, k3')   + 17 perms ]
                     #      + (1/nbar^3)[ B(k1+k1', k2+k2', k3+k3')    + 5 perms ] }
                     #
-                    # The T and B lines (Eq. B5, B6) need only what jaxpower.pt already has;
-                    # P6 and P5 need new perturbation theory and are omitted (P6 is picked up
-                    # automatically if `theory` supplies a 6-point callable). As for the PB
-                    # block's P5 term, there is NO radial delta -- both triangles' orientations
+                    # The T and B lines (Eq. B5, B6) need only what jaxpower.pt already has.
+                    # The 1/nbar P5 line is still omitted. The connected P6 does now get picked up if
+                    # `theory` supplies a 6-point callable, i.e. responds to a 6-field key --
+                    # before 2026-08-29 this comment claimed that but no 6-field `get_base` was
+                    # ever issued, so the term was silently absent; see _P6 just below. As for the PB
+                    # block's P5 term, there is no radial delta -- both triangles' orientations
                     # are integrated independently -- which is why this is the family that
                     # populates the OFF-DIAGONAL. The reference: "for the off-diagonal
                     # elements, the P6 term becomes dominant, and the PP, PT and BB terms are
@@ -3310,17 +3312,43 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                     # (default 4), and scans over the primed nodes to bound memory. Raise it
                     # if the P6 contribution matters at the per-cent level for your case.
                     # COV3_NO_P6=1 switches the term off entirely.
+                    # There are two node sets, because the two families of Eq. (33) have opposite needs
+                    # (both measured 2026-08-30 against paired Monte Carlo on the same integrand):
+                    #
+                    #   shot lines -- converge on the tensor grid, but not by q = 4. The T-line is
+                    #     98-99% of the shot total and q = 4 recovers only 0.68 of it at k = 0.09
+                    #     and 0.44 at k = 0.21 (q = 10: 0.91 / 0.73). They are ~34x cheaper per
+                    #     configuration than the connected term, so a high q is affordable here.
+                    #     COV3_P6_QTRI (default 4, kept for reproducibility -- raise it in production).
+                    #
+                    #   connected P6 -- out of reach of a tensor grid at all. It is a
+                    #     sign-changing cancellation residue (individual topologies 3-38x their
+                    #     sum) whose sharp structure lives on the joint diagonal |k_i + k'_j| ~ 0,
+                    #     which a q-level product grid aliases: q = 4 gets even the sign wrong below
+                    #     k ~ 0.2 and 0.14-0.15 of the answer above it; q = 10 costs 244x more and
+                    #     is still 50-100% short, the deficit falling only as q^-0.8..-1.8 (5%
+                    #     would need q ~ 65-190, i.e. 1e11-1e13 node pairs). Paired Monte Carlo --
+                    #     one random orientation per triangle per sample, N evaluations per bin
+                    #     pair instead of N^2 -- reaches 1% with N ~ 6.5e4.
+                    #     COV3_P6_MC (default 65536; 0 falls back to the tensor grid).
                     _p6_q = int(os.environ.get('COV3_P6_QTRI', '4'))
+                    _p6_mc = int(os.environ.get('COV3_P6_MC', '65536'))
                     if not int(os.environ.get('COV3_NO_P6', '0')) and _p6_q > 0:
                         _T6 = get_base(fields + fieldsp[:1])            # connected T (4 legs)
                         _B6 = get_base(fields)                          # connected B (3 legs)
+                        # The connected P6, the leading term of Eq. (33). It shares the (1/V)
+                        # prefactor of the whole brace, so it is accumulated alongside the shot
+                        # lines and picked up by norm_p6 below. Unlike them it carries no
+                        # permutation sum (the connected 6-point is already symmetric under
+                        # relabelling of its legs) and no shot factor.
+                        _P6 = get_base(fields + fieldsp)                # connected P6 (6 legs)
                         _sn6 = get_shotnoise(a, ap)
                         # Two galaxies shared between the two B estimators -> order 3, three
                         # shared -> order 4. Poisson fallback sn^(m-1) keeps this inert for a
                         # scalar `shotnoise`.
                         _sn6_2 = get_sn_moment((a, a, a), 3)
                         _sn6_3 = get_sn_moment((a, a, a, a), 4)
-                        if _sn6 != 0 and not (_T6 is None and _B6 is None):
+                        if _P6 is not None or (_sn6 != 0 and not (_T6 is None and _B6 is None)):
                             _ig = IntegralND(mu1=integration(-1., 1., size=_p6_q),
                                              mu2=integration(-1., 1., size=_p6_q),
                                              phi2=integration(0., 2. * np.pi, size=_p6_q,
@@ -3362,6 +3390,9 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                                 def _q(x):    # (nbinsp, 3) at node iv -> same
                                     return jnp.broadcast_to(x[iv][None, None, :, :], _shp + (3,))
                                 acc = jnp.zeros(_shp)
+                                if _P6 is not None and not _p6_mc:
+                                    acc = acc + _P6(_u(U[0]), _u(U[1]), _u(U[2]),
+                                                    _q(Q[0]), _q(Q[1]), _q(Q[2]))
                                 if _T6 is not None:
                                     for (i, j, k, l, m, n) in _TP:
                                         acc = acc + _sn6_2 * _T6(
@@ -3380,6 +3411,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
 
                             _p6_cache = cache.setdefault('p6_ell_independent', {})
                             _p6_key = (fields, fieldsp, _p6_q,
+                                       _P6 is not None and not _p6_mc,
                                        float(_sn6_2), float(_sn6_3),
                                        np.asarray(coords).tobytes(),
                                        np.asarray(coordsp).tobytes())
@@ -3389,12 +3421,69 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                                 _, _p6_cache[_p6_key] = jax.lax.scan(
                                     _p6_node, 0., jnp.arange(len(_w6)))
                             _acc_all = _p6_cache[_p6_key]
-                            _p6 = jnp.einsum('p,u,puab->ab', _wSp, _wSu, _acc_all)
-                            norm_p6 = M / (8. * np.pi)**2 / volume
+                            # The grid piece: sum_(u,p) w_u S_u w_p S_p acc / (8 pi)^2 is the
+                            # normalised double angular average.
+                            _p6 = jnp.einsum('p,u,puab->ab', _wSp, _wSu, _acc_all) \
+                                / (8. * np.pi)**2
+
+                            # The connected piece, on paired Monte-Carlo nodes: one random
+                            # orientation for each triangle per sample. Eq. (33) integrates the
+                            # two orientations independently (there is no radial delta in this
+                            # family), so the draws are independent; the estimator is the plain
+                            # mean (1/N) sum_n S(u_n) S'(q_n) P6_n, already normalised, which is
+                            # why it is added to `_p6` after the (8 pi)^2 division and not before.
+                            if _P6 is not None and _p6_mc:
+                                _mcc = cache.setdefault('p6_mc_ell_independent', {})
+                                _mck = (fields, fieldsp, _p6_mc,
+                                        np.asarray(coords).tobytes(),
+                                        np.asarray(coordsp).tobytes())
+                                if _mck not in _mcc:
+                                    _rng = np.random.default_rng(
+                                        int(os.environ.get('COV3_P6_MC_SEED', '42')))
+                                    _am = _rng.uniform(-1., 1., (2, _p6_mc))
+                                    _ap = _rng.uniform(-1., 1., (2, _p6_mc))
+                                    _pm = _rng.uniform(0., 2. * np.pi, _p6_mc)
+                                    _pp = _rng.uniform(0., 2. * np.pi, _p6_mc)
+                                    _, (_muh1, _muh2, _), (_mu1, _mu2, _mu3) = jax.vmap(_fu)(
+                                        jnp.asarray(_am[0]), jnp.asarray(_am[1]),
+                                        jnp.asarray(_pm))
+                                    _, (_mph1, _mph2, _), (_mq1, _mq2, _mq3) = jax.vmap(_fp)(
+                                        jnp.asarray(_ap[0]), jnp.asarray(_ap[1]),
+                                        jnp.asarray(_pp))
+                                    _mshp = (_p6_mc, coords.shape[-1], coordsp.shape[-1])
+
+                                    def _mc_chunk(_lo, _hi):
+                                        def _e(x, ax):    # (n, nb, 3) -> (n, nbins, nbinsp, 3)
+                                            x = x[_lo:_hi]
+                                            return jnp.broadcast_to(
+                                                x[:, :, None, :] if ax == 0
+                                                else x[:, None, :, :],
+                                                (_hi - _lo,) + _mshp[1:] + (3,))
+                                        return _P6(_e(_mu1, 0), _e(_mu2, 0), _e(_mu3, 0),
+                                                   _e(_mq1, 1), _e(_mq2, 1), _e(_mq3, 1))
+
+                                    _step = max(1, int(os.environ.get('COV3_P6_MC_CHUNK', '4096')))
+                                    _mc_acc = jnp.concatenate(
+                                        [_mc_chunk(_lo, min(_lo + _step, _p6_mc))
+                                         for _lo in range(0, _p6_mc, _step)], axis=0)
+                                    _mcc[_mck] = (_mc_acc, _muh1, _muh2, _mph1, _mph2)
+                                _mc_acc, _muh1, _muh2, _mph1, _mph2 = _mcc[_mck]
+                                _Sn = S(_muh1, _muh2) * Sp(_mph1, _mph2)          # (N,)
+                                _p6 = _p6 + jnp.einsum('n,nab->ab', _Sn, _mc_acc) / _p6_mc
+
+                            norm_p6 = M / volume
                             parts['p6'] = norm_p6 * _p6
                             if os.environ.get('COV3_BOX_DEBUG'):
                                 print(f"box33 P6 ell={ell} ellp={ellp}: max|.| = "
                                       f"{np.abs(np.asarray(parts['p6'])).max():.3e}")
+                            if os.environ.get('COV3_DUMP_P6'):
+                                np.savez(os.environ['COV3_DUMP_P6']
+                                         + f"_i{i}_ip{ip}_ell{''.join(map(str, ell))}"
+                                         + f"_ellp{''.join(map(str, ellp))}.npz",
+                                         p6=np.asarray(parts['p6']), ell=ell, ellp=ellp,
+                                         M=M, volume=volume, wSu=np.asarray(_wSu),
+                                         wSp=np.asarray(_wSp), coords=np.asarray(coords),
+                                         coordsp=np.asarray(coordsp))
 
                     block = parts['ppp'] + parts['bb'] + parts['pt'] + parts.get('p6', 0.)
 

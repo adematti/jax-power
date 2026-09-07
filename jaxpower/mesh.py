@@ -2087,6 +2087,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
     with_sharding = bool(sharding_mesh.axis_names)
 
     positions = (positions + attrs.boxsize / 2. - attrs.boxcenter) / attrs.cellsize
+    out = jnp.zeros_like(positions, shape=positions.shape[:1], dtype=mesh.value.dtype)
     _read = lambda mesh, positions, out: resampler.read(mesh, positions, out=out)
 
     #order = resampler.order
@@ -2100,7 +2101,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
 
-        positions = _shard_map_particles(s, positions, jnp.arange(sharding_mesh.devices.size), sharding_mesh=sharding_mesh)
+        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(sharding_mesh.devices.size))
 
         kw_sharding = dict(halo_size=halo_add + resampler.order, sharding_mesh=sharding_mesh)
         value, offset = pad_halo(value, **kw_sharding, factor=1)
@@ -2114,19 +2115,7 @@ def _read(mesh, positions: jax.Array, resampler: str | Callable='cic', compensat
     #    idx = jnp.round(positions[8]).astype(int)
     #    print('0', positions[8], idx, [(tuple(ishift), float(value[tuple(idx + ishift)])) for ishift in ishifts])
 
-    def gather(positions):
-        out = jnp.zeros_like(positions, shape=positions.shape[:-1], dtype=value.dtype)
-        return _read(value, positions, out)
-
-    # particles may come in chunks, as a leading axis; the mesh does not change between them, so its
-    # halo has already been exchanged once, above, and each chunk only gathers
-    if positions.ndim <= 2:
-        return gather(positions)
-
-    def body(carry, positions):
-        return carry, gather(positions)
-
-    return jax.lax.scan(body, None, positions)[1]
+    return _read(value, positions, out)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -2550,7 +2539,7 @@ class ParticleField(object):
 
     @property
     def size(self):
-        # positions may carry leading chunk axes: the size is the number of particles
+        # the number of particles, whatever leading axes the positions carry
         return int(np.prod(self.positions.shape[:-1]))
 
     def sum(self, *args, **kwargs):
@@ -2687,17 +2676,6 @@ class ParticleField(object):
         return new
 
 
-def _shard_map_particles(fun, positions, *args, sharding_mesh=None):
-    """
-    Apply ``fun`` to sharded particles, whose array may carry a leading chunk axis.
-
-    Chunks are replicated across devices and the particles themselves sharded, i.e. every chunk
-    spans all of them, so the partition spec depends on the number of axes.
-    """
-    spec = P(sharding_mesh.axis_names) if positions.ndim <= 2 else P(None, sharding_mesh.axis_names)
-    return shard_map(fun, mesh=sharding_mesh, in_specs=(spec, P(sharding_mesh.axis_names)), out_specs=spec)(positions, *args)
-
-
 @partial(jax.jit, static_argnames=['resampler',  'interlacing', 'compensate', 'out', 'halo_add'])
 def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', interlacing: int=0, compensate: bool=False, out: str='real', halo_add: int=0):
     """WARNING: in case of multiprocessing, positions and weights are assumed to be exchanged!"""
@@ -2728,20 +2706,9 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
         def s(positions, idevice):
             return positions - shard_shifts[idevice[0]]
 
-        positions = _shard_map_particles(s, positions, jnp.arange(sharding_mesh.devices.size), sharding_mesh=sharding_mesh)
+        positions = shard_map(s, mesh=sharding_mesh, in_specs=(P(sharding_mesh.axis_names),) * 2, out_specs=P(sharding_mesh.axis_names))(positions, jnp.arange(sharding_mesh.devices.size))
 
         _paint = shard_map(_paint, mesh=sharding_mesh, in_specs=(P(*sharding_mesh.axis_names), P(sharding_mesh.axis_names), P(sharding_mesh.axis_names)), out_specs=P(*sharding_mesh.axis_names))  # check_rep=False otherwise error in jvp
-
-    def _scatter(value, positions, weights):
-        # particles may come in chunks, as a leading axis: painting them one chunk at a time keeps
-        # the (large) buffers of the scatter to one chunk, while the halo is exchanged only once
-        if positions.ndim <= 2:
-            return _paint(value, positions, weights)
-
-        def body(carry, x):
-            return _paint(carry, *x), None
-
-        return jax.lax.scan(body, value, (positions, weights))[0]
 
     def paint(positions, weights=None):
         mesh = attrs.create(kind='real', fill=0.)
@@ -2756,7 +2723,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
             #print('padded', value.shape, offset)
             positions = positions + offset
             #print(positions.min(axis=0), positions.max(axis=0), value.shape)
-            value = _scatter(value, positions, w)
+            value = _paint(value, positions, w)
             #hs = kw_sharding['halo_size']
             #print(value[:2 * hs].std(), value[-2 * hs:].std(), value[:, :2 * hs].std(), value[:, -2 * hs:].std())
             value = exchange_halo(value, **kw_sharding)
@@ -2764,7 +2731,7 @@ def _paint(attrs, positions, weights=None, resampler: str | Callable='cic', inte
             value = unpad_halo(value, **kw_sharding)
             #print('unpadded', value.shape)
         else:
-            value = _scatter(value, positions, w)
+            value = _paint(value, positions, w)
         return mesh.clone(value=value)
 
     if interlacing <= 1:

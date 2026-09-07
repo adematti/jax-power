@@ -61,17 +61,8 @@ def _aliasing_shotnoise_kernel(order: int):
 from itertools import product
 
 
-_resampler_kernels = [
-    None,
-    lambda s: jnp.full(jnp.shape(s)[-1:], 1.), # NGP
-    lambda s: 1 - s, # CIC
-    lambda s: (s <= 1/2) * (3/4 - s**2) + (1/2 < s) / 2 * (3/2 - s)**2, # TSC
-    lambda s: (s <= 1) / 6 * (4 - 6 * s**2 + 3 * s**3) + (1 < s) / 6 * (2 - s)**3, # PCS
-]
-
-
-# Same kernels, elementwise: they are applied one axis at a time, so that the (N, ndim) arrays of
-# separations and weights --- three quarters of the memory of painting and reading --- never exist.
+# Elementwise: applied one axis at a time, so that the (N, ndim) arrays of separations and
+# weights --- three quarters of the memory of painting and reading --- never exist.
 _resampler_kernels_1d = [
     None,
     lambda s: jnp.ones_like(s), # NGP
@@ -101,8 +92,13 @@ def _index_weight(positions, id0, ishift, shape, order, idtype):
 
 
 def _get_index_dtype(size):
-    """Integer type able to address a mesh of that many cells."""
-    return 'int32' if size < 2**31 - 1 else 'int64'
+    """Integer type able to address a mesh of that many cells.
+
+    Signed, and as narrow as the mesh allows: these index the gathers and scatters, so int32
+    where it fits halves that memory. `np.min_scalar_type` is the obvious built-in but returns
+    unsigned types, and `np.intp` is always 64-bit on a 64-bit host -- neither is usable here.
+    """
+    return np.int32 if size <= np.iinfo(np.int32).max else np.int64
 
 
 def paint(mesh: tuple | jax.Array, positions, weights=1., order: int=2):
