@@ -2203,7 +2203,7 @@ def _get_extent(*positions, mpicomm=None):
     """Return minimum physical extent (min, max) corresponding to input positions."""
     if not positions:
         raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
-    backend, _ = _get_distributed_backend(positions[0], mpicomm=mpicomm)
+    backend, kw = _get_distributed_backend(positions[0], mpicomm=mpicomm)
     # Find bounding coordinates
     nonempty_positions = [pos for pos in positions if pos.size]
     if backend == 'jax':
@@ -2217,6 +2217,9 @@ def _get_extent(*positions, mpicomm=None):
         if nonempty_positions:
             pos_min = np.array([np.min(p, axis=0) for p in nonempty_positions]).min(axis=0)
             pos_max = np.array([np.max(p, axis=0) for p in nonempty_positions]).max(axis=0)
+        # the communicator resolved by default_mpicomm inside _get_distributed_backend, which
+        # defaults to MPI.COMM_WORLD; the local `mpicomm` is still whatever the caller passed
+        mpicomm = kw['mpicomm']
         pos_min, pos_max = mpicomm.allgather(pos_min), mpicomm.allgather(pos_max)
         pos_min, pos_max = [p for p in pos_min if p is not None], [p for p in pos_max if p is not None]
         if not pos_min or not pos_max:
