@@ -4,8 +4,54 @@ from jax import numpy as jnp
 
 from lsstypes import (Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, Mesh3SpectrumPole, Mesh3SpectrumPoles, Mesh3CorrelationPole, Mesh3CorrelationPoles,
                       ObservableLeaf, ObservableTree, WindowMatrix, CovarianceMatrix, read, write)
-from lsstypes.base import from_state, _edges_names, register_type, _check_data_names, _check_data_shapes
+from lsstypes.base import from_state, _edges_names, register_type, _check_data_names, _check_data_shapes, deep_eq
 from lsstypes.utils import plotter, my_ones_like, my_zeros_like
+
+
+def _hash_static(obj):
+    # Structural hash for anything that may sit in aux_data: dicts, sequences, scalars,
+    # and arrays, which are unhashable and so take the fallback branch.
+    if isinstance(obj, dict):
+        return hash(frozenset((name, _hash_static(value)) for name, value in obj.items()))
+    if isinstance(obj, (tuple, list)):
+        return hash(tuple(_hash_static(value) for value in obj))
+    try:
+        return hash(obj)
+    except TypeError:
+        array = np.asarray(obj)
+        return hash((array.shape, array.dtype.str, array.tobytes()))
+
+
+class Static(object):
+    """
+    Wrapper making the static part of a pytree usable as jax aux_data.
+
+    jax stores aux_data in the :class:`PyTreeDef` and requires it to be hashable and to
+    compare with ``==`` to a plain bool. A dict holding numpy arrays is neither: it is
+    unhashable, so :func:`jax.jit` cannot key its cache on it, and comparing two such dicts
+    evaluates ``array == array``, which raises on the ambiguous truth value. This wrapper
+    hashes structurally and defers equality to :func:`lsstypes.base.deep_eq`.
+    """
+    __slots__ = ('data', '_cache')
+
+    def __init__(self, data):
+        self.data = data
+        self._cache = None
+
+    def __hash__(self):
+        # Lazy: flattening happens far more often than hashing, and hashing walks the arrays.
+        if self._cache is None:
+            self._cache = _hash_static(self.data)
+        return self._cache
+
+    def __eq__(self, other):
+        if self is other: return True
+        if type(other) is not type(self): return NotImplemented
+        return hash(self) == hash(other) and deep_eq(self.data, other.data)
+
+    def __repr__(self):
+        return '{}({})'.format(self.__class__.__name__, self.data)
+
 
 
 def make_leaf_pytree(cls):
@@ -19,11 +65,11 @@ def make_leaf_pytree(cls):
                 edges_names.append(name)
         aux_data = {name: getattr(self, name) for name in ['_attrs', '_meta', '_coords_names', '_values_names']}
         aux_data['_edges_names'] = edges_names
-        return tuple(children), aux_data
+        return tuple(children), Static(aux_data)
 
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        aux_data = dict(aux_data)
+        aux_data = dict(aux_data.data)
         edges_names = aux_data.pop('_edges_names')
         new.__dict__.update(aux_data)
         new._data = {name: child for name, child in zip(new._coords_names + new._values_names + edges_names, children)}
@@ -39,11 +85,11 @@ def make_tree_pytree(cls):
     def tree_flatten(self):
         children = tuple(self._branches)
         aux_data = {name: getattr(self, name) for name in ['_attrs', '_meta', '_labels', '_strlabels']}
-        return children, aux_data
+        return children, Static(aux_data)
 
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update(aux_data)
+        new.__dict__.update(aux_data.data)
         new._branches = list(children)
         return new
 
@@ -57,11 +103,11 @@ def make_window_pytree(cls):
     def tree_flatten(self):
         children = (self._value, self._observable, self._theory)
         aux_data = {name: getattr(self, name) for name in ['_attrs']}
-        return children, aux_data
+        return children, Static(aux_data)
 
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update(aux_data)
+        new.__dict__.update(aux_data.data)
         new._value, new._observable, new._theory = tuple(children)
         return new
 
@@ -75,11 +121,11 @@ def make_covariance_pytree(cls):
     def tree_flatten(self):
         children = (self._value, self._observable)
         aux_data = {name: getattr(self, name) for name in ['_attrs']}
-        return children, aux_data
+        return children, Static(aux_data)
 
     def tree_unflatten(cls, aux_data, children):
         new = cls.__new__(cls)
-        new.__dict__.update(aux_data)
+        new.__dict__.update(aux_data.data)
         new._value, new._observable = tuple(children)
         return new
 
