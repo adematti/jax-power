@@ -71,13 +71,16 @@ For bispectra, replace `mesh2` → `mesh3` throughout.
 | `mesh.py` | `MeshAttrs`, all field classes, sharding, particle exchange |
 | `mesh2.py` | 2-point power spectrum: `BinMesh2SpectrumPoles`, `compute_mesh2_spectrum`, window matrices |
 | `mesh3.py` | 3-point bispectrum: `BinMesh3SpectrumPoles`, `compute_mesh3_spectrum` |
+| `meshn.py` | n-point spectrum with all legs binned in `|k|` (trispectrum and higher, for covariance validation): `BinMeshNSpectrumPoles`, `compute_meshn_spectrum`, `compute_mesh{4,5,6}_spectrum` |
 | `particle2/3.py` | Direct particle-pair / triplet statistics (uses `cucount.jax`) |
-| `cov2/3.py` | Covariance and window matrices; `compute_fkp2_covariance_window` |
+| `cov2.py` | 2-point covariance and window matrices; `compute_fkp2_covariance_window` |
+| `cov3.py` | Power spectrum x bispectrum covariance in a periodic box, arXiv:1908.06234 term by term: `compute_spectrum3_covariance`, plus the survey-window builders `compute_fkp2/3_covariance_window`. Multitracer throughout; every term has a survey window. Build those windows with `split=<seed>`, or the randoms' self-pairs inflate `1/Q_W(s->0)` by up to 33% |
+| `oqe.py` | Optimal quadratic estimator weightings: the `MeshOperator` algebra with explicit transposes, `SeparableOperator` (`sum_a f_a(k) D_a(x)`), the weightings `ideal_weight`, `separable_inverse_weight` and `local_multipole_weight`, and the matching `compute_oqe2_normalization` / `compute_oqe2_shotnoise` |
 | `types.py` | JAX pytree registration for `lsstypes` observable classes |
 | `resamplers.py` | NGP/CIC/TSC/PCS painting kernels |
 | `kernels.py` | Spectral kernels (gradient, Gaussian smoothing) |
 | `fftlog.py` | FFTlog Bessel/correlation transforms |
-| `pt.py` | Perturbation theory quadrature integrals |
+| `pt.py` | Perturbation theory: the one-loop tracer spectra, and the tree-level n-point for n = 2..6 (`make_spectra_redshift_tracer`) that `cov3.py` needs for P5 and P6. All n-point callables take the `n - 1` independent legs |
 | `mock.py` | `generate_gaussian_mesh`, `generate_uniform_particles` |
 | `rotation.py` | Window matrix rotation (`WindowRotationSpectrum2`) |
 | `utils.py` | Legendre/spherical harmonics, logging, `register_pytree_dataclass` |
