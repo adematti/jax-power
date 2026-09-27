@@ -61,7 +61,7 @@ def _make_edges3(kind, mattrs, edges, ells, basis='scoccimarro', batch_size=None
         vec = mattrs.kcoords(kind='separation', sparse=True)
         vec0 = mattrs.kfun.min()
         if mattrs.is_hermitian:
-            wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
+            wmodes = _get_hermitian_weights(vec, mattrs.meshsize, sharding_mesh=None)
     else:
         vec = mattrs.xcoords(kind='separation', sparse=True)
         vec0 = mattrs.cellsize.min()

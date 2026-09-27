@@ -81,7 +81,7 @@ def _make_edgesn(mattrs, edges, ells, ndim, basis='scoccimarro', batch_size=None
     vec0 = mattrs.kfun.min()
     wmodes = None
     if mattrs.is_hermitian:
-        wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
+        wmodes = _get_hermitian_weights(vec, mattrs.meshsize, sharding_mesh=None)
     vecmax = vec0 * np.min(mattrs.meshsize) / 2.
 
     if isinstance(mask_edges, (list, tuple)):

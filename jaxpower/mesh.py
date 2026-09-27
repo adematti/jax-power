@@ -2819,14 +2819,28 @@ def _find_unique_edges(xvec, x0, xmin=0., xmax=np.inf, sharding_mesh=None):
 
 
 @default_sharding_mesh
-@partial(jax.jit, static_argnames=('sharding_mesh',))
-def _get_hermitian_weights(coords, sharding_mesh=None):
+@partial(jax.jit, static_argnames=('meshsize', 'sharding_mesh'))
+def _get_hermitian_weights(coords, meshsize, sharding_mesh=None):
+    r"""
+    Weight of each mode of the Hermitian (rfft) layout in a sum over the full Fourier grid.
+
+    The rfft stores the last axis for :math:`0 \leq k_z \leq N/2` only. A plane
+    :math:`0 < k_z < N/2` stands for itself and its conjugate, so has weight 2. The plane
+    :math:`k_z = 0`, and for even :math:`N` the Nyquist plane :math:`k_z = N/2`, are their own
+    conjugates up to a permutation of :math:`(k_x, k_y)`, so every one of their modes is already
+    stored once and has weight 1. ``meshsize`` is needed because, from the coordinates alone, the last
+    stored plane of an even grid (Nyquist) cannot be told from the last positive plane of an odd one.
+    """
     shape = np.broadcast_shapes(*[xx.shape for xx in coords])
+    nyquist_plane = int(np.asarray(meshsize)[-1]) % 2 == 0
 
     def get_nonsingular(zvec):
         nonsingular = jnp.ones(shape, dtype='i4')
-        # Get the indices that have positive freq along symmetry axis = -1
-        nonsingular += zvec > 0.
+        # Positive frequencies along the symmetry axis (-1) count twice, except the self-conjugate Nyquist plane
+        doubled = zvec > 0.
+        if nyquist_plane:
+            doubled &= zvec < jnp.max(zvec)
+        nonsingular += doubled
         return nonsingular.ravel()
 
     if sharding_mesh.axis_names:

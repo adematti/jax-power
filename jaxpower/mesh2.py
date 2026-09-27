@@ -28,7 +28,7 @@ def _make_edges2(kind, mattrs, edges, ells, mode_oversampling=0):
         vec = mattrs.kcoords(kind='separation', sparse=True)
         vec0 = mattrs.kfun.min()
         if mattrs.is_hermitian:
-            wmodes = _get_hermitian_weights(vec, sharding_mesh=None)
+            wmodes = _get_hermitian_weights(vec, mattrs.meshsize, sharding_mesh=None)
     else:
         vec = mattrs.xcoords(kind='separation', sparse=True)
         vec0 = mattrs.cellsize.min()
@@ -181,7 +181,7 @@ class BinMesh2CorrelationPoles(object):
             knorm = jnp.sqrt(sum(kk**2 for kk in self.mattrs.kcoords(sparse=True)))
             wmodes = None
             if self.mattrs.is_hermitian:  # count the missing conjugate modes of the hermitian layout
-                wmodes = _get_hermitian_weights(self.mattrs.kcoords(kind='separation', sparse=True), sharding_mesh=None).reshape(knorm.shape)
+                wmodes = _get_hermitian_weights(self.mattrs.kcoords(kind='separation', sparse=True), self.mattrs.meshsize, sharding_mesh=None).reshape(knorm.shape)
 
             def bin(ibin):
                 jn = get_spherical_jn(ell)(knorm * self.xavg[ibin])
