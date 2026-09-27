@@ -12,9 +12,7 @@ from .cov2 import compute_fkp2_covariance_window, compute_mesh2_covariance_windo
 # cov2's exported one above, and `compute_fkp3_covariance_window` is only useful together with it,
 # so both stay behind `from jaxpower.cov3 import ...`.
 from .cov3 import compute_spectrum3_covariance
-from .oqe import (MeshOperator, Identity, RealOperator, FourierOperator, Chain, Sum, FunctionOperator, SeparableOperator,
-ideal_weight, separable_inverse_weight, local_multipole_weight, check_transpose, as_weight_pair, compute_oqe2_normalization, compute_oqe2_shotnoise, compute_oqe2_mc_normalization, compute_oqe2_mc_shotnoise,
-Weighting, covariance_operator, covariance_weight, real_jacobi, resolve_field)
+from .oqe import (SeparableWeighting, separable_inverse_weight, compute_oqe2_normalization, compute_oqe2_shotnoise, covariance_weight)
 from .rotation import WindowRotationSpectrum2
 from .mock import generate_gaussian_mesh, generate_spectrum2_mesh, generate_anisotropic_gaussian_mesh, generate_spectrum2_alm, generate_spectrum3_alm, generate_spectrum3_mesh, generate_uniform_particles
 from .utils import setup_logging
