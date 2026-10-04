@@ -660,7 +660,7 @@ def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
     return toret
 
 
-def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarray | int=4096, order=3, pad_coords: callable=None, pad_value: callable=None):
+def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarray | int=4096, order=3, pad_coords: callable=None, pad_value: Callable | str=None):
     """
     Extrapolate / resample the configuration-space window function.
 
@@ -682,9 +682,18 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
     pad_coords : callable, optional
         A function that takes coords and label as input arguments and returns padded coordinates
         (add 1 element at the first and last positions).
-    pad_value : callable, optional
+    pad_value : callable, str, optional
         A function that takes leaf value and label as input arguments and returns padded leaf value
-        (add 1 element at the first and last positions).
+        (add 1 element at the first and last positions). Zero beyond the largest separation in all cases; towards zero
+        separation (below the first bin):
+
+        - ``None`` (default): the first value is held on every axis, which suits correlation functions, whose
+          multipoles with ell > 0 need not vanish there;
+        - ``'window'``: per axis, according to the multipole of its leg in the leaf label ``ells`` -- held along a
+          leg with ell = 0, zero along a leg with ell > 0, whose angular moment of a window vanishes as the
+          separation goes to zero. ``ells`` is (ell1, ell2, L) for a 3-point window in the sugiyama basis, whose two
+          axes are s1, s2 (so Q_022 is held along s1, where it tends to the anisotropy of the second leg, and zeroed
+          along s2), or ell for a 2-point window; a leaf without ``ells`` is held on every axis.
 
     Returns
     -------
@@ -713,7 +722,22 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
             # Add 0 in front, last value at the end
             return jnp.pad(coords, (1, 1), mode='constant', constant_values=(coords[0] - (coords[1] - coords[0]), coords[-1] + (coords[-1] - coords[-2])))
 
-    if pad_value is None:
+    if pad_value == 'window':
+        def pad_value(value, label=None):
+            ells = (0,) * value.ndim
+            if label is not None and 'ells' in label:
+                ells = tuple(np.atleast_1d(label['ells']).tolist())
+            value = jnp.pad(value, ((0, 1),) * value.ndim, mode='constant', constant_values=0.)
+            for axis in range(value.ndim):
+                pad = [(0, 0)] * value.ndim
+                pad[axis] = (1, 0)
+                if ells[axis] == 0:
+                    value = jnp.pad(value, pad, mode='edge')
+                else:
+                    value = jnp.pad(value, pad, mode='constant', constant_values=0.)
+            return value
+
+    elif pad_value is None:
         def pad_value(value, label=None):
             value = jnp.pad(value, ((0, 1),) * value.ndim, mode='constant', constant_values=0.)
             value = jnp.pad(value, ((1, 0),) * value.ndim, mode='edge')

@@ -1622,6 +1622,11 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         little effect and use it as a cross-check rather than a correction -- these multipoles bin
         only two legs and carry no angular factor, so the output measure :math:`k_1^2k_2^2`
         factorizes and the separable ``matrix_rebin`` is already the exact 2-D bin average.
+    flags : tuple, optional
+        Scoccimarro basis: ``('lowrank',)`` evaluates each term through a separable (SVD) expansion of the window
+        multipoles -- two 1D radial matrices per leg, evaluated directly at the output sub-points -- instead of a 2D
+        FFTlog per theory bin and an interpolated read. Converged at its defaults where the FFTlog path is not (the
+        latter's 1024-point window grid is ~2% off on a cube window), and ~3x faster at ``ellmax = 16``.
     batch_size : int, optional
         Number of theory bins whose 2D FFTlog pair is evaluated in parallel (the ``batch_size`` of
         the underlying :func:`jax.lax.map`). This is the main throughput knob: the per-bin work is a
@@ -2093,7 +2098,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         # order. (Both angular factors, the only users of the static-order get_Ylm, are precomputed
         # above, so m_in no longer reaches the runner and the orders are always traced.)
         @partial(jax.jit, static_argnums=(0,))
-        def run_term(wain, to_spectrum, Qs, out_weight, ell1_theory, ell2_theory, bessel_table1, bessel_table2, volume_in):
+        def run_term(wain, to_spectrum, Qs, out_weight, ell1_theory, ell2_theory, bessel_table1, bessel_table2, volume_in, sign_out=1.):
 
             # depends on (kout_sub12, to_spectrum.k) -- constant across theory bins, so the
             # searchsorted runs once per term here instead of once per (term, bin)
@@ -2109,6 +2114,10 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 # Per-axis FFTlog convention: (-i)^ell / (2 pi^2), which for a real input is
                 # (-1)^(ell // 2) / (2 pi^2) at both parities (odd poles carry the imaginary part).
                 phase1 = (1 - 2 * ((ell1_theory // 2) % 2)) / (2. * jnp.pi**2)
+                # Odd-leg phase, as in the sugiyama branch: a TripoSH multipole with two odd legs is real, and its
+                # phase i^(l1' + l2') is the per-leg product above times -1 (ell1_theory odd implies ell2_theory odd).
+                # The output side carries the same -1, as sign_out.
+                phase1 = phase1 * jnp.where(ell1_theory % 2 == 1, -1., 1.)
                 phase2 = (1 - 2 * ((ell2_theory // 2) % 2)) / (2. * jnp.pi**2)
                 bessel1 = phase1 * bessel_row(ell1_theory, bessel_table1, bessel_index[0][index_bin])   # (nquad, n_r1)
                 bessel2 = phase2 * bessel_row(ell2_theory, bessel_table2, bessel_index[1][index_bin])   # (nquad, n_r2)
@@ -2122,7 +2131,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 # dependence is already folded into out_weight, hence no shape factor here.
                 # bin average = sum_sub w k^2 I_000 S^(3) read  /  sum_sub w k^2 I_000,
                 # with the gather done on the distinct (k1, k2) sub-points only
-                read_sub = read_apply(read_index_sub, to_spectrum(correlation)[1])
+                read_sub = read_apply(read_index_sub, sign_out * to_spectrum(correlation)[1])
                 numerator = jnp.sum(out_weight * read_sub.reshape(-1, nsub12), axis=-1)
                 spectrum = numerator / out_denominator
                 # compute_measure(kout) = pi^2/(k1 k2 k3) * Theta vanishes on output
@@ -2135,6 +2144,114 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 return jnp.nan_to_num(spectrum)
 
             return jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
+
+        # flags=('lowrank',): the same matrix through a separable window. With
+        # Qs(r1, r2) = sum_n u_n(r1) v_n(r2), the per-bin 2D FFTlog of run_term factorizes into two 1D
+        # radial matrices per leg, A_n(k1, k1'_a) = 4 pi i^l1 / (2 pi^2) i^l1' int r^2 dr j_l1(k1 r) u_n(r) j_l1'(k1'_a r),
+        # evaluated directly at the output sub-points, and the bin's entry is sum_n A_n TW_j B_n^T -- small
+        # GEMMs, no 2D transform and no interpolated read. The factors come from an SVD of each window
+        # multipole weighted by the radial measure (sqrt(s^3 dln s) per axis), truncated at lowrank_rtol (1e-7) of the
+        # isotropic multipole's leading singular value, resampled on a linear r grid that resolves
+        # j_l(k r) j_l'(k' r) at the largest k; a term's factors are the concatenation of its multipoles'.
+        lowrank = 'lowrank' in (flags or ())
+        if lowrank:
+            # 1e-7: at 1e-5 the small anisotropic multipoles that drive the off-diagonal L <- L' blocks are truncated
+            # (75% off on the cube window); 1e-7 is converged to 3e-4 in every block
+            lowrank_rtol = 1e-7
+            s1_np, s2_np = [np.asarray(s) for s in s_window]
+            svd_weight = lambda s: np.sqrt(s**3 * np.gradient(np.log(s)))
+            w1_np, w2_np = svd_weight(s1_np), svd_weight(s2_np)
+            # the interpolated window vanishes beyond its largest tabulated separation
+            rmax = 0.
+            for _, leaf in window.items():
+                value = np.abs(np.asarray(leaf.value()))
+                for s_np, axis in [(s1_np, 1), (s2_np, 0)]:
+                    nonzero = np.flatnonzero(value.max(axis=axis) > 0.)
+                    if nonzero.size: rmax = max(rmax, s_np[min(nonzero[-1] + 1, s_np.size - 1)])
+            kmax_lin = float(np.max(np.asarray(kout_sub12))) + float(np.max(np.asarray(edgesin)))
+            dr_lin = 2. * np.pi / (16. * kmax_lin)   # 16 points per period of j_l(k r) j_l'(k' r); 32 changes nothing
+            r_lin = (np.arange(int(np.ceil(rmax / dr_lin))) + 0.5) * dr_lin
+            sqrt_r2dr = np.sqrt(r_lin**2 * dr_lin)
+
+            def to_lin(f, s):
+                return np.stack([np.interp(np.log(r_lin), np.log(s), ff, right=0.) for ff in f.T], axis=-1)
+
+            def weighted_svd(value):
+                return np.linalg.svd(w1_np[:, None] * value * w2_np[None, :], full_matrices=False)
+
+            s_ref = weighted_svd(np.asarray(get_w_rect((0, 0, 0), (0, 0)) if has_w_rect((0, 0, 0), (0, 0))
+                                            else next(iter(window)).value().real))[1][0]
+            factors_cache = {}
+
+            def window_factors(q, wain):
+                if (q, wain) not in factors_cache:
+                    value = np.asarray(get_w_rect(q, wain)) * s1_np[:, None]**wain[0] * s2_np[None, :]**wain[1]
+                    U, S, Vt = weighted_svd(value)
+                    keep = S > lowrank_rtol * s_ref
+                    u = U[:, keep] * np.sqrt(S[keep]) / w1_np[:, None]
+                    v = Vt[keep].T * np.sqrt(S[keep]) / w2_np[:, None]
+                    factors_cache[q, wain] = (to_lin(u, s1_np), to_lin(v, s2_np))
+                return factors_cache[q, wain]
+
+            def term_factors(wcoeffs, wain):
+                """u, v (nr, R) with Qs = u v^T: the per-multipole factors (computed once) scaled by the term's
+                coefficients and concatenated on the device -- no per-term factorization on the host, which
+                dominated the run (a QR + SVD per term at ranks of ~100). R is padded to a multiple of 32 so
+                that run_term_lowrank compiles for a handful of shapes only."""
+                present = [(q, coeff) for q, coeff in wcoeffs if has_w_rect(q, wain)]
+                uv = [window_factors_device(q, wain) for q, _ in present]
+                u = jnp.concatenate([coeff * u for (_, coeff), (u, _) in zip(present, uv)], axis=1)
+                v = jnp.concatenate([v for _, v in uv], axis=1)
+                rank = max(32 * int(np.ceil(u.shape[1] / 32)), 32)
+                pad = ((0, 0), (0, rank - u.shape[1]))
+                return jnp.pad(u, pad), jnp.pad(v, pad)
+
+            factors_device = {}
+
+            def window_factors_device(q, wain):
+                if (q, wain) not in factors_device:
+                    factors_device[q, wain] = tuple(jnp.asarray(f) for f in window_factors(q, wain))
+                return factors_device[q, wain]
+
+            # Bessel tables on the linear grid: output side at the distinct sub-point k of each leg,
+            # theory side at the quadrature nodes of each distinct 1D theory bin
+            kout_unique, kout_inverse, jout_lin, jin_lin = [], [], [], []
+            for leg in range(2):
+                k_u, k_inv = np.unique(np.asarray(kout_sub12)[:, leg], return_inverse=True)
+                kout_unique.append(k_u)
+                kout_inverse.append(jnp.asarray(k_inv.ravel()))
+                jout_lin.append(spherical_jn_all(jnp.asarray(k_u)[:, None] * jnp.asarray(r_lin)[None, :]))   # (L + 1, nk, nr)
+                edges_1d = np.unique(np.asarray(edgesin)[:, leg, :], axis=0)
+                k_lo, k_hi = jnp.asarray(edges_1d[:, 0]), jnp.asarray(edges_1d[:, 1])
+                k_nodes = k_lo[:, None] + 0.5 * (k_hi - k_lo)[:, None] * (nodes_in[None, :] + 1.)
+                jin_lin.append(spherical_jn_all(k_nodes[..., None] * jnp.asarray(r_lin)[None, None, :]))   # (L + 1, nbin1d, nquad, nr)
+
+            @jax.jit
+            def run_term_lowrank(u, v, out_weight, ell_out1, ell_out2, ell1_theory, ell2_theory, volume_in, sign_out=1.):
+                # the per-axis phases of run_term: SpectrumToCorrelation on the theory side, 4 pi (-1)^(l // 2) of
+                # CorrelationToSpectrum on the output side
+                phase1 = (1 - 2 * ((ell1_theory // 2) % 2)) / (2. * jnp.pi**2)
+                phase1 = phase1 * jnp.where(ell1_theory % 2 == 1, -1., 1.)   # odd-leg phase, as in run_term
+                phase2 = (1 - 2 * ((ell2_theory // 2) % 2)) / (2. * jnp.pi**2)
+                phase_out = (4. * jnp.pi)**2 * (1 - 2 * ((ell_out1 // 2) % 2)) * (1 - 2 * ((ell_out2 // 2) % 2))
+                r2dr = jnp.asarray(sqrt_r2dr**2)
+                # (R, nk_out, nbin1d, nquad)
+                A = phase_out * phase1 * jnp.einsum('kr,rn,bqr->nkbq', jout_lin[0][ell_out1], u * r2dr[:, None], jin_lin[0][ell1_theory])
+                B = phase2 * jnp.einsum('kr,rn,bqr->nkbq', jout_lin[1][ell_out2], v * r2dr[:, None], jin_lin[1][ell2_theory])
+
+                def convolve(index_bin):
+                    k1_nodes, k1_weights = in_nodes(index_bin, 0, nodes_in, weights_in)
+                    k2_nodes, k2_weights = in_nodes(index_bin, 1, nodes_in, weights_in)
+                    theory_weight = ((k1_weights * k1_nodes**2)[:, None] * (k2_weights * k2_nodes**2)[None, :]
+                                     * volume_in[index_bin])
+                    a = A[:, :, bessel_index[0][index_bin]]   # (R, nk1, nquad)
+                    b = B[:, :, bessel_index[1][index_bin]]
+                    grid = jnp.einsum('nka,ab,nlb->kl', a, theory_weight, b)
+                    read_sub = sign_out * grid[kout_inverse[0], kout_inverse[1]]
+                    numerator = jnp.sum(out_weight * read_sub.reshape(-1, nsub12), axis=-1)
+                    return jnp.nan_to_num(numerator / out_denominator)
+
+                return jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=256).T
 
         # Count the surviving terms up front (a pure-Python label lookup, no device work), so the bar
         # measures what is actually run: of the (ellmax + 1)^2 terms per block only ~4 * ellmax - 1
@@ -2183,6 +2300,17 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     # The very same predicate feeds the progress bar and the key enumeration above, so
                     # the three cannot disagree about which terms exist.
                     if not any(has_w_rect(q, wain) for q, _ in wcoeffs): continue
+                    if lowrank:
+                        out_weight = out_weights_all[index_of_key_out[sugiyama_ell_out]]
+                        volume_in = volume_in_all[:, index_of_key_in[sugiyama_ell_theory, m_in]]
+                        u, v = term_factors(wcoeffs, wain)
+                        term = run_term_lowrank(u, v, out_weight, jnp.asarray(sugiyama_ell_out[0]), jnp.asarray(sugiyama_ell_out[1]),
+                                                jnp.asarray(sugiyama_ell_theory[0]), jnp.asarray(sugiyama_ell_theory[1]), volume_in,
+                                                sign_out=-1. if sugiyama_ell_out[0] % 2 else 1.)
+                        if pbar: jax.block_until_ready(term)
+                        block += term
+                        progress.update(1)
+                        continue
                     Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                     # fftlog
                     # lowring=False, xy=1: align the two transforms' grids exactly. With the
@@ -2204,7 +2332,8 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                     # always traced now, so every term reuses the same compilation
                     ell1_theory, ell2_theory = jnp.asarray(sugiyama_ell_theory[0]), jnp.asarray(sugiyama_ell_theory[1])
                     term = run_term(wain, to_spectrum, Qs, out_weight, ell1_theory, ell2_theory,
-                                    bessel_table[0], bessel_table[1], volume_in)
+                                    bessel_table[0], bessel_table[1], volume_in,
+                                    sign_out=-1. if sugiyama_ell_out[0] % 2 else 1.)
                     if pbar: jax.block_until_ready(term)  # otherwise the bar races ahead of the device
                     block += term
                     progress.update(1)
@@ -2234,16 +2363,27 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
             wmat_tmp[ellin, wain] = []
             for ill, ell in enumerate(ells):
 
-                def convolve(idx, swap=False):
+                # Odd-leg phase. The FFTlog transforms are per axis, with the 2-point convention that
+                # an odd pole carries its imaginary part: phase (-1)^(ell // 2) on each leg. A sugiyama
+                # multipole with two odd legs (ell1 + ell2 is even) is real, so its phase
+                # (-i)^(ell1 + ell2) = (-1)^((ell1 + ell2) / 2) is the per-leg product times -1, on the
+                # way in (theory) and on the way out (observable). Without it every odd-odd theory
+                # multipole, (1,1,L), (1,3,L), ..., entered with the wrong sign, and every odd-odd
+                # observable came out with it: B202 was 3-7% high on a 1000 Mpc/h cube for the terms
+                # carrying the free-leg power P(k3), and B110 had the wrong sign. Checked against a
+                # brute-force, multipole-free convolution (claude_window_b202_ellwmax/brute_window.py).
+                sign_out = -1. if ell[0] % 2 else 1.
+
+                def convolve(idx, swap=False, sign_in=1.):
                     idx_axes = (index_in_swap if swap else index_in)[idx]
                     theory = Min_axes[0][:, idx_axes[0]][:, None] * Min_axes[1][:, idx_axes[1]][None, :]
-                    correlation = to_correlation(theory)[1]
+                    correlation = sign_in * to_correlation(theory)[1]
                     correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
                     # Separable output rebin: Mout_axes[d] is small
                     # (n_unique_axis, n_k_axis), so this never materializes
                     # a (nbins1 x nbins2, n_k1 x n_k2) dense tensor -- only
                     # the same (n_k1, n_k2) grid tophat/read already used.
-                    rebinned = Mout_axes[0] @ to_spectrum(correlation)[1] @ Mout_axes[1].T
+                    rebinned = Mout_axes[0] @ (sign_out * to_spectrum(correlation)[1]) @ Mout_axes[1].T
                     return rebinned[index_out[:, 0], index_out[:, 1]]
 
                 tmp = jnp.zeros(shape=(len(kout), len(edgesin)))
@@ -2268,7 +2408,7 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
                 for ellt, swap, wcoeffs in passes[ellin, wain, ell]:
                     Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
                     to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellt, minfolds=0, lowring=False, xy=1.)
-                    term = jax.lax.map(partial(convolve, swap=swap), jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
+                    term = jax.lax.map(partial(convolve, swap=swap, sign_in=-1. if ellt[0] % 2 else 1.), jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
                     if pbar: jax.block_until_ready(term)
                     tmp += term
                     progress.update(1)
