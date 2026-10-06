@@ -409,7 +409,7 @@ def compute_spectrum2_covariance(window2, poles, delta=None, return_type=None, f
 
     Reference
     ---------
-    https://arxiv.org/pdf/1811.0571
+    https://arxiv.org/pdf/1811.05714
 
     Returns
     -------

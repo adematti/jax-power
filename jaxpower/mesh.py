@@ -2851,6 +2851,30 @@ def _get_hermitian_weights(coords, meshsize, sharding_mesh=None):
     return get_nonsingular(coords[-1])
 
 
+def _slab_bincount(ibin, weights, length, nslabs=1):
+    """
+    ``jnp.bincount`` accumulated slab by slab, the slab sums combined in the widest float available.
+    A single float32 bincount over ~1e6 entries per bin is off by up to ~1e-3 (enough to shift
+    k-bin centres by a tenth of a bin); slab sums bring this to ~1e-7. Output dtype is that of float ``weights``.
+    Counts (``weights`` None or integer) are exact int64 with x64; without it, int32 would overflow beyond
+    2**31 entries per bin, so the int32 slab counts are summed (and returned) in float32.
+    """
+    if weights is None or not jnp.issubdtype(weights.dtype, jnp.floating):
+        if jax.config.jax_enable_x64:
+            return jnp.bincount(ibin, weights=None if weights is None else weights.astype('i8'), length=length)
+        sum_dtype = output_dtype = jnp.float32
+    else:
+        sum_dtype, output_dtype = jnp.promote_types(weights.dtype, jax.dtypes.canonicalize_dtype(np.float64)), weights.dtype
+    if nslabs <= 1:
+        return jnp.bincount(ibin, weights=weights, length=length).astype(output_dtype)
+    count = partial(jnp.bincount, length=length)
+    if weights is None:
+        toret = jax.vmap(count)(ibin.reshape(nslabs, -1))
+    else:
+        toret = jax.vmap(count)(ibin.reshape(nslabs, -1), weights.reshape(nslabs, -1))
+    return toret.sum(axis=0, dtype=sum_dtype).astype(output_dtype)
+
+
 @default_sharding_mesh
 @partial(jax.jit, static_argnames=('sharding_mesh', 'ravel'))  # if we want to save some memory, consider linear binning
 def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sharding_mesh=None, ravel=True):
@@ -2861,9 +2885,9 @@ def _get_bin_attrs(coords, edges: jax.Array, weights: None | jax.Array=None, sha
         coords = coords.ravel()
 
         ibin = jnp.digitize(coords, edges, right=False)
-        x = jnp.bincount(ibin, weights=coords if weights is None else coords * weights, length=len(edges) + 1)[1:-1]
+        x = _slab_bincount(ibin, coords if weights is None else coords * weights, length=len(edges) + 1, nslabs=shape[0])[1:-1]
         del coords
-        nmodes = jnp.bincount(ibin, weights=weights, length=len(edges) + 1)[1:-1]
+        nmodes = _slab_bincount(ibin, weights, length=len(edges) + 1, nslabs=shape[0])[1:-1]
         if not ravel:
             ibin = ibin.reshape(shape)
         return ibin, nmodes, x
@@ -2902,17 +2926,18 @@ def _bincount(ibin, value, weights=None, length=None, sharding_mesh=None):
         ibin = [ibin]
 
     def _count(value, *ibin):
+        nslabs = value.shape[0] if value.ndim > 1 else 1
         value = value.ravel()
         if weights is not None:
             value *= weights
 
         def count(ib):
-            return jnp.bincount(ib, weights=value, length=length + 2)
+            return _slab_bincount(ib, value, length=length + 2, nslabs=nslabs)
 
         if jnp.iscomplexobj(value):  # bincount much slower with complex numbers
 
             def count(ib):
-                return jnp.bincount(ib, weights=value.real, length=length + 2) + 1j * jnp.bincount(ib, weights=value.imag, length=length + 2)
+                return _slab_bincount(ib, value.real, length=length + 2, nslabs=nslabs) + 1j * _slab_bincount(ib, value.imag, length=length + 2, nslabs=nslabs)
 
         value = sum(count(ib.ravel() if ib.ndim > 1 else ib) for ib in ibin)
         return value[1:-1] / len(ibin)

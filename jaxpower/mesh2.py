@@ -264,6 +264,8 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
         Input mesh(es).
     bin : BinMesh2SpectrumPoles
         Binning operator.
+        If ``None``, monopole in linear bins of width the fundamental wavenumber, up to the Nyquist wavenumber;
+        this needs concrete mesh attributes, so build ``bin`` outside of :func:`jax.jit`.
     los : str or array-like, optional
         Line-of-sight specification.
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
@@ -278,6 +280,8 @@ def compute_mesh2_spectrum(*meshes: RealMeshField | ComplexMeshField, bin: BinMe
     meshes, fields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
+    if bin is None:
+        bin = BinMesh2SpectrumPoles(mattrs, edges={'step': mattrs.kfun.min()}, ells=0)
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)
@@ -388,6 +392,8 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
         Input meshes.
     bin : BinMesh2CorrelationPoles
         Binning operator.
+        If ``None``, monopole in linear bins of width the cell size, up to half the box size;
+        this needs concrete mesh attributes, so build ``bin`` outside of :func:`jax.jit`.
     los : str or array-like, optional
         Line-of-sight specification.
         If ``los`` is 'firstpoint' or 'local' (resp. 'endpoint'), use local (varying) first point (resp. end point) line-of-sight.
@@ -401,6 +407,8 @@ def compute_mesh2_correlation(*meshes: RealMeshField | ComplexMeshField, bin: Bi
     meshes, fields = _format_meshes(*meshes)
     rdtype = meshes[0].real.dtype
     mattrs = meshes[0].attrs
+    if bin is None:
+        bin = BinMesh2CorrelationPoles(mattrs, edges={'step': mattrs.cellsize.min()}, ells=0)
     norm = mattrs.meshsize.prod(dtype=rdtype) / mattrs.cellsize.prod() * jnp.ones_like(bin.xavg)
 
     los, vlos, swap = _format_los(los, ndim=mattrs.ndim)

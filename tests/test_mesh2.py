@@ -4,6 +4,7 @@ from pathlib import Path
 from functools import partial
 
 import numpy as np
+import pytest
 import jax
 from jax import random
 from jax import numpy as jnp
@@ -17,7 +18,7 @@ from jaxpower import (BinMesh2SpectrumPoles, compute_mesh2_spectrum,
                       Mesh2SpectrumPole, Mesh2SpectrumPoles, Mesh2CorrelationPole, Mesh2CorrelationPoles, WindowMatrix, read, utils, create_sharded_random)
 
 
-dirname = Path('_tests')
+dirname = Path(__file__).parent / '_tests'
 
 
 def test_mesh2_spectrum(plot=False):
@@ -298,7 +299,7 @@ def test_checkpoint():
         return {ell: get_fun(ill) for ill, ell in enumerate(ells)}
 
     def make_callable(poles):
-        knorm = jnp.sqrt(sum(kk**2 for kk in mattrs.kcoords(sparse=True, hermitian=True))).ravel()
+        knorm = jnp.sqrt(sum(kk**2 for kk in mattrs.kcoords(sparse=True))).ravel()
         interp = Interpolator1D(kin, knorm)
         del knorm
         def get_fun(ill):
@@ -312,16 +313,19 @@ def test_checkpoint():
             los = 'firstpoint'
         return compute_mesh2_spectrum_mean(mattrs, theory=theory, bin=bin, los=los)
 
+    def view(spectrum):  # ObservableTree.value() concatenates with numpy, which fails under tracing
+        return jnp.concatenate([pole.value().ravel() for pole in spectrum])
+
     #print(jax.grad(lambda poles: mean(poles).view()[2])(poles))
     from jax.ad_checkpoint import checkpoint_name
 
     def mock(poles, los='local', seed=42):
         mesh = generate_anisotropic_gaussian_mesh(mattrs, make_callable(poles), los=los, seed=seed)
         #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(mattrs, make_callable(poles), los='x', seed=seed))(poles)
-        return compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
+        return view(compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)))[-3]
 
     def power(mesh, los='local'):
-        return compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()[-3]
+        return view(compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)))[-3]
 
     def gaussian_survey(mattrs, size=int(1e6), seed=random.key(42), scale=0.03, paint=False):
         # Generate Gaussian-distributed positions
@@ -333,14 +337,14 @@ def test_checkpoint():
     selection = gaussian_survey(mattrs, paint=True)
 
     #@partial(jax.checkpoint, static_argnums=(2,))
-    policy = jax.checkpoint_policies.write_only_these_names('save')
+    policy = jax.checkpoint_policies.save_only_these_names('save')
 
     #@partial(jax.checkpoint, static_argnums=2)
     def apply_selection(mesh, selection, cv=False):
         mesh = mesh * selection
         if not cv:  # with radial integral constraint
-            dmin = np.min(selection.boxcenter - selection.boxsize / 2.)
-            dmax = (1. + 1e-9) * np.sqrt(np.sum((selection.boxcenter + selection.boxsize / 2.)**2))
+            dmin = jnp.min(selection.boxcenter - selection.boxsize / 2.)
+            dmax = (1. + 1e-9) * jnp.sqrt(jnp.sum((selection.boxcenter + selection.boxsize / 2.)**2))
             edges = jnp.linspace(dmin, dmax, 1000)
             rnorm = jnp.sqrt(sum(xx**2 for xx in selection.coords(sparse=True))).ravel()
             ibin = jnp.digitize(rnorm, edges, right=False)
@@ -352,19 +356,19 @@ def test_checkpoint():
         return mesh
 
     def mock_diff(theory, selection, los='local', seed=42, unitary_amplitude=True):
-        mesh = generate_anisotropic_gaussian_mesh(selection.mattrs, (kinedges, list(theory)), los=los, seed=seed,
+        mesh = generate_anisotropic_gaussian_mesh(selection.attrs, make_callable(theory), los=los, seed=seed,
                                                   unitary_amplitude=unitary_amplitude)
         los = {'local': 'firstpoint'}.get(los, los)
         #return compute_mesh2_spectrum(apply_selection(mesh, selection, False), bin=bin, los=los).view()[-3]
         toret = [compute_mesh2_spectrum(apply_selection(mesh, selection, cv=cv), bin=bin, los=los) for cv in [False, True]]
-        return toret[0].clone(value=toret[0].value() - toret[1].value()).value()[-3]
+        return (view(toret[0]) - view(toret[1]))[-3]
 
     def mock_vmap(poles, los='local'):
         seeds = random.split(random.key(42), 4)
         def func(seed):
             mesh = generate_anisotropic_gaussian_mesh(mattrs, make_callable(poles), los=los, seed=seed)
             #mesh = jax.checkpoint(lambda poles: generate_anisotropic_gaussian_mesh(attrs, make_callable(poles), los='x', seed=seed))(poles)
-            return compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)).view()
+            return view(compute_mesh2_spectrum(mesh, bin=bin, los={'local': 'firstpoint'}.get(los, los)))
         return jnp.mean(jax.vmap(func)(seeds), axis=0)
 
     option = 1
@@ -598,7 +602,7 @@ def test_window_timing():
         return toret
 
     selection = gaussian_survey(mattrs, paint=True)
-    norm = compute_fkp2_normalization(selection, selection)
+    norm = compute_normalization(selection, selection)
 
     for flag in ['smooth', 'infinite'][-1:]:
         for los, thlos in [('x', None), ('firstpoint', 'firstpoint'), ('firstpoint', 'local')][-1:]:
@@ -811,7 +815,7 @@ def test_sympy():
         x = sp.symbols('x', real=True, positive=True)
         integrand = sp.simplify(sp.expand_func(sp.jn(ell, x)))
         # i^ell; we take in the imaginary part of the odd power spectrum multipoles
-        expr = integrandells = (0, 2, 4)
+        expr = integrand
         expr_lows = sp.series(expr, x=x, x0=0, n=8).removeO()
         print(expr)
         print(expr_lows)
@@ -875,8 +879,10 @@ def test_sharded_spectrum():
     with create_sharding_mesh() as sharding_mesh:
         print(sharding_mesh)
         test = compute_spectrum()
-        if False and jax.process_index() == 0:
-            test.write(ref_fn)
+        if not ref_fn.exists():  # the reference is local, not in git: the first run writes it, later (e.g. sharded) runs compare
+            if jax.process_index() == 0:
+                test.write(ref_fn)
+            pytest.skip(f'wrote reference {ref_fn}; rerun to compare')
         print(test.value())
         assert np.allclose(test.value(), read(ref_fn).value())
 
