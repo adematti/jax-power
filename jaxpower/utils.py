@@ -674,7 +674,7 @@ def get_Ylm_all(ellmax: int, reduced: bool=False):
         cos = jnp.asarray(cos)
         dtype = cos.dtype
         a, ab, d, onehot = (jnp.asarray(tmp, dtype=dtype) for tmp in coeffs)
-        sin = jnp.sqrt(1. - cos**2)
+        sin = jnp.sqrt(jnp.clip(1. - cos**2, 0., None))  # |cos| can exceed 1 by round-off; NaN * 0 would spread to every m
         c00 = 1. / np.sqrt(4. * np.pi)
         # lam holds lambda_{ell m} for all m at fixed ell, m on the last axis
         lam = jnp.zeros(cos.shape + (ellmax + 1,), dtype=dtype).at[..., 0].set(c00)
