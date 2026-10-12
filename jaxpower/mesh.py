@@ -3177,6 +3177,21 @@ def compute_box_normalization(*inputs: RealMeshField | ParticleField) -> jax.Arr
     return norm
 
 
+def get_wide_angle_selection_mesh(mesh: RealMeshField, wa_order: int=1) -> RealMeshField:
+    r"""
+    Weight a selection mesh by :math:`x^{-n}`, :math:`n` the wide-angle order, :math:`x` the distance to the observer.
+
+    Used as the line-of-sight leg of the window correlation to obtain the order-:math:`n` window multipoles:
+    the first mesh of :func:`compute_mesh2_correlation`, e.g.
+    ``compute_mesh2_correlation(get_wide_angle_selection_mesh(randoms), randoms, los='firstpoint')``,
+    or the third mesh of :func:`compute_mesh3_correlation`.
+    """
+    xnorm = jnp.sqrt(sum(xx**2 for xx in mesh.attrs.rcoords(sparse=True)))
+    # The observer may sit on a mesh node (e.g. at a box corner): 0 * inf would turn the whole window into NaN
+    mask = xnorm == 0.
+    return mesh * jnp.where(mask, 0., jnp.where(mask, 1., xnorm)**(-wa_order))
+
+
 def _make_input_tuple(*inputs):
     if len(inputs) == 1 and isinstance(inputs[0], (tuple, list)):  # tuple of meshes
         inputs = inputs[0]

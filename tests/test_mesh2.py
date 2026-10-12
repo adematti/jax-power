@@ -1052,6 +1052,23 @@ def test_ref():
                 assert np.allclose(result[los, basis], ref[los, basis])
 
 
+
+def test_wide_angle2_coeffs():
+    # first-point coefficients of the odd wide-angle expansion, as pypower's odd_wide_angle_coefficients:
+    # xi_ell^(1) = -c_{ell-1} xi_{ell-1} + c_{ell+1} xi_{ell+1}, c_ell = ell (ell + 1) / (2 (2 ell + 1))
+    from jaxpower.mesh2 import get_wide_angle2_theory_coeffs, get_window_coeffs
+    c = lambda ell: ell * (ell + 1) / (2. * (2 * ell + 1))
+    assert get_wide_angle2_theory_coeffs(0) == []
+    for ellin in (2, 4, 6):
+        assert np.allclose(dict(get_wide_angle2_theory_coeffs(ellin))[ellin - 1], c(ellin))
+        assert np.allclose(dict(get_wide_angle2_theory_coeffs(ellin))[ellin + 1], -c(ellin))
+    # without wide-angle, the order-0 window terms only
+    assert get_window_coeffs(2, 2) == [term for term in get_window_coeffs(2, 2, wide_angle=True) if term[1] == 0]
+    assert all(n == 0 for _, n, _ in get_window_coeffs(2, 2))
+    # the folded terms of the quadrupole into the monopole read the dipole and octupole windows Q_1, Q_3, at order 1
+    terms = [(q, n) for q, n, coeff in get_window_coeffs(0, 2, wide_angle=True) if n == 1]
+    assert sorted(terms) == [(1, 1), (3, 1)], terms
+
 if __name__ == '__main__':
 
     from jax import config

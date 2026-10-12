@@ -1212,7 +1212,7 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
     return list(shotnoise)
 
 
-def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory ell
+def get_sugiyama_window_convolution_coeffs(ell, ellin, odd_window: bool=False):  # observed ell, theory ell
     # Prefactor, eq. 63 of https://arxiv.org/pdf/1803.02132
     # ell = (ell_1, ell_2, L)
     # ellin = (ell_1', ell_2', L')
@@ -1222,7 +1222,9 @@ def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory 
     #for ellw in itertools.product(*([range(max(ell) + max(ellin) + 1)] * 3)):
     for ellw in itertools.product(*[range(ell_ + ellin_ + 1) for ell_, ellin_ in zip(ell, ellin)]):
         if sum(ellw) % 2: continue
-        if ellw[2] % 2: continue
+        # Odd window L_w are dropped, unless odd_window: the first-order wide-angle children
+        # (L' odd, see get_wide_angle3_theory_coeffs) need them to reach an even observed L.
+        if ellw[2] % 2 and not odd_window: continue
         # Cheap 3j triangle / parity pruning before the expensive 9j
         Hw = wigner_3j(*ellw, 0, 0, 0)
         if abs(Hw) < 1e-7: continue
@@ -1236,7 +1238,80 @@ def get_sugiyama_window_convolution_coeffs(ell, ellin):  # observed ell, theory 
     return coeffs
 
 
-def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: bool=False, basis: str='sugiyama', ellmax: int=4):
+@functools.lru_cache(maxsize=None)
+def get_wide_angle3_theory_coeffs(ellin: tuple, wa_order: tuple=(1, 0)):
+    r"""
+    First-order wide-angle children of a theory TripoSH multipole, for the line of sight at :math:`\mathbf{x}_3`.
+
+    The theory multipoles :math:`\zeta^{(0)}_{\ell_1\ell_2L}(r_1, r_2)` are defined about the triplet centroid,
+    :math:`\hat{\mathbf{n}}_c = \hat{\mathbf{x}}_3 + (\mathbf{r}_1 + \mathbf{r}_2)_\perp / (3 x_3) + \mathcal{O}(r^2 / x_3^2)`,
+    :math:`\mathbf{r}_i = \mathbf{x}_i - \mathbf{x}_3`. In the basis :math:`S_{\ell_1\ell_2L}(\hat{\mathbf{r}}_1, \hat{\mathbf{r}}_2, \hat{\mathbf{x}}_3)`
+    of arXiv:1803.02132 this gives
+    :math:`\zeta = \sum [\zeta^{(0)} + (r_1 / x_3) \zeta^{(1,0)} + (r_2 / x_3) \zeta^{(0,1)}] S`, with, for leg 1,
+    :math:`\zeta^{(1,0)}_{\ell_1'\ell_2L'} \ni \frac{1}{3} \mathcal{D}^{LL'}_{\ell_1\ell_1'}(\ell_2) \zeta^{(0)}_{\ell_1\ell_2L}`,
+    :math:`\ell_1' = \ell_1 \pm 1`, :math:`L' = L \pm 1`, and
+
+    .. math::
+
+        \mathcal{D}^{LL'}_{\ell\ell'}(\lambda) = (-1)^{\ell + 1} g_{LL'} (2\ell' + 1)
+        \begin{pmatrix} 1 & \ell & \ell' \\ 0 & 0 & 0 \end{pmatrix}
+        \begin{Bmatrix} \ell & \ell' & 1 \\ L' & L & \lambda \end{Bmatrix},
+        \quad g_{L,L+1} = L \sqrt{\frac{(L+1)(2L+3)}{2L+1}}, \quad g_{L,L-1} = (L+1) \sqrt{\frac{L(2L-1)}{2L+1}}.
+
+    Same for leg 2 with :math:`\ell_1 \leftrightarrow \ell_2`. Only the geometric line-of-sight change is included.
+    See desi-gqc-notes, sec. "First-order wide-angle corrections".
+
+    Parameters
+    ----------
+    ellin : tuple
+        Theory multipole :math:`(\ell_1, \ell_2, L)`, at wide-angle order 0.
+    wa_order : tuple, default=(1, 0)
+        Wide-angle order, :math:`(1, 0)` (leg 1) or :math:`(0, 1)` (leg 2).
+
+    Returns
+    -------
+    coeffs : list of (child, coeff), such that :math:`\zeta^{(n_1, n_2)}_\mathrm{child} \ni \mathrm{coeff} \, \zeta^{(0)}_\mathrm{ellin}`.
+    """
+    from .utils import _wigner_6j
+    ellin, wa_order = tuple(int(ell) for ell in ellin), tuple(int(n) for n in wa_order)
+    if wa_order not in [(1, 0), (0, 1)]:
+        raise NotImplementedError('only first-order wide-angle terms (1, 0) and (0, 1) are implemented')
+    leg = wa_order.index(1)
+    ell, ell_other, L = ellin[leg], ellin[1 - leg], ellin[2]
+    toret = []
+    for ellp in (ell - 1, ell + 1):
+        for Lp in (L - 1, L + 1):
+            if ellp < 0 or Lp < 0 or not (abs(ellp - ell_other) <= Lp <= ellp + ell_other): continue
+            if Lp == L + 1: g = L * np.sqrt((L + 1) * (2 * L + 3) / (2 * L + 1))
+            else: g = (L + 1) * np.sqrt(L * (2 * L - 1) / (2 * L + 1))
+            coeff = (-1)**(ell + 1) * g * (2 * ellp + 1) * wigner_3j(1, ell, ellp, 0, 0, 0) * _wigner_6j(ell, ellp, 1, Lp, L, ell_other) / 3.
+            if abs(coeff) < 1e-10: continue
+            child = (ellp, ell_other, Lp) if leg == 0 else (ell_other, ellp, Lp)
+            toret.append((child, coeff))
+    return toret
+
+
+def get_wide_angle3_window_coeffs(ell, ellin, wain=(0, 0), wide_angle: bool=False):
+    r"""
+    Window coefficients :math:`(\ell^w, (n_1, n_2), \mathrm{coeff})` for observed sugiyama multipole ``ell`` and theory ``ellin``:
+    the kernel multiplying :math:`\zeta_\mathrm{ellin}` is :math:`\sum \mathrm{coeff} \, Q^{(n_1, n_2)}_{\ell^w}(r_1, r_2) r_1^{n_1} r_2^{n_2}`.
+    Without ``wide_angle``, these are the :func:`get_sugiyama_window_convolution_coeffs` terms at order ``wain``.
+    With ``wide_angle``, ``ellin`` must be at order 0, and the first-order terms of its children
+    (:func:`get_wide_angle3_theory_coeffs`) are folded in.
+    """
+    ellin, wain = tuple(ellin), tuple(wain)
+    toret = [(q, wain, coeff) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, ellin)]
+    if wide_angle:
+        if wain != (0, 0):
+            raise ValueError('with wide_angle = True, theory multipoles must be given at wide-angle order (0, 0)')
+        for wa in [(1, 0), (0, 1)]:
+            for child, cchild in get_wide_angle3_theory_coeffs(ellin, wa):
+                toret += [(q, wa, cchild * coeff) for q, coeff in get_sugiyama_window_convolution_coeffs(ell, child, odd_window=True)]
+    return toret
+
+
+
+def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: bool=False, basis: str='sugiyama', ellmax: int=4, wide_angle: bool=False):
     r"""
     Window multipoles to measure for an output binning (sugiyama or scoccimarro basis).
 
@@ -1254,6 +1329,12 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: boo
         quadrature window uses are returned: :math:`\ell_1 + \ell_2` even, :math:`L` even with
         :math:`|\ell_1 - \ell_2| \leq L \leq \ell_1 + \ell_2`, and :math:`L \leq \max L_{\rm out} + \max L'` (the line-of-sight
         selection rule); theory multipoles are the even :math:`L' \leq 2\,` ``ellsin`` if an integer.
+    wide_angle : bool, default=False
+        Sugiyama basis only: return the window multipoles needed by :func:`compute_smooth3_spectrum_window` with
+        ``wide_angle=True``, as a dictionary ``{(n1, n2): dict(ells=...)}`` per wide-angle order: the order-:math:`(n_1, n_2)`
+        window has the line-of-sight leg (the third one) weighted by :math:`x^{-(n_1 + n_2)}` (:func:`get_wide_angle_selection_mesh`).
+        If the first two fields are the same, :math:`Q^{(0,1)}_{\ell_1\ell_2L}(r_1, r_2) = Q^{(1,0)}_{\ell_2\ell_1L}(r_2, r_1)`,
+        so only orders :math:`(0, 0)` and :math:`(1, 0)` are listed (with unsorted :math:`(\ell_1, \ell_2)` at :math:`(1, 0)`).
 
     Returns
     -------
@@ -1275,24 +1356,35 @@ def get_smooth3_window_bin_attrs(ells, ellsin=3, fields=None, return_ellsin: boo
         non_zero_ellsin, ellw = [], []
         for ellin in ellsin:  # ell1 3-tuple, wain wide-angle order
             for ill, ell in enumerate(ells):
-                coeffs = get_sugiyama_window_convolution_coeffs(ell, ellin)
+                coeffs = get_wide_angle3_window_coeffs(ell, ellin, wide_angle=wide_angle)
                 if coeffs and ellin not in non_zero_ellsin:
                     non_zero_ellsin.append(ellin)
-                for ellw_, _ in coeffs:
-                    if fields[1] == fields[0]: ellw_ = tuple(sorted(ellw_[:2])) + ellw_[2:]
-                    if ellw_ not in ellw: ellw.append(ellw_)
+                ellw += [(ellw_, wa) for ellw_, wa, _ in coeffs]
     elif 'scoccimarro' in basis:
+        if wide_angle:
+            raise NotImplementedError('wide-angle orders are not supported for the scoccimarro basis')
         if isinstance(ellsin, numbers.Number):
             ellsin = list(range(0, 2 * ellsin + 1, 2))
         non_zero_ellsin = [ellin for ellin in ellsin if (ellin[0] if np.ndim(ellin) else ellin) % 2 == 0]
         Lmax = max(ells) + max(ellin[0] if np.ndim(ellin) else ellin for ellin in non_zero_ellsin)
         ellw = [(ell1, ell2, L) for ell1 in range(ellmax + 1) for ell2 in range(ell1 if fields[1] == fields[0] else 0, ellmax + 1)
                 if (ell1 + ell2) % 2 == 0 for L in range(abs(ell1 - ell2), min(ell1 + ell2, Lmax) + 1, 2)]
+        ellw = [(ellw_, (0, 0)) for ellw_ in ellw]
     else:
         raise NotImplementedError(f'unknown basis {basis}')
-    ellw = sorted(set(ellw))
-
-    ellw = dict(ells=ellw, basis='sugiyama', mask_edges='')
+    canonical = set()
+    for ellw_, wa in ellw:
+        if fields[1] == fields[0]:
+            # Q^{(n1, n2)}_{l1 l2 L}(r1, r2) = Q^{(n2, n1)}_{l2 l1 L}(r2, r1): keep l1 <= l2 at order (0, 0),
+            # and n1 >= n2 at first order -- compute_smooth3_spectrum_window reads the transpose
+            if wa[1] > wa[0] or (wa[1] == wa[0] and ellw_[0] > ellw_[1]):
+                ellw_, wa = tuple(ellw_[1::-1]) + tuple(ellw_[2:]), tuple(wa[::-1])
+        canonical.add((tuple(ellw_), tuple(wa)))
+    if wide_angle:
+        ellw = {wa: dict(ells=sorted(ellw_ for ellw_, wa_ in canonical if wa_ == wa), basis='sugiyama', mask_edges='')
+                for wa in sorted(set(wa for _, wa in canonical))}
+    else:
+        ellw = dict(ells=sorted(ellw_ for ellw_, _ in canonical), basis='sugiyama', mask_edges='')
     if return_ellsin:
         return ellw, non_zero_ellsin
     return ellw
@@ -1412,7 +1504,7 @@ def get_scoccimarro_symmetrization_matrix(kin=None, kin_ordered=None, edges_orde
 
 
 def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin: tuple=None, bin: BinMesh3SpectrumPoles=None,
-                                    batch_size: int=None, pbar: bool=False, rows=None, return_identity: bool=False) -> WindowMatrix:
+                                    batch_size: int=None, pbar: bool=False, rows=None, return_identity: bool=False, wide_angle: bool=False) -> WindowMatrix:
     r"""
     Compute the "smooth" (no binning effect) bispectrum window matrix.
 
@@ -1460,6 +1552,14 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
         Scoccimarro basis: also return :math:`I`, the window matrix of an infinite uniform survey (:math:`Q_{000} = 1`, the
         others zero, so :math:`k' = k`): each row is the output-bin average of the theory basis functions, with the same
         output-bin rule as the window. For predictions :math:`B_{\rm box} + (W - I)\, t` and identity-level tests.
+    wide_angle : bool, default=False
+        Sugiyama basis only: include the first-order wide-angle correction for the line of sight at the third point, for
+        theory multipoles defined about the triplet centroid (plane-parallel models). The theory multipoles stay at
+        wide-angle order :math:`(0, 0)`; the order-1 terms are folded into the window kernel in configuration space
+        (:func:`get_wide_angle3_theory_coeffs`), where they are algebraic. ``window`` must then carry ``wa_orders``
+        :math:`(0, 0)` and :math:`(1, 0)` (and :math:`(0, 1)`, unless the first two fields are the same), the latter computed
+        with the line-of-sight leg weighted by :math:`1 / x`, see :func:`get_smooth3_window_bin_attrs` with ``wide_angle=True``.
+        Only the geometric line-of-sight change is included.
 
     Returns
     -------
@@ -1472,12 +1572,14 @@ def compute_smooth3_spectrum_window(window, edgesin: np.ndarray | tuple, ellsin:
     identity : WindowMatrix, if ``return_identity`` (scoccimarro basis).
     """
     if 'scoccimarro' in bin.basis:
+        if wide_angle:
+            raise NotImplementedError('wide-angle orders are not supported for the scoccimarro basis')
         value, identity, kin, kin_edges, ellsin, wa_orders = _compute_smooth3_spectrum_window_scoccimarro(
             window, edgesin, ellsin=(0, 2, 4) if ellsin is None else ellsin, bin=bin,
             rows=rows, return_identity=return_identity, batch_size=1.5e5 if batch_size is None else batch_size, pbar=pbar)
     else:
         value, identity, kin, kin_edges, ellsin, wa_orders = _compute_smooth3_spectrum_window_sugiyama(
-            window, edgesin, ellsin=ellsin, bin=bin, batch_size=batch_size, pbar=pbar)
+            window, edgesin, ellsin=ellsin, bin=bin, batch_size=batch_size, pbar=pbar, wide_angle=wide_angle)
     observable = Mesh3SpectrumPoles([Mesh3SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes[ill], num_raw=jnp.zeros_like(bin.xavg[..., 0]),
                                                        basis=bin.basis, ell=ell) for ill, ell in enumerate(bin.ells)])
     kin = jnp.asarray(kin)
@@ -1602,7 +1704,7 @@ def _compute_smooth3_spectrum_window_scoccimarro(window, edgesin, ellsin=(0, 2, 
     return value, identity[0] if return_identity else None, kpoints, None, list(ellsin), [(0, 0)] * len(ellsin)
 
 
-def _compute_smooth3_spectrum_window_sugiyama(window, edgesin, ellsin=None, bin=None, batch_size=None, pbar=False):
+def _compute_smooth3_spectrum_window_sugiyama(window, edgesin, ellsin=None, bin=None, batch_size=None, pbar=False, wide_angle=False):
     """Sugiyama window through the harmonic (TripoSH) convolution: (matrix, None, theory k, theory k edges, theory ells, wide-angle orders)."""
     ells = bin.ells
     if isinstance(edgesin, ObservableTree):
@@ -1649,35 +1751,48 @@ def _compute_smooth3_spectrum_window_sugiyama(window, edgesin, ellsin=None, bin=
         batch_size = int(np.clip(memory_target // max(_nbytes, 1), 1, batch_size_max))
     batch_size = max(int(batch_size), 1)
 
+    window_has_wa = 'wa_orders' in window.labels(return_type='keys')
+    window_labels = window.labels(return_type='flatten')
+
     def get_w_rect_label(q, wain):
-        """Label of the window multipole a term reads, and whether it comes in transposed."""
-        transpose = False
-        if q not in window.ells:
-            q = q[1::-1] + q[2:]
-            transpose = True
-        kw = dict(ells=q)
-        if 'wa_orders' in window.labels(return_type='keys'):
-            kw.update(wa_orders=wain)
-        elif wain != (0, 0):
+        r"""Label of the window multipole a term reads, and whether it comes in transposed.
+
+        :math:`Q^{(n_1, n_2)}_{\ell_1\ell_2L}(r_1, r_2) = Q^{(n_2, n_1)}_{\ell_2\ell_1L}(r_2, r_1)`: a transposed read
+        swaps the wide-angle orders too -- else :math:`Q^{(0, 1)}` would silently be read as :math:`Q^{(1, 0)}`."""
+        q, wain = tuple(q), tuple(wain)
+        if not window_has_wa and wain != (0, 0):
             raise ValueError('wa_orders must be provided in input window')
-        return kw, transpose
+
+        def label(q, wain):
+            kw = dict(ells=q)
+            if window_has_wa: kw.update(wa_orders=wain)
+            return kw
+
+        kw = label(q, wain)
+        if kw in window_labels: return kw, False
+        kw_transpose = label(q[1::-1] + q[2:], wain[::-1])
+        if kw_transpose in window_labels: return kw_transpose, True
+        return kw, False
+
+    def has_w_rect(q, wain):
+        """Whether ``window`` carries this multipole at all; absent ones contribute exactly zero."""
+        kw, _ = get_w_rect_label(q, wain)
+        return kw in window_labels
 
     def get_w_rect(q, wain):
-        transpose = False
-        if q not in window.ells:
-            q = q[1::-1] + q[2:]
-            transpose = True
-        kw = dict(ells=q)
-        if 'wa_orders' in window.labels(return_type='keys'):
-            kw.update(wa_orders=wain)
-        elif wain != (0, 0):
-            raise ValueError('wa_orders must be provided in input window')
-        if kw in window.labels(return_type='flatten'):
+        kw, transpose = get_w_rect_label(q, wain)
+        if kw in window_labels:
             value = window.get(**kw).value().real
             if transpose:
                 value = jnp.swapaxes(value, 0, 1)
             return value
         return jnp.zeros(())
+
+    s_window = tuple(next(iter(window)).coords().values())
+
+    def get_kernel(terms):
+        """Window kernel sum coeff Q^{(n1, n2)}_w(r1, r2) r1^n1 r2^n2 of a list of (w, (n1, n2), coeff) terms."""
+        return sum(coeff * get_w_rect(q, n) * s_window[0][:, None]**n[0] * s_window[1][None, :]**n[1] for q, n, coeff in terms)
 
     def axis_basis_matrices(edges, k_axes, kind, nsub=1):
         """Per-axis (separable) replacement for the sharp tophat/read: build,
@@ -1770,7 +1885,7 @@ def _compute_smooth3_spectrum_window_sugiyama(window, edgesin, ellsin=None, bin=
         if ellin[1] != ellin[0] and (ellin_swap, wain) not in ellsin:
             toret.append((ellin_swap, True))
         return [(ellt, swap, coeffs) for ellt, swap in toret
-                if (coeffs := get_sugiyama_window_convolution_coeffs(ell, ellt))]
+                if (coeffs := get_wide_angle3_window_coeffs(ell, ellt, wain=wain, wide_angle=wide_angle))]
 
     passes = {(ellin, wain, ell): get_passes(ellin, wain, ell) for ellin, wain in ellsin for ell in ells}
     progress = make_pbar(sum(map(len, passes.values())))
@@ -1794,7 +1909,7 @@ def _compute_smooth3_spectrum_window_sugiyama(window, edgesin, ellsin=None, bin=
                 idx_axes = (index_in_swap if swap else index_in)[idx]
                 theory = Min_axes[0][:, idx_axes[0]][:, None] * Min_axes[1][:, idx_axes[1]][None, :]
                 correlation = sign_in * to_correlation(theory)[1]
-                correlation = correlation * Qs * to_correlation.s[0][:, None]**wain[0] * to_correlation.s[1][None, :]**wain[1]
+                correlation = correlation * Qs
                 # Separable output rebin: Mout_axes[d] is small
                 # (n_unique_axis, n_k_axis), so this never materializes
                 # a (nbins1 x nbins2, n_k1 x n_k2) dense tensor -- only
@@ -1817,7 +1932,7 @@ def _compute_smooth3_spectrum_window_sugiyama(window, edgesin, ellsin=None, bin=
             index_out, Mout_axes = axis_basis_matrices(bin.edges, to_spectrum.k, kind='rebin', nsub=8)
 
             for ellt, swap, wcoeffs in passes[ellin, wain, ell]:
-                Qs = sum(coeff * get_w_rect(q, wain) for q, coeff in wcoeffs)
+                Qs = get_kernel(wcoeffs)
                 to_correlation = SpectrumToCorrelation(k=to_spectrum.k, ell=ellt, minfolds=0, lowring=False, xy=1.)
                 term = jax.lax.map(partial(convolve, swap=swap, sign_in=-1. if ellt[0] % 2 else 1.), jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
                 if pbar: jax.block_until_ready(term)
