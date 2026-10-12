@@ -1,5 +1,6 @@
 import os
 import numbers
+import warnings
 import operator
 import functools
 from functools import partial
@@ -625,39 +626,34 @@ def compute_fkp2_shotnoise(*fkps: FKPField | ParticleField, bin: BinMesh2Spectru
     return shotnoise
 
 
-def compute_wide_angle_spectrum2_poles(poles: dict[Callable]):
+def get_wide_angle2_theory_coeffs(ellin: int, wa_order: int=1):
     r"""
-    Add (first) wide-angle order power spectrum multipoles to input dictionary of poles.
+    First-order wide-angle children of a theory correlation multipole, for the first-point line of sight.
+
+    The theory multipoles :math:`\xi_{\ell'}^{(0)}` are defined about the pair midpoint; expanding
+    :math:`\hat{\mathbf{s}} \cdot \hat{\mathbf{d}}` about the first-point line of sight :math:`\hat{\mathbf{x}}_1`
+    (separation :math:`\mathbf{s} = \mathbf{x}_2 - \mathbf{x}_1`) gives, to first order in :math:`s / x_1`,
+    :math:`\xi = \sum_\ell [\xi_\ell^{(0)} + (s / x_1) \xi_\ell^{(1)}] \mathcal{L}_\ell(\hat{\mathbf{s}} \cdot \hat{\mathbf{x}}_1)`, with
+    :math:`\xi_{\ell' \mp 1}^{(1)} \ni \pm c_{\ell'} \xi_{\ell'}^{(0)}`, :math:`c_\ell = \ell (\ell + 1) / (2 (2 \ell + 1))`.
+    These are ``pypower``'s first-point coefficients (``odd_wide_angle_coefficients``),
+    applied in configuration space where they are algebraic. See desi-gqc-notes, sec. "First-order wide-angle corrections".
 
     Parameters
     ----------
-    poles : dict[Callable]
-        A dictionary of callables, with keys the multipole orders :math:`\ell`.
-        Non-provided poles are assumed zero.
+    ellin : int
+        Theory multipole order :math:`\ell'` (wide-angle order 0).
+    wa_order : int, default=1
+        Wide-angle order; only 1 is supported.
 
     Returns
     -------
-    poles : Dictionary of callables with keys (multipole order, wide-angle order) :math:`(\ell, n)`.
+    coeffs : list of (p, coeff), such that :math:`\xi_p^{(1)} = \sum \mathrm{coeff} \, \xi_{\ell'}^{(0)}`.
     """
-    toret = {(ell, 0): pole for ell, pole in poles.items()}
-    for ell in range(max(list(toret) + [0]) + 1):
-        tmp = []
-        if ell - 1 in poles:
-            p = poles[ell - 1]
-            coeff = - ell * (ell - 1) / (2. * (2. * ell - 1))
-            tmp.append(coeff * (ell - 1), p)
-            tmp.append(- coeff, lambda k: k * jax.jacfwd(p)(k))
-        if ell + 1 in poles:
-            p = poles[ell + 1]
-            coeff = - (ell + 1) * (ell + 2) / (2. * (2. * ell + 3))
-            tmp.append(coeff * (ell + 1), p)
-            tmp.append(coeff, lambda k: k * jax.jacfwd(p)(k))
-
-        def func(k):
-            return sum(coeff * p(k) for coeff, p in tmp)
-
-        toret[(ell, 1)] = func
-    return toret
+    if wa_order != 1:
+        raise NotImplementedError('only wide-angle order 1 is implemented')
+    c = ellin * (ellin + 1) / (2. * (2 * ellin + 1))
+    if c == 0.: return []
+    return [(ellin - 1, c), (ellin + 1, -c)]
 
 
 def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarray | int=4096, order=3, pad_coords: callable=None, pad_value: Callable | str=None):
@@ -810,16 +806,34 @@ def interpolate_window_function(window: ObservableTree, coords: tuple | np.ndarr
     return window.map(partial(extrapolate_leaf, coords=coords), input_label=True)
 
 
-def get_window_coeffs(ell, ellin):
-    coeffs = []
-    for q in range(abs(ell - ellin), ell + ellin + 1):
-        coeff = (2 * ell + 1) * legendre_product(ell, ellin, q)
-        if abs(coeff) < 1e-7: continue
-        coeffs.append((q, coeff))
-    return coeffs
+def get_window_coeffs(ell, ellin, wide_angle: bool=False):
+    r"""
+    Coefficients of the window kernel multiplying the theory correlation multipole ``ellin`` in observed multipole ``ell``.
+
+    Returns triplets :math:`(q, n, \mathrm{coeff})`, such that the kernel is :math:`\sum \mathrm{coeff} \, Q_q^{(n)}(s) s^n`,
+    with :math:`\mathrm{coeff} = (2 \ell + 1) (\ell \, \ell' \, q; 0 0 0)^2` at the order ``n`` of ``ellin`` (``ellin`` may be ``(ell, n)``).
+    With ``wide_angle``, ``ellin`` must be at order 0, and the first-order terms of its children
+    (:func:`get_wide_angle2_theory_coeffs`) are folded in.
+    """
+    def _coeffs(ellin):
+        coeffs = []
+        for q in range(abs(ell - ellin), ell + ellin + 1):
+            coeff = (2 * ell + 1) * legendre_product(ell, ellin, q)
+            if abs(coeff) < 1e-7: continue
+            coeffs.append((q, coeff))
+        return coeffs
+
+    ellin, wain = ellin if isinstance(ellin, tuple) else (ellin, 0)
+    toret = [(q, wain, coeff) for q, coeff in _coeffs(ellin)]
+    if wide_angle:
+        if wain != 0:
+            raise ValueError('with wide_angle = True, theory multipoles must be given at wide-angle order 0')
+        for p, cp in get_wide_angle2_theory_coeffs(ellin, wa_order=1):
+            toret += [(q, 1, cp * coeff) for q, coeff in _coeffs(p)]
+    return toret
 
 
-def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
+def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False, wide_angle: bool=False):
     """
     Get the window bin attributes for sugiyama basis.
 
@@ -829,6 +843,10 @@ def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
         Observed multipole orders.
     ellsin : tuple, int
         Theory multipole orders, or number of even multipoles up to which to compute the window.
+    wide_angle : bool, default=False
+        If ``True``, return the window multipoles needed by :func:`compute_smooth2_spectrum_window` with ``wide_angle=True``,
+        as a dictionary ``{n: dict(ells=...)}`` for wide-angle orders ``n = 0, 1``:
+        the order-1 window has the line-of-sight leg weighted by :math:`1 / x`, see :func:`compute_smooth2_spectrum_window`.
 
     Returns
     -------
@@ -838,24 +856,27 @@ def get_smooth2_window_bin_attrs(ells, ellsin=3, return_ellsin: bool=False):
         ellsin = list(range(0, 2 * ellsin - 1, 2))
     ellsin = list(ellsin)
     non_zero_ellsin = []
-    ellw = []
+    ellw = {}
     for ellin in ellsin:  # ell 1-integer
         for ill, ell in enumerate(ells):
-            coeffs = get_window_coeffs(ell, ellin)
+            coeffs = get_window_coeffs(ell, ellin, wide_angle=wide_angle)
             if coeffs and ellin not in non_zero_ellsin:
                 non_zero_ellsin.append(ellin)
-            for ell, _ in coeffs:
-                if ell not in ellw: ellw.append(ell)
+            for q, n, _ in coeffs:
+                ellw.setdefault(n, [])
+                if q not in ellw[n]: ellw[n].append(q)
 
-    ellw = dict(ells=ellw)
+    if wide_angle:
+        ellw = {n: dict(ells=sorted(ellw.get(n, []))) for n in (0, 1)}
+    else:
+        ellw = dict(ells=ellw.get(0, []))
     if return_ellsin:
         return ellw, non_zero_ellsin
     return ellw
 
 
-
-def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('rect',),
-                                    ninsub: int=1, noutsub: int=1, batch_size=None) -> WindowMatrix:
+def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=None, bin: BinMesh2SpectrumPoles=None, flags=('fftlog',),
+                                    ninsub: int=1, noutsub: int=1, batch_size=None, wide_angle: bool=False) -> WindowMatrix:
     """
     Compute the "smooth" (no binning effect) power spectrum window matrix.
 
@@ -869,8 +890,12 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         Input multipole orders. Optional when ``edgesin`` is provided.
     bin : BinMesh2SpectrumPoles
         Output binning.
+    flags : tuple, default=('fftlog',)
+        ``'fftlog'``: FFTlog transforms, ``window`` must be sampled on a log-spaced :math:`s` grid
+        (see :func:`interpolate_window_function`).
+        ``'rect'`` (deprecated): direct rectangle-rule Bessel sums on the window's own :math:`s` grid.
     ninsub : int, default=1
-        Theory-side sub-binning, ``'fftlog'`` path only (the ``'rect'`` path already integrates the
+        Theory-side sub-binning, ``'fftlog'`` path only (the deprecated ``'rect'`` path integrates the
         theory over the input bin edges analytically, via ``BesselIntegral(..., edges=True)``).
         With ``ninsub = 1`` the theory bin is represented by one spline basis function centred on
         the bin; with ``ninsub > 1`` the spline nodes are refined to ``ninsub`` Gauss-Legendre
@@ -884,10 +909,18 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         Output-side sub-binning, both paths: average the prediction over each output bin using
         ``noutsub`` Gauss-Legendre points weighted by :math:`k^2`, instead of evaluating at the
         bin's representative :math:`k`. The ``'fftlog'`` path already applies a :math:`k^2`-weighted
-        bin average through ``matrix_rebin``, so this mainly refines it; the ``'rect'`` path
-        evaluates at bin centres, so it is the more useful knob there.
+        bin average through ``matrix_rebin``, so this mainly refines it; the deprecated ``'rect'`` path
+        evaluates at bin centres.
     batch_size : int, optional
         Size of the batch for each step to execute in parallel.
+    wide_angle : bool, default=False
+        If ``True``, include the first-order wide-angle correction for the first-point line of sight,
+        for theory multipoles defined about the pair midpoint (plane-parallel models).
+        The theory multipoles stay at wide-angle order 0; the order-1 terms are folded into the window kernel
+        in configuration space (:func:`get_wide_angle2_theory_coeffs`), where they are algebraic, so no :math:`k`-derivative is involved.
+        ``window`` must then carry ``wa_orders`` 0 and 1, the latter (odd multipoles) computed with the line-of-sight leg
+        weighted by :math:`1 / x` (see :func:`get_smooth2_window_bin_attrs` with ``wide_angle=True``).
+        Only the geometric line-of-sight change is included, as in ``pypower``.
 
     Returns
     -------
@@ -914,6 +947,9 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         if k2: w = w * k**2
         return k, w
     ells = bin.ells
+    if 'rect' in flags:
+        warnings.warn("flags=('rect',) is deprecated: use the default flags=('fftlog',), with the window interpolated "
+                      "on a log-spaced s grid (interpolate_window_function)", DeprecationWarning, stacklevel=2)
 
     if isinstance(edgesin, ObservableTree):
         ellsin = edgesin.ells
@@ -935,17 +971,19 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
         wmat_tmp[ellin, wain] = []
         for ill, ell in enumerate(ells):
 
-            def get_w(q):
+            def get_w(q, n):
                 kw = dict(ells=q)
                 if 'wa_orders' in window.labels(return_type='keys'):
-                    kw.update(wa_orders=wain)
-                elif wain != 0:
+                    kw.update(wa_orders=n)
+                elif n != 0:
                     raise ValueError('wa_orders must be provided in input window')
                 if kw in window.labels(return_type='flatten'):
                     return window.get(**kw).value().real
                 return jnp.zeros(())
 
-            Qs = sum(coeff * get_w(q) for q, coeff in get_window_coeffs(ell, ellin))
+            # Window kernel sum_q coeff Q_q^(n)(s) s^n, including the folded wide-angle terms if requested
+            swindow = next(iter(window)).coords('s')
+            Qs = sum(coeff * get_w(q, n) * swindow**n for q, n, coeff in get_window_coeffs(ell, (ellin, wain), wide_angle=wide_angle))
 
             #integ = BesselIntegral(window.get(0).edges('s'), kout, ell=ell, method='rect', mode='forward', edges=True, volume=False)
             if 'rect' in flags:
@@ -958,7 +996,7 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                 Qs = jnp.where(snmodes == 0, 0., Qs)
 
                 def f(edgein):
-                    tophat_Qs = BesselIntegral(edgein, savg, ell=ellin, edges=True, method='rect', mode='backward').w[..., 0] * Qs * savg**wain
+                    tophat_Qs = BesselIntegral(edgein, savg, ell=ellin, edges=True, method='rect', mode='backward').w[..., 0] * Qs
                     def f2(kk):
                         integ = BesselIntegral(savg, kk, ell=ell, method='rect', mode='forward', edges=False, volume=False)
                         return integ(snmodes * tophat_Qs)
@@ -1037,11 +1075,16 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
                     theory = Min[:, idx]
                     correlation = to_correlation(theory)[1]
                     #correlation = (ell == ellin) * correlation
-                    correlation = correlation * Qs * to_correlation.s**wain
+                    correlation = correlation * Qs
                     return Mout @ to_spectrum(correlation)[1]
 
                 tmp = jax.lax.map(convolve, jnp.arange(edgesin.shape[0]), batch_size=batch_size).T
 
+            # Odd-multipole phase. The estimator (compute_mesh2_spectrum) stores the imaginary part of
+            # sum delta(x1) delta(x2) L_ell(k.x1) e^{-ik.(x2 - x1)}, i.e. of (-i)^ell 4 pi int s^2 j_ell xi_ell,
+            # which for odd ell is (-1)^((ell + 1) / 2) 4 pi int s^2 j_ell xi_ell. The Hankel transforms above carry
+            # (-1)^(ell // 2), the even-ell phase, hence the sign for odd ell (checked against compute_mesh2_spectrum_mean).
+            if ell % 2: tmp = -tmp
             wmat_tmp[ellin, wain].append(tmp)
         wmat_tmp[ellin, wain] = jnp.concatenate(wmat_tmp[ellin, wain], axis=0)
 

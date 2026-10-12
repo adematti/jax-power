@@ -1470,6 +1470,37 @@ def test_smooth_window_scoccimarro_inject(nmocks=20, plot=False):
           f'window amplitude {ratio:.4f} +- {err:.4f} on {len(sel)} bins)')
 
 
+
+def test_wide_angle3_coeffs():
+    # The first-order change of the TripoSH basis under n_c = x3 + (r1 + r2)_perp / (3 x3), against finite differences:
+    # 3 * get_wide_angle3_theory_coeffs gives the derivative along the leg direction, (r_hat_i)_perp . grad_n S_{l1 l2 L}.
+    from scipy.special import sph_harm_y
+    from jaxpower.utils import wigner_3j
+    from jaxpower.mesh3 import get_wide_angle3_theory_coeffs
+
+    def y(ell, m, v):
+        theta, phi = np.arccos(np.clip(v[..., 2], -1, 1)), np.arctan2(v[..., 1], v[..., 0])
+        return np.sqrt(4 * np.pi / (2 * ell + 1)) * sph_harm_y(ell, m, theta, phi)
+
+    def S(l1, l2, L, a, b, n):
+        toret = 0.
+        for m1 in range(-l1, l1 + 1):
+            for m2 in range(-l2, l2 + 1):
+                if abs(m1 + m2) > L: continue
+                toret = toret + wigner_3j(l1, l2, L, m1, m2, -m1 - m2) * y(l1, m1, a) * y(l2, m2, b) * y(L, -m1 - m2, n)
+        return toret
+
+    normalize = lambda v: v / np.linalg.norm(v, axis=-1)[..., None]
+    rng = np.random.default_rng(42)
+    a, b, n = (normalize(rng.normal(size=(500, 3))) for _ in range(3))
+    eps = 1e-6
+    for ellin in [(0, 0, 0), (2, 0, 2), (0, 2, 2), (1, 1, 2), (2, 2, 2), (2, 2, 4), (1, 3, 2), (4, 4, 4)]:
+        for wa, v in [((1, 0), a), ((0, 1), b)]:
+            vperp = v - np.sum(v * n, axis=-1)[:, None] * n
+            ref = (S(*ellin, a, b, normalize(n + eps * vperp)) - S(*ellin, a, b, normalize(n - eps * vperp))) / (2 * eps)
+            test = sum((3. * coeff * S(*child, a, b, n) for child, coeff in get_wide_angle3_theory_coeffs(ellin, wa)), 0. * ref)
+            assert np.allclose(test, ref, atol=1e-7 * max(np.max(np.abs(ref)), 1.)), (ellin, wa)
+
 if __name__ == '__main__':
 
     #import os
