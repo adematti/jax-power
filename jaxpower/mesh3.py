@@ -1585,8 +1585,9 @@ def _compute_smooth3_spectrum_window_scoccimarro(window, edgesin, ellsin=(0, 2, 
     lookup = np.full(np.prod(shape), -1)
     lookup[(inodes[:, 0] * shape[1] + inodes[:, 1]) * shape[2] + inodes[:, 2]] = np.arange(len(knodes))
     col = lookup[(index[:, 0, a] * shape[1] + index[:, 1, b]) * shape[2] + index[:, 2, c]]
-    if np.any(col < 0): raise ValueError('a projection point reads a node outside the basis')
     phivalue = values[:, 0, a] * values[:, 1, b] * values[:, 2, c]
+    if np.any((col < 0) & (phivalue != 0.)): raise ValueError('a projection point reads a node outside the basis')
+    col = np.maximum(col, 0)   # zero entries of the node windows
     phi = scipy.sparse.csr_matrix((phivalue.ravel(), (np.repeat(np.arange(len(kpoints)), col.shape[1]), col.ravel())), shape=(len(kpoints), len(knodes)))
     wphi = (scipy.sparse.diags(weights) @ phi).tocsr()
     # Gram matrix on the nodes with support; the B-splines that only graze the region carry almost no measure: small ridge
@@ -1862,14 +1863,19 @@ def _get_scoccimarro_theory_basis(edgesin, basis='cubic'):
     (nbin, 2), contiguous, any widths); a cell is one product bin, kept if it contains a closed triangle. The basis is
     trilinear hats on the cell corners (``basis='linear'``) or tensor cubic B-splines centred on the grid knots (``'cubic'``:
     one more knot beyond each end), both uniform in the grid index: with variable widths, the cubic pieces are still
-    polynomial in each cell, but only continuous where the width changes.
+    polynomial in each cell, but only continuous where the width changes. The cubic basis has the natural boundary
+    condition (zero second derivative at both ends of the range): the B-splines of the two padding knots lie almost
+    entirely outside the range, where the theory is not fitted -- left free, their coefficients run to ~1e5 x the model,
+    cancelling at the fit points but not where the window reads them -- so they are not nodes but fold into their two
+    inward neighbours, :math:`c_0 = 2 c_1 - c_2`.
 
     Returns
     -------
     dict: ``cells`` (ncell, 3, 2) cell edges; ``knodes`` (nnode, 3) node coordinates; ``inodes`` (nnode, 3) their grid
-    indices; ``shape`` grid size per leg; ``step`` smallest knot spacing; ``order`` 1 or 3; ``index(k)`` the fractional
-    grid index of ``k`` and ``knot(j)`` the coordinate of grid index ``j`` (jax arrays; piecewise linear, extrapolated
-    with the end widths).
+    indices; ``shape`` grid size per leg; ``step`` smallest knot spacing; ``order`` 1 or 3; ``fold`` (nknot, shape[0])
+    per-leg values of the node functions on the knot B-splines (the identity off the padding knots); ``index(k)`` the
+    fractional knot index of ``k`` and ``knot(j)`` the coordinate of knot index ``j`` (jax arrays; piecewise linear,
+    extrapolated with the end widths).
     """
     edgesin = np.asarray(edgesin, dtype='f8')
     if edgesin.ndim == 1: edgesin = np.column_stack([edgesin[:-1], edgesin[1:]])
@@ -1906,15 +1912,23 @@ def _get_scoccimarro_theory_basis(edgesin, basis='cubic'):
     # the basis functions not vanishing on a cell (lower knot j per leg) are those of knots j to j + 1 (linear), j - 1 to j + 2 (cubic)
     offsets = np.array(list(itertools.product(range(-1, 3) if order == 3 else range(2), repeat=ndim)))
     inodes = np.unique((np.rint(np.asarray(index(cells[:, :, 0]))).astype(int)[:, None, :] + offsets[None]).reshape(-1, ndim), axis=0)
-    knodes, shape = np.asarray(knot(inodes.astype('f8'))), tuple(int(inodes[:, axis].max()) + 1 for axis in range(ndim))
-    return dict(cells=cells, knodes=knodes, inodes=inodes, shape=shape, step=step, order=order, index=index, knot=knot)
+    nknot = len(knots)
+    fold = np.eye(nknot)
+    if order == 3:  # natural boundary condition: the padding knots 0 and nknot - 1 are not nodes
+        inodes = inodes[np.all((inodes >= 1) & (inodes <= nknot - 2), axis=-1)]
+        fold = fold[:, 1:-1]
+        fold[0, :2], fold[-1, -2:] = [2., -1.], [-1., 2.]
+    knodes = np.asarray(knot(inodes.astype('f8')))
+    inodes = inodes - (order == 3)   # node index = knot index - 1 for the cubic basis
+    return dict(cells=cells, knodes=knodes, inodes=inodes, shape=(fold.shape[1],) * ndim, step=step, order=order, fold=fold, index=index, knot=knot)
 
 
 def _get_scoccimarro_basis_weights(k, basis, n=None):
     """
-    Per-leg values at ``k`` (array) of the theory ``basis`` functions (:func:`_get_scoccimarro_theory_basis`), one per grid
-    knot. With ``n``: dense, ``k.shape + (n,)`` (jax, for the dense contractions); else sparse: (knot indices, values) of
-    the ``order + 1`` functions not vanishing at ``k``, each ``k.shape + (order + 1,)`` (numpy).
+    Per-leg values at ``k`` (array) of the node functions of the theory ``basis`` (:func:`_get_scoccimarro_theory_basis`).
+    With ``n`` (the number of nodes per leg): dense, ``k.shape + (n,)`` (jax, for the dense contractions); else sparse:
+    (node indices, values) of a window of ``order + 1`` consecutive nodes holding every function not vanishing at ``k``
+    inside the range, each ``k.shape + (order + 1,)`` (numpy).
     """
     xp = np if n is None else jnp
     x = np.asarray(basis['index'](k)) if n is None else basis['index'](k)
@@ -1922,12 +1936,17 @@ def _get_scoccimarro_basis_weights(k, basis, n=None):
     u = x - cell
     if basis['order'] == 1:   # linear hats
         offsets, values = [0, 1], [1. - u, u]
-    else:                     # uniform cubic B-splines (in the grid index)
+    else:                     # uniform cubic B-splines (in the knot index)
         offsets, values = [-1, 0, 1, 2], [(1. - u)**3 / 6., (3. * u**3 - 6. * u**2 + 4.) / 6., (-3. * u**3 + 3. * u**2 + 3. * u + 1.) / 6., u**3 / 6.]
-    if n is None:
-        return np.stack([cell.astype(int) + offset for offset in offsets], axis=-1), np.stack(values, axis=-1)
-    nodes = jnp.arange(n)
-    return sum(value[..., None] * (cell[..., None] + offset == nodes) for offset, value in zip(offsets, values))
+    # the knot B-splines not vanishing at k, onto the node functions (rows of the fold matrix; zero beyond the knots)
+    fold = xp.asarray(basis['fold'])
+    nknot, nnode = fold.shape
+    dense = sum(value[..., None] * xp.where(((cell + offset >= 0) & (cell + offset < nknot))[..., None], fold[xp.clip(cell + offset, 0, nknot - 1).astype(int)], 0.)
+                for offset, value in zip(offsets, values))
+    if n is not None: return dense
+    start = np.clip(cell.astype(int) + offsets[0] - (nknot - nnode) // 2, 0, nnode - len(offsets))
+    index = start[..., None] + np.arange(len(offsets))
+    return index, np.take_along_axis(dense, index, axis=-1)
 
 
 def _get_scoccimarro_bin_rule(edges, nbin, ntet):
@@ -1985,8 +2004,8 @@ def _get_scoccimarro_qgrid(s, Q000, basis, kmax):
     - Cells: the kernel oscillates with period :math:`\sim q_D = 2\pi / D`, :math:`D` the survey size (where the ``Q000``
       diagonal, on ``s``, falls to :math:`10^{-3}` of :math:`Q_{000}(0, 0)`): the cells are fractions of :math:`q_D`
       (finest near :math:`q = 0`, where the kernel is concentrated), and never coarser than for the LRG1 window.
-    - Nodes: the response varies on the theory cell scale, whatever the window: nodes 1/8, 1/4, 1, 2, 4 steps of the
-      theory ``basis`` apart, finest near :math:`q = 0`.
+    - Nodes: the response varies on the theory cell scale, whatever the window: nodes 1/8, 1/4, 1, 2, 4 median steps of
+      the theory ``basis`` apart, finest near :math:`q = 0` (the median: cells refined at low k only do not need it).
     - The grid stops at :math:`q_\mathrm{max}` = ``kmax`` (largest output :math:`k`) + the largest :math:`k'` the basis
       reaches: a larger :math:`q` sends every leg to :math:`k' = |k - q| \geq q - k`, outside the basis (exact truncation).
 
@@ -1994,7 +2013,7 @@ def _get_scoccimarro_qgrid(s, Q000, basis, kmax):
     """
     diag = np.abs(np.diag(Q000)) / np.abs(Q000[0, 0])
     qD = min(2. * np.pi / s[np.argmax(diag < 1e-3)], 0.004)   # 0.004: LRG1 (D = 1590 Mpc/h)
-    step = basis['step']
+    step = np.median(np.diff(np.asarray(basis['knot'](np.arange(len(basis['fold']), dtype='f8')))))
     qmax = kmax + float(basis['knot'](basis['inodes'].max() + (basis['order'] + 1) / 2))   # end of the last node's support
     qedges = np.unique(np.concatenate([np.arange(0., qD, qD / 200.), np.arange(qD, 12.5 * qD, qD / 20.),
                                        np.arange(12.5 * qD, 75. * qD, qD / 4.), np.arange(75. * qD, qmax + qD / 2., qD / 2.)]))
