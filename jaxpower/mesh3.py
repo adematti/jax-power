@@ -1120,7 +1120,9 @@ def compute_fkp3_shotnoise(*fkps, bin=None, los: str | np.ndarray='z', resampler
             else:
                 weights = particles[0].weights * particles[1].weights * particles[2].weights
                 rmesh = particles[0].clone(weights=weights).paint(**kwargs, out='real')
-                xvec = mattrs.rcoords(sparse=True)
+                # Y_lm of the line of sight of the estimator: x^ if local, else the global one
+                vlos = _format_los(los, ndim=mattrs.ndim)[1]
+                xvec = mattrs.rcoords(sparse=True) if vlos is None else vlos
                 s111_ellm = {(ell, m): jnp.sum(rmesh.value * get_Ylm(ell, m, reduced=True, real=False, conj=True)(*xvec)) for ell, m in ellms}
             s111 = s111_ellm.get((0, 0), 0.)
             if is_correlation:
