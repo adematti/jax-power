@@ -34,7 +34,7 @@ the window-multipole normalisation), so do not consult it for these equations.
   tie and stays at five.
 * Which kernel: ``BB`` takes :math:`Q_{\mathcal W}^{(2)}` between two 3-field groups, ``PB``
   between a 2-field and a 3-field group, and ``PPP`` the three-anchor
-  :math:`Q_{\mathcal W}^{(3)}` of :func:`compute_QW_ABC`, which carries four momentum arguments.
+  :math:`Q_{\mathcal W}^{(3)}`, which carries four momentum arguments.
   ``PT`` takes *no* kernel: its tie cannot be expanded in one at all, and it is consumed as a
   vector instead, with the window entering through the effective tie volume alone. So does
   ``BB``'s doubly-derived ``(2, 2)`` pairing. See :func:`_block_bb_pt_window` and
@@ -178,6 +178,7 @@ from functools import partial
 import functools
 import itertools
 import os
+import threading
 
 import numpy as np
 import jax
@@ -288,22 +289,65 @@ class ModeCount(object):
     *are* its edges, evaluating this at a bin centre returns that bin's own population.
     """
 
-    def __init__(self, mattrs, dk, nk=8192):
+    def __init__(self, mattrs, dk, nk=8192, kmax=None):
         boxsize = np.asarray(mattrs.boxsize) * np.ones(3)
         meshsize = np.asarray(mattrs.meshsize) * np.ones(3, dtype=int)
         axes = [np.fft.fftfreq(int(n), d=float(l) / int(n)) * 2. * np.pi
                 for n, l in zip(meshsize, boxsize)]
-        knorm = np.sqrt(sum(a**2 for a in np.meshgrid(*axes, indexing='ij'))).ravel()
+        # Only enumerate the modes a shell below `kmax` can hold. The full grid is the mesh's,
+        # 256^3 = 16.7M magnitudes here, and it is built through a `meshgrid` whose temporaries
+        # are several times that again -- for a table that is then asked about k < 0.2, where
+        # the sphere holds a few times 10^4 modes. Bounding each axis by `kmax` before the
+        # product is what makes this proportional to the question rather than to the mesh, and
+        # with sub-binning there are three of these objects, one per distinct bin width.
+        #
+        # Above `kmax` the shells are densely populated and the continuum count is accurate to
+        # far better than a per cent, so `__call__` falls back to it rather than to the table's
+        # zero. The discreteness correction is a low-k effect -- on a 500 Mpc/h box it is worth
+        # 10-15% in the first bin and nothing above k ~ 0.09.
+        self.volume = float(np.prod(boxsize))
+        if kmax is None:
+            kmax = float(np.sqrt(sum(np.abs(a).max()**2 for a in axes)))
+        self.kmax = float(kmax) + float(dk)
+        sel = [a[np.abs(a) <= self.kmax] for a in axes]
+        knorm = np.sqrt(sum(x**2 for x in np.meshgrid(*sel, indexing='ij'))).ravel()
+        knorm = knorm[knorm <= self.kmax]
         knorm.sort()
         self.knorm, self.dk = knorm, float(dk)
-        self.k = np.linspace(0., float(knorm[-1]), nk)
+        self.k = np.linspace(0., self.kmax, nk)
         lo = np.searchsorted(knorm, np.maximum(self.k - dk / 2., 0.), side='left')
         hi = np.searchsorted(knorm, self.k + dk / 2., side='right')
         self.table = (hi - lo).astype(float)
         self._k, self._table = jnp.asarray(self.k), jnp.asarray(self.table)
 
     def __call__(self, k):
-        return jnp.interp(jnp.asarray(k), self._k, self._table, left=0., right=0.)
+        k = jnp.asarray(k)
+        # Degenerate quadrature configurations reach this with a non-finite magnitude -- the
+        # `PT` tie is where it happens -- and their contribution is discarded by a `jnp.where`
+        # further down. Arithmetic carries that harmlessly, which is why the continuum count
+        # never noticed. `jnp.interp` does not: it resolves the value through a searchsorted and
+        # a gather, and the index built from a NaN is out of bounds. On GPU that is an illegal
+        # memory access which aborts the process, with no Python frame and a report pointing at
+        # whatever unrelated transfer happens to synchronise next; on CPU it reads quietly.
+        finite = jnp.isfinite(k)
+        # The table is on a uniform grid by construction, so its interpolation index is an
+        # arithmetic expression rather than a search -- and that matters for more than speed. A
+        # computed index can be clipped into range *before* the gather; `jnp.interp` resolves
+        # its own through a searchsorted whose result, for a non-finite or out-of-range input,
+        # indexes outside the table. On GPU that is an illegal memory access which aborts the
+        # process with no Python frame, blamed on whatever transfer synchronises next.
+        size = self._table.shape[0]
+        position = jnp.where(finite, k, 0.) / self.kmax * (size - 1)
+        position = jnp.clip(position, 0., size - 1.)
+        index = jnp.clip(jnp.floor(position).astype(jnp.int32), 0, size - 2)
+        frac = position - index
+        counted = self._table[index] * (1. - frac) + self._table[index + 1] * frac
+        # `- dk/2` so a shell that only partly reaches past the enumerated range is not read off
+        # a table that is missing its upper half.
+        out = jnp.where(k < self.kmax - self.dk / 2., counted,
+                        _continuum_count(k, self.dk, self.volume))
+        # Zero, as for a shell holding no modes: such a configuration is not measurable.
+        return jnp.where(finite, out, 0.)
 
     def ratio_to_continuum(self, k, volume):
         """Diagnostic: measured / Eq. (43)."""
@@ -385,20 +429,6 @@ def quad_nodes(kinds, order, seed=0, size=None):
     return np.stack([g.ravel() for g in grids], axis=-1), w
 
 
-def _batched(fun, nodes, weights, batch_size, shape):
-    """``sum_q w_q fun(nodes[q])`` with the node axis chopped into batches."""
-    nodes, weights = np.asarray(nodes), np.asarray(weights)
-    n = len(weights)
-    batch_size = n if batch_size is None else min(batch_size, n)
-    out = jnp.zeros(shape)
-    vfun = jax.jit(jax.vmap(fun))
-    for start in range(0, n, batch_size):
-        sl = slice(start, min(start + batch_size, n))
-        val = vfun(jnp.asarray(nodes[sl]))
-        out = out + jnp.tensordot(jnp.asarray(weights[sl]), val, axes=(0, 0))
-    return out
-
-
 # ======================================================================================
 # the spectra, dressed with discreteness
 # ======================================================================================
@@ -421,7 +451,8 @@ def sum_over_terms(spectrum, terms):
     """
     grouped = {}
     for amplitude, fields, momenta in terms:
-        if amplitude == 0.:
+        # A traced amplitude (the coincidence-order split) cannot be tested; static zeros are still dropped
+        if not isinstance(amplitude, jax.core.Tracer) and amplitude == 0.:
             continue
         configurations, amplitudes = grouped.setdefault(tuple(fields), ([], []))
         configurations.append(tuple(momenta))
@@ -430,9 +461,33 @@ def sum_over_terms(spectrum, terms):
     for fields, (configurations, amplitudes) in grouped.items():
         stacked = [jnp.stack(jnp.broadcast_arrays(*leg)) for leg in zip(*configurations)]
         values = spectrum(fields, *stacked)
-        amplitudes = jnp.asarray(amplitudes).reshape((-1,) + (1,) * (jnp.ndim(values) - 1))
+        # An amplitude may be an array (a damped coincidence, `coincidence_damping`): broadcast each to one value's shape
+        amplitudes = jnp.stack([jnp.broadcast_to(amplitude, jnp.shape(values)[1:]) for amplitude in amplitudes])
         total = total + (amplitudes * values).sum(axis=0)
     return total
+
+
+#: The coincidence-order split of :func:`compute_spectrum3_covariance` (``coincidence_orders``): every pair-coincidence
+#: amplitude is multiplied by ``scale``, and :func:`_run` evaluates its physics at all ``levels`` of that scale in one
+#: pass (the connected spectra do not depend on it, so the vectorisation computes them once), caching the results by
+#: call order so that the repeated assemblies read them back. Idle outside that function.
+class _CoincidenceState(threading.local):
+    """Per-thread, so that terms computed concurrently on several devices (``devices``) keep their own levels."""
+
+    def __init__(self):
+        self.__dict__.update(scale=1., levels=None, level=0, counter=0, cache={})
+
+    def __getitem__(self, name):
+        return self.__dict__[name]
+
+    def __setitem__(self, name, value):
+        self.__dict__[name] = value
+
+    def update(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+_COINCIDENCE = _CoincidenceState()
 
 
 class Spectra(object):
@@ -460,8 +515,14 @@ class Spectra(object):
     than being silently ignored.
     """
 
-    def __init__(self, theory=None, shotnoise=0.):
+    def __init__(self, theory=None, shotnoise=0., count_power_shot=True, coincidence_damping=None):
         self._theory = theory if theory is not None else (lambda fields: None)
+        # `coincidence_damping(first, second, kfirst, ksecond)`: the factor of a coincidence between two fields whose
+        # points are the same objects displaced -- pre- and post-reconstruction -- as a function of the two legs' momenta
+        self._coincidence_damping = coincidence_damping
+        # Whether the constant of P^(N) = P + 1/nbar follows the coincidence-order scale (see
+        # `compute_spectrum3_covariance`'s `coincidence_orders`); it does not matter otherwise
+        self._count_power_shot = bool(count_power_shot)
         self._cache = {}
         # A `{order: moment}` dict is the one spelling that is refused rather than used: no term
         # here is a triple or quadruple coincidence, so `{3: ..., 4: ...}` would be silently
@@ -495,20 +556,32 @@ class Spectra(object):
         return self.get(fields) is not None
 
     # ---- shot noise -------------------------------------------------------------------
-    def coincidence(self, first, second):
+    def coincidence(self, first, second, kfirst=None, ksecond=None, scaled=True):
         """The amplitude of a pair of points landing on top of one another.
 
         This is both the constant added to :math:`P_{ab}` to make :math:`P^{(N)}_{ab}` and what
         every coincidence structure in :math:`B^{(N)}`, :math:`T^{(N)}` and the :math:`P_6` shot
         lines is built from. It is zero across distinct tracers: two points of different types
-        are never the same point.
+        are never the same point. Two fields of the same objects displaced (pre- and post-recon) do
+        coincide, and ``coincidence_damping`` then gives the factor of the displacement between the two
+        copies, from the momenta ``kfirst``, ``ksecond`` of the two legs.
         """
         shotnoise = self._shotnoise
         if callable(shotnoise):
-            return shotnoise(first, second)
-        if isinstance(shotnoise, dict):
-            return shotnoise.get((first, second), shotnoise.get((second, first), 0.))
-        return shotnoise if first == second else 0.
+            value = shotnoise(first, second)
+        elif isinstance(shotnoise, dict):
+            value = shotnoise.get((first, second), shotnoise.get((second, first), 0.))
+        else:
+            value = shotnoise if first == second else 0.
+        # A static zero (distinct tracers) stays a static zero, so that `sum_over_terms` can still drop it
+        if _static_zero(value):
+            return value
+        if self._coincidence_damping is not None and kfirst is not None:
+            value = value * self._coincidence_damping(first, second, kfirst, ksecond)
+        if not scaled:
+            return value
+        # Scaled for the coincidence-order split (1 otherwise): a line with m coincidences goes as scale^m
+        return value * _COINCIDENCE['scale']
 
     # ---- the connected spectra -------------------------------------------------------
     # `fields` names one tracer per leg and is as long as the configuration: two for P, three for
@@ -534,8 +607,35 @@ class Spectra(object):
 
     # ---- Eq. (11) --------------------------------------------------------------------
     def power_shot(self, fields, k):
-        r""":math:`P^{(N)}_{ab}(k) = P_{ab}(k) + \delta_{ab} / \bar n`."""
-        return self.power(fields, k) + self.coincidence(*fields)
+        r""":math:`P^{(N)}_{ab}(k) = P_{ab}(k) + \delta_{ab} / \bar n`.
+
+        Only ever a factor of a product (PP, PB, PPP, PT); the coincidences of the higher spectra are built on the plain
+        :meth:`power`. With ``count_power_shot=False`` its constant stays at the nominal amplitude under the
+        coincidence-order split, so that the orders count the coincidences of B, T, P5, P6 alone.
+        """
+        return self.power(fields, k) + self.coincidence(*fields, k, -k, scaled=self._count_power_shot)
+
+    def power_shot_parts(self, fields, k):
+        """:meth:`power_shot` as ``[(None, P), ((0, 1), constant)]``: each piece with the pair of legs it merges.
+
+        The coincidence piece is left out where it is a static zero (distinct tracers). The pieces sum to
+        :meth:`power_shot`; with ``shot_windows`` each takes the window of its own points.
+        """
+        parts = [(None, self.power(fields, k))]
+        constant = self.coincidence(*fields, k, -k, scaled=self._count_power_shot)
+        if not _static_zero(constant):
+            parts.append(((0, 1), constant * jnp.ones_like(parts[0][1])))
+        return parts
+
+    def bispectrum_shot_parts(self, fields, k1, k2, k3):
+        """:meth:`bispectrum_shot` as ``[(None, B), ((0, 1), ...), ((0, 2), ...)]``, each with the legs it merges."""
+        a, b, c = fields
+        parts = [(None, self.connected(fields, k1, k2))]
+        for (i, j), amplitude, rest, k in (((0, 1), self.coincidence(a, b, k1, k2), (a, c), k3),
+                                          ((0, 2), self.coincidence(a, c, k1, k3), (a, b), k2)):
+            if not _static_zero(amplitude):
+                parts.append(((i, j), amplitude * self.power(rest, k)))
+        return parts
 
     # ---- Eq. (24) --------------------------------------------------------------------
     def bispectrum_shot(self, fields, k1, k2, k3):
@@ -550,8 +650,8 @@ class Spectra(object):
         """
         a, b, c = fields
         return (self.connected(fields, k1, k2)
-                + self.coincidence(a, b) * self.power((a, c), k3)
-                + self.coincidence(a, c) * self.power((a, b), k2))
+                + self.coincidence(a, b, k1, k2) * self.power((a, c), k3)
+                + self.coincidence(a, c, k1, k3) * self.power((a, b), k2))
 
     # ---- Eq. (14) --------------------------------------------------------------------
     def trispectrum_shot(self, fields, k1, k2, k1p, k2p):
@@ -567,15 +667,37 @@ class Spectra(object):
         total = self.connected(fields, k1, k2, k1p)
         # One cross pair coincides; the merged point plus the two free legs make a bispectrum.
         total = total + sum_over_terms(self.connected, [
-            (self.coincidence(a, c), (a, b, d), (-k1 - k1p, k1)),
-            (self.coincidence(a, d), (a, b, c), (-k1 - k2p, k1)),
-            (self.coincidence(b, c), (b, a, d), (-k2 - k1p, k2)),
-            (self.coincidence(b, d), (b, a, c), (-k2 - k2p, k2))])
+            (self.coincidence(a, c, k1, k1p), (a, b, d), (-k1 - k1p, k1)),
+            (self.coincidence(a, d, k1, k2p), (a, b, c), (-k1 - k2p, k1)),
+            (self.coincidence(b, c, k2, k1p), (b, a, d), (-k2 - k1p, k2)),
+            (self.coincidence(b, d, k2, k2p), (b, a, c), (-k2 - k2p, k2))])
         # Two disjoint cross pairs coincide; one power spectrum is left.
         total = total + sum_over_terms(self.power, [
-            (self.coincidence(a, c) * self.coincidence(b, d), (a, b), (k1 + k1p,)),
-            (self.coincidence(a, d) * self.coincidence(b, c), (a, b), (k1 + k2p,))])
+            (self.coincidence(a, c, k1, k1p) * self.coincidence(b, d, k2, k2p), (a, b), (k1 + k1p,)),
+            (self.coincidence(a, d, k1, k2p) * self.coincidence(b, c, k2, k1p), (a, b), (k1 + k2p,))])
         return total
+
+    def trispectrum_shot_parts(self, fields, k1, k2, k1p, k2p):
+        """:meth:`trispectrum_shot` as ``[(merges, value)]``, ``merges`` the tuple of leg pairs each line merges.
+
+        Legs ``(0, 1)`` are one estimator's pair and ``(2, 3)`` the other's, as in :meth:`trispectrum_shot`; the lines
+        are its four single cross pairs and two double ones, static zeros dropped.
+        """
+        a, b, c, d = fields
+        parts = [((), self.connected(fields, k1, k2, k1p))]
+        singles = (((0, 2), self.coincidence(a, c, k1, k1p), (a, b, d), (-k1 - k1p, k1)),
+                   ((0, 3), self.coincidence(a, d, k1, k2p), (a, b, c), (-k1 - k2p, k1)),
+                   ((1, 2), self.coincidence(b, c, k2, k1p), (b, a, d), (-k2 - k1p, k2)),
+                   ((1, 3), self.coincidence(b, d, k2, k2p), (b, a, c), (-k2 - k2p, k2)))
+        for pair, amplitude, sub, momenta in singles:
+            if not _static_zero(amplitude):
+                parts.append(((pair,), amplitude * self.connected(sub, *momenta)))
+        doubles = ((((0, 2), (1, 3)), self.coincidence(a, c, k1, k1p) * self.coincidence(b, d, k2, k2p), k1 + k1p),
+                   (((0, 3), (1, 2)), self.coincidence(a, d, k1, k2p) * self.coincidence(b, c, k2, k1p), k1 + k2p))
+        for pairs, amplitude, k in doubles:
+            if not _static_zero(amplitude):
+                parts.append((pairs, amplitude * self.power((a, b), k)))
+        return parts
 
     # ---- Eq. (27) --------------------------------------------------------------------
     def five_point_shot(self, fields, k, k1, k2, k3):
@@ -597,7 +719,7 @@ class Spectra(object):
         for tied, sign in enumerate((1., -1.)):
             for other in range(3):
                 free = [index for index in range(3) if index != other]
-                terms.append((self.coincidence(pair[tied], triangle[other]),
+                terms.append((self.coincidence(pair[tied], triangle[other], sign * k, legs[other]),
                               (pair[tied], pair[1 - tied], triangle[free[0]], triangle[free[1]]),
                               (sign * k + legs[other], -sign * k, legs[free[0]])))
         total = total + sum_over_terms(self.connected, terms)
@@ -607,8 +729,8 @@ class Spectra(object):
         terms = []
         for first, second in ((0, 1), (0, 2), (1, 2)):
             for tied, sign in enumerate((1., -1.)):
-                amplitude = (self.coincidence(pair[tied], triangle[first])
-                             * self.coincidence(pair[1 - tied], triangle[second]))
+                amplitude = (self.coincidence(pair[tied], triangle[first], sign * k, legs[first])
+                             * self.coincidence(pair[1 - tied], triangle[second], -sign * k, legs[second]))
                 terms.append((amplitude,
                               (triangle[first], triangle[second], triangle[3 - first - second]),
                               (sign * k + legs[first], legs[second] - sign * k)))
@@ -631,7 +753,7 @@ class Spectra(object):
             for j in range(3):
                 free_left = [index for index in range(3) if index != i]
                 free_right = [index for index in range(3) if index != j]
-                terms.append((self.coincidence(left[i], right[j]),
+                terms.append((self.coincidence(left[i], right[j], unprimed[i], primed[j]),
                               (left[i], left[free_left[0]], left[free_left[1]],
                                right[free_right[0]], right[free_right[1]]),
                               (unprimed[i] + primed[j], unprimed[free_left[0]],
@@ -645,8 +767,8 @@ class Spectra(object):
                 for j2 in range(3):
                     if j2 == j:
                         continue
-                    amplitude = (self.coincidence(left[i], right[j])
-                                 * self.coincidence(left[i2], right[j2]))
+                    amplitude = (self.coincidence(left[i], right[j], unprimed[i], primed[j])
+                                 * self.coincidence(left[i2], right[j2], unprimed[i2], primed[j2]))
                     terms.append((amplitude,
                                   (left[i], left[i2], left[3 - i - i2], right[3 - j - j2]),
                                   (unprimed[i] + primed[j], unprimed[i2] + primed[j2],
@@ -659,9 +781,9 @@ class Spectra(object):
             for j2 in range(3):
                 if j2 == j:
                     continue
-                amplitude = (self.coincidence(left[0], right[j])
-                             * self.coincidence(left[1], right[j2])
-                             * self.coincidence(left[2], right[3 - j - j2]))
+                amplitude = (self.coincidence(left[0], right[j], unprimed[0], primed[j])
+                             * self.coincidence(left[1], right[j2], unprimed[1], primed[j2])
+                             * self.coincidence(left[2], right[3 - j - j2], unprimed[2], primed[3 - j - j2]))
                 terms.append((amplitude, left,
                               (unprimed[0] + primed[j], unprimed[1] + primed[j2])))
         return total + sum_over_terms(self.connected, terms)
@@ -716,6 +838,55 @@ def _run(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kin
     affordable: the 1296-tree :math:`P_6` is paid once for all ten pairs of ``(B000, B202,
     B110, B220)``.
     """
+    if _COINCIDENCE['levels'] is not None:
+        # Coincidence-order split: every level in one pass on the first assembly, read back on the others
+        key = _COINCIDENCE['counter']
+        _COINCIDENCE['counter'] += 1
+        if key not in _COINCIDENCE['cache']:
+            _COINCIDENCE['cache'][key] = _run_levels(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kind_p,
+                                                     _COINCIDENCE['levels'])
+        return _COINCIDENCE['cache'][key][_COINCIDENCE['level']]
+    return _run_levels(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kind_p, None)
+
+
+def _run_shot(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kind_p, rho):
+    r""":func:`_run`, with the lines carrying ``m`` coincidences weighted by ``rho[m]`` (``None``: :func:`_run`).
+
+    Every coincidence carries the coincidence scale ``s``, so the integrand is a polynomial :math:`\sum_m c_m s^m` of
+    degree at most 3; it is evaluated at ``s = 0 .. 3`` in one pass and :math:`\sum_m \rho_m c_m` read off the
+    Vandermonde system. This is how the purely connected blocks take their shot windows
+    (:meth:`SurveyGeometry.shot_ratios`).
+    """
+    if rho is None:
+        return _run(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kind_p)
+    scales = np.arange(4.)
+    rho = np.concatenate([np.asarray(rho, dtype='f8'), np.ones(4 - len(rho))])
+    vinv = np.linalg.solve(np.vander(scales, 4, increasing=True), np.eye(4))   # integrals at scales 0..3 -> per-order c_m
+
+    def orders():
+        outs = _run_levels(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kind_p, list(scales))
+        return [[[sum(vinv[m, level] * outs[level][i][j] for level in range(4)) for j in range(len(ells_p))]
+                 for i in range(len(ells_u))] for m in range(4)]
+
+    if _COINCIDENCE['levels'] is not None:
+        # Coincidence-order split in progress: the per-order integrals once (cached by call order, as `_run` does),
+        # weighted by rho_m and evaluated at the split's current scale s, sum_m rho_m c_m s^m
+        key = ('shot', _COINCIDENCE['counter'])
+        _COINCIDENCE['counter'] += 1
+        if key not in _COINCIDENCE['cache']:
+            _COINCIDENCE['cache'][key] = orders()
+        c, scale = _COINCIDENCE['cache'][key], _COINCIDENCE['scale']
+    else:
+        c, scale = orders(), 1.
+    return [[sum(rho[m] * scale**m * c[m][i][j] for m in range(4)) for j in range(len(ells_p))] for i in range(len(ells_u))]
+
+
+def _run_levels(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kind_p, levels):
+    """:func:`_run`'s integral; with ``levels``, at every coincidence scale of ``levels`` at once, as a list over them.
+
+    The node function is vectorised over the scale inside the same compiled call; operations that do not depend on it
+    (the connected spectra, the geometry) are not batched by :func:`jax.vmap`, so they are paid once.
+    """
     nu_ell, np_ell = len(ells_u), len(ells_p)
     proj_u = [get_legendre(e) if kind_u == 2 else _Sfun(e) for e in ells_u]
     proj_p = [get_legendre(e) if kind_p == 2 else _Sfun(e) for e in ells_p]
@@ -724,29 +895,49 @@ def _run(term_fn, nodes, weights, batch_size, shape, ells_u, ells_p, kind_u, kin
     nodes, weights = np.asarray(nodes), np.asarray(weights)
     n = len(weights)
     bs = n if batch_size is None else min(batch_size, n)
-    out = [[jnp.zeros(shape) for _ in range(np_ell)] for _ in range(nu_ell)]
+    nlevels = 1 if levels is None else len(levels)
+    outs = [[[jnp.zeros(shape) for _ in range(np_ell)] for _ in range(nu_ell)] for _ in range(nlevels)]
     nhat_u = 1 if kind_u == 2 else 2
 
-    @jax.jit
-    def _batch(nd):
-        return jax.vmap(term_fn)(nd)
+    if levels is None:
+        @jax.jit
+        def _batch(nd):
+            res = jax.vmap(term_fn)(nd)
+            return (res[0][None],) + tuple(res[1:])
+    else:
+        scales = jnp.asarray(levels, dtype='f8')
+
+        def _at(scale, nd):
+            previous = _COINCIDENCE['scale']
+            _COINCIDENCE['scale'] = scale
+            try:
+                return jax.vmap(term_fn)(nd)
+            finally:
+                _COINCIDENCE['scale'] = previous
+
+        @jax.jit
+        def _batch(nd):
+            res = jax.vmap(_at, in_axes=(0, None))(scales, nd)
+            # The unit vectors do not depend on the scale: any level's will do
+            return (res[0],) + tuple(hat[0] for hat in res[1:])
 
     for start in range(0, n, bs):
         sl = slice(start, min(start + bs, n))
         res = _batch(jnp.asarray(nodes[sl]))
-        val, hats = res[0], res[1:]
+        vals, hats = res[0], res[1:]
         w = jnp.asarray(weights[sl])
         hu, hp = hats[:nhat_u], hats[nhat_u:]
         ndim = 1 + len(shape)
         for i in range(nu_ell):
             su = (proj_u[i](hu[0][..., 2]) if kind_u == 2 else proj_u[i](*hu)) * pref_u[i]
-            su = _align(jnp.broadcast_to(su, jnp.shape(val)[:1] + jnp.shape(su)[1:]), ndim) \
+            su = _align(jnp.broadcast_to(su, jnp.shape(vals)[1:2] + jnp.shape(su)[1:]), ndim) \
                 if jnp.ndim(su) else su
             for j in range(np_ell):
                 sp = (proj_p[j](hp[0][..., 2]) if kind_p == 2 else proj_p[j](*hp)) * pref_p[j]
                 sp = _align(sp, ndim) if jnp.ndim(sp) else sp
-                out[i][j] = out[i][j] + jnp.tensordot(w, su * sp * val, axes=(0, 0))
-    return out
+                for level in range(nlevels):
+                    outs[level][i][j] = outs[level][i][j] + jnp.tensordot(w, su * sp * vals[level], axes=(0, 0))
+    return outs[0] if levels is None else outs
 
 
 # ======================================================================================
@@ -780,6 +971,8 @@ class BoxGeometry(object):
     #: blocks hoist it out of the quadrature. A survey window's does, which is why the windowed
     #: blocks are separate integrals rather than the same one reweighted.
     directional = False
+    #: A box has one shot-noise level, so its shot lines need no window of their own.
+    shot_windows = False
 
     def __init__(self, volume, count=None):
         self.volume = volume
@@ -821,14 +1014,44 @@ class SurveyGeometry(object):
 
     directional = True
 
-    def __init__(self, window2, window3=None, cache=None):
+    def __init__(self, window2, window3=None, cache=None, shot_windows=False):
         self.window2 = window2
         self.window3 = window3
         self.cache = {} if cache is None else cache
+        # With shot_windows, every shot line takes the window of its merged points (approximation 2 lifted):
+        # the windows must have been built with compute_fkp2_covariance_window(..., shot=True)
+        self.shot_windows = bool(shot_windows)
 
     def inverse_volume(self, rows, cols):
         """The window monopole, which *is* :math:`1/V^{(4)}` for two anchors."""
-        return self.window2.get(fields1=tuple(rows), fields2=tuple(cols), ells=0).value()[0]
+        return self.window2.get(fields1=_lookup_label(rows), fields2=_lookup_label(cols), ells=0).value()[0]
+
+    def shot_ratios(self, first, second, degree=3):
+        r""":math:`\rho_m`, ``m = 0 .. degree``: the zero-lag window of the grouping ``(first, second)`` with ``m`` of
+        its pairs merged into single points, over the unmerged one.
+
+        A purely connected block (``T``, ``P5``, ``P6``) sees the window only through :math:`1/V^{(n)}`, so a shot line
+        with ``m`` coincidences takes :math:`\int \tilde S^m W^{n - 2m}` where approximation 2 gives it
+        :math:`\int W^n`, and :math:`\rho_m` is the whole correction. ``first`` and ``second`` must be a grouping of
+        the block's fields in which every pair of one group is a pair that can coincide (one point from each
+        estimator). The merged and unmerged windows share their flattened fields, hence their normalisation, which
+        cancels. All the variants with ``m`` merges are averaged; they are one number when the merged fields share
+        one window (one tracer, or two weightings / displacements of one catalogue), which is the case this is for.
+        """
+        key = ('shot_ratios', tuple(first), tuple(second), degree)
+        if key not in self.cache:
+            q0 = self.inverse_volume(first, second)
+            sums, counts = [0.] * (degree + 1), [0] * (degree + 1)
+            for g1 in merged_group_variants(first):
+                for g2 in merged_group_variants(second):
+                    m = _n_merged(g1) + _n_merged(g2)
+                    if m > degree:
+                        continue
+                    sums[m] = sums[m] + self.inverse_volume(g1, g2) / q0
+                    counts[m] += 1
+            # an order with no variant has no lines either: its coefficient is zero, the ratio immaterial
+            self.cache[key] = [np.real(total / count) if count else 1. for total, count in zip(sums, counts)]
+        return self.cache[key]
 
     def inverse_volume3(self, first, second, third):
         """:math:`1/V^{(6)}`, the monopole of the three-anchor window."""
@@ -869,6 +1092,11 @@ def _block_pp_gaussian(sp, u, p, geometry, order, count=None):
                 u['ells'], p['ells'], 2, 2)
 
 
+def _static_zero(value):
+    """Whether a coincidence amplitude is the static zero of two distinct tracers (never coincident)."""
+    return not isinstance(value, jax.Array) and np.all(np.asarray(value) == 0.)
+
+
 def _block_pp_gaussian_window(sp, u, p, geometry, order, window_ells=(0, 2, 4)):
     r"""The Gaussian ``Cov[P, P]`` with a survey window (``desi-cov3-notes/covariance.tex``).
 
@@ -902,30 +1130,49 @@ def _block_pp_gaussian_window(sp, u, p, geometry, order, window_ells=(0, 2, 4)):
     mu = nodes[:, 0]
     hats = _ahat(jnp.asarray(mu))
 
-    def angular(fields, k, ells, sign):
-        """``int dmu/2 L_ell(mu) L_ellw(mu) P^(N)_fields(sign * k)``, keyed by ``(ell, ellw)``."""
-        power = sp.power_shot(fields, sign * k[:, None, None] * hats[None, :, :])
+    def angular(fields, k, ells, sign, part):
+        """``int dmu/2 L_ell(mu) L_ellw(mu) X_fields(sign * k)``, keyed by ``(ell, ellw)``.
+
+        ``X`` is ``P^(N)`` (``part='all'``), or its two pieces apart: the clustering ``P`` and the coincidence
+        constant ``P^(N) - P``, which take different windows with ``shot_windows``.
+        """
+        kvec = sign * k[:, None, None] * hats[None, :, :]
+        if part == 'all':
+            power = sp.power_shot(fields, kvec)
+        elif part == 'power':
+            power = sp.power(fields, kvec)
+        else:
+            power = sp.power_shot(fields, kvec) - sp.power(fields, kvec)
         return {(ell, ellw): np.asarray(jnp.tensordot(
                     power, jnp.asarray(weights * get_legendre(ell)(sign * mu)
                                        * get_legendre(ellw)(sign * mu)), axes=(1, 0)))
                 for ell in ells for ellw in window_ells}
 
+    def pieces(group):
+        """``(window group, part)``: one window for the whole ``P^(N)``, or, with shot windows and a pair that can
+        coincide, the clustering on the pair's window and the coincidence on the merged point's."""
+        if geometry.shot_windows and not _static_zero(sp.coincidence(*group, scaled=False)):
+            return [(tuple(group), 'power'), ((_merged(*group),), 'shot')]
+        return [(tuple(group), 'all')]
+
     out = [[0. for _ in p['ells']] for _ in u['ells']]
     for rows, cols, sign in (((a, c), (b, d), -1.), ((a, d), (b, c), 1.)):
-        left = angular(rows, ku, u['ells'], 1.)
-        right = angular(cols, kp, p['ells'], sign)
-        for ell1 in window_ells:
-            for ell2 in window_ells:
-                block = compute_spectrum2_covariance_window_block(
-                    (geometry.window2, geometry.window2), u['edges'], p['edges'], ell1, ell2,
-                    fields1=tuple(rows), fields2=tuple(cols), cache=geometry.cache)
-                block = np.asarray(block) * ((2 * ell1 + 1) * (2 * ell2 + 1)
-                                             * (-1)**(ell1 // 2) * (-1)**(ell2 // 2))
-                for i, ell in enumerate(u['ells']):
-                    for j, ellp in enumerate(p['ells']):
-                        out[i][j] = out[i][j] + ((2 * ell + 1) * (2 * ellp + 1) * block
-                                                 * left[ell, ell1][:, None]
-                                                 * right[ellp, ell2][None, :])
+        for wrows, prows in pieces(rows):
+            for wcols, pcols in pieces(cols):
+                left = angular(rows, ku, u['ells'], 1., prows)
+                right = angular(cols, kp, p['ells'], sign, pcols)
+                for ell1 in window_ells:
+                    for ell2 in window_ells:
+                        block = compute_spectrum2_covariance_window_block(
+                            (geometry.window2, geometry.window2), u['edges'], p['edges'], ell1, ell2,
+                            fields1=_lookup_label(wrows), fields2=_lookup_label(wcols), cache=geometry.cache)
+                        block = np.asarray(block) * ((2 * ell1 + 1) * (2 * ell2 + 1)
+                                                     * (-1)**(ell1 // 2) * (-1)**(ell2 // 2))
+                        for i, ell in enumerate(u['ells']):
+                            for j, ellp in enumerate(p['ells']):
+                                out[i][j] = out[i][j] + ((2 * ell + 1) * (2 * ellp + 1) * block
+                                                         * left[ell, ell1][:, None]
+                                                         * right[ellp, ell2][None, :])
     return out
 
 
@@ -941,8 +1188,11 @@ def _block_pp_trispectrum(sp, u, p, geometry, order, batch_size=None):
         return (sp.trispectrum_shot(fields, kv, -kv, kpv, -kpv)
                 * geometry.inverse_volume(u['fields'], p['fields'])), khat, kphat
 
-    return _run(term, nodes, weights, batch_size, (len(u['k']), len(p['k'])),
-                u['ells'], p['ells'], 2, 2)
+    # the coincidences are the cross pairs (a c), (b d), (a d), (b c): grouped (a c)(b d)
+    (a, b), (c, d) = u['fields'], p['fields']
+    rho = geometry.shot_ratios((a, c), (b, d), degree=2) if geometry.shot_windows else None
+    return _run_shot(term, nodes, weights, batch_size, (len(u['k']), len(p['k'])),
+                     u['ells'], p['ells'], 2, 2, rho)
 
 
 # ======================================================================================
@@ -1059,7 +1309,8 @@ def _block_pb_unconnected_window(sp, u, p, geometry, order, window_ells=(0, 2, 4
     :math:`k_3 = |k_1 + k_2|` varies over the integral and the table has to be contracted inside
     it -- but :math:`k_3` depends only on :math:`x = \hat k_1 \cdot \hat k_2`, so it takes only
     ``order`` distinct values per bin pair rather than one per node, and the nodes sharing an
-    :math:`x` are summed before the contraction.
+    :math:`x` are summed before the contraction. The table is cell-averaged over each node's
+    :math:`x` cell (:func:`_closure_measure`), not sampled at the node.
     """
     k = np.asarray(u['k'])
     k1, k2 = np.asarray(p['k'][0]), np.asarray(p['k'][1])
@@ -1092,6 +1343,10 @@ def _block_pb_unconnected_window(sp, u, p, geometry, order, window_ells=(0, 2, 4
         x_nodes = x_nodes[:, None]
     x_index = (np.arange(len(weights)) // order) % order
     closure = np.sqrt(k1**2 + k2**2 + 2. * k1 * k2 * x_nodes)
+    # The closure leg's window table, cell-averaged over each x node's own cell rather than sampled at the node: the
+    # window is narrower in k than a cell, so point sampling draws one streak k = k3(x_i) per node across the block (as
+    # BB, PT and PPP already avoid). One row per (x node, bin), as `closure.ravel()`.
+    measure_closure = _closure_measure(k1, k2, order, np.arange(order), closure_min)
 
     projections = [(_Sfun(ell)(hats[0], hats[1]) * _NH2(ell)) for ell in p['ells']]
     out = [[0. for _ in p['ells']] for _ in u['ells']]
@@ -1103,33 +1358,40 @@ def _block_pb_unconnected_window(sp, u, p, geometry, order, window_ells=(0, 2, 4
         for which in (0, 1):
             rows = (pair[which], triangle[slot])
             cols = (pair[1 - which],) + untied
-            physics = (sp.power_shot(rows, legs[slot])
-                       * sp.bispectrum_shot(cols, legs[slot], *others))
-            for iell, ell in enumerate(u['ells']):
-                if ell not in window_ells:
-                    # Orthogonality leaves nothing: the window carries no such channel.
-                    continue
-                for ellw in window_ells:
-                    coefficient = ((2 * ell + 1) * (2 * ellw + 1)
-                                   * (-1)**(ell // 2) * (-1)**(ellw // 2))
-                    weighted = (jnp.asarray(weights)[:, None] * jnp.asarray(x_jacobian)
-                                * get_legendre(ellw)(tie_cosine) * physics)
-                    table = compute_spectrum2_covariance_window_block(
-                        geometry.window2, u['edges'],
-                        leg_edges[slot] if slot < 2 else closure.ravel(), ell, ellw,
-                        fields1=rows, fields2=cols, cache=geometry.cache,
-                        k2_is_points=slot == 2)
-                    table = np.asarray(table)
-                    for jell, projection in enumerate(projections):
-                        integrand = np.asarray(projection * weighted)
-                        if slot < 2:
-                            block = table * integrand.sum(axis=0)[None, :]
-                        else:
-                            grouped = np.zeros((order, nbin))
-                            np.add.at(grouped, x_index, integrand)
-                            block = np.einsum('kxb,xb->kb',
-                                              table.reshape(len(k), order, nbin), grouped)
-                        out[iell][jell] = out[iell][jell] + coefficient * block
+            if geometry.shot_windows:
+                # each piece on the window of its own points: the tied pair merged or not, and the bispectrum's
+                # tied leg merged with either untied one or not
+                pieces = [(_merge_group(rows, mr), _merge_group(cols, mc), pr * pc)
+                          for mr, pr in sp.power_shot_parts(rows, legs[slot])
+                          for mc, pc in sp.bispectrum_shot_parts(cols, legs[slot], *others)]
+            else:
+                pieces = [(rows, cols, sp.power_shot(rows, legs[slot]) * sp.bispectrum_shot(cols, legs[slot], *others))]
+            for wrows, wcols, physics in pieces:
+                for iell, ell in enumerate(u['ells']):
+                    if ell not in window_ells:
+                        # Orthogonality leaves nothing: the window carries no such channel.
+                        continue
+                    for ellw in window_ells:
+                        coefficient = ((2 * ell + 1) * (2 * ellw + 1)
+                                       * (-1)**(ell // 2) * (-1)**(ellw // 2))
+                        weighted = (jnp.asarray(weights)[:, None] * jnp.asarray(x_jacobian)
+                                    * get_legendre(ellw)(tie_cosine) * physics)
+                        table = compute_spectrum2_covariance_window_block(
+                            geometry.window2, u['edges'],
+                            leg_edges[slot] if slot < 2 else closure.ravel(), ell, ellw,
+                            fields1=_lookup_label(wrows), fields2=_lookup_label(wcols), cache=geometry.cache,
+                            k2_is_points=slot == 2, k2_measure=measure_closure if slot == 2 else None)
+                        table = np.asarray(table)
+                        for jell, projection in enumerate(projections):
+                            integrand = np.asarray(projection * weighted)
+                            if slot < 2:
+                                block = table * integrand.sum(axis=0)[None, :]
+                            else:
+                                grouped = np.zeros((order, nbin))
+                                np.add.at(grouped, x_index, integrand)
+                                block = np.einsum('kxb,xb->kb',
+                                                  table.reshape(len(k), order, nbin), grouped)
+                            out[iell][jell] = out[iell][jell] + coefficient * block
     return out
 
 
@@ -1162,8 +1424,11 @@ def _block_pb_p5(sp, u, p, geometry, order, batch_size=None, size=None, seed=0,
         return (sp.five_point_shot(fields, kv, K1, K2, K3) * xjac
                 * geometry.inverse_volume(u['fields'], p['fields'])), khat, a, b
 
-    return _run(term, nodes, weights, batch_size, (len(u['k']), p['k'].shape[1]),
-                u['ells'], p['ells'], 2, 3)
+    # coincidences pair a power-spectrum point with a bispectrum one: grouped (b e)(a c d), up to two merges
+    (fa, fb), (fc, fd, fe) = u['fields'], p['fields']
+    rho = geometry.shot_ratios((fb, fe), (fa, fc, fd), degree=2) if geometry.shot_windows else None
+    return _run_shot(term, nodes, weights, batch_size, (len(u['k']), p['k'].shape[1]),
+                     u['ells'], p['ells'], 2, 3, rho)
 
 
 # ======================================================================================
@@ -1242,8 +1507,71 @@ def _block_bb_ppp(sp, u, p, geometry, order, count=None, closure_min=None):
     return out
 
 
+def _tie_window_table(geometry, uedges, pedges, groups, window_ells):
+    r"""``Q_{\mathcal W}(k_i, k'_j)`` for a tie between two *binned* legs, per Legendre pair.
+
+    The box ties two binned legs with :math:`\delta_D(k_i \mp k'_j)`, and :func:`_bb_tie_terms`
+    consumes it as the hard selector ``|k_i - k'_j| < dk'/2`` times Eq. (47)'s mode count. That
+    selector is the delta, and a survey does not have one: the window replaces it by
+    :math:`Q_{\mathcal W}`, which is dense in the two bins. Returned here is the same expansion
+    the ``PP`` block uses,
+
+    .. math::
+        Q_{\mathcal W}(k_i, k'_j) = \sum_{\ell_1 \ell_2} Q_{\ell_1 \ell_2}(k_i, k'_j)\,
+            \mathcal L_{\ell_1}(\mu)\, \mathcal L_{\ell_2}(\mu'),
+
+    **but with the primed index held at** :math:`\ell_2 = 0`, returned as a list of
+    ``(ell1, table)`` with ``table`` of shape ``(nbins, nbinsp)``, so the caller supplies one
+    line-of-sight cosine at each quadrature node. It occupies exactly the slot ``_inv_nmode *
+    sel`` did, with the same normalisation -- which is what :func:`_block_pp_gaussian_window`
+    rests on, validated there against :mod:`jaxpower.cov2`.
+
+    **Why the primed index is zero, and what happens if it is not.** Eq. (delta_split) of
+    ``desi-cov3-notes/covariance.tex`` splits the box's tie into a radial delta and an angular
+    one, and says that replacing the delta by :math:`Q_{\mathcal W}` does both at once: it
+    substitutes the radial coupling *and* gives back the angular integral the delta had removed.
+    This block cannot take the second half -- the trispectrum has support only on the closed
+    configuration, so the tie direction stays pinned at :math:`\hat k'_j = -\hat k_i`. What is
+    being computed here is therefore the *orientation-averaged* redistribution: how the tie's
+    total weight, which is :math:`1/V_{\rm tie}` whatever the bins, is shared out over the
+    primed bins by the spread of :math:`|k_i + q|` as ``q`` runs over the window's support. That
+    average over :math:`\hat k'_j` is what sets :math:`\ell_2 = 0`.
+
+    Summing :math:`\ell_2` over ``window_ells`` as well, with :math:`\mu'` sampled at the pinned
+    direction instead of averaged, **is wrong by a factor of about four**, and not subtly: for an
+    isotropic window the stored multipole is the monopole alone, the 3j-squared of Eq. (qw_m0)
+    then forces :math:`\ell_1 = \ell_2`, and :math:`\sum_\ell (2\ell+1)
+    \mathcal L_\ell(\mu) \mathcal L_\ell(\mu')` at :math:`\mu' = \mu` is a truncated
+    :math:`\delta(\mu - \mu')` rather than a window. Measured on
+    ``claude_cov3_window/box_limit.py --term PT``: 3.99 against the 1.027 the unwindowed tie
+    gives.
+
+    ``uedges``/``pedges`` are the two tied legs' own bin edges, shape ``(nbins, 2)``: the caller
+    picks the leg out of the bispectrum bin's ``(nbins, 2, 2)`` edge array.
+
+    **What this does not repair.** The tie's *direction* stays exact -- the primed leg vector is
+    still set to :math:`\pm` the unprimed one, so the trispectrum is evaluated on the ridge where
+    it is a peak rather than over the ridge's width. That is deliberate, and
+    :func:`_block_bb_pt_window` says why at length: an :math:`m = 0` double-Legendre kernel
+    cannot localise a direction, so freeing the tie is not an option here. What is repaired is
+    the *magnitude* mismatch, the part the paper's own top-hat represents and the part a bin
+    can see.
+    """
+    # by points, not entries: a merged entry is two points (and a merged group's label may be a bare string)
+    same_size = _n_points(groups[0]) == _n_points(groups[1])
+    window = (geometry.window2, geometry.window2) if same_size else geometry.window2
+    tables = []
+    for ell1 in window_ells:
+        block = compute_spectrum2_covariance_window_block(
+            window, np.asarray(uedges), np.asarray(pedges), ell1, 0,
+            fields1=_lookup_label(groups[0]), fields2=_lookup_label(groups[1]), cache=geometry.cache)
+        tables.append((ell1, np.asarray(block).real * (2 * ell1 + 1) * (-1)**(ell1 // 2)))
+    return tables
+
+
 def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=None,
-                  pairs=None, tie_volume=None, closure_min=None, qmin=None, qwidth=0.):
+                  pairs=None, tie_volume=None, closure_min=None, qmin=None, qwidth=0.,
+                  tie_window=True, window_ells=(0, 2, 4)):
     r"""The nine leg pairings of Eqs. (B8) and (B9), which differ only in ``sign`` and ``value``.
 
     ``sign = +1`` is ``BB``, whose delta is :math:`\delta_D(k_i - k'_j)`; ``sign = -1`` is ``PT``,
@@ -1371,6 +1699,9 @@ def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=
                           tuple(unprimed[index] for index in untied_u)
                           + tuple(primed[index] for index in untied_p))
             volume = geometry.volume if tie_volume is None else tie_volume(*groups)
+            # With shot windows, each line of the inner product is weighted by the window of its own points: the merged
+            # groups' tie volume (a ratio to the plain one) or, for a tie between two binned legs, their own table.
+            shot = geometry.shot_windows and tie_volume is not None
             if tie_volume is None:
                 pair_weight = partial(geometry.pair_weight, count=count)
             else:
@@ -1381,11 +1712,24 @@ def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=
             # direction. Each is either an exact bin interval, an exact floor on a closure
             # magnitude, or free -- and a mapped axis ('M', on [0, 1]) serves the first two
             # alike. `floor` is None only when a caller switches the floors off.
-            lo = hi = sel = None
+            lo = hi = sel = tie_table = None
             if j < 2:                                                            # case A
                 if i < 2:
                     sel = np.abs(ku[i] - kp[j]) < dkp / 2.
-                    if not sel.any():
+                    if tie_window and geometry.directional:
+                        # Both tied legs are binned, so the box's delta is the `sel` top-hat and
+                        # the window's replacement is a dense Q_W over the same two bins. The
+                        # selector is dropped entirely rather than multiplied in: Q_W already
+                        # carries the bin overlap, and keeping `sel` would re-impose the delta
+                        # the window is there to remove.
+                        tie_table = _tie_window_table(geometry, u['edges'][:, i, :],
+                                                      p['edges'][:, j, :], groups, window_ells)
+                        if shot:
+                            # built here, outside the traced integrand: FFTLog's setup cannot run under jit
+                            tie_table = _ShotTables(lambda merged, _i=i, _j=j: _tie_window_table(
+                                geometry, u['edges'][:, _i, :], p['edges'][:, _j, :], merged, window_ells), groups,
+                                tie_table, _tie_merged_variants(sp, kind, groups))
+                    elif not sel.any():
                         continue
                     # The unprimed closure leg is free here, and carries a power spectrum.
                     lo = _closure_x_floor(ku[0], ku[1], floor)
@@ -1407,8 +1751,11 @@ def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=
                 kinds = 'm{}pMp'.format('m' if lo is None else 'M')
             nodes, weights = quad_nodes(kinds, order)
 
+            ratio = (lambda merged, _v=volume: _v / tie_volume(*merged)) if shot else None
+
             def term(nd, _i=i, _j=j, _lo=lo, _hi=hi, _sel=sel, _w=pair_weight,
-                     _uu=untied_u, _up=untied_p, _floor=floor, _qmin=soft, _qw=qwidth):
+                     _uu=untied_u, _up=untied_p, _floor=floor, _qmin=soft, _qw=qwidth,
+                     _tie=tie_table, _groups=groups, _ratio=ratio):
                 mu = jnp.broadcast_to(nd[0], shape)
                 if _j < 2:                                                       # case A
                     if _i < 2:
@@ -1428,7 +1775,23 @@ def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=
                     pl = [None, None, None]
                     pl[_j], pl[o] = sign * tie, po
                     pl[2] = -pl[0] - pl[1]
-                    wn = _w(ktie, kp[_j], dkp) * jac * yjac * (1. if _i == 2 else _sel)
+                    if _tie is None:
+                        wn = _w(ktie, kp[_j], dkp) * (1. if _i == 2 else _sel)
+                    else:
+                        # The unprimed tied leg is `sign * ahat`, and its line-of-sight cosine
+                        # is the only one the window sees here: the primed one is averaged over,
+                        # which is `_tie_window_table`'s ell2 = 0. The stored multipoles are even,
+                        # so the sign is immaterial numerically; it is written out because it is a
+                        # property of the tie, not of the window.
+                        mu_tie = sign * ahat[..., 2]
+
+                        def wn_of(tables):
+                            out = 0.
+                            for ell1, table in tables:
+                                out = out + table * get_legendre(ell1)(mu_tie)
+                            return out
+                        wn = wn_of(_tie.plain if isinstance(_tie, _ShotTables) else _tie)
+                    wn = wn * jac * yjac
                 elif _i < 2:                                                     # case B
                     xp = _lo + (_hi - _lo) * nd[1]
                     jac = jnp.where(_hi > _lo, (_hi - _lo) / 2., 0.)
@@ -1457,6 +1820,37 @@ def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=
                     pl = [p1, p2, -p1 - p2]
                     wn = _w(_norm(p1), kp[0], dkp) * jac * xjac
                 untied_u, untied_p = _uu, _up
+                if _ratio is not None:
+                    # the lines of the inner product, each with its own merged groups and geometry weight
+                    if kind == 'BB':
+                        parts_u = sp.bispectrum_shot_parts(
+                            (unprimed[_i],) + tuple(unprimed[index] for index in untied_u),
+                            ul[_i], *[ul[index] for index in untied_u])
+                        parts_p = sp.bispectrum_shot_parts(
+                            (primed[_j],) + tuple(primed[index] for index in untied_p),
+                            pl[_j], *[pl[index] for index in untied_p])
+                        lines = [((_merge_group(_groups[0], mu), _merge_group(_groups[1], mp)), vu * vp)
+                                 for (mu, vu), (mp, vp) in itertools.product(parts_u, parts_p)]
+                    else:
+                        quad = ([ul[index] for index in untied_u]
+                                + [pl[index] for index in untied_p])
+                        parts_tie = sp.power_shot_parts((unprimed[_i], primed[_j]), ul[_i])
+                        parts_quad = sp.trispectrum_shot_parts(
+                            tuple(unprimed[index] for index in untied_u)
+                            + tuple(primed[index] for index in untied_p), *quad)
+                        mask = _soft_momentum_mask(_qmin, *quad, qwidth=_qw)
+                        lines = [((_merge_group(_groups[0], mt), _merge_pairs(_groups[1], mq)), vt * vq * mask)
+                                 for (mt, vt), (mq, vq) in itertools.product(parts_tie, parts_quad)]
+                    val = 0.
+                    for merged, line in lines:
+                        if isinstance(_tie, _ShotTables) and _j < 2 and _i < 2:
+                            weight = wn_of(_tie.get(merged)) * jac * yjac
+                        else:
+                            weight = wn * _ratio(merged)
+                        val = val + weight * line
+                    hu = [leg / jnp.clip(_norm(leg), 1e-30, None)[..., None] for leg in ul[:2]]
+                    hp = [leg / jnp.clip(_norm(leg), 1e-30, None)[..., None] for leg in pl[:2]]
+                    return val, hu[0], hu[1], hp[0], hp[1]
                 if kind == 'BB':
                     # Eq. (B2): the tied leg leads each bispectrum, and each factor is written on
                     # its *own* triangle with its own triangle's field labels. The Wick
@@ -1491,6 +1885,36 @@ def _bb_tie_terms(sp, u, p, geometry, order, sign, kind, batch_size=None, count=
             out = blk if out is None else [[c + d for c, d in zip(ra, rb)]
                                            for ra, rb in zip(out, blk)]
     return out
+
+
+class _ShotTables(object):
+    """The tie-window tables of a pairing's merged group variants (``plain``: the unmerged one), all built at
+    construction, since the integrand that reads them is traced."""
+
+    def __init__(self, build, groups, plain, variants):
+        self._groups, self.plain = tuple(groups), plain
+        self._tables = {tuple(tuple(group) for group in merged): build(merged) for merged in variants
+                        if tuple(tuple(group) for group in merged) != self._groups}
+
+    def get(self, merged):
+        merged = tuple(tuple(group) for group in merged)
+        if merged == self._groups:
+            return self.plain
+        return self._tables[merged]
+
+
+def _tie_merged_variants(sp, kind, groups):
+    """The merged group pairs a tie term's lines can take: those whose coincidences are not static zeros."""
+    def can(group, pairs):
+        return all(not _static_zero(sp.coincidence(group[i], group[j], scaled=False)) for i, j in pairs)
+    g1, g2 = tuple(groups[0]), tuple(groups[1])
+    if kind == 'BB':
+        options = [None, (0, 1), (0, 2)]
+        return [(_merge_group(g1, mu), _merge_group(g2, mp)) for mu in options for mp in options
+                if (mu is None or can(g1, [mu])) and (mp is None or can(g2, [mp]))]
+    quads = [(), ((0, 2),), ((0, 3),), ((1, 2),), ((1, 3),), ((0, 2), (1, 3)), ((0, 3), (1, 2))]
+    return [(_merge_group(g1, mt), _merge_pairs(g2, mq)) for mt in (None, (0, 1)) for mq in quads
+            if (mt is None or can(g1, [mt])) and can(g2, mq)]
 
 
 def _closure_x_floor(ka, kb, closure_min):
@@ -1623,6 +2047,45 @@ def _ppp_channels(lmax=2):
     return channels
 
 
+def ppp_window3_ells(channel_lmax=2):
+    r"""The three-anchor window multipoles the ``PPP`` channel sum actually reads.
+
+    :func:`_ppp_channels` is a list of S-basis channels, and the block sums over every *pair* of
+    them. Each pair asks
+    :func:`get_sugiyama_covariance_window_convolution_coeffs` for a set of window multipoles
+    ``q``, and :func:`compute_spectrum3_covariance_window_block` silently drops -- with a warning
+    -- every ``q`` the window does not store.
+
+    **A monopole-only window is not the harmless choice it looks like.** The monopole does feed
+    every *diagonal* channel pair exactly, through the Parseval weight
+    :math:`(2L_1+1)(2L_2+1)(2J+1) H^2 = 1/\|S_\ell\|^2`, which is why
+    :func:`_ppp_channels` is deliberately independent of what the window stores. But at
+    ``channel_lmax = 2`` there are 8 channels and so 64 pairs, and only those 8 diagonal ones
+    survive: the other 56 lose 100% of their coefficient weight and contribute nothing.
+
+    Pass this list as ``ells`` to :func:`compute_fkp3_covariance_window`. It is 29 multipoles at
+    ``channel_lmax = 2``, against the 1 a monopole-only build stores, and it costs 8 minutes
+    instead of 5 seconds on the 96^3 window mesh of ``claude_cov3_cutsky_mocks``.
+
+    **What it is worth, measured against 500 cutsky mocks there**: 1% on ``B000``'s ``PPP`` block
+    and 8% on ``B202``'s, taking ``sigma(B202)`` from 0.957 to 0.968 of the mocks. It does *not*
+    widen the kernel in ``k``: the row profiles are unchanged to a per cent, and ``B000``'s
+    window-induced near-diagonal correlation stays at +0.124 against the mocks' +0.236. So the
+    56 dropped channel pairs are a per-cent-level correctness fix and are **not** the cause of
+    that deficit, which is the missing bin coupling of :func:`_block_bb_pt_window` and the
+    windowless ``T``/``P5``/``P6`` blocks. Do not spend the truncation on it again.
+    """
+    channels = _ppp_channels(channel_lmax)
+    ells = []
+    for left in channels:
+        for right in channels:
+            for q, _ in get_sugiyama_covariance_window_convolution_coeffs(left, right):
+                q = tuple(q)
+                if q not in ells:
+                    ells.append(q)
+    return sorted(ells)
+
+
 def _block_bb_ppp_window(sp, u, p, geometry, order, channel_lmax=2, closure_min=None):
     r"""The Gaussian ``Cov[B, B]`` ``PPP`` term with a survey window.
 
@@ -1735,53 +2198,69 @@ Each :math:`P^{(N)}` is symmetrised over its two tied momenta, :math:`(P(k_m) + 
     out = [[0. for _ in p['ells']] for _ in u['ells']]
     for permutation in itertools.permutations(range(3)):
         anchors = [(unprimed[leg], primed[permutation[leg]]) for leg in range(3)]
-        # Each factor is (P(k_m) + P(k'_m)) / 2, so it is evaluated at *both* ends of its tie:
-        # the unprimed leg m and the primed leg the permutation pairs it with. The product of
-        # the three expands into the eight `mask` terms below, each weighted 1/8.
-        side_u = [np.asarray(sp.power_shot(anchors[leg], legs_u[leg])) for leg in range(3)]
-        side_p = [np.asarray(sp.power_shot(anchors[leg], legs_p[permutation[leg]]))
-                  for leg in range(3)]
         paxes = (permutation[0], permutation[1])
-        channel_p = channels_primed(paxes)
-        points = closure_p if 2 in paxes else None
-        for channel_left in channels:
-            # The unprimed side depends on the mask only through which factors land on it, and
-            # not on `channel_right`, so it is built once per mask here.
-            weighted_u = {}
-            for mask in range(8):
-                physics_u = 1.
-                for leg in range(3):
-                    if (mask >> leg) & 1:
-                        physics_u = physics_u * side_u[leg]
-                weighted_u[mask] = [(np.asarray(weights_u)[:, None] * projection
-                                     * channel_u[channel_left] * np.asarray(jacobian_u)
-                                     * physics_u).sum(axis=0)
-                                    for projection in project_u]
-            for channel_right in channels:
-                table = np.asarray(compute_spectrum3_covariance_window_block(
-                    geometry.window3, u['edges'], p['edges'], channel_left, channel_right,
-                    fields1=anchors[0], fields2=anchors[1], fields3=anchors[2],
-                    cache=geometry.cache, paxes=paxes, kp_points=points,
-                    kp_measure=measure_p if points is not None else None)).real
+        # With shot windows, each anchor's P^(N) is split into its clustering part (on the anchor pair's window) and its
+        # coincidence constant (on the merged anchor's): one window per subset of merged anchors.
+        if geometry.shot_windows:
+            merge_sets = [merged for merged in itertools.product((False, True), repeat=3)
+                          if all(not merged[leg] or not _static_zero(sp.coincidence(*anchors[leg], scaled=False))
+                                 for leg in range(3))]
+        else:
+            merge_sets = [None]
+        for merged in merge_sets:
+            if merged is None:
+                side = lambda leg, k: sp.power_shot(anchors[leg], k)
+                labels = anchors
+            else:
+                side = lambda leg, k: ((sp.power_shot(anchors[leg], k) - sp.power(anchors[leg], k)) if merged[leg]
+                                       else sp.power(anchors[leg], k))
+                labels = [(_merged(*anchors[leg]),) if merged[leg] else anchors[leg] for leg in range(3)]
+            # Each factor is (P(k_m) + P(k'_m)) / 2, so it is evaluated at *both* ends of its tie:
+            # the unprimed leg m and the primed leg the permutation pairs it with. The product of
+            # the three expands into the eight `mask` terms below, each weighted 1/8.
+            side_u = [np.asarray(side(leg, legs_u[leg])) for leg in range(3)]
+            side_p = [np.asarray(side(leg, legs_p[permutation[leg]])) for leg in range(3)]
+            channel_p = channels_primed(paxes)
+            points = closure_p if 2 in paxes else None
+            for channel_left in channels:
+                # The unprimed side depends on the mask only through which factors land on it, and
+                # not on `channel_right`, so it is built once per mask here.
+                weighted_u = {}
                 for mask in range(8):
-                    physics_p = 1.
+                    physics_u = 1.
                     for leg in range(3):
-                        if not (mask >> leg) & 1:
-                            physics_p = physics_p * side_p[leg]
-                    for jell, projection in enumerate(project_p):
-                        # The estimator's own weight stays at its own legs -- it does not
-                        # permute -- while the channel basis does, so this carries the primed
-                        # bin axis, and so does the physics that now sits on this side.
-                        weighted_p = (np.asarray(weights_p)[:, None] * projection[:, None]
-                                      * channel_p[channel_right] * physics_p)
-                        for iell, left in enumerate(weighted_u[mask]):
-                            # A points axis is appended only when the window block actually
-                            # carries one; the primed closure sweep may collapse it.
-                            if table.ndim == 2:
-                                block = table * left[:, None] * weighted_p.sum(axis=0)[None, :]
-                            else:
-                                block = np.einsum('bcn,b,nc->bc', table, left, weighted_p)
-                            out[iell][jell] = out[iell][jell] + 0.125 * block
+                        if (mask >> leg) & 1:
+                            physics_u = physics_u * side_u[leg]
+                    weighted_u[mask] = [(np.asarray(weights_u)[:, None] * projection
+                                         * channel_u[channel_left] * np.asarray(jacobian_u)
+                                         * physics_u).sum(axis=0)
+                                        for projection in project_u]
+                for channel_right in channels:
+                    table = np.asarray(compute_spectrum3_covariance_window_block(
+                        geometry.window3, u['edges'], p['edges'], channel_left, channel_right,
+                        fields1=_lookup_label(labels[0]), fields2=_lookup_label(labels[1]),
+                        fields3=_lookup_label(labels[2]),
+                        cache=geometry.cache, paxes=paxes, kp_points=points,
+                        kp_measure=measure_p if points is not None else None)).real
+                    for mask in range(8):
+                        physics_p = 1.
+                        for leg in range(3):
+                            if not (mask >> leg) & 1:
+                                physics_p = physics_p * side_p[leg]
+                        for jell, projection in enumerate(project_p):
+                            # The estimator's own weight stays at its own legs -- it does not
+                            # permute -- while the channel basis does, so this carries the primed
+                            # bin axis, and so does the physics that now sits on this side.
+                            weighted_p = (np.asarray(weights_p)[:, None] * projection[:, None]
+                                          * channel_p[channel_right] * physics_p)
+                            for iell, left in enumerate(weighted_u[mask]):
+                                # A points axis is appended only when the window block actually
+                                # carries one; the primed closure sweep may collapse it.
+                                if table.ndim == 2:
+                                    block = table * left[:, None] * weighted_p.sum(axis=0)[None, :]
+                                else:
+                                    block = np.einsum('bcn,b,nc->bc', table, left, weighted_p)
+                                out[iell][jell] = out[iell][jell] + 0.125 * block
     return out
 
 
@@ -1929,7 +2408,10 @@ def _block_bb_bb_window(sp, u, p, geometry, order, window_ells=(0, 2, 4),
     for i in tie_legs:
         rest_u = [index for index in range(3) if index != i]
         fields_u = (unprimed[i],) + tuple(unprimed[index] for index in rest_u)
-        value_u = sp.bispectrum_shot(fields_u, legs_u[i], *[legs_u[index] for index in rest_u])
+        if geometry.shot_windows:
+            parts_u = sp.bispectrum_shot_parts(fields_u, legs_u[i], *[legs_u[index] for index in rest_u])
+        else:
+            parts_u = [(None, sp.bispectrum_shot(fields_u, legs_u[i], *[legs_u[index] for index in rest_u]))]
         cosine_u = np.asarray(legs_u[i][..., 2] / jnp.clip(norms_u[i], 1e-30, None))
         spec_u = (edges_u[:, i, :] if i < 2 else np.asarray(norms_u[2]).ravel())
         for j in tie_legs:
@@ -1946,49 +2428,54 @@ def _block_bb_bb_window(sp, u, p, geometry, order, window_ells=(0, 2, 4),
                 continue
             rest_p = [index for index in range(3) if index != j]
             fields_p = (primed[j],) + tuple(primed[index] for index in rest_p)
-            value_p = sp.bispectrum_shot(fields_p, legs_p[j],
-                                         *[legs_p[index] for index in rest_p])
+            if geometry.shot_windows:
+                parts_p = sp.bispectrum_shot_parts(fields_p, legs_p[j], *[legs_p[index] for index in rest_p])
+            else:
+                parts_p = [(None, sp.bispectrum_shot(fields_p, legs_p[j], *[legs_p[index] for index in rest_p]))]
             cosine_p = np.asarray(legs_p[j][..., 2] / jnp.clip(norms_p[j], 1e-30, None))
             spec_p = (edges_p[:, j, :] if j < 2 else np.asarray(norms_p[2]).ravel())
-            for ell1 in window_ells:
-                for ell2 in window_ells:
-                    # Same-size field groups: the swap A <-> B is an equivalent relabelling, so
-                    # the window is symmetrized by handing the block a pair. Mixed sizes have
-                    # fixed roles and must not be swapped -- see `compute_QW_AB`.
-                    table = np.asarray(compute_spectrum2_covariance_window_block(
-                        (geometry.window2, geometry.window2), spec_u, spec_p, ell1, ell2,
-                        fields1=fields_u, fields2=fields_p, cache=geometry.cache,
-                        k1_is_points=i == 2, k2_is_points=j == 2,
-                        k1_measure=measure_u if i == 2 else None,
-                        k2_measure=measure_p if j == 2 else None)).real
-                    # A leg with its own bin edges gives a table with no node axis, and its
-                    # side of the integral is summed over nodes first; a closure leg keeps one.
-                    axes_u = 'nb' if i == 2 else 'b'
-                    axes_p = 'mc' if j == 2 else 'c'
-                    table = table.reshape(((len(weights_u), nbin_u) if i == 2 else (nbin_u,))
-                                          + ((len(weights_p), nbin_p) if j == 2 else (nbin_p,)))
-                    coefficient = ((2 * ell1 + 1) * (2 * ell2 + 1)
-                                   * (-1)**(ell1 // 2) * (-1)**(ell2 // 2))
-                    legendre_u = np.asarray(get_legendre(ell1)(cosine_u))
-                    legendre_p = np.asarray(get_legendre(ell2)(cosine_p))
-                    contraction = f'{axes_u}{axes_p},{axes_u},{axes_p}->bc'
-                    for iell, projection_u in enumerate(project_u):
-                        # The projections depend on the triangle's directions alone, which carry
-                        # no bin axis -- the bins only set the leg magnitudes -- so they broadcast
-                        # in explicitly.
-                        side_u = (np.asarray(weights_u)[:, None]
-                                  * np.asarray(projection_u) * np.asarray(jacobian_u)
-                                  * legendre_u * np.asarray(value_u))
-                        if i != 2:
-                            side_u = side_u.sum(axis=0)
-                        for jell, projection_p in enumerate(project_p):
-                            side_p = (np.asarray(weights_p)[:, None]
-                                      * np.asarray(projection_p) * np.asarray(jacobian_p)
-                                      * legendre_p * np.asarray(value_p))
-                            if j != 2:
-                                side_p = side_p.sum(axis=0)
-                            out[iell][jell] = out[iell][jell] + coefficient * np.einsum(
-                                contraction, table, side_u, side_p)
+            # with shot windows, each (B^(N) piece, B^(N) piece) on the window of its own points
+            for (mu, value_u), (mp, value_p) in itertools.product(parts_u, parts_p):
+                for ell1 in window_ells:
+                    for ell2 in window_ells:
+                        # Same-size field groups: the swap A <-> B is an equivalent relabelling, so
+                        # the window is symmetrized by handing the block a pair. Mixed sizes have
+                        # fixed roles and must not be swapped -- see `compute_QW_AB`.
+                        table = np.asarray(compute_spectrum2_covariance_window_block(
+                            (geometry.window2, geometry.window2), spec_u, spec_p, ell1, ell2,
+                            fields1=_lookup_label(_merge_group(fields_u, mu)),
+                            fields2=_lookup_label(_merge_group(fields_p, mp)), cache=geometry.cache,
+                            k1_is_points=i == 2, k2_is_points=j == 2,
+                            k1_measure=measure_u if i == 2 else None,
+                            k2_measure=measure_p if j == 2 else None)).real
+                        # A leg with its own bin edges gives a table with no node axis, and its
+                        # side of the integral is summed over nodes first; a closure leg keeps one.
+                        axes_u = 'nb' if i == 2 else 'b'
+                        axes_p = 'mc' if j == 2 else 'c'
+                        table = table.reshape(((len(weights_u), nbin_u) if i == 2 else (nbin_u,))
+                                              + ((len(weights_p), nbin_p) if j == 2 else (nbin_p,)))
+                        coefficient = ((2 * ell1 + 1) * (2 * ell2 + 1)
+                                       * (-1)**(ell1 // 2) * (-1)**(ell2 // 2))
+                        legendre_u = np.asarray(get_legendre(ell1)(cosine_u))
+                        legendre_p = np.asarray(get_legendre(ell2)(cosine_p))
+                        contraction = f'{axes_u}{axes_p},{axes_u},{axes_p}->bc'
+                        for iell, projection_u in enumerate(project_u):
+                            # The projections depend on the triangle's directions alone, which carry
+                            # no bin axis -- the bins only set the leg magnitudes -- so they broadcast
+                            # in explicitly.
+                            side_u = (np.asarray(weights_u)[:, None]
+                                      * np.asarray(projection_u) * np.asarray(jacobian_u)
+                                      * legendre_u * np.asarray(value_u))
+                            if i != 2:
+                                side_u = side_u.sum(axis=0)
+                            for jell, projection_p in enumerate(project_p):
+                                side_p = (np.asarray(weights_p)[:, None]
+                                          * np.asarray(projection_p) * np.asarray(jacobian_p)
+                                          * legendre_p * np.asarray(value_p))
+                                if j != 2:
+                                    side_p = side_p.sum(axis=0)
+                                out[iell][jell] = out[iell][jell] + coefficient * np.einsum(
+                                    contraction, table, side_u, side_p)
     if double_closure and 2 in tie_legs:
         extra = _c22_tie(sp, u, p, geometry, order, 1., 'BB', batch_size=batch_size,
                          tie_volume=_tie_volume(geometry), closure_min=closure_min)
@@ -1997,7 +2484,7 @@ def _block_bb_bb_window(sp, u, p, geometry, order, window_ells=(0, 2, 4),
 
 
 def _block_bb_pt_window(sp, u, p, geometry, order, batch_size=None, pairs=None,
-                        closure_min=None):
+                        closure_min=None, tie_window=True):
     r"""The connected ``Cov[B, B]`` ``PT`` term with a survey window, by the exact vector tie.
 
     .. math::
@@ -2034,6 +2521,144 @@ def _block_bb_pt_window(sp, u, p, geometry, order, batch_size=None, pairs=None,
     the 1.027 below bounds this block's bookkeeping, not its accuracy on a real survey. That needs
     mocks.
 
+    **The mocks have now been run, and the visible consequence is the larger one.** 500
+    AbacusSummit boxes measured twice -- periodically and carved into a cutsky -- against this
+    code with each arm's own box limit removed
+    (``claude_cov3_cutsky_mocks/window_offdiag.py``, ``box_limit.py``): ``B000``'s
+    *window-induced* first off-diagonal correlation is **+0.124 against the mocks' +0.236**,
+    while the box limits agree to 1.5% (+0.269 vs +0.273). Printed term by term, this block and
+    ``P6`` come out as their box blocks times a single constant, 1.03 and 1.04 at every bin
+    separation alike, and together they are 55% of ``Cov[B000, B000]`` one bin off the diagonal.
+    So the bin coupling the selector above withholds is the leading error in this block on a
+    survey, and it is not small. ``sigma(B000)`` is unaffected (0.958 of the mocks), which is why
+    no variance check found it.
+
+    Parameters
+    ----------
+    tie_window : bool, default=True
+        Give the four pairings whose two tied legs are both *binned* the window's own bin
+        coupling, through :func:`_tie_window_table`, instead of the box's hard selector. The tie
+        **direction** stays exact either way -- what is restored is only the redistribution of
+        the tie's weight over the primed bins, which is the "visible" consequence above.
+
+        ``False`` is the pre-2026-09-23 behaviour, kept so the published numbers are reproducible
+        and so this block's contribution can be isolated. It is not the better default: without
+        it ``B000``'s first off-diagonal is 2 to 6 sigma below the mocks at seven of eight bins.
+
+        **Measured against the 500 cutsky mocks, it fixes the isotropic channel and costs the
+        anisotropic one at low k**:
+
+        =========================  ==========  ==========  =========
+        quantity                   off         on          mocks
+        =========================  ==========  ==========  =========
+        ``B000`` induced, d = 1    +0.124      **+0.240**  +0.236
+        ``B000`` induced, d = 2    +0.069      +0.118      +0.135
+        ``B202`` induced, d = 1    +0.093      **+0.210**  +0.092
+        ``sigma(B000)`` / mock     0.958       0.901       --
+        ``sigma(B202)`` / mock     0.968       0.901       --
+        =========================  ==========  ==========  =========
+
+        ``B000`` lands on the mocks at every separation; ``B202`` overshoots by 2.3x and both
+        variances lose 6-7% to the bins the weight moves into.
+
+        **The overshoot is this redistribution, not the theory's anisotropy** -- measured, in
+        ``claude_cov3_cutsky_mocks/b202_offdiag.py``, and worth stating because the campaign's
+        other anisotropic disagreements really are the theory's. The test is the box limit, which
+        ``tie_window`` does not touch at all: if the ``Z3``/``Z4``/``Z5`` over-anisotropy of
+        ``b202-anisotropy-not-projection`` were behind it, ``B202``'s off-diagonal correlation
+        would already overshoot there. It does the opposite -- analytic minus 500 periodic mocks
+        is -0.037, -0.017, -0.004, -0.034 at d = 1..4, i.e. **-2.1 sigma** at d = 1 and negative
+        at all four, against an induced overshoot of +4.9 sigma. ``B000``'s box limit is clean
+        (-0.2, +0.8, +1.2, +0.9 sigma). Nor is it the window's multipoles: restricting
+        ``window_ells`` to ``(0,)`` moves ``B202``'s induced correlation by 0.009.
+
+        **This is Eq. (pt_leading) of ``desi-cov3-notes/covariance.tex``, and that equation
+        predicts where it fails.** The notes derive it: with the primed direction held at the tie
+        -- which ``PT`` must do, since its four untied legs sum to
+        :math:`-(\mathbf k_i + \mathbf k'_j)` and the connected trispectrum has support only
+        where they close -- what multiplies the physics is :math:`Q_{\mathcal W}` *averaged*
+        over that direction, and "the bracket keeps the :math:`L_2 = 0` channel alone". That is
+        exactly what :func:`_tie_window_table` builds, prefactor for prefactor. The notes also
+        warn against the pointwise sum at locked angles, which they measure at a factor 2.07 on
+        their uniform-box window; this codebase's harness gives 3.99.
+
+        And Eq. (pt_leading) is stated as "the leading term of an expansion in the window's
+        angular width :math:`\theta_{\mathcal W}`, with corrections
+        :math:`\mathcal O(\theta_{\mathcal W}^2 \nabla^2 G)`". The estimator weight carries
+        an :math:`\ell` on the tied leg, and :math:`\nabla^2` on the sphere has eigenvalue
+        :math:`-\ell(\ell+1)`: **identically zero for** ``B000``'s :math:`(0,0,0)` and
+        :math:`-6` for the :math:`\ell = 2` index of ``B202``'s :math:`(2,0,2)`. So the
+        correction is absent from the isotropic channel and goes as
+        :math:`3(k_{\mathcal W}/k)^2` for the anisotropic one, and the block-averaged 2.3x above
+        is the two lowest bins, not a uniform failure. Per bin, with
+        :math:`k_{\mathcal W} = 2\pi/V^{1/3} = 0.0185` on this cutsky
+        (``claude_cov3_cutsky_mocks/b202_offdiag.py``):
+
+        ==========================  =====  =====  =====  =====  =====  =====  =====  =====
+        k                           0.033  0.051  0.071  0.091  0.111  0.130  0.150  0.170
+        ==========================  =====  =====  =====  =====  =====  =====  =====  =====
+        :math:`3\theta_W^2`          0.97   0.39   0.21   0.12   0.08   0.06   0.05   0.04
+        ``B000`` r(k,k+dk), tie off  +0.2   -2.4   -4.5   -2.1   -2.9   -4.8   -6.2   -5.0
+        ``B000`` r(k,k+dk), tie on   +1.9   +0.1   -0.9   +1.1   +0.5   -0.8   -1.8   -1.2
+        ``B202`` r(k,k+dk), tie on   +3.0   +3.7   +0.8   +1.9   -0.1   +1.7   +1.6   +1.4
+        ==========================  =====  =====  =====  =====  =====  =====  =====  =====
+
+        (excess over the mocks in bootstrap sigma). ``B000`` is 2 to 6 sigma low at seven of
+        eight bins without this switch and within 1.9 sigma at every bin with it. ``B202``
+        overshoots only where :math:`3\theta_W^2 \gtrsim 0.4`, which is where the notes say the
+        expansion stops converging, and is within ~2 sigma from ``k = 0.07`` up. The repair for
+        those two bins is the notes' own second-order term, not a redesign of this block.
+
+        **Two candidates for a bookkeeping error were followed and both are dead**, which is why
+        the second-order term is what is left:
+
+        *The primed triangle's tied leg carries bin i's magnitude, not bin j's.* True, and it
+        matters nowhere. :func:`get_S` takes unit vectors, so the estimator's projection is
+        magnitude-blind; the primed leg directions are the pinned tie and the free
+        :func:`_bhat`, neither of which knows a magnitude. The only other use is the primed
+        closure leg inside :math:`T` -- and there :math:`k_i` is the *required* value, since the
+        four untied legs sum to :math:`-(\mathbf k_i + \mathbf k'_j)` and a connected
+        trispectrum exists only where they close. Writing the leg at bin :math:`j`'s magnitude
+        and restoring :math:`T`'s closure by shifting its copy of that leg returns the identical
+        expression.
+
+        That is also why "unpin the tie" is not an option to be reached for later. Three things
+        are wanted -- the primed triangle closes, :math:`T` closes, leg :math:`j` sits honestly
+        in bin :math:`j` -- and they are two constraints on one vector. Any two are available,
+        never three, and the primed triangle's closure is the estimator's own, so the choice is
+        between the other two. Pinning the tie takes :math:`T`'s.
+
+        *The tie's cross spectrum is evaluated one-sidedly*, at :math:`k_i` rather than
+        :math:`(P(k_i) + P(k'_j))/2`. This is the very asymmetry
+        :func:`_block_bb_ppp_window` found worth **25% on its anisotropic channel and 6% on its
+        isotropic one**, so it was the obvious suspect. Implemented and measured here it moves
+        ``B202``'s induced correlation from +0.267 to +0.266 -- median relative change zero, the
+        differences confined to far off-diagonal entries the window has already suppressed -- and
+        costs the block 3x its runtime. Reverted; ``PPP``'s one-sidedness does not transfer,
+        because that block chooses a side for each of three spectra and this one has a single
+        spectrum whose two ends differ only by the bin mismatch.
+
+        One cost is *not* explained by :math:`\theta_{\mathcal W}`: the 6% the variances lose is
+        flat in ``k`` (``B000`` 0.98/0.91/0.99/... -> 0.95/0.86/0.93/...), so it is the
+        redistribution moving weight off the diagonal rather than the expansion failing. The
+        ``B000`` ``PT`` row sum is conserved to a few per cent above the lowest bin (0.88, 1.15,
+        1.08, 1.07, 1.05, ..., 1.00), so the weight goes where it should; whether the diagonal
+        should fall that far is a separate question, and note ``PPP`` is independently 20-40%
+        *short* on its own row sum, which pushes the variances the other way.
+
+        That 6% is the one reason to keep ``False`` within reach: it is a real regression on the
+        variances, and it is not the :math:`\theta_{\mathcal W}` expansion failing. Set
+        ``tie_window=False`` to reproduce a covariance computed before this became the default.
+
+        On the uniform-box window of ``claude_cov3_window/box_limit.py --term PT`` the diagonal
+        goes to 0.76-0.85 of the periodic answer, against 1.027 with the selector. That is not by
+        itself a failure -- a box-shaped *window* is not a periodic box and does couple bins --
+        but it does mean this switch changes what
+        ``test_cov3.py::test_window_periodic_approximation`` measures, so leave it off there.
+    window_ells : tuple, default=(0, 2, 4)
+        Window multipoles summed on the *unprimed* tied leg when ``tie_window`` is on. The primed
+        one is held at zero; :func:`_tie_window_table` says why at length.
+
     The doubly-derived ``(2, 2)`` pairing goes through :func:`_c22_tie`, which averages the two
     anchorings; see there.
 
@@ -2059,7 +2684,7 @@ def _block_bb_pt_window(sp, u, p, geometry, order, batch_size=None, pairs=None,
     rest = [pair for pair in selected if pair != (2, 2)]
     if rest:
         out = _bb_tie_terms(sp, u, p, geometry, order, -1., 'PT', batch_size, None, rest,
-                            tie_volume=volume, closure_min=closure_min)
+                            tie_volume=volume, closure_min=closure_min, tie_window=tie_window)
     if (2, 2) in selected:
         add = _c22_tie(sp, u, p, geometry, order, -1., 'PT', batch_size,
                        tie_volume=volume, closure_min=closure_min)
@@ -2121,7 +2746,10 @@ def _block_bb_p6(sp, u, p, geometry, order, batch_size=None, size=None, seed=0,
                * geometry.inverse_volume(u['fields'], p['fields']))
         return val, a, b, ap, bp
 
-    return _run(term, nodes, weights, batch_size, shape, u['ells'], p['ells'], 3, 3)
+    # cross ties between the two triangles, up to three: grouped (c f)(a d b e)
+    (fa, fb, fc), (fd, fe, ff) = u['fields'], p['fields']
+    rho = geometry.shot_ratios((fc, ff), (fa, fd, fb, fe), degree=3) if geometry.shot_windows else None
+    return _run_shot(term, nodes, weights, batch_size, shape, u['ells'], p['ells'], 3, 3, rho)
 
 
 # ======================================================================================
@@ -2135,7 +2763,8 @@ TERMS = ('PP', 'T', 'PB', 'P5', 'PPP', 'BB', 'PT', 'P6')
 #: Quadrature defaults. ``order`` is the number of nodes per angular axis for the gridded blocks;
 #: ``p6_size`` and ``p5_size`` switch those blocks to scrambled Sobol with that many points
 #: (``None`` grids them instead). Every one of these is scanned in ``test_convergence.py``.
-DEFAULTS = dict(order3=16, order5=8, order7=6, p5_size=None, p6_size=1 << 13, seed=0)
+DEFAULTS = dict(order3=16, order5=8, order7=6, p5_size=None, p6_size=1 << 13, seed=0,
+                tie_window=True)
 
 
 def _group(observable):
@@ -2219,8 +2848,9 @@ def _subbin_group(g, count, nsub):
 
 def compute_spectrum3_covariance(window2, window3, observable, theory=None, shotnoise: float=0.,
                                  cache=None, batch_size=None,
-                                 terms=TERMS, nmodes='continuum', nsub=(4, 2),
-                                 **options):
+                                 terms=TERMS, nmodes='continuum', nsub=(4, 2), coincidence_orders=None,
+                                 count_power_shot=True, devices=None, coincidence_damping=None, shot_windows=False,
+                                 coincidence_amplitudes=None, **options):
     r"""The periodic-box covariance of arXiv:1908.06234.
 
     Parameters
@@ -2249,13 +2879,97 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
         ``window2`` instead, which is what a measurement on that mesh actually averages over;
         see :class:`ModeCount`. Use ``'mesh'`` whenever the covariance is to be compared with
         mocks measured on a known grid, and make sure ``window2.meshsize`` is that grid's.
+    coincidence_orders : int, optional
+        Split the covariance by the number of pair coincidences its lines carry: return
+        ``{m: CovarianceMatrix}`` for ``m = 0 .. coincidence_orders``, the lines with ``m`` powers of
+        ``shotnoise``, which sum to the usual covariance. Every term is a polynomial of degree at most 3
+        in the pair amplitude (products of disjoint pairs; six points hold at most three), so 3 splits
+        all of them. The terms built on :func:`_run` (``T``, ``P5``, ``P6``, ``PT``, and ``PB``, ``PPP``
+        in a box) evaluate every level in one pass, the connected spectra computed once; the others are
+        assembled once per level. One extra level checks that the degree is enough.
+    count_power_shot : bool, optional
+        With ``coincidence_orders``: whether the constant of the factor :math:`P^{(N)} = P + 1/\bar n` in PP, PB, PPP,
+        PT is counted as a coincidence. ``False`` keeps it at order 0, so that the orders count the coincidences inside
+        :math:`B^{(N)}, T^{(N)}, P_5^{(N)}, P_6^{(N)}` alone -- what a per-order amplitude of the tracer multiplies, PT
+        then carrying T's coincidences only. The orders still sum to the covariance.
+    devices : str, int or list, optional
+        Compute the terms concurrently, one per device: ``'all'`` (every local device), a count, or a list of
+        devices. Each term runs in its own thread pinned to a free device with :func:`jax.default_device`, the
+        longest first (PT, P6, P5, BB, ...), and the terms are summed -- they partition the covariance
+        (``test_terms_are_additive``). The wall time is then about that of the longest term. Combines with
+        ``coincidence_orders`` (the split's state is per thread).
+    shot_windows : bool, optional
+        Give every shot line the window of its own merged points rather than the clustering window
+        (approximation 2 of the module docstring, lifted). The survey windows must have been built with
+        ``compute_fkp2_covariance_window(..., shot=True)``. Implemented exactly for ``PP``; for the purely connected
+        ``T``, ``P5``, ``P6`` through the coincidence-order ratios of :meth:`SurveyGeometry.shot_ratios`, which is exact
+        for them (they see the window only through :math:`1/V^{(n)}`). Ignored for a periodic box, where there is one
+        shot-noise level. Combines with ``coincidence_orders``: each order carries its own shot windows.
+    coincidence_damping : callable, optional
+        ``coincidence_damping(first, second, kfirst, ksecond)``, the factor of every coincidence between the fields
+        ``first`` and ``second`` given the momenta of the two coinciding legs. For fields that are the same objects
+        displaced -- pre- and post-reconstruction, with ``shotnoise`` a callable that is nonzero across them -- it is
+        the average phase of the displacement between the two copies. ``None``: 1.
+    coincidence_amplitudes : tuple, optional
+        :math:`(A_1, A_2, A_3)`, the non-Poisson amplitudes of the lines with 1, 2, 3 pair coincidences (Poisson: all 1),
+        e.g. the halo model's :math:`A_1 = 1 + x`, :math:`A_2 = (1 + x)^2`, :math:`A_3 = 1 + 3x + \bar n^{-1} \int dn
+        \langle N(N-1)(N-2) \rangle`, :math:`x = \bar n P_{1h}(0)`. ``theory`` must then be the clustering part only (no
+        stochastic amplitudes): every coincidence is added here, once. Implemented as the covariance at the pair level
+        :math:`A_1 / \bar n` -- which puts :math:`A_1^m` on every line with :math:`m` coincidences, :math:`P^{(N)}` and
+        :math:`B^{(N)}` included -- plus :math:`(A_3 / A_1^3 - 1)` times the order-3 lines of the connected ``T``, ``P5``,
+        ``P6`` and ``PT`` (the latter with ``count_power_shot=False``, its ``P^{(N)}`` constant left at :math:`A_1`). Requires
+        :math:`A_2 = A_1^2`: the constant of :math:`B^{(N)}` is the square of its pair level, so another :math:`A_2` has
+        no place in ``PB``, ``PPP``, ``BB``.
     **options
         Quadrature settings, see :data:`DEFAULTS`.
 
     Returns
     -------
-    CovarianceMatrix
+    CovarianceMatrix, or dict of them with ``coincidence_orders``
     """
+    if coincidence_amplitudes is not None:
+        A1, A2, A3 = (float(amplitude) for amplitude in coincidence_amplitudes)
+        if not np.isclose(A2, A1**2, rtol=1e-3, atol=0.):
+            raise ValueError(f'coincidence_amplitudes needs A_2 = A_1^2 (got A_1 = {A1}, A_2 = {A2}): the constant of B^(N) is '
+                             'the square of its pair level, so a separate A_2 cannot be represented')
+        # 1. Every pair coincidence at the level A_1 / nbar: a line with m coincidences then carries A_1^m, which is the right
+        #    amplitude for m = 1 and, since A_2 = A_1^2, for m = 2 -- in P^(N), B^(N) and the connected terms alike.
+        if callable(shotnoise):
+            raised_shotnoise = lambda first, second: A1 * shotnoise(first, second)
+        else:
+            raised_shotnoise = A1 * shotnoise
+        common = dict(theory=theory, shotnoise=raised_shotnoise, batch_size=batch_size, nmodes=nmodes, nsub=nsub, devices=devices,
+                      coincidence_damping=coincidence_damping, shot_windows=shot_windows, **options)
+        covariance = compute_spectrum3_covariance(window2, window3, observable, terms=terms, cache=cache,
+                                                  coincidence_orders=coincidence_orders, count_power_shot=count_power_shot, **common)
+        # 2. The three-coincidence lines of the connected terms carry A_1^3 after step 1, but should carry A_3: add
+        #    (A_3 / A_1^3 - 1) times them. In PT only T^(N)'s coincidences count, hence count_power_shot=False there.
+        connected_terms = [term for term in ('T', 'P5', 'P6', 'PT') if term in terms]
+        if connected_terms and not np.isclose(A3, A1**3, rtol=1e-12, atol=0.):
+            third_order = 0.
+            for term in connected_terms:
+                orders = compute_spectrum3_covariance(window2, window3, observable, terms=(term,), cache={}, coincidence_orders=3,
+                                                      count_power_shot=False, **common)
+                third_order = third_order + np.asarray(orders[3].value())
+            correction = (A3 / A1**3 - 1.) * third_order
+            if coincidence_orders is None:
+                covariance = covariance.clone(value=np.asarray(covariance.value()) + correction)
+            else:
+                covariance = dict(covariance)
+                covariance[3] = covariance[3].clone(value=np.asarray(covariance[3].value()) + correction)
+        return covariance
+    if devices is not None and len(_as_devices(devices)) > 1:
+        selected = [term for term in TERMS if term in terms]
+        return _terms_on_devices(lambda term: compute_spectrum3_covariance(
+            window2, window3, observable, theory=theory, shotnoise=shotnoise, cache={}, batch_size=batch_size,
+            terms=(term,), nmodes=nmodes, nsub=nsub, coincidence_orders=coincidence_orders,
+            count_power_shot=count_power_shot, devices=None, coincidence_damping=coincidence_damping,
+            shot_windows=shot_windows, **options), selected, _as_devices(devices))
+    if coincidence_orders is not None:
+        return _coincidence_orders(lambda: compute_spectrum3_covariance(
+            window2, window3, observable, theory=theory, shotnoise=shotnoise, cache=cache, batch_size=batch_size,
+            terms=terms, nmodes=nmodes, nsub=nsub, count_power_shot=count_power_shot, coincidence_damping=coincidence_damping,
+            shot_windows=shot_windows, **options), int(coincidence_orders))
     # The periodic box is selected by passing a MeshAttrs, exactly as the retired implementation
     # did; anything else is a survey window. This is the `use_window_kernels` branch of
     # `_cov3_legacy.py`, expressed as which geometry object the blocks are handed.
@@ -2288,7 +3002,7 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
             raise ValueError('window2 and window3 describe different boxes')
         volume = float(np.prod(np.asarray(window2.boxsize)))
     opt = dict(DEFAULTS, **options)
-    sp = Spectra(theory=theory, shotnoise=shotnoise)
+    sp = Spectra(theory=theory, shotnoise=shotnoise, count_power_shot=count_power_shot, coincidence_damping=coincidence_damping)
     groups = _group(observable)
     if nmodes not in ('continuum', 'mesh'):
         raise ValueError(f"nmodes must be 'continuum' or 'mesh', not {nmodes!r}")
@@ -2299,11 +3013,20 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
     if nmodes == 'mesh':
         # One counter per distinct bin width; the shell width is what defines the count.
         cache = {} if cache is None else cache
+        # Every magnitude a block asks about is a bin edge or a closure leg built from two of
+        # them, so twice the largest edge bounds the lot; `ModeCount` answers above it from the
+        # continuum anyway, so this only sets where the discrete count is available.
+        kmax = 2. * max(float(np.max(np.asarray(g['edges']))) for g in groups)
         for g in groups:
             for dk in np.unique(np.round(np.asarray(g['dk']), 12)):
-                counts.setdefault(float(dk), cache.setdefault(
-                    ('modecount', float(dk), tuple(np.atleast_1d(window2.meshsize).tolist())),
-                    ModeCount(window2, float(dk))))
+                key = ('modecount', float(dk), float(kmax),
+                       tuple(np.atleast_1d(window2.meshsize).tolist()))
+                # Not `setdefault`: its default argument is evaluated whether or not the key is
+                # present, so the counter would be rebuilt on every call and the cache would buy
+                # nothing but memory.
+                if key not in cache:
+                    cache[key] = ModeCount(window2, float(dk), kmax=kmax)
+                counts.setdefault(float(dk), cache[key])
         if any(np.ptp(np.round(np.asarray(g['dk']), 12)) > 0 for g in groups):
             raise ValueError("nmodes='mesh' needs one bin width per observable leaf")
     # Round the lookup the same way the keys were rounded: 0.03 - 0.01 is not 0.02 in binary.
@@ -2317,12 +3040,20 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                              'observable')
         dk = widths.pop()
         ns = {2: nsub[0], 3: nsub[1]}
-        subcount = {m: ModeCount(window2, dk / n) for m, n in ns.items() if n > 1}
+        subcount = {}
+        for m, n in ns.items():
+            if n <= 1:
+                continue
+            key = ('modecount', float(dk / n), float(kmax),
+                   tuple(np.atleast_1d(window2.meshsize).tolist()))
+            if key not in cache:
+                cache[key] = ModeCount(window2, dk / n, kmax=kmax)
+            subcount[m] = cache[key]
         subgroups = [_subbin_group(g, count, ns[g['nfields']]) if ns[g['nfields']] > 1
                      else (g, np.eye(g['size'])) for g in groups]
     # Everything geometric the blocks touch goes through here; a survey window replaces this
     # object rather than adding a branch inside each block.
-    geometry = (SurveyGeometry(window2, window3, cache) if survey
+    geometry = (SurveyGeometry(window2, window3, cache, shot_windows=shot_windows) if survey
                 else BoxGeometry(volume, count))
     nitem = sum(len(g['index']) for g in groups)
     blocks = [[None] * nitem for _ in range(nitem)]
@@ -2364,7 +3095,8 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
                          if geometry.directional
                          else dict(order=opt['order5'], batch_size=batch_size, count=count)),
                         ('PT', _block_bb_pt_window if geometry.directional else _block_bb_pt,
-                         dict(order=opt['order5'], batch_size=batch_size)
+                         dict(order=opt['order5'], batch_size=batch_size,
+                              tie_window=opt['tie_window'])
                          if geometry.directional
                          else dict(order=opt['order5'], batch_size=batch_size, count=count)),
                         ('P6', _block_bb_p6, dict(order=opt['order7'], batch_size=batch_size,
@@ -2409,6 +3141,72 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
     return out
 
 
+#: Relative cost of each term on a survey window at the default quadrature (A100, batch_size 1024), to start the
+#: longest first when the terms are spread over devices.
+_TERM_COST = {'PT': 8, 'P6': 7, 'P5': 5, 'BB': 4, 'PPP': 3, 'PB': 2, 'T': 1, 'PP': 1}
+
+
+def _as_devices(devices):
+    if isinstance(devices, str):
+        if devices != 'all':
+            raise ValueError(f"devices must be 'all', a count or a list of devices, not {devices!r}")
+        return list(jax.local_devices())
+    if isinstance(devices, (int, np.integer)):
+        return list(jax.local_devices())[:int(devices)]
+    return list(devices)
+
+
+def _terms_on_devices(compute, terms, devices):
+    """``compute(term)`` for every term, concurrently, one per free device (longest first), summed."""
+    import queue
+    from concurrent.futures import ThreadPoolExecutor
+    free = queue.Queue()
+    for device in devices:
+        free.put(device)
+
+    def work(term):
+        device = free.get()
+        try:
+            # The covariance comes back assembled on the host (np.block), so the device is done when this returns
+            with jax.default_device(device):
+                return compute(term)
+        finally:
+            free.put(device)
+
+    order = sorted(terms, key=lambda term: -_TERM_COST.get(term, 0))
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        results = list(executor.map(work, order))
+    if isinstance(results[0], dict):
+        return {m: results[0][m].clone(value=sum(np.asarray(r[m].value()) for r in results)) for m in results[0]}
+    return results[0].clone(value=sum(np.asarray(r.value()) for r in results))
+
+
+def _coincidence_orders(assemble, degree):
+    """Run ``assemble`` (one covariance) at coincidence scales 0 .. degree + 1 and solve for the order-by-order parts."""
+    levels = np.arange(degree + 2, dtype='f8')
+    if _COINCIDENCE['levels'] is not None:
+        raise RuntimeError('coincidence-order split already in progress')
+    _COINCIDENCE.update(levels=levels, cache={})
+    values = []
+    try:
+        for level, scale in enumerate(levels):
+            _COINCIDENCE.update(level=level, counter=0, scale=float(scale))
+            covariance = assemble()
+            values.append(np.asarray(covariance.value()))
+    finally:
+        _COINCIDENCE.update(scale=1., levels=None, level=0, counter=0, cache={})
+    values = np.array(values)
+    vandermonde = levels[:, None] ** np.arange(degree + 1)[None, :]
+    coeffs = np.linalg.lstsq(vandermonde, values.reshape(len(levels), -1), rcond=None)[0]
+    # The extra level must be reproduced: otherwise the covariance has higher powers of the pair amplitude
+    residual = values.reshape(len(levels), -1) - vandermonde @ coeffs
+    scale = np.abs(values).max()
+    if np.abs(residual).max() > 1e-8 * scale:
+        raise ValueError(f'coincidence orders above {degree} are present (residual {np.abs(residual).max() / scale:.1e}); raise coincidence_orders')
+    coeffs = coeffs.reshape((degree + 1,) + values.shape[1:])
+    return {m: covariance.clone(value=coeffs[m]) for m in range(degree + 1)}
+
+
 # --------------------------------------------------------------------------------------
 # survey-window construction
 #
@@ -2419,9 +3217,129 @@ def compute_spectrum3_covariance(window2, window3, observable, theory=None, shot
 # shares its name with the one in `cov2`, which is the exported one and a different object;
 # neither of these is exported.
 # --------------------------------------------------------------------------------------
+def _entry_components(entry):
+    """The fields of one window entry: a merged (shot-noise) entry is a tuple of two."""
+    return tuple(entry) if isinstance(entry, tuple) else (entry,)
+
+
+def _canonical_entry(entry):
+    return tuple(sorted(entry)) if isinstance(entry, tuple) else entry
+
+
+def _canonical_group(group):
+    """Plain entries sorted as before (so that existing labels are unchanged), merged ones after them."""
+    group = tuple(group)
+    plain = sorted(entry for entry in group if not isinstance(entry, tuple))
+    merged = sorted(_canonical_entry(entry) for entry in group if isinstance(entry, tuple))
+    return tuple(plain) + tuple(merged)
+
+
+def _n_points(group):
+    """The number of points of a window group, merged entries counting two."""
+    return sum(len(_entry_components(entry)) for entry in tuple(group))
+
+
+def _n_merged(group):
+    return sum(isinstance(entry, tuple) for entry in group)
+
+
+def _lookup_label(group):
+    """A group as passed to ``window.get``: plain groups exactly as given (as before), merged ones canonical."""
+    group = tuple(group)
+    return window_label(group) if any(isinstance(entry, tuple) for entry in group) else group
+
+
+def _merge_group(group, pair):
+    """``group`` with its entries ``pair = (i, j)`` merged into one point (``None``: unchanged)."""
+    group = tuple(group)
+    if pair is None:
+        return group
+    i, j = pair
+    return tuple(entry for index, entry in enumerate(group) if index not in (i, j)) + ((group[i], group[j]),)
+
+
+def _merge_pairs(group, pairs):
+    """``group`` with each of the disjoint index pairs ``pairs`` merged into one point."""
+    group = tuple(group)
+    used = {index for pair in pairs for index in pair}
+    return (tuple(entry for index, entry in enumerate(group) if index not in used)
+            + tuple((group[i], group[j]) for i, j in pairs))
+
+
+def _merged(first, second):
+    """The window entry of the coincidence of a point of ``first`` with one of ``second``."""
+    return (first, second)
+
+
+def window_label(group):
+    """The stored label of a window group: plain groups unchanged; a merged entry ``(a, b)`` written ``'a*b'``.
+
+    ``lsstypes`` joins tuple labels with ``'_'`` and refuses length-1 tuples, so nested tuples would collide
+    (``((a, b), c)`` and ``(a, b, c)``); a group that is one merged point is labelled by that point's string.
+    """
+    group = _canonical_group(group)
+    if not any(isinstance(entry, tuple) for entry in group):
+        return group
+    labels = tuple(f'{entry[0]}*{entry[1]}' if isinstance(entry, tuple) else entry for entry in group)
+    return labels[0] if len(labels) == 1 else labels
+
+
+def merged_group_variants(group):
+    """``group`` and every grouping of it with disjoint pairs of its plain entries merged, canonical and unique.
+
+    ``(a, b)`` gives ``(a, b)`` and ``((a, b),)``; ``(a, b, c, d)`` also gives the two-merge groupings
+    ``((a, b), (c, d))`` and so on. A merged entry is one point carrying two weights: a coincidence.
+    """
+    group = tuple(group)
+    out = [_canonical_group(group)]
+
+    def recurse(plain, merged):
+        for i in range(len(plain)):
+            for j in range(i + 1, len(plain)):
+                rest = plain[:i] + plain[i + 1:j] + plain[j + 1:]
+                new = merged + ((plain[i], plain[j]),)
+                label = _canonical_group(rest + new)
+                if label not in out:
+                    out.append(label)
+                recurse(rest, new)
+
+    recurse(tuple(entry for entry in group if not isinstance(entry, tuple)),
+            tuple(entry for entry in group if isinstance(entry, tuple)))
+    return out
+
+
+def _shot_entry(fkp_a, fkp_b, mask_a, mask_b, Wa, Wb, paint_kwargs, get_randoms, factor_b=None):
+    r"""The window field of one merged point: :math:`\propto n_r w_a w_b`, normalised to :math:`\int W_a W_b`.
+
+    ``Wa``, ``Wb`` are the two components' own window fields on disjoint random subsets (``mask_a``,
+    ``mask_b``); their product fixes the normalisation without self-pair noise. With ``factor_b``
+    (per-random :math:`\propto 1/\bar n`) the shape is :math:`W_a W'_b`, two paints like :math:`W_a W_b`;
+    without, one paint of :math:`w_a w_b` from the union of the two subsets. Either way the merged
+    point is disjoint from every other entry of the product. The two fields must be one set of
+    randoms (two weightings of it).
+    """
+    WaWb = Wa * Wb
+    if factor_b is not None:
+        rb = get_randoms(fkp_b)
+        weights = rb.weights * factor_b
+        if mask_b is not None:
+            weights = weights * mask_b
+        mesh = Wa * rb.clone(weights=weights).paint(**paint_kwargs, out="real")
+        return mesh * (WaWb.sum() / mesh.sum())
+    ra, rb = get_randoms(fkp_a), get_randoms(fkp_b)
+    wa, wb = ra.weights, rb.weights
+    if wa.shape != wb.shape:
+        raise ValueError('a merged window entry needs both fields on the same randoms (two weightings of one catalogue)')
+    weights = wa * wb
+    if mask_a is not None:
+        weights = weights * (mask_a + mask_b)
+    mesh = ra.clone(weights=weights).paint(**paint_kwargs, out="real")
+    return mesh * (WaWb.sum() / mesh.sum())
+
+
 def compute_fkp2_covariance_window(fkps, bin=None, los="local", fields=None, split=None,
                                    group_sizes=(2, 3, 4), max_total_size=6,
-                                   group_pairs=None, **kwargs):
+                                   group_pairs=None, shot=False, split_fields=None, shot_factors=None, **kwargs):
     r"""
     Compute the two-anchor covariance-window multipoles used by ``compute_QW_AB``.
 
@@ -2444,6 +3362,26 @@ def compute_fkp2_covariance_window(fkps, bin=None, los="local", fields=None, spl
         ``(fields1, fields2)``.  When omitted, all combinations with replacement
         of the requested ``group_sizes`` are generated, restricted by
         ``max_total_size``.
+    shot : bool, default=False
+        Also compute the shot-noise variants of every group pair: each way of merging two entries
+        of the same group into one point, :func:`merged_group_variants`. A merged entry ``(a, b)``
+        is a single point carrying both weights, painted from the randoms of ``a`` with weight
+        :math:`w_a w_b` and normalised so that it integrates to :math:`\int W_a W_b` -- so that
+        for a constant :math:`\bar n` it *is* :math:`W_a W_b`, and the coincidence amplitude
+        ``shotnoise`` keeps its meaning. The normalisation ``norm`` of a merged window is that of
+        the unmerged one (merged entries flattened into their components). ``compute_spectrum3_covariance``
+        uses these with ``shot_windows=True``.
+    shot_factors : dict, optional
+        Per-random factors :math:`f_i \propto 1/\bar n(x_i)` by field (e.g. ``{'LRG': 1 / NX}``). With them a merged
+        entry is the product :math:`W_a W'_b`, :math:`W'_b` painted with weights :math:`w_b f`, which has exactly the
+        mesh structure of :math:`W_a W_b` (two paints) and so reduces to it for a constant :math:`\bar n`. Without
+        them it is one paint of :math:`w_a w_b`, whose single mesh kernel differs from the product's at the survey
+        edges (a few per cent on a coarse mesh: measured 4-8% at 31 Mpc/h cells on a 1 Gpc/h box).
+    split_fields : dict, optional
+        Maps a field to the label used to split its randoms into disjoint subsets
+        (:func:`split_particles`). Two fields that are one catalogue with two weightings -- the
+        power spectrum's and the bispectrum's weights on the same galaxies -- must be split as one
+        field, ``{'LRG_B': 'LRG'}``, or their products carry the randoms' self-pairs.
 
     Notes
     -----
@@ -2501,8 +3439,7 @@ def compute_fkp2_covariance_window(fkps, bin=None, los="local", fields=None, spl
 
         return alpha * mesh / mesh.cellsize.prod()
 
-    def canonical_group(group):
-        return tuple(sorted(tuple(group)))
+    canonical_group = _canonical_group
 
     if group_pairs is None:
         groups_by_size = {
@@ -2519,6 +3456,9 @@ def compute_fkp2_covariance_window(fkps, bin=None, los="local", fields=None, spl
                         group_pairs.append((group1, group2))
     else:
         group_pairs = [(tuple(group1), tuple(group2)) for group1, group2 in group_pairs]
+    if shot:
+        group_pairs = [(g1, g2) for group1, group2 in group_pairs
+                       for g1 in merged_group_variants(group1) for g2 in merged_group_variants(group2)]
 
     splits = None
     if split is not None:
@@ -2536,27 +3476,40 @@ def compute_fkp2_covariance_window(fkps, bin=None, los="local", fields=None, spl
         if wfield in windows:
             continue
 
-        flat_field = group1 + group2
+        # A merged entry (a, b) is one point carrying both weights; its components are split from the
+        # randoms like any other entry, so that it is disjoint from the rest of the product, and the
+        # normalisation is that of the unmerged window, on the flattened components.
+        entries1, entries2 = [_entry_components(e) for e in group1], [_entry_components(e) for e in group2]
+        flat_field = sum(entries1 + entries2, start=tuple())
         _fkps = [fkps[field] for field in flat_field]
         masks = [None] * len(_fkps)
 
         if split is not None:
-            seed = list({field: splits[field] for field in flat_field}.values())
-            masks = split_particles(*[get_randoms(fkp) for fkp in _fkps], seed=seed, fields=list(flat_field), return_masks=True)
+            split_labels = [field if split_fields is None else split_fields.get(field, field) for field in flat_field]
+            seed = list({label: splits[field] for label, field in zip(split_labels, flat_field)}.values())
+            masks = split_particles(*[get_randoms(fkp) for fkp in _fkps], seed=seed, fields=split_labels, return_masks=True)
 
-        n1 = len(group1)
-        WA = get_W(_fkps[0], mask=masks[0])
-        for fkp, mask in zip(_fkps[1:n1], masks[1:n1], strict=True):
-            WA = WA * get_W(fkp, mask=mask)
-
-        WB = get_W(_fkps[n1], mask=masks[n1])
-        for fkp, mask in zip(_fkps[n1 + 1:], masks[n1 + 1:], strict=True):
-            WB = WB * get_W(fkp, mask=mask)
+        Ws = [get_W(fkp, mask=mask) for fkp, mask in zip(_fkps, masks, strict=True)]
+        index = iter(range(len(flat_field)))
+        factors = []
+        for entries in (entries1, entries2):
+            factor = None
+            for comps in entries:
+                idx = [next(index) for _ in comps]
+                if len(comps) == 1:
+                    value = Ws[idx[0]]
+                else:
+                    factor_b = None if shot_factors is None else shot_factors.get(flat_field[idx[1]], None)
+                    value = _shot_entry(_fkps[idx[0]], _fkps[idx[1]], masks[idx[0]], masks[idx[1]],
+                                        Ws[idx[0]], Ws[idx[1]], kwargs, get_randoms, factor_b=factor_b)
+                factor = value if factor is None else factor * value
+            factors.append(factor)
+        WA, WB = factors
 
         # Normalization: cross-pair group1's anchor field (fkps[0]) with
         # group1's remaining n1-1 fields with the last fields of group2, not
         # the naive product of each group's own fields (WA.sum()*WB.sum()).
-        Ws = [get_W(fkp, mask=mask) for fkp, mask in zip(_fkps, masks, strict=True)]
+        n1 = sum(len(comps) for comps in entries1)
         normA = Ws[0]
         for w in Ws[n1:2 * n1 - 1]:
             normA = normA * w
@@ -2568,16 +3521,17 @@ def compute_fkp2_covariance_window(fkps, bin=None, los="local", fields=None, spl
         norm = normA.sum() * normB.sum()
         update = dict(norm=[norm * jnp.ones_like(bin.xavg)] * len(bin.ells))
         windows[wfield] = compute_mesh2_window(WA, WB, bin=bin, los=los).clone(**update)
-        del WA, WB
+        del WA, WB, Ws
 
     return ObservableTree(
         list(windows.values()),
-        fields1=[field_groups[0] for field_groups in windows],
-        fields2=[field_groups[1] for field_groups in windows],
+        fields1=[window_label(field_groups[0]) for field_groups in windows],
+        fields2=[window_label(field_groups[1]) for field_groups in windows],
     )
 
 
-def compute_fkp3_covariance_window(fkps, bin=None, los="local", fields=None, split=None, **kwargs):
+def compute_fkp3_covariance_window(fkps, bin=None, los="local", fields=None, split=None, shot=False,
+                                   shot_factors=None, split_fields=None, **kwargs):
     r"""
     Compute the WWW 3-point covariance-window multipoles
 
@@ -2593,7 +3547,13 @@ def compute_fkp3_covariance_window(fkps, bin=None, los="local", fields=None, spl
 
         Q_W^{ABC}(s1, s2) ~ < W_A(x) W_B(x + s1) W_C(x + s2) >.
 
-    This function only computes the WWW piece.
+    This function only computes the WWW piece, unless ``shot`` (``True``, or a list of ``(merged_A, merged_B,
+    merged_C)`` flags to build only those): then also every variant with one, two
+    or all three anchors a merged point -- a coincidence of the anchor's unprimed and primed points, the
+    shot-noise part of that anchor's :math:`P^{(N)}` -- painted as in :func:`compute_fkp2_covariance_window`
+    (same ``shot_factors``, ``split_fields``), with the unmerged window's normalisation. A merged anchor
+    ``(a, b)`` is labelled ``'a*b'``. Each window is stored under both orders of the interchangeable
+    anchors A and B, so that a lookup in either order finds it.
     """
     if not isinstance(fkps, (tuple, list)):
         fkps = [fkps]
@@ -2648,23 +3608,44 @@ def compute_fkp3_covariance_window(fkps, bin=None, los="local", fields=None, spl
     triplets = tuple((pab[0], pab[1], pc) for pab in pairs_ab for pc in pairs)
     windows = {}
     compute_mesh3_window = jax.jit(compute_mesh3, static_argnames=["los"])
+    # shot: True for every merge pattern of the three anchors, or an explicit list of (merged_A, merged_B, merged_C)
+    # flags, so that the variants can be built by separate jobs and merged afterwards
+    if shot is True:
+        flag_sets = tuple(itertools.product((False, True), repeat=3))
+    elif shot:
+        flag_sets = tuple(tuple(bool(f) for f in flags) for flags in shot)
+    else:
+        flag_sets = ((False, False, False),)
 
-    for triple in triplets:
+    def anchor_label(pair, merged):
+        return f'{pair[0]}*{pair[1]}' if merged else pair
+
+    for triple, flags in itertools.product(triplets, flag_sets):
         wfield = tuple(tuple(sorted(pair)) for pair in triple)
         flat_field = sum(wfield, start=tuple())
+        label = tuple(anchor_label(pair, merged) for pair, merged in zip(wfield, flags))
 
-        if wfield in windows:
+        if label in windows:
             continue
 
         _fkps = [fkps[field] for field in flat_field]
         masks = [None] * len(_fkps)
 
         if split is not None:
-            seed = list({field: splits[field] for field in flat_field}.values())
-            masks = split_particles(*[get_randoms(fkp) for fkp in _fkps], seed=seed, fields=list(flat_field), return_masks=True)
+            split_labels = [field if split_fields is None else split_fields.get(field, field) for field in flat_field]
+            seed = list({lab: splits[field] for lab, field in zip(split_labels, flat_field)}.values())
+            masks = split_particles(*[get_randoms(fkp) for fkp in _fkps], seed=seed, fields=split_labels, return_masks=True)
 
         Ws = [get_W(_fkps[i], mask=masks[i]) for i in range(6)]
-        WA, WB, WC = Ws[0] * Ws[1], Ws[2] * Ws[3], Ws[4] * Ws[5]
+
+        def anchor(i, merged):
+            if not merged:
+                return Ws[2 * i] * Ws[2 * i + 1]
+            factor_b = None if shot_factors is None else shot_factors.get(flat_field[2 * i + 1], None)
+            return _shot_entry(_fkps[2 * i], _fkps[2 * i + 1], masks[2 * i], masks[2 * i + 1], Ws[2 * i], Ws[2 * i + 1],
+                               kwargs, get_randoms, factor_b=factor_b)
+
+        WA, WB, WC = (anchor(i, merged) for i, merged in enumerate(flags))
 
         # Normalization: the product of the two bispectrum-estimator
         # normalizations, int(n_a n_b n_c) x int(n_a' n_b' n_c') (and not the
@@ -2678,7 +3659,11 @@ def compute_fkp3_covariance_window(fkps, bin=None, los="local", fields=None, spl
         norm = (Ws[0] * Ws[2] * Ws[4]).sum() * (Ws[1] * Ws[3] * Ws[5]).sum() / WA.cellsize.prod()
         del Ws
         update = dict(norm=[norm * jnp.ones_like(bin.xavg[..., 0])] * len(bin.ells))
-        windows[wfield] = compute_mesh3_window(WA, WB, WC, bin=bin, los=los).clone(**update)
+        windows[label] = compute_mesh3_window(WA, WB, WC, bin=bin, los=los).clone(**update)
+        # Q_W^{ABC} = Q_W^{BAC}: the same window under the other order of the two arm anchors
+        swapped = (label[1], label[0], label[2])
+        if swapped not in windows:
+            windows[swapped] = windows[label]
         del WA, WB, WC
 
     return ObservableTree(
@@ -3400,60 +4385,6 @@ def compute_QW_AB(window2, k1edges, k2edges, khat_dot_n, khatp_dot_n, fields1=No
 
             term = block * L1[:, None] * L2[None, :]
             out = term if out is None else out + term
-    return out
-
-
-def compute_QW_ABC(window3, kedges, kpedges,
-                   khat1, khat2, khat1p, khat2p,
-                   fields1=None, fields2=None, fields3=None,
-                   ells=None, cache=None, batch_size=None):
-    """
-    Reconstruct
-
-        Q_W^{ABC}(k1,k1',k2,k2')
-        =
-        sum_{ell,ellin}
-        Q^W_{ell,ellin}(k1,k2;k1',k2')
-        S_ell(khat1,khat2,n)
-        S_ellin(khat1',khat2',n)
-
-    using compute_spectrum3_covariance_window_block.
-    """
-    if cache is None:
-        cache = {}
-    if ells is None:
-        ells = [(0, 0, 0)]
-
-    block_cache = cache.setdefault("QW_ABC_ell_blocks", {})
-    basis_cache = cache.setdefault("QW_ABC_S_basis", {})
-
-    def basis(ell, xhat1, xhat2):
-        key = ("S", tuple(ell))
-        if key not in basis_cache:
-            basis_cache[key] = get_S(ell, z3=True)
-        return jnp.ravel(basis_cache[key](xhat1, xhat2))
-
-    Sell = {tuple(ell): basis(ell, khat1, khat2) for ell in ells}
-    Sellp = {tuple(ell): basis(ell, khat1p, khat2p) for ell in ells}
-
-    out = None
-
-    for ell in ells:
-        ell = tuple(ell)
-        S_ell = Sell[ell]
-        for ellp in ells:
-            ellp = tuple(ellp)
-            S_ellp = Sellp[ellp]
-            key = (id(window3), tuple(np.ravel(kedges)), tuple(np.ravel(kpedges)), ell, ellp, (fields1, fields2, fields3))
-            if key not in block_cache:
-                block_cache[key] = compute_spectrum3_covariance_window_block(
-                    window3, kedges, kpedges, ell, ellp,
-                    fields1=fields1, fields2=fields2, fields3=fields3,
-                    cache=cache, batch_size=batch_size,
-                )
-            term = block_cache[key] * S_ell[:, None] * S_ellp[None, :]
-            out = term if out is None else out + term
-
     return out
 
 

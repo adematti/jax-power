@@ -30,7 +30,9 @@ import jax
 jax.config.update('jax_enable_x64', True)
 import jax.numpy as jnp
 
-from jaxpower.pt import spectrum3_redshift_tracer, spectrum4_redshift_tracer
+from jaxpower.pt import spectrum3_redshift_tracer
+# `spectrum4_redshift_tracer` was retired from `jaxpower.pt` by the cov3 rewrite; it lives here.
+from jaxpower._pt_legacy import spectrum4_redshift_tracer
 
 
 ZEFF, F = 0.5, 0.76
@@ -62,20 +64,20 @@ def _tetrad(scale=1.):
             jnp.array([[0.070, -0.024, -0.038]]) * scale)
 
 
-def _T(bias, shot=0., scale=1., pkscale=1.):
+def _T(bias, scale=1., pkscale=1.):
     pk, pknow = _cosmo()
     return float(spectrum4_redshift_tracer(*_tetrad(scale),
                                            lambda q: pkscale * pk(q),
                                            lambda q: pkscale * pknow(q),
-                                           f=F, bias_params={0: dict(bias)}, shot=shot)[0])
+                                           f=F, bias_params={0: dict(bias)})[0])
 
 
-def _B(bias, k1vec, k2vec, shot=0., pkscale=1.):
+def _B(bias, k1vec, k2vec, pkscale=1.):
     pk, pknow = _cosmo()
     return float(spectrum3_redshift_tracer(k1vec, k2vec,
                                            lambda q: pkscale * pk(q),
                                            lambda q: pkscale * pknow(q),
-                                           f=F, bias_params={0: dict(bias)}, shot=shot)[0])
+                                           f=F, bias_params={0: dict(bias)})[0])
 
 
 def _P(bias, kvec, pkscale=1.):
@@ -90,6 +92,27 @@ def _P(bias, kvec, pkscale=1.):
     eIR = (1. + F * mu**2 * (2. + F)) * sigma2 + (F * mu)**2 * (mu**2 - 1.) * sigma2_delta
     pkl, pknw = float(pkscale * pk(k)), float(pkscale * pknow(k))
     return Z1**2 * (pknw + (pkl - pknw) * np.exp(-eIR * k**2))
+
+
+def _vertex(bias, kvec, sn):
+    """The redshift-space stochastic vertex ``b1 B_eps + f mu^2 P_eps`` at Poisson, ``(b1 + f mu^2) / nbar``.
+
+    At Poisson the stochastic sector is the exact discreteness expansion of a Poisson sample of the
+    redshift-space field, ``sn sum_i P_g^s(k_i) + sn^2``, and ``P_g^s = Z1^2 P = (b1 + f mu^2) Z1 P``: the
+    vertex is ``Z1 / nbar`` (EFT counterterms aside). A ``2 f mu^2`` (FolpsD's ``2 Pshot``) counts the
+    redshift-space piece twice.
+    """
+    kvec = np.asarray(kvec).reshape(3)
+    k = float(np.sqrt(np.sum(kvec**2)))
+    mu = float(kvec[2] / k) if k > 0 else 0.
+    return sn * (bias['b1'] + F * mu**2)
+
+
+def _leg(bias, kvec, sn, pkscale=1.):
+    """One stochastic leg: the vertex times the surviving long mode ``Z1(k) P(k)``."""
+    return _vertex(bias, kvec, sn) * _P(bias, kvec, pkscale=pkscale) \
+        / (bias['b1'] + F * (np.asarray(kvec).reshape(3)[2]
+                             / max(float(np.sqrt(np.sum(np.asarray(kvec).reshape(3)**2))), 1e-30))**2)
 
 
 @pytest.mark.parametrize('order', [3, 4])
@@ -109,32 +132,38 @@ def test_stochastic_dimensions(order):
     bias0 = dict(BIAS)
 
     def bias_sn(scale):
-        return dict(BIAS, snb0=scale * SN, sn0=scale * SN / 2.)
+        return dict(BIAS, snb0=scale * SN, sn0=scale * SN)
 
     if order == 3:
         k1v, k2v = _tetrad()[0], _tetrad()[1]
-        f = lambda b, s, sh: _B(b, k1v, k2v, shot=sh, pkscale=s)
+        f = lambda b, s: _B(b, k1v, k2v, pkscale=s)
     else:
-        f = lambda b, s, sh: _T(b, shot=sh, pkscale=s)
+        f = lambda b, s: _T(b, pkscale=s)
 
-    ref = f(bias_sn(1.), 1., SN) - f(bias0, 1., 0.)
-    joint = f(bias_sn(lam), lam, lam * SN) - f(bias0, lam, 0.)
+    ref = f(bias_sn(1.), 1.) - f(bias0, 1.)
+    joint = f(bias_sn(lam), lam) - f(bias0, lam)
     e = np.log(joint / ref) / np.log(lam)
-    p = np.log((f(bias_sn(1.), lam, SN) - f(bias0, lam, 0.)) / ref) / np.log(lam)
-    q = np.log((f(bias_sn(mu), 1., mu * SN) - f(bias0, 1., 0.)) / ref) / np.log(mu)
+    p = np.log((f(bias_sn(1.), lam) - f(bias0, lam)) / ref) / np.log(lam)
+    q = np.log((f(bias_sn(mu), 1.) - f(bias0, 1.)) / ref) / np.log(mu)
     print(f'order {order}: joint exponent {e:.6f} (must be {order - 1}); '
           f'separate (p, q) = ({p:.3f}, {q:.3f})')
     assert abs(e - (order - 1)) < 1e-8, f'joint exponent {e:.6f} != {order - 1}'
 
 
 def test_bispectrum_poisson_limit():
-    """B^(N) - B == sn [P(k1) + P(k2) + P(k3)] + sn^2."""
+    """B^(N) - B == sum_i (b1 + f mu_i^2) sn Z1(k_i) P(k_i) + sn^2 = sn sum_i P_g^s(k_i) + sn^2, the Poisson identity.
+
+    See :func:`_vertex`. The constant is ``sn**2`` because
+    at Poisson ``P_eps = 1 / nbar`` and the three-point self-contraction is ``1 / nbar**2`` --
+    which is exactly why the model writes it as ``sn0**2`` and why ``sn0 = 1/(2 nbar)`` cannot be
+    the Poisson point, it would put that constant at a quarter of its value.
+    """
     k1v, k2v = _tetrad()[0], _tetrad()[1]
     k3v = -k1v - k2v
     bias0 = dict(BIAS)
-    bias1 = dict(BIAS, snb0=SN, sn0=SN / 2.)
-    got = _B(bias1, k1v, k2v, shot=SN) - _B(bias0, k1v, k2v)
-    ref = SN * sum(_P(bias0, kv) for kv in (k1v, k2v, k3v)) + SN**2
+    bias1 = dict(BIAS, snb0=SN, sn0=SN)
+    got = _B(bias1, k1v, k2v) - _B(bias0, k1v, k2v)
+    ref = sum(_leg(bias0, kv, SN) for kv in (k1v, k2v, k3v)) + SN**2
     assert np.isclose(got, ref, rtol=1e-10), (got, ref)
 
 
@@ -144,9 +173,9 @@ def test_trispectrum_poisson_limit():
     k4v = -k1v - k2v - k3v
     kv = (k1v, k2v, k3v, k4v)
     bias0 = dict(BIAS)
-    bias1 = dict(BIAS, snb0=SN, sn0=SN / 2.)
+    bias1 = dict(BIAS, snb0=SN, sn0=SN)
 
-    got = _T(bias1, shot=SN) - _T(bias0)
+    got = _T(bias1) - _T(bias0)
 
     # one pair coincides -> sn B(k_i + k_j, k_k, k_l)
     ref = 0.
@@ -167,7 +196,7 @@ def test_trispectrum_poisson_limit():
 
 def test_no_stochastic_terms_is_unchanged():
     """With snb0 = sn0 = shot = 0 the trispectrum is the tree one -- no regression."""
-    assert _T(dict(BIAS), shot=0.) == _T(dict(BIAS, snb0=0., sn0=0.), shot=0.)
+    assert _T(dict(BIAS)) == _T(dict(BIAS, snb0=0., sn0=0.))
 
 
 def test_parallelogram_pair_guard():
@@ -179,12 +208,31 @@ def test_parallelogram_pair_guard():
     kv = jnp.array([[0., 0., 0.08]])
     kpv = jnp.array([[0.05, 0., 0.03]])
     pk, pknow = _cosmo()
-    bias1 = dict(BIAS, snb0=SN, sn0=SN / 2.)
+    bias1 = dict(BIAS, snb0=SN, sn0=SN)
     out = spectrum4_redshift_tracer(kv, -kv, kpv, pk, pknow, f=F,
-                                    bias_params={0: dict(bias1)}, shot=SN)
+                                    bias_params={0: dict(bias1)})
     assert np.isfinite(np.asarray(out)).all()
     # and the guard must actually remove something: the same legs with a tiny offset that
     # makes both pair momenta nonzero give a different, larger answer
     out_off = spectrum4_redshift_tracer(kv, -kv * 0.98, kpv, pk, pknow, f=F,
-                                        bias_params={0: dict(bias1)}, shot=SN)
+                                        bias_params={0: dict(bias1)})
     assert not np.isclose(float(out[0]), float(out_off[0]), rtol=1e-3)
+
+
+def test_stochastic_excess_above_subtracted_poisson():
+    """``shotnoise=s`` with ``snb0 = sn0 = x`` (the excess above a subtracted Poisson level) must equal the total-level model
+    at ``s + x`` minus the total-level model at ``s``: the measurement removed the Poisson ``s`` legs and ``s^2``, and what it
+    keeps of the coincident partition is ``(s + x)^2 - s^2 = x^2 + 2 s x``. The default ``shotnoise=0`` is the total level."""
+    pk, pknow = _cosmo()
+    k1v, k2v = _tetrad()[0], _tetrad()[1]
+    s, x = SN, 0.4 * SN
+
+    def B(sn, shotnoise=0.):
+        return float(spectrum3_redshift_tracer(k1v, k2v, pk, pknow, f=F, bias_params={0: dict(BIAS, snb0=sn, sn0=sn)},
+                                               shotnoise=shotnoise)[0])
+
+    excess = B(x, shotnoise=s) - B(0., shotnoise=s)
+    reference = B(s + x) - B(s)
+    print(f'excess model {excess:.6e}, total-level difference {reference:.6e}, old (shotnoise ignored) {B(x) - B(0.):.6e}')
+    assert np.isclose(excess, reference, rtol=1e-12, atol=0.)
+    assert B(x, shotnoise=0.) == B(x)

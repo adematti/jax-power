@@ -43,8 +43,8 @@ import jax
 from jax import numpy as jnp
 from dataclasses import dataclass
 
-from .mesh import (BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, staticarray, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs,
-compute_box_normalization, __format_meshes)
+from .mesh import (BaseMeshField, MeshAttrs, RealMeshField, ComplexMeshField, ParticleField, FKPField, staticarray, _get_hermitian_weights, _find_unique_edges, _get_bin_attrs,
+compute_box_normalization, compute_normalization, split_particles, __format_meshes)
 from .mesh3 import _format_los
 from .types import MeshNSpectrumPole, MeshNSpectrumPoles
 from .utils import get_legendre, register_pytree_dataclass
@@ -445,3 +445,103 @@ def compute_boxn_normalization(*inputs: RealMeshField | ParticleField, bin: BinM
     if bin is not None:
         return [norm] * len(bin.ells)
     return norm
+
+
+def _fkp_parts(fkp):
+    """``(data, randoms)`` of an :class:`FKPField`; a plain :class:`ParticleField` is its own randoms, with no data."""
+    if isinstance(fkp, FKPField):
+        return fkp.data, fkp.randoms
+    return None, fkp
+
+
+def _weighted_density_integral(fkp, powers, seed=0, cellsize=10., **kwargs):
+    r"""Unbiased estimate of :math:`\int d^3x \, \bar{n}(x)^m w(x)^{\sum_i p_i}` with :math:`m` = ``len(powers)``.
+
+    The randoms are split into :math:`m` disjoint subsets. Subset :math:`i` is painted with weights :math:`w^{p_i}` and scaled
+    by its own :math:`\alpha_i = \sum_{\rm data} w / \sum_{R_i} w`, an estimate of :math:`\bar{n} w^{p_i}`. The product of
+    the :math:`m` meshes then carries no self-coincidence (a random appears in one subset only), hence no shot-noise bias.
+    """
+    data, randoms = _fkp_parts(fkp)
+    m = len(powers)
+    subsets = list(split_particles(*([randoms] + [None] * (m - 1)), seed=seed, fields=[0] * m)) if m > 1 else [randoms]
+    wdata = data.sum() if data is not None else randoms.sum()
+    meshes, alpha = [], 1.
+    for subset, power in zip(subsets, powers, strict=True):
+        alpha *= wdata / subset.sum()
+        meshes.append(subset.clone(weights=subset.weights**power) if power != 1 else subset)
+    return alpha * compute_normalization(*meshes, cellsize=cellsize, **kwargs)
+
+
+def compute_fkpn_normalization(fkp: FKPField | ParticleField, bin: BinMeshNSpectrumPoles=None, ndim: int=None, cellsize: float=10., split: int=0, **kwargs):
+    r"""
+    Survey normalization of the :math:`n`-point spectrum, :math:`I_n = \int d^3x \, \bar{n}(x)^n w(x)^n`.
+
+    In the local (diagonal-window) approximation the FKP estimate of the :math:`n`-point spectrum, built from
+    :math:`F = w (n_g - \alpha n_r)`, measures :math:`I_n P_n`; this is the :math:`n`-point generalisation of
+    :func:`mesh3.compute_fkp3_normalization`, and like it is estimated from ``ndim`` disjoint random subsamples (seed
+    ``split``), so that no random coincides with itself in the product of meshes.
+
+    Parameters
+    ----------
+    fkp : FKPField or ParticleField
+        FKP field (its randoms are split), or randoms alone (then normalized to their own weights).
+    bin : BinMeshNSpectrumPoles, optional
+        Binning operator: sets ``ndim`` and returns one factor per multipole.
+    ndim : int, optional
+        Number of legs, if ``bin`` is not given.
+    cellsize : float, default=10.
+        Cell size of the meshes the normalization is computed on.
+    split : int, default=0
+        Seed of the random splitting.
+
+    Returns
+    -------
+    norm : float, list
+    """
+    ndim = bin.ndim if bin is not None else ndim
+    norm = _weighted_density_integral(fkp, [1] * ndim, seed=split, cellsize=cellsize, **kwargs)
+    if bin is not None:
+        return [norm] * len(bin.ells)
+    return norm
+
+
+def compute_fkpn_coincidence(fkp: FKPField | ParticleField, ndim: int, cellsize: float=10., split: int=0, norm=None, **kwargs):
+    r"""
+    Amplitudes of the coincident-particle (discreteness) terms of the FKP :math:`n`-point spectrum.
+
+    For any point process the connected :math:`n`-point of the weighted field is a sum over set partitions of the legs; a
+    partition into :math:`m` blocks puts each block on one particle, contributing :math:`\bar{n} w^{b}` for a block of
+    :math:`b` legs, so :math:`\bar{n}^m w^n` in total whatever the block sizes. In the local approximation the term is
+    therefore
+
+    .. math::
+        A_m \, C_m(K_{B_1}, \ldots, K_{B_m}), \qquad A_m = \frac{\int d^3x \, \bar{n}^m w^n}{I_n},
+
+    a function of the number of blocks :math:`m` alone (in a box, :math:`\bar{n}^{-(n - m)}`). It is not a product over
+    blocks of a per-block weight, which only coincides with it in a box. The randoms of :math:`F = w (n_g - \alpha n_r)`
+    add :math:`(-\alpha)^n \times` their own coincidences, all :math:`n` legs on one random: a factor
+    :math:`1 + (-1)^n \alpha^{n - 1}` on :math:`A_1` (the usual :math:`1 + \alpha` at :math:`n = 2`), applied here.
+
+    Each :math:`\int \bar{n}^m w^n` uses :math:`m` disjoint random subsets, one painted with :math:`w^{n - m + 1}` and the
+    others with :math:`w`.
+
+    Returns
+    -------
+    amplitudes : jax.Array
+        Shape ``(ndim + 1,)``: ``amplitudes[m]`` for ``m = 1 .. ndim`` (``amplitudes[0] = 0``); ``amplitudes[ndim] = 1``.
+    """
+    if norm is None:
+        norm = compute_fkpn_normalization(fkp, ndim=ndim, cellsize=cellsize, split=split, **kwargs)
+    data, randoms = _fkp_parts(fkp)
+    alpha = data.sum() / randoms.sum() if data is not None else 1.
+    out = [0.]
+    for m in range(1, ndim + 1):
+        if m == ndim:
+            out.append(1.)
+            continue
+        value = _weighted_density_integral(fkp, [ndim - m + 1] + [1] * (m - 1), seed=split, cellsize=cellsize, **kwargs) / norm
+        if m == 1:
+            value = value * (1. + (-1)**ndim * alpha**(ndim - 1))
+        out.append(value)
+    return jnp.array(out)
+

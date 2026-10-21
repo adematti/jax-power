@@ -223,11 +223,27 @@ def K13_tt(r, thresh=1e-2):
     return jnp.where(jnp.abs(dr) < thresh, series, exact)
 
 
+def _loop_grid(kk, qmin=1e-5, qmax=10., size_lnr=400, size_mu=40):
+    r"""``(r, mu, weight)`` for a one-loop integral at ``kk``: ``r = q / k`` Gauss-Legendre in :math:`\ln r` over absolute
+    :math:`q \in [q_{\rm min}, q_{\rm max}]` (the nodes scaled to each :math:`k`, so that the UV is the same at every
+    :math:`k`), :math:`\mu \in [-1, 1]` Gauss-Legendre; ``weight`` is :math:`dr\, d\mu`, shape ``(size_lnr, size_mu)``."""
+    u, wu = np.polynomial.legendre.leggauss(size_lnr)
+    u, wu = jnp.asarray(0.5 * (u + 1.)), jnp.asarray(0.5 * wu)
+    mu, wmu = np.polynomial.legendre.leggauss(size_mu)
+    mu, wmu = jnp.asarray(mu), jnp.asarray(wmu)
+    lnr0, lnr1 = jnp.log(qmin / kk), jnp.log(qmax / kk)
+    r = jnp.exp(lnr0 + u * (lnr1 - lnr0))
+    wr = wu * (lnr1 - lnr0) * r
+    return r[:, None], mu[None, :], wr[:, None] * wmu[None, :]
+
+
 def compute_spt_matter_1loop(
     k: jnp.ndarray,
     pk_callable: callable,
-    integ_mu: Integral1D=integration(a=-1.0, b=1.0, size=10),
-    integ_r: Integral1D=integration(a=5e-4, b=10.0, size=100),
+    qmin: float=1e-5,
+    qmax: float=10.,
+    size_lnr: int=400,
+    size_mu: int=40,
 ):
     r"""
     Compute 1-loop SPT matter spectra:
@@ -235,83 +251,88 @@ def compute_spt_matter_1loop(
 
     Formula:
         P_ab = P_11 + P_22_ab + P_13_ab
+
+    with, :math:`r = q / k`, :math:`y^2 = 1 + r^2 - 2 r \mu`,
+
+    .. math::
+
+        P_{22}^{ab}(k) = \frac{k^3}{4 \pi^2} \int dr \int_{-1}^{1} d\mu\, P_L(kr) P_L(ky) \frac{K^{ab}_{22}(r, \mu)}{98\, y^4}, \qquad
+        P_{13}^{ab}(k) = \frac{k^3}{2 \pi^2} P_L(k) \int dr\, P_L(kr) \frac{K^{ab}_{13}(r)}{504}.
+
+    The integrals run over :math:`q \in [q_{\rm min}, q_{\rm max}]` in absolute units, Gauss-Legendre in :math:`\ln r` with
+    the nodes scaled to each :math:`k` -- a fixed range in :math:`r` truncates the UV at low :math:`k` (``r < 10`` stops at
+    :math:`q = 0.2` for :math:`k = 0.02`, 17% of :math:`P_{13}`). :math:`P_{22}` is symmetric under
+    :math:`\mathbf{q} \to \mathbf{k} - \mathbf{q}` and is integrated over :math:`r < y` twice, which keeps the quadrature
+    off its integrable point :math:`\mathbf{q} = \mathbf{k}`. Beyond ``r = 50`` the :math:`K_{13}` take their :math:`r^{-2}`
+    asymptote, where the exact expressions cancel :math:`r^4` terms to :math:`r^{-2}` and lose float64 precision.
+
+    Checked against a dense direct quadrature of :math:`2 \int_q F_2^2 P P` and of the textbook :math:`P_{13}`: 1e-3.
+    An earlier version carried :math:`k^3 / (2\pi^2)` on :math:`P_{22}`, twice the right prefactor, and ``r`` in
+    ``[5e-4, 10]``.
     """
     k = jnp.atleast_1d(k)
-    integ_rmu = IntegralND(r=integ_r, mu=integ_mu)
+    u, wu = np.polynomial.legendre.leggauss(size_lnr)
+    u, wu = 0.5 * (u + 1.), 0.5 * wu
+    mu, wmu = np.polynomial.legendre.leggauss(size_mu)
+    u, wu, mu, wmu = (jnp.asarray(a) for a in (u, wu, mu, wmu))
+    kern13 = {"dd": K13_dd, "dt": K13_dt, "tt": K13_tt}
+    rlarge = 50.
+    asymptote = {name: float(kernel(jnp.asarray(rlarge))) * rlarge**2 for name, kernel in kern13.items()}
 
-    def I22(kind, kk):
-        # P22:
-        # ∫ dr dμ P_L(kr) P_L(ky) K22_ab(r,μ)
-        r, mu = integ_rmu.x(['r', 'mu'])
-        y2 = 1.0 + r * r - 2.0 * r * mu
-        y = jnp.sqrt(jnp.maximum(y2, 1e-30))
-
-        pk1 = pk_callable(kk * r)
-        pk2 = pk_callable(kk * y)
-
-        A = 3.0 * r + 7.0 * mu - 10.0 * r * mu * mu
-        B = -r + 7.0 * mu - 6.0 * r * mu * mu
-
-        ker = 1.0 / 98.0 * {"dd": A * A, "dt": A * B, "tt": B * B}[kind]
-
-        return kk**3 / (2.0 * jnp.pi**2) * integ_rmu(pk1 * pk2 * ker / y2**2)
-
-    r = integ_r.x()
-
-    def I13(kind, kk):
-        # P13:
-        # P_L(k) ∫ dr P_L(kr) K13_ab(r)
-        pk = pk_callable(kk)
-        pkr = pk_callable(kk * r)
-
-        ker = 1.0 / 504.0 * {"dd": K13_dd, "dt": K13_dt, "tt": K13_tt}[kind](r)
-
-        return kk**3 / (2.0 * jnp.pi**2) * pk * integ_r(pkr * ker)
+    def _k13(name, r):
+        return jnp.where(r > rlarge, asymptote[name] / jnp.where(r > rlarge, r, 1.)**2, kern13[name](jnp.minimum(r, rlarge)))
 
     def one_k(kk):
+        lnr0, lnr1 = jnp.log(qmin / kk), jnp.log(qmax / kk)
+        r = jnp.exp(lnr0 + u * (lnr1 - lnr0))
+        wr = wu * (lnr1 - lnr0) * r  # dr
         P11 = pk_callable(kk)
+        pkr = pk_callable(kk * r)
 
-        P22_dd = I22("dd", kk)
-        P22_dt = I22("dt", kk)
-        P22_tt = I22("tt", kk)
-
-        P13_dd = I13("dd", kk)
-        P13_dt = I13("dt", kk)
-        P13_tt = I13("tt", kk)
-
-        return {"k": kk, "P11": P11, "P22_dd": P22_dd, "P22_dt": P22_dt, "P22_tt": P22_tt, "P13_dd": P13_dd, "P13_dt": P13_dt, "P13_tt": P13_tt,
-                "Pdd": P11 + P22_dd + P13_dd, "Pdt": P11 + P22_dt + P13_dt, "Ptt": P11 + P22_tt + P13_tt}
+        # P22, on (r, mu), over r < y (twice)
+        R, MU = r[:, None], mu[None, :]
+        y2 = 1.0 + R * R - 2.0 * R * MU
+        y = jnp.sqrt(jnp.maximum(y2, 1e-30))
+        A = 3.0 * R + 7.0 * MU - 10.0 * R * MU * MU
+        B = -R + 7.0 * MU - 6.0 * R * MU * MU
+        weight = 2. * jnp.where(R < y, 1., 0.) * wr[:, None] * wmu[None, :] * pkr[:, None] * pk_callable(kk * y) / jnp.maximum(y2, 1e-30)**2
+        pref22 = kk**3 / (4.0 * jnp.pi**2) / 98.0
+        P22 = {name: pref22 * jnp.sum(weight * ker) for name, ker in [("dd", A * A), ("dt", A * B), ("tt", B * B)]}
+        # P13
+        pref13 = kk**3 / (2.0 * jnp.pi**2) / 504.0 * P11
+        P13 = {name: pref13 * jnp.sum(wr * pkr * _k13(name, r)) for name in kern13}
+        out = {"k": kk, "P11": P11}
+        for name in ("dd", "dt", "tt"):
+            out[f"P22_{name}"], out[f"P13_{name}"] = P22[name], P13[name]
+            out[f"P{name}"] = P11 + P22[name] + P13[name]
+        return out
 
     out = jax.vmap(one_k)(k)
     return {name: out[name] for name in out}
 
 
-# 1-loop bias basis
-
 def compute_bias_terms_1loop(k: jnp.ndarray,
                      pk_callable: callable,
-                     integ_mu: Integral1D=integration(a=-1.0, b=1.0, size=10),
-                     integ_r: Integral1D=integration(a=5e-4, b=10.0, size=100)):
-
+                     qmin: float=1e-5, qmax: float=10., size_lnr: int=400, size_mu: int=40):
+    r"""The one-loop bias terms, on the per-:math:`k` grid of :func:`_loop_grid` (absolute :math:`q \in [q_{\rm min},
+    q_{\rm max}]`). An earlier version integrated ``r = q / k`` over a fixed ``[5e-4, 10]`` with 10 ``mu`` nodes, which
+    truncates the UV at low :math:`k`: ``sigma3sq`` 21% low at ``k = 0.02``, ``Pb1bs2`` 8% off at ``k = 0.3``."""
     k = jnp.atleast_1d(k)
-    integ_rmu = IntegralND(r=integ_r, mu=integ_mu)
-    r, mu = integ_rmu.x(['r', 'mu'])
-
-    y = jnp.sqrt(jnp.maximum(1.0 + r * r - 2.0 * r * mu, 1e-30))
-    mu_qkmq = (mu - r) / y
-    mu_mqk = mu
-
-    F2_q = F2(r, y, mu_qkmq)
-    G2_q = G2(r, y, mu_qkmq)
-    S2_q = S2(mu_qkmq)
-    S2_mqk = S2(mu_mqk)
 
     def one_k(kk):
+        r, mu, weight = _loop_grid(kk, qmin=qmin, qmax=qmax, size_lnr=size_lnr, size_mu=size_mu)
+        y = jnp.sqrt(jnp.maximum(1.0 + r * r - 2.0 * r * mu, 1e-30))
+        mu_qkmq = (mu - r) / y
+        mu_mqk = mu
+        F2_q = F2(r, y, mu_qkmq)
+        G2_q = G2(r, y, mu_qkmq)
+        S2_q = S2(mu_qkmq)
+        S2_mqk = S2(mu_mqk)
         Pq = pk_callable(kk * r)
         Pp = pk_callable(kk * y)
 
         def integ(expr):
-            return kk**3 / (4.0 * jnp.pi**2) * integ_rmu(r**2 * expr)
+            return kk**3 / (4.0 * jnp.pi**2) * jnp.sum(weight * r**2 * expr)
 
         Pb1b2 = integ(F2_q * Pq * Pp)
         Pb1bs2 = integ(F2_q * S2_q * Pq * Pp)
@@ -361,15 +382,15 @@ def compute_sigma2v(pk_callable, integ_k=integration(a=5e-4, b=10., size=100)):
 # Main multitracer TNS A and B terms
 
 
-def compute_tns_A_B_terms(k, Pdd, Pdt=None, Ptt=None,
-    integ_r=integration(a=5e-4, b=10.0, size=100),
-    integ_x=integration(a=-1.0, b=1.0, size=20),
-):
+def compute_tns_A_B_terms(k, Pdd, Pdt=None, Ptt=None, qmin=1e-5, qmax=10., size_lnr=400, size_x=40):
     r"""
     Multitracer TNS A and B terms following Appendix A of arXiv:2007.09011,
     assuming c_A = c_B = 1.
 
     Output is organized in powers of f, mu^2 and bias terms.
+
+    Integrated on the per-:math:`k` grid of :func:`_loop_grid` (absolute :math:`q \in [q_{\rm min}, q_{\rm max}]`). An
+    earlier version integrated ``r = q / k`` over a fixed ``[5e-4, 10]`` with 20 ``x`` nodes: ``A`` 33% off at ``k = 0.02``.
     """
     if Pdt is None:
         Pdt = Pdd
@@ -378,8 +399,6 @@ def compute_tns_A_B_terms(k, Pdd, Pdt=None, Ptt=None,
 
     k = jnp.atleast_1d(k)
 
-    integ_rx = IntegralND(r=integ_r, x=integ_x)
-    r, x = integ_rx.x(["r", "x"])
 
     def _safe_sqrt(x, eps=1e-30):
         return jnp.sqrt(jnp.maximum(x, eps))
@@ -477,6 +496,11 @@ def compute_tns_A_B_terms(k, Pdd, Pdt=None, Ptt=None,
         return bb, b, const
 
     def one_k(kk):
+        r, x, weight = _loop_grid(kk, qmin=qmin, qmax=qmax, size_lnr=size_lnr, size_mu=size_x)
+
+        def integ_rx(expr):
+            return jnp.sum(weight * expr)
+
         Dgeom = 1.0 + r**2 - 2.0 * r * x
         y = _safe_sqrt(Dgeom)
 
@@ -588,8 +612,17 @@ def fog_damping(*kmu_X, f=1., sigma2v=1., damping='lor'):
     raise ValueError(f"damping must be None, 'exp', 'lor' or 'vdg', got {damping!r}")
 
 
-def spectrum2_redshift_tracer_eft(matter, bias, A_B, sigma2v, mu, f,
-                                  bias_params, alpha0=0.0, alpha2=0.0, alpha4=0.0, ctilde=0.0, shot=0.0, damping='lor'):
+#: Parameters that extend the model rather than define it, so an omitted one means "not
+#: included" and zero is the value that says so. Everything else in `bias_params` must be given.
+_OPTIONAL_BIAS = ('alpha0', 'alpha2', 'alpha4', 'ctilde', 'c0', 'c1', 'c2', 'b3nl', 'snb0',
+                  'sn0', 'X_FoG')
+
+
+def _bias_get(pars, name):
+    return pars[name] if name in pars or name not in _OPTIONAL_BIAS else 0.
+
+
+def spectrum2_redshift_tracer_eft(matter, bias, A_B, sigma2v, mu, f, bias_params, damping='lor'):
     k = matter['k']
     mu = jnp.atleast_1d(mu)
     mu2 = mu[None, :]**2
@@ -607,8 +640,23 @@ def spectrum2_redshift_tracer_eft(matter, bias, A_B, sigma2v, mu, f,
     Ps = real['Pdd_ab'][:, None] + f * mu2 * (real['Pdt_a'][:, None] + real['Ptd_b'][:, None]) + f**2 * mu2**2 * real['Ptt'][:, None] + A + B
 
     PkK_lin_ab = bA * bB * PL[:, None] + f * mu2 * (bA + bB) * PL[:, None] + f**2 * mu2**2 * PL[:, None]
-    #alpha0 = bA * bias_params[b]['alpha0'] + bB * bias_params[a]['alpha0']
-    #alpha2 = bias_params[a]['alpha2'] + bias_params[b]['alpha2']
+
+    # The counterterms and the stochastic amplitude come through `bias_params` like every other
+    # parameter. They used to be keyword arguments, which forced every caller to split one bias
+    # dictionary into two objects before calling -- `desi-clustering`'s `split_ct` existed for no
+    # other reason -- and made `P` the only n-point in this module with two parameter channels.
+    #
+    # Symmetrised over the two legs, so `P_ab` does not depend on the order they are named in;
+    # exact for an auto spectrum, where both are the same field.
+    def _ct(name):
+        return 0.5 * (_bias_get(bias_params[a], name) + _bias_get(bias_params[b], name))
+
+    alpha0, alpha2, alpha4, ctilde = (_ct(name) for name in
+                                      ('alpha0', 'alpha2', 'alpha4', 'ctilde'))
+    # `sn0` is the stochastic amplitude `P_eps`, the same `<eps eps>` the bispectrum's vertex and
+    # constant carry. Two points of different tracers are never the same point, so a cross
+    # spectrum has none of it.
+    shot = _bias_get(bias_params[a], 'sn0') if a == b else 0.
     Pct = (alpha0 + alpha2 * mu2 + alpha4 * mu2**2) * (k[:, None]**2) * PL[:, None]
     kmu = k[:, None] * mu[None, :]
     Pnlo = ctilde * (f * kmu)**4 * PkK_lin_ab
@@ -659,7 +707,7 @@ def prepare_spectrum2_redshift_tracer(k, pk_callable, pknow_callable, kbao=1.0 /
     return table, table_now
 
 
-def spectrum2_redshift_tracer(mu_or_kvec, table, table_now, f, bias_params, **ct_params):
+def spectrum2_redshift_tracer(mu_or_kvec, table, table_now, f, bias_params, damping='lor'):
     """
     Evaluate the redshift-space power spectrum.
 
@@ -687,8 +735,8 @@ def spectrum2_redshift_tracer(mu_or_kvec, table, table_now, f, bias_params, **ct
 
     fields, bias_params = _format_bias_params(bias_params, nfields=2)
     a, b = fields
-    pk_eft = spectrum2_redshift_tracer_eft(table['matter'], table['bias'], table['A_B'], table['sigma2v'], mu, f, bias_params, **ct_params)
-    pknow_eft = spectrum2_redshift_tracer_eft(table_now['matter'], table_now['bias'], table_now['A_B'], table['sigma2v'], mu, f, bias_params, **ct_params)
+    pk_eft = spectrum2_redshift_tracer_eft(table['matter'], table['bias'], table['A_B'], table['sigma2v'], mu, f, bias_params, damping=damping)
+    pknow_eft = spectrum2_redshift_tracer_eft(table_now['matter'], table_now['bias'], table_now['A_B'], table['sigma2v'], mu, f, bias_params, damping=damping)
     pk_ir = _spectrum2_ir_resum(table['matter']['k'], mu, table['matter']['P11'], table_now['matter']['P11'], pk_eft, pknow_eft, f, table['sigma2'], table['sigma2_delta'], bias_params[a]['b1'], bias_params[b]['b1'])
 
     if is_kvec:
@@ -764,38 +812,74 @@ class ProjectToSell:
 
 # Note: shot noise formula isn't correct for multitracer, but let's marginalize over it anyway...
 
-def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias_params, shot=0., sigma2v=None, sigma2=None, sigma2_delta=None, damping='lor', srnl=None):
-    """
+def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias_params, sigma2v=None, sigma2=None, sigma2_delta=None, damping='lor', srnl=None, edge_damping=None, fields=None, linear_fields=(), shotnoise=0.):
+    r"""
     JAX-friendly cross-bispectrum model B^{abc}(k1, k2, k3), with k3 = -k1 - k2.
 
     Parameters
     ----------
     k1vec, k2vec : array_like[..., 3]
         Wavevectors of the first two bispectrum legs.
-    fields : tuple
-        Tuple (a, b, c) of field identifiers.
+    fields : tuple, optional
+        Tuple (a, b, c) of field identifiers, keys of ``bias_params``; default its keys in order, the last repeated.
     f, sigma2v, sigma2, sigma2_delta : float
         RSD / IR / FoG parameters.
     bias_params : dict
         Mapping field -> parameters.
         Each entry can be either a dict with keys
         ('b1', 'b2', 'bs', 'c1', 'c2', 'snb0', 'sn0', 'X_FoG')
+
+        ``snb0`` and ``sn0`` are FolpsD's ``Bshot`` and ``Pshot``, the two stochastic amplitudes
+        :math:`B_\epsilon` and :math:`P_\epsilon`, each carrying its own ``1 / nbar``. There is
+        no third shot-noise argument: the bispectrum's discreteness is these two and nothing else.
+
+        The vertex attached to a long mode is ``b1 B_eps + f mu^2 P_eps``: ``b1 B_eps`` is the response of the
+        stochasticity to the long-wavelength density, and ``f mu^2 P_eps`` the noise carried by the
+        redshift-space mapping of the leg it sits on. The remaining long leg is an ordinary ``Z1(k) P_L(k)``,
+        hence the ``Z1eft * pkIR`` factor.
+
+        **Poisson sits at ``snb0 = sn0 = 1 / nbar``**, and the sector must then be the exact discreteness
+        expansion of a Poisson sample of the redshift-space field, ``(1/nbar) sum_i P_g^s(k_i) + 1/nbar^2``
+        with ``P_g^s = Z1^2 P_L``. Since ``Z1^2 = (b1 + f mu^2) Z1``, each leg is ``(b1 + f mu_i^2) Z1 P_L / nbar``:
+        the coefficient of ``f mu^2`` is ``P_eps``, **not** ``2 P_eps`` (FolpsD's ``2 Pshot``, which counts the
+        redshift-space piece twice; Ivanov et al. 2021 carry ``(1 + P_shot) / nbar`` on it). The constant
+        ``sn0**2 = 1/nbar**2`` is the three-point self-contraction, which is why FolpsD writes it as ``Pshot**2``.
         or a tuple/list in that order.
+    shotnoise : float, default=0.
+        The Poisson level :math:`s` already subtracted from the measured bispectrum, when ``snb0`` and ``sn0`` are the
+        excess above Poisson (a shot-noise-subtracted measurement fitted with the stochastic amplitudes centred on 0).
+        The legs are linear in the amplitudes, so the excess carries over to them unchanged; the fully coincident
+        partition is quadratic, and its excess is :math:`(s + P_\epsilon)^2 - s^2 = P_\epsilon^2 + 2 s P_\epsilon`, not
+        :math:`P_\epsilon^2`. With the halo-model coincidence amplitudes, :math:`P_\epsilon = (A_1 - 1) s` gives
+        :math:`(A_1^2 - 1) s^2 = (A_2 - 1) s^2`, of which :math:`P_\epsilon^2` is only :math:`(A_1 - 1)^2 s^2`. The
+        default 0 is the total-level convention (``snb0 = sn0 = 1 / nbar`` at Poisson), unchanged.
     pk_callable : callable
         Callable returning the linear power spectrum P(k) for a given k.
     pknow_callable : callable
         Callable returning the no-wiggle linear power spectrum P_now(k) for a given k.
     damping : str, default='lor'
         One of ('lor', 'exp', 'vdg').
-    shot : float, default=0.
-        Constant shot-noise contribution.
+    edge_damping : callable, optional
+        ``edge_damping(qvec)``: the damping of a propagator whose two ends are different fields -- a pre- and a
+        post-reconstruction field, :math:`D_\times(q) = e^{-q^2 \sigma^2(\mu_q) / 2}`. Each tree term has its vertex
+        at one leg and propagators on the other two legs' momenta, and a propagator joining different fields takes
+        this factor at its momentum: with leg 1 alone post-recon, the vertex-at-1 term takes
+        :math:`D_\times(k_2) D_\times(k_3)` and the other two :math:`D_\times(k_1)`. The stochastic sector takes
+        :math:`D_\times` of the odd leg, the momentum that displaces that point against the other two. Ignored
+        when the three fields agree.
+    linear_fields : tuple, optional
+        Fields that are linear in the initial field (a post-recon field treated as :math:`D_\times Z_1 \delta_L`): a vertex at
+        such a leg vanishes, and the leg only enters as a propagator into the vertex at another.
 
     Returns
     -------
     bispectrum : array_like
         Modeled bispectrum B^{abc}(k1, k2, k3).
     """
-    fields, bias_params = _format_bias_params(bias_params, nfields=3)
+    if fields is None:
+        fields, bias_params = _format_bias_params(bias_params, nfields=3)
+    else:
+        fields = list(fields)
     a, b, c = fields
 
     if sigma2v is None:
@@ -857,9 +941,11 @@ def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias
         # (folps.py, Z1eft1/2/3), which uses this same (c1 mu^2 + c2 mu^4) k^2 basis and sign.
         # These are *independent* of the power spectrum counterterms alpha0 / alpha2 / alpha4
         # (see spectrum2_redshift_tracer_eft), again as in FOLPS: P and B carry their own sets.
+        # `c0` is the isotropic counterterm, -c0 k^2 (Ivanov et al. 2021, arXiv:2110.10161, Eq. 3.10); optional, 0 if absent.
         c1, c2 = _get_bias_params(field, ['c1', 'c2'])
+        c0 = _bias_get(bias_params[field], 'c0')
         base = _Z1(field, mu) if srnl is None else _srnl_Z1(field, k, mu)
-        return base - (c1 * mu**2 + c2 * mu**4) * k**2
+        return base - (c0 + c1 * mu**2 + c2 * mu**4) * k**2
 
     def _Z2(field, ki, kj, xij, mui, muj):
         b1, b2, bs = _get_bias_params(field, ['b1', 'b2', 'bs'])
@@ -903,25 +989,64 @@ def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias
     Z1eft2 = _Z1eft(b, k2, mu2)
     Z1eft3 = _Z1eft(c, k3, mu3)
 
-    B12 = 2. * _Z2(c, k1, k2, x12, mu1, mu2) * Z1eft1 * pkIR1 * Z1eft2 * pkIR2
-    B23 = 2. * _Z2(a, k2, k3, x23, mu2, mu3) * Z1eft2 * pkIR2 * Z1eft3 * pkIR3
-    B31 = 2. * _Z2(b, k3, k1, x31, mu3, mu1) * Z1eft3 * pkIR3 * Z1eft1 * pkIR1
+    def _Z2v(field, ki, kj, xij, mui, muj):
+        if field in linear_fields:
+            return 0.
+        return _Z2(field, ki, kj, xij, mui, muj)
+
+    B12 = 2. * _Z2v(c, k1, k2, x12, mu1, mu2) * Z1eft1 * pkIR1 * Z1eft2 * pkIR2
+    B23 = 2. * _Z2v(a, k2, k3, x23, mu2, mu3) * Z1eft2 * pkIR2 * Z1eft3 * pkIR3
+    B31 = 2. * _Z2v(b, k3, k1, x31, mu3, mu1) * Z1eft3 * pkIR3 * Z1eft1 * pkIR1
 
     X1, X2, X3 = [_get_bias_params(field, 'X_FoG') for field in fields]
     W = fog_damping((k1 * mu1, X1), (k2 * mu2, X2), (k3 * mu3, X3), f=f, sigma2v=sigma2v, damping=damping)
 
+    # FolpsD `folps/folps.py:3108`, with one correction:
+    #
+    #     shot = (b1 Bshot + Pshot f_i mu_i^2) Z1eft_i pkIR_i summed over the three legs
+    #            + Pshot**2
+    #     bispectrum = W (B12 + B23 + B31) + shot
+    #
+    # FolpsD writes `2 Pshot f_i mu_i^2`. At Poisson (Bshot = Pshot = 1/nbar) the sector must be the exact
+    # discreteness expansion (1/nbar) sum_i Z1(k_i)^2 P(k_i) + 1/nbar^2, and Z1^2 = (b1 + f mu^2) Z1 gives the
+    # coefficient 1: the 2 counts the redshift-space piece twice (tests/test_pt_stochastic.py pins the identity).
+    #
+    # `snb0` is its `Bshot` and `sn0` its `Pshot`: two amplitudes, each carrying its own
+    # `1 / nbar`, and **the fully coincident partition is `Pshot**2`, the same parameter as the
+    # legs** -- not a third quantity. This used to read `shot**2` with `shot` a separate
+    # argument, which is where the spurious third stochastic knob came from.
     def _shot_leg(field, k, mu, Z1eft, pkIR):
         b1, snb0, sn0 = _get_bias_params(field, ['b1', 'snb0', 'sn0'])
-        return (b1 * snb0 + 2. * sn0 * f * mu**2) * Z1eft * pkIR
+        return (b1 * snb0 + sn0 * f * mu**2) * Z1eft * pkIR
 
     legs = (_shot_leg(a, k1, mu1, Z1eft1, pkIR1) + _shot_leg(b, k2, mu2, Z1eft2, pkIR2)
             + _shot_leg(c, k3, mu3, Z1eft3, pkIR3))
 
+    # FolpsD keeps the stochastic sector OUTSIDE the Fingers-of-God factor -- `W (B12 + B23 +
+    # B31) + shot` -- and `folps_bins_beta.py` damps the three legs per leg while still leaving
+    # `Pshot**2` undamped. jaxpower damps all of it, which is a deliberate departure recorded
+    # below; it is the one place this function still differs from FolpsD.
+    # The fully coincident partition (three legs on one object). With sn0 the total shot level it is sn0**2. With sn0 the
+    # excess above a Poisson level s already subtracted from the data (`shotnoise`), it is (s + sn0)**2 minus the s**2 the
+    # subtraction removed; shotnoise = 0 gives back sn0**2.
+    sn0 = _get_bias_params(a, 'sn0')
+    stochastic = legs + (shotnoise + sn0)**2 - shotnoise**2
+    if edge_damping is not None and len(set(fields)) > 1:
+        # Three legs, two fields: one leg is odd
+        D1, D2, D3 = edge_damping(k1vec), edge_damping(k2vec), edge_damping(k3vec)
+
+        def _edge(x, y, D):
+            return D if x != y else 1.
+
+        B12 = B12 * _edge(a, c, D1) * _edge(b, c, D2)
+        B23 = B23 * _edge(b, a, D2) * _edge(c, a, D3)
+        B31 = B31 * _edge(c, b, D3) * _edge(a, b, D1)
+        odd = [i for i, field in enumerate(fields) if list(fields).count(field) == 1][0]
+        stochastic = stochastic * (D1, D2, D3)[odd]
     # The damping multiplies the whole spectrum, the stochastic legs and the fully coincident
-    # partition included. `shot**2` used to be held out on the grounds that two points at the
-    # same place have no relative displacement to be smeared -- but they are still observed
-    # through the same line-of-sight velocity field as everything else.
-    return W * (B12 + B23 + B31 + legs + shot**2)
+    # partition included. Two points at the same place have no relative displacement to be
+    # smeared, but they are still observed through the same line-of-sight velocity field.
+    return W * (B12 + B23 + B31 + stochastic)
 
 
 
@@ -951,7 +1076,7 @@ def spectrum3_redshift_tracer(k1vec, k2vec, pk_callable, pknow_callable, f, bias
 # (1 + delta) e^{i f k mu u} and reading off which legs go to the density factor and which to the
 # velocity factors. These are the same kernels `spectrum3_redshift_tracer` and
 # `spectrum4_redshift_tracer` above write out by hand at n = 3 and 4, and they agree with them --
-# which is what `validate_partition_bias` and `tests/test_cov3.py` pin.
+# which is what `tests/test_pt.py::test_partition_bias` and `tests/test_cov3.py` pin.
 # ======================================================================================
 
 #: An edge momentum below this fraction of the largest external leg is treated as identically
@@ -1156,7 +1281,7 @@ class BiasModel(object):
         # The tidal term takes G, not F: g2 here is the coefficient of G_2[Phi_v], as Philcox's
         # `2 g2 angK Gn2` in K_3 fixes it, with Gamma_3 in the third-order block that is zero.
         # Three blocks would need genuinely third-order operators this model does not have.
-        # `validate_partition_bias` checks all of it against the explicit K_2 and K_3 above.
+        # `tests/test_pt.py::test_partition_bias` checks all of it against the explicit K_2 and K_3 above.
         loc = tid = 0.
         for part in _set_partitions(mask):
             if len(part) != 2:
@@ -1292,19 +1417,64 @@ def tree_classes(n):
 # the n-point spectra
 # --------------------------------------------------------------------------------------
 
-def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, paper=False, jit=True):
+def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, sigma2v=None,
+                                  damping='lor', paper=False, jit=True, labels=None, edge_damping=None,
+                                  same_damping=None, linear_labels=(), vertex_damping=0., vertex_k2=0.):
     r"""Return ``P_n(*legs)``, the connected tree-level redshift-space :math:`n`-point spectrum.
 
     ``legs`` are ``n`` arrays of shape ``(..., 3)`` summing to zero.
+
+    ``labels`` (one field label per leg) with ``edge_damping(qvec)`` damps every propagator whose two ends carry
+    different labels by ``edge_damping`` at its own momentum -- the pre / post-reconstruction cross n-point, with
+    :math:`D_\times(q) = e^{-q^2 \sigma^2(\mu_q) / 2}` (arXiv:2602.12343, Eq. B.3, edge by edge). A propagator
+    between two legs of the same label is undamped, unless ``same_damping = {label: callable}`` gives one for it:
+    two post-recon points have no relative displacement as ``q -> 0``, so their propagator is not ``D_\times``.
+    ``linear_labels`` marks fields linear in the initial field: a node of one with degree >= 2 contributes zero,
+    so such a leg only enters as a leaf.
+
+    ``vertex_damping`` (:math:`\sigma`, Mpc/h) and ``vertex_k2`` (:math:`a`, (Mpc/h)^2) dress every nonlinear vertex,
+    :math:`Z_m \to Z_m\, e^{-(m - 1) \sigma^2 \lambda^2 / 2} (1 + a K^2)^{m - 1}` for :math:`m \geq 2`, with :math:`K` the
+    vertex's output wavevector and :math:`\lambda` its line-of-sight component: an effective model of the shell-crossing
+    (Fingers-of-God) suppression acting per vertex, and of the loop corrections the tree misses, for the connected
+    4- to 6-points of the covariance. They multiply the ``X_FoG`` factor, they do not replace it. Both are calibrated
+    on the data's own soft modes, not fitted to P and B (which do not constrain them); 0 is the tree, exactly.
 
     ``paper=True`` reproduces Sugiyama's own term list rather than the complete one: at
     :math:`n = 6` it drops the six labelled stars :math:`K_{1,5}` that Eq. (A11) omits. It
     changes nothing at :math:`n \leq 5`, where every topology is listed (Eq. A9's *multiplicities*
     are wrong -- 40 and 36 against 60 and 60 -- but Cayley's counts are used either way).
     """
-    bias = bias if isinstance(bias, BiasModel) else BiasModel(**(bias or {}))
-    Z = {m: make_Zn(m, f=f, bias=bias) for m in range(1, n)}
+    # `X_FoG` and `damping` mean here exactly what they mean in `spectrum2_redshift_tracer` and
+    # `spectrum3_redshift_tracer`: one Fingers-of-God factor over the whole n-point, built from
+    # every leg's line-of-sight component including the closing one. This function used to apply
+    # none, which made it the only n-point in the module whose damping had to be bolted on from
+    # outside; a `with_fog_damping` wrapper and `desi-clustering`'s own copy of it both existed
+    # for that, and both are gone. `X_FoG = 0` gives `W = 1` exactly, the old behaviour.
+    X_FoG = _bias_get(dict(bias) if isinstance(bias, dict) else {'X_FoG': 0.}, 'X_FoG')
+    if isinstance(bias, dict):
+        bias = BiasModel(**{name: value for name, value in bias.items()
+                            if name in ('b1', 'b2', 'bs')})
+    elif not isinstance(bias, BiasModel):
+        bias = BiasModel(**(bias or {}))
+    if sigma2v is None:
+        sigma2v = compute_sigma2v(pk_callable)
+    def dressed_kernel(m):
+        # Z_m times exp(-(m - 1) sigma^2 lambda^2 / 2) (1 + a K^2)^(m - 1), K the vertex's output momentum (the sum of the
+        # incoming ones) and lambda its line-of-sight component. Z_1 is never dressed; at sigma = a = 0 both factors are
+        # exactly 1, so the tree is reproduced bit for bit.
+        Zm = make_Zn(m, f=f, bias=bias)
+        if m == 1:
+            return Zm
 
+        def Z(vs):
+            K = functools.reduce(operator.add, vs)
+            damping_factor = jnp.exp(-0.5 * (m - 1) * vertex_damping**2 * K[..., 2]**2)
+            k2_factor = (1. + vertex_k2 * jnp.sum(K**2, axis=-1))**(m - 1)
+            return Zm(vs) * damping_factor * k2_factor
+
+        return Z
+
+    Z = {m: dressed_kernel(m) for m in range(1, n)}
     def make_body(edges):
         degs = _degrees(edges, n)
         comps = [_component(edges, e, v, n) for e, (u, v) in enumerate(edges)]
@@ -1312,7 +1482,7 @@ def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, paper=False, 
                  for i in range(n)]
         mult = float(reduce(lambda x, y: x * y, [math.factorial(d) for d in degs], 1))
 
-        def body(kc):
+        def body(kc, codes=None):
             Q = [reduce(lambda x, y: x + y, [kc[m] for m in comp]) for comp in comps]
             # An internal line whose momentum vanishes IDENTICALLY -- the edge separating the two
             # closed triangles of a Cov[B, B] configuration, or the (k, -k) pair of a Cov[P, B]
@@ -1329,12 +1499,36 @@ def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, paper=False, 
             Q = [jnp.where((_norm(q) > _ZERO_EDGE * scale)[..., None], q, 0.) for q in Q]
             term = mult
             for i in range(n):
-                term = term * Z[degs[i]]([s * Q[e] for (e, s) in incid[i]])
+                qs = [s * Q[e] for (e, s) in incid[i]]
+                kernel = Z[degs[i]](qs)
+                if codes is not None and degs[i] >= 2:
+                    for code in linear_codes:
+                        kernel = jnp.where(codes[i] == code, 0., kernel)
+                term = term * kernel
             for q in Q:
                 term = term * pk_callable(_norm(q))
+            if codes is not None:
+                # `codes` are the field codes of the nodes, in this tree's order
+                for e, (u, v) in enumerate(edges):
+                    cross = codes[u] != codes[v]
+                    factor = jnp.where(cross, edge_damping(Q[e]), 1.) if edge_damping is not None else 1.
+                    for code, damp in same_codes.items():
+                        factor = jnp.where((codes[u] == code) & (codes[v] == code), damp(Q[e]), factor)
+                    term = term * factor
             return term
 
         return body
+
+    codes = same_codes = None
+    linear_codes = []
+    if labels is not None:
+        assert len(labels) == n, f'one label per leg: {n}'
+        unique = sorted(set(labels), key=list(labels).index)
+        codes = np.array([unique.index(label) for label in labels], dtype=np.int32)
+        same_codes = {unique.index(label): damp for label, damp in (same_damping or {}).items() if label in unique}
+        linear_codes = [unique.index(label) for label in linear_labels if label in unique]
+        if len(unique) == 1 and not same_codes and not linear_codes:
+            codes = None
 
     classes = tree_classes(n)
     if paper and n >= 6:
@@ -1346,11 +1540,12 @@ def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, paper=False, 
         out = 0.
         for body, sig in tables:
             if len(sig) == 1:
-                out = out + body([q[i] for i in sig[0]])
+                out = out + body([q[i] for i in sig[0]], None if codes is None else [int(codes[i]) for i in sig[0]])
                 continue
 
             def step(carry, row, _b=body):
-                return carry + _b([jnp.take(q, row[i], axis=0) for i in range(n)]), None
+                return carry + _b([jnp.take(q, row[i], axis=0) for i in range(n)],
+                                  None if codes is None else [jnp.take(jnp.asarray(codes), row[i]) for i in range(n)]), None
 
             acc, _ = jax.lax.scan(step, jnp.zeros(q.shape[1:-1]), jnp.asarray(sig))
             out = out + acc
@@ -1369,7 +1564,13 @@ def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, paper=False, 
         assert len(legs) == n - 1, f'the connected {n}-point takes its {n - 1} independent legs'
         legs = [jnp.asarray(v) for v in legs]
         legs = legs + [-reduce(lambda a, b: a + b, legs)]
-        return _P(jnp.stack(jnp.broadcast_arrays(*legs)))
+        stacked = jnp.stack(jnp.broadcast_arrays(*legs))
+        # `broadcast_arrays` has already put every leg at a common shape, so the line-of-sight
+        # components below are contiguous -- the strided views that bit the batched quadrature on
+        # GPU cannot arise here.
+        W = fog_damping(*[(leg[..., 2], X_FoG) for leg in stacked], f=f, sigma2v=sigma2v,
+                        damping=damping)
+        return W * _P(stacked)
 
     P.ntree = ntree
     P.nclass = len(classes)
@@ -1381,82 +1582,9 @@ def make_spectrum_redshift_tracer(n, pk_callable, f=0., bias=None, paper=False, 
     return P
 
 
-def with_fog_damping(fun, n, f, X_FoG, sigma2v, damping='lor'):
-    r"""Wrap a connected ``n``-point in the Fingers-of-God factor ``jaxpower.pt`` gives ``B``
-    and ``T``.
-
-    ``spectrum3_redshift_tracer`` multiplies the whole tree bispectrum by
-    ``fog_damping((k_i mu_i, X_i) for each of its three legs)`` and
-    ``spectrum4_redshift_tracer`` does the same over four; the tree spectra built here carry
-    none. Mixing the two in one covariance is not a small inconsistency at :math:`k \sim 0.3`:
-    the 2-, 3- and 4-point are suppressed while the 5- and 6-point are not, so every correlation
-    the latter carry is inflated relative to the variances that normalise it.
-
-    Measured on the 500 Abacus LRG boxes, supplying it takes the full :math:`k < 0.3` covariance
-    from a smallest correlation eigenvalue of -0.275 to **+0.045** -- positive definite over the
-    whole range -- and brings the P-vs-B canonical correlation onto the mocks' at every cut. It
-    introduces no parameter: ``X_FoG`` and ``sigma2v`` are the ones the bispectrum fit already
-    used. The cost is that :math:`\sigma(B_{000})` falls from 0.955 to 0.874 of the mocks'.
-
-    ``k mu`` is the leg's line-of-sight component, so no extra geometry is needed.
-    """
-    def wrapped(*legs):
-        # The damping kernel needs every leg's line-of-sight component, the closing one included;
-        # the spectrum itself takes only the independent ones. Handing `fun` the closed list is
-        # the mistake to avoid here.
-        legs = [jnp.asarray(v) for v in legs]
-        closed = legs + [-reduce(lambda a, b: a + b, legs)]
-        W = fog_damping(*[(leg[..., 2], X_FoG) for leg in closed], f=f, sigma2v=sigma2v,
-                        damping=damping)
-        return W * fun(*legs)
-
-    return wrapped
-
-
-def validate_partition_bias(atol=1e-12, size=200, seed=0):
-    """The two-block partition sum must reproduce this module's own K_2 and K_3.
-
-    Both were validated against ``jaxpower.pt``'s Z_2 and Z_3, so they are the reference, and the
-    sum is what continues them into K_4 and K_5. It is checked here term by term -- the local
-    part alone with ``bs = 0``, the tidal part alone with ``b2' = 0``, and the two together --
-    because the two failures the continuation invites cancel in neither: dropping the block
-    factorials leaves the local part short by 2/3 at n = 3, and putting F where G belongs leaves
-    the tidal part wrong at n = 3 while both stay exact at n = 2.
-    """
-    rng = np.random.default_rng(seed)
-    b1 = 2.0
-    out = {}
-    # (b2, bs) with, in turn, no tidal operator, no local one (b2' = b2 + 2 bs / 3 = 0), both.
-    cases = {'local': (1.0, 0.), 'tidal': (0.8, -1.2), 'both': (1.0, -0.7)}
-    for n in (2, 3):
-        vs = [jnp.asarray(rng.normal(scale=0.1, size=(size, 3))) for _ in range(n)]
-        F, G, ksum = fg_tables(vs)
-        mask = (1 << n) - 1
-        loc = tid = 0.
-        for part in _set_partitions(mask):
-            if len(part) != 2:
-                continue
-            ba, bb = part
-            w = float(math.factorial(bin(ba).count('1')) * math.factorial(bin(bb).count('1')))
-            loc = loc + w * np.asarray(F[ba]) * np.asarray(F[bb])
-            tid = tid + w * np.asarray(_sigma2(ksum[ba], ksum[bb])) \
-                * np.asarray(G[ba]) * np.asarray(G[bb])
-        lin = np.asarray(BiasModel(b1=b1)(mask, F, G, ksum, vs))
-        for name, (b2, bs) in cases.items():
-            ref = np.asarray(BiasModel(b1=b1, b2=b2, bs=bs)(mask, F, G, ksum, vs)) - lin
-            b2p, g2 = b2 + 2. / 3. * bs, bs / 2.
-            pred = (b2p * loc + 2. * g2 * tid) / math.factorial(n)
-            # Against the sample's typical magnitude, not element by element: the two sides group
-            # the same terms differently, so where one configuration happens to cancel, a
-            # per-element ratio reports round-off on a vanishing denominator rather than an error.
-            err = float(np.max(np.abs(ref - pred)) / np.median(np.abs(ref)))
-            out[n, name] = err
-            assert err < atol, \
-                f'K_{n} ({name}) disagrees with the partition sum by {err:.3e}'
-    return out
-
-
 def make_spectra_redshift_tracer(pk_callable, f=0., bias=None, nmax=6, paper=False, jit=True):
     """``{2: P, 3: B, 4: T, 5: P5, 6: P6}`` up to ``nmax``, sharing one bias model."""
     return {n: make_spectrum_redshift_tracer(n, pk_callable, f=f, bias=bias, paper=paper, jit=jit)
             for n in range(2, nmax + 1)}
+
+

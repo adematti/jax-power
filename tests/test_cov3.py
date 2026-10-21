@@ -576,6 +576,89 @@ def test_terms_are_additive(rtol=1e-10):
     assert err < rtol, err
 
 
+def test_coincidence_orders(rtol=1e-8):
+    """``coincidence_orders`` splits each term by its number of pair coincidences.
+
+    The orders must sum to the usual covariance, order 0 must be the covariance at zero shot noise, and
+    each order must scale as ``shotnoise^m`` -- term by term, since the terms built on ``_run`` evaluate
+    every level in one pass while the others are assembled once per level.
+    """
+    from jaxpower.cov3 import TERMS
+
+    mattrs = MeshAttrs(boxsize=BOXSIZE, meshsize=64)
+    obs = _observable()
+    theory = _tree_theory()
+    shot = 1995.
+    for term in list(TERMS) + [TERMS]:
+        kw = dict(theory=theory, terms=(term,) if isinstance(term, str) else term, **CHEAP)
+        total = np.asarray(compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, **kw).value())
+        zero = np.asarray(compute_spectrum3_covariance(mattrs, None, obs, shotnoise=0., **kw).value())
+        orders = compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, coincidence_orders=3, **kw)
+        halved = compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot / 2., coincidence_orders=3, **kw)
+        scale = np.abs(total).max()
+        err_sum = np.abs(sum(np.asarray(c.value()) for c in orders.values()) - total).max() / scale
+        err_zero = np.abs(np.asarray(orders[0].value()) - zero).max() / scale
+        err_power = max(np.abs(np.asarray(halved[m].value()) * 2**m - np.asarray(orders[m].value())).max() for m in orders) / scale
+        present = [m for m in orders if np.abs(np.asarray(orders[m].value())).max() > 1e-12 * scale]
+        name = term if isinstance(term, str) else 'all'
+        print(f'  {name:<4} orders present {present}: sum {err_sum:.1e}, order 0 vs shotnoise 0 {err_zero:.1e}, s^m scaling {err_power:.1e}')
+        assert err_sum < rtol and err_zero < rtol and err_power < rtol, (name, err_sum, err_zero, err_power)
+
+
+def test_coincidence_orders_without_power_shot(rtol=1e-8):
+    """``count_power_shot=False`` keeps P^(N)'s constant out of the orders: they still sum to the covariance, the terms
+    with no P^(N) factor (T, P5, P6) are unchanged, and PT's orders are those of T^(N) alone."""
+    mattrs = MeshAttrs(boxsize=BOXSIZE, meshsize=64)
+    obs = _observable()
+    theory = _tree_theory()
+    shot = 1995.
+    for term in ['T', 'P5', 'P6', 'PT', 'PB', 'PP']:
+        kw = dict(theory=theory, terms=(term,), shotnoise=shot, **CHEAP)
+        total = np.asarray(compute_spectrum3_covariance(mattrs, None, obs, **kw).value())
+        counted = compute_spectrum3_covariance(mattrs, None, obs, coincidence_orders=3, **kw)
+        uncounted = compute_spectrum3_covariance(mattrs, None, obs, coincidence_orders=3, count_power_shot=False, **kw)
+        scale = np.abs(total).max()
+        err_sum = np.abs(sum(np.asarray(c.value()) for c in uncounted.values()) - total).max() / scale
+        diff = max(np.abs(np.asarray(uncounted[m].value()) - np.asarray(counted[m].value())).max() for m in counted) / scale
+        present = [m for m in uncounted if np.abs(np.asarray(uncounted[m].value())).max() > 1e-12 * scale]
+        print(f'  {term:<3} orders present {present}: sum {err_sum:.1e}, change from counting P^(N) {diff:.1e}')
+        assert err_sum < rtol, (term, err_sum)
+        if term in ('T', 'P5', 'P6'):
+            assert diff < rtol, (term, diff)
+        else:
+            assert diff > rtol, (term, diff)
+
+
+def test_coincidence_amplitudes(rtol=1e-8):
+    """``coincidence_amplitudes=(A_1, A_2, A_3)`` weights the lines with m coincidences by A_m, once: Poisson amplitudes change
+    nothing; on the connected T the order-m lines come out as (1, A_1, A_1^2, A_3) times the Poisson ones; A_2 != A_1^2 is
+    refused (the B^(N) constant is the square of its pair level)."""
+    mattrs = MeshAttrs(boxsize=BOXSIZE, meshsize=64)
+    obs = _observable()
+    theory = _tree_theory()
+    shot = 1995.
+    A1, A3 = 1.4, 3.12
+    kw = dict(theory=theory, **CHEAP)
+    plain = np.asarray(compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, terms=('T', 'PB'), **kw).value())
+    poisson = np.asarray(compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, terms=('T', 'PB'),
+                                                      coincidence_amplitudes=(1., 1., 1.), **kw).value())
+    scale = np.abs(plain).max()
+    assert np.abs(poisson - plain).max() < rtol * scale
+    orders = compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, terms=('T',), coincidence_orders=3, **kw)
+    expected = sum(w * np.asarray(orders[m].value()) for m, w in zip(range(4), (1., A1, A1**2, A3)))
+    got = np.asarray(compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, terms=('T',),
+                                                  coincidence_amplitudes=(A1, A1**2, A3), **kw).value())
+    err = np.abs(got - expected).max() / np.abs(expected).max()
+    print(f'  T with (A_1, A_1^2, A_3) = ({A1}, {A1**2:.2f}, {A3}): {err:.1e} from the reweighted Poisson orders')
+    assert err < rtol, err
+    try:
+        compute_spectrum3_covariance(mattrs, None, obs, shotnoise=shot, terms=('T',), coincidence_amplitudes=(A1, 1.95 * 1.1, A3), **kw)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('A_2 != A_1^2 must be refused')
+
+
 # --------------------------------------------------------------------------------------
 # the survey window
 # --------------------------------------------------------------------------------------
@@ -739,19 +822,34 @@ def test_window_periodic_approximation(atol=0.25, rtol=0.1):
     ====  ==================  ======================  =========
     PB    ``order3`` 6, 10    0.909, 0.911            yes
     BB    ``order5`` 6, 10    0.955, 0.983            converging
-    PPP   ``order5`` 6, 8     1.102, 1.159            converging
-    PT    ``order5`` 6, 10    1.034, 1.050            yes
+    PPP   ``order5`` 6, 8     0.958, 0.983            converging
+    PT    ``order5`` 6, 10    0.972, 0.989            yes
     ====  ==================  ======================  =========
 
-    ``PT`` is flat because its windowed block *is* the box block with Eq. (47)'s mode count
-    taken in the window's effective tie volume: the vector tie is consumed exactly, so almost the
-    only difference between the two sides of this ratio is that one number, and 1.027 is that
-    number -- the 2|4 grouping's ``V Q_W(s -> 0)`` on this window, see :data:`WINDOW_SPLIT`. It
-    reads 1.03-1.05 rather than 1.027 because two other things differ: the closure floor and the
-    soft-momentum mask, which each side takes from its own volume, so their thresholds differ by
-    :math:`1.027^{1/3}` and the mask's discontinuity converges at its own rate on each. The same
-    construction serves ``BB``'s
-    ``(2, 2)`` pairing, which lands at 1.010 on its own; the rest of ``BB`` is the channel
+    (Re-measured 2026-09-23. The ``PPP`` row previously read 1.102, 1.159 here; nothing in this
+    run's ``PPP`` path was changed to produce that, and the cause of the drift has not been
+    established. It still passes ``atol`` and is still not asserted stable.)
+
+    ``PT`` used to be *flat* here, 1.034 and 1.050, because its windowed block was the box block
+    with Eq. (47)'s mode count taken in the window's effective tie volume and nothing else: the
+    vector tie was consumed exactly, so almost the only difference between the two sides of the
+    ratio was that one number, 1.027 -- the 2|4 grouping's ``V Q_W(s -> 0)`` on this window, see
+    :data:`WINDOW_SPLIT`. With ``tie_window`` on (the default since 2026-09-23) the four pairings
+    whose tied legs are both binned carry the window's own bin coupling instead of a hard
+    selector, so the block genuinely spreads across bins and the diagonal entries this ratio is
+    taken on lose weight to their neighbours. That it lands *closer* to one rather than further,
+    0.972 and 0.989, is not the test getting easier: the previous 1.03-1.05 was the tie volume
+    showing through undiluted, and the new numbers are that excess partly spent on a coupling
+    that ought to be there. The spread is what moved most, [0.937, 0.974] to [0.931, 1.005].
+
+    How much the diagonal loses depends on the window's width against the bin: at these
+    ``step = 0.02`` bins the window is under one bin wide and the diagonal keeps 97%, while
+    ``claude_cov3_window/box_limit.py`` at ``step = 0.01`` sees it keep 76-85%. A ratio taken on
+    diagonal entries alone is therefore no longer a clean box-limit statement for this block --
+    see ``tie_window`` on :func:`jaxpower.cov3._block_bb_pt_window`, and
+    ``claude_cov3_cutsky_mocks`` for the mock comparison that settles it.
+
+    ``BB``'s ``(2, 2)`` pairing lands at 1.010 on its own; the rest of ``BB`` is the channel
     expansion and is what leaves the block at 0.98.
 
     Note what this test cannot see. Every block here evaluates a power spectrum on a closure leg,
