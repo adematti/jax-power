@@ -659,7 +659,7 @@ def make_array_from_single_device_arrays(sharding, per_device_arrays, return_sli
                 pad = _get_pad_constant_jax(constant_values)
             elif pad == 'uniform':
                 limits = [_make_array([_safe_min(per_device_array)[None, ...] for per_device_array in per_device_arrays]).min(axis=0),
-                          _make_array([_safe_max(per_device_array)[None, ...] for per_device_array in per_device_arrays]).min(axis=0)]
+                          _make_array([_safe_max(per_device_array)[None, ...] for per_device_array in per_device_arrays]).max(axis=0)]
                 pad = _get_pad_uniform_jax(limits)
             else:
                 raise ValueError('mean or global_mean supported only')
@@ -2204,6 +2204,10 @@ def _get_extent(*positions, mpicomm=None):
     if not positions:
         raise ValueError('positions must be provided if boxsize and boxcenter are not specified, or check is True')
     backend, kw = _get_distributed_backend(positions[0], mpicomm=mpicomm)
+    if backend == 'jax' and isinstance(positions[0], np.ndarray) and jax.process_count() > 1:
+        # 'jax' is chosen for numpy arrays when a process has several devices; but numpy arrays are process-local,
+        # so the jnp reductions below would give each process its own extent (and its own mesh): reduce over MPI
+        backend, kw = 'mpi', {'mpicomm': mpicomm if mpicomm is not None else get_mpicomm()}
     # Find bounding coordinates
     nonempty_positions = [pos for pos in positions if pos.size]
     if backend == 'jax':
