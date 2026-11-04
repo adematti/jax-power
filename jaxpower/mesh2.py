@@ -1117,6 +1117,32 @@ def compute_smooth2_spectrum_window(window, edgesin: np.ndarray, ellsin: tuple=N
     return WindowMatrix(observable=observable, theory=theory, value=wmat)
 
 
+def _get_local_theory_coefficients(ellsin, swap=False):
+    r"""
+    Coefficients of the local theory line of sight. The theory is :math:`\sum_{\ell_1, \ell_2} A_{\ell_1 \ell_2}(k) \mathcal{L}_{\ell_1}(\hat{k} \cdot \hat{x}_1) \mathcal{L}_{\ell_2}(\hat{k} \cdot \hat{x}_2)`,
+    :math:`\ell_1, \ell_2 \in \{0, 2\}`, with :math:`x_1` (resp. :math:`x_2`) the position of the first (resp. second) mesh.
+    ``ellsin`` lists either:
+
+    - multipoles :math:`\ell \in \{0, 2, 4\}` of the plane-parallel power spectrum, :math:`A_{\ell_1 \ell_2}` following from the Cholesky decomposition
+      of the Gaussian mock (see the notes), with :math:`A_{02} = A_{20}` (exact for an auto-correlation)
+    - pairs :math:`(\ell_1, \ell_2)`, i.e. :math:`A_{\ell_1 \ell_2}` themselves, as needed for a cross-correlation, where :math:`A_{02} \neq A_{20}`.
+
+    Returns a dictionary mapping the legs :math:`(\ell_1, \ell_2)` of the computation (swapped if ``swap``, i.e. the meshes are swapped)
+    to the list of (index in ``ellsin``, coefficient).
+    """
+    cholesky = {0: {(0, 0): 1.}, 2: {(0, 2): 1. / 2., (2, 0): 1. / 2.}, 4: {(0, 0): -7. / 18., (0, 2): -5. / 18., (2, 0): -5. / 18., (2, 2): 35. / 18.}}
+    toret = {(ell1, ell2): [] for ell1, ell2 in itertools.product((0, 2), (0, 2))}
+    for illin, ellin in enumerate(ellsin):
+        if isinstance(ellin, tuple):
+            if ellin not in toret:
+                raise ValueError(f'local theory line of sight: (ell1, ell2) must be in {list(toret)}, found {ellin}')
+            coefficients = {ellin: 1.}
+        else:
+            coefficients = cholesky.get(ellin, {})
+        for (ell1, ell2), coeff in coefficients.items():
+            toret[(ell2, ell1) if swap else (ell1, ell2)].append((illin, coeff))
+    return toret
+
 
 def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | MeshAttrs, edgesin: np.ndarray, ellsin: tuple=None,
                                   bin: BinMesh2SpectrumPoles=None, los: str | np.ndarray='z',
@@ -1133,6 +1159,12 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         Input bin edges.
     ellsin : tuple, list
         Input multipole orders.
+        For a local line of sight, the theory line of sight is the first point (default), with optional wide-angle orders
+        :math:`n` as tuples :math:`(\ell, n)`; pass ``(ellsin, 'local')`` for the local theory line of sight, where ``ellsin`` lists
+        either plane-parallel multipoles :math:`\ell \in \{0, 2, 4\}` (assuming :math:`A_{02} = A_{20}`, exact for an auto-correlation),
+        or pairs :math:`(\ell_1, \ell_2)` with :math:`\ell_1, \ell_2 \in \{0, 2\}`, for the theory
+        :math:`\sum_{\ell_1, \ell_2} A_{\ell_1 \ell_2}(k) \mathcal{L}_{\ell_1}(\hat{k} \cdot \hat{x}_1) \mathcal{L}_{\ell_2}(\hat{k} \cdot \hat{x}_2)`,
+        :math:`x_1` (resp. :math:`x_2`) the position of the first (resp. second) mesh; for a cross-correlation, :math:`A_{02} \neq A_{20}`.
     bin : BinMesh2SpectrumPoles
         Output binning.
     los : str, array, default=None
@@ -1356,8 +1388,12 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         # The Fourier-space grid
         kvec = A0.coords(sparse=True)
 
-        Ylms = {ell: [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in set(ells) | set(ellsin)}
-        spherical_jn = {ell: get_spherical_jn(ell) for ell in set(ells) | set(ellsin)}
+        # (ell, wide-angle order) or, for the local theory line of sight, (ell1, ell2) with ell1, ell2 in {0, 2}
+        ells_theory = {ellin[0] if isinstance(ellin, tuple) else ellin for ellin in ellsin}
+        # local theory line of sight: legs ell1, ell2 in {0, 2}, and their Gaunt products p in {0, 2, 4} (flags=('infinite',))
+        if theory_los == 'local': ells_theory |= {0, 2, 4}
+        Ylms = {ell: [get_Ylm(ell, m, reduced=False, real=True) for m in range(-ell, ell + 1)] for ell in set(ells) | ells_theory}
+        spherical_jn = {ell: get_spherical_jn(ell) for ell in set(ells) | ells_theory}
         has_buffer = False
 
         if isinstance(buffer, str) and buffer in ['gpu', 'cpu']:
@@ -1646,13 +1682,8 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
                         wmat_tmp[ell1, ell2] = my_map(f, edgesin)
 
             wmat = jnp.zeros((len(ellsin),) + wmat_tmp[0, 0].shape, dtype=wmat_tmp[0, 0].dtype)
-            coeff2 = {(0, 0): [(0, 1), (4, -7. / 18.)],
-                      (0, 2): [(2, 1. / 2.), (4, -5. / 18.)],
-                      (2, 2): [(4, 35. / 18.)]}
-            coeff2[2, 0] = coeff2[0, 2]
-            for illin, ellin in enumerate(ellsin):
-                for ell1, ell2 in coeff2:
-                    coeff = sum(coeff * (ell == ellin) for ell, coeff in coeff2[ell1, ell2])
+            for (ell1, ell2), coefficients in _get_local_theory_coefficients(ellsin, swap=swap).items():
+                for illin, coeff in coefficients:
                     wmat = wmat.at[illin].add(coeff * wmat_tmp[ell1, ell2])
             wmat = wmat.reshape(-1, wmat.shape[-1]).T
 
@@ -1664,8 +1695,9 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
     for ill, ell in enumerate(ells):
         observable.append(Mesh2SpectrumPole(k=bin.xavg, k_edges=bin.edges, nmodes=bin.nmodes, num_raw=jnp.zeros_like(bin.xavg), num_shotnoise=jnp.zeros_like(bin.xavg), norm=jnp.ones_like(bin.xavg) * norm[ill], ell=ell))
         stop = start + observable[-1].size
-        wmat[start:stop] = wmat[start:stop].real if ell % 2 == 0 else wmat[start:stop].imag
-        stop = start
+        # meshes swapped (endpoint line of sight): conjugate, as compute_mesh2_spectrum, i.e. flip the sign of odd multipoles
+        wmat[start:stop] = wmat[start:stop].real if ell % 2 == 0 else (-1 if swap else 1) * wmat[start:stop].imag
+        start = stop
     wmat = wmat.real
     observable = Mesh2SpectrumPoles(observable)
 
@@ -1676,7 +1708,9 @@ def compute_mesh2_spectrum_window(*meshes: RealMeshField | ComplexMeshField | Me
         theory.append(Mesh2SpectrumPole(k=kin, k_edges=edgesin, num_raw=jnp.zeros_like(kin)))
     #theory = Mesh2SpectrumPoles(theory, ells=ellsin)
     kw = dict(ells=list(ellsin))
-    if isinstance(ellsin[0], tuple):  # ell, wide-angle order
+    if vlos is None and theory_los == 'local':  # ell or (ell1, ell2), see _get_local_theory_coefficients
+        pass
+    elif isinstance(ellsin[0], tuple):  # ell, wide-angle order
         kw = dict(ells=[ell[0] for ell in ellsin], wa_orders=[ell[1] for ell in ellsin])
     theory = ObservableTree(theory, **kw)
     return WindowMatrix(observable=observable, theory=theory, value=wmat)
@@ -1697,6 +1731,8 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         or a dictionary of callables, with keys the multipole orders :math:`\ell`.
         Also possible to add wide-angle order :math:`n`, such that the key is the tuple :math:`(\ell, n)`.
         One can also directly provided a :class:`ObservableTree` or :class:`Mesh2SpectrumPoles` instance.
+        Pass ``(theory, 'local')`` for the local theory line of sight; then keys are either the plane-parallel multipoles
+        :math:`\ell \in \{0, 2, 4\}`, or pairs :math:`(\ell_1, \ell_2)`, see :func:`compute_mesh2_spectrum_window`.
     bin : BinMesh2SpectrumPoles
         Output binning.
     los : str, array, default=None
@@ -1756,7 +1792,7 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         is_callable = all(callable(pole) for pole in poles.values())
         if not is_callable:
             from .utils import Interpolator1D
-            interp = Interpolator1D(kin, knorm, edges=len(kin) == len(poles[0]) + 1)
+            interp = Interpolator1D(kin, knorm, edges=len(kin) == len(next(iter(poles.values()))) + 1)
 
     def get_theory(ell=None, pole=None):
         if pole is None:
@@ -1806,9 +1842,12 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
         return Mesh2SpectrumPoles(spectrum)
 
     else:
-        poles = {ell if isinstance(ell, tuple) else (ell, 0): pole for ell, pole in poles.items()} # wide-angle = 0 as a default
-
-        ellsin = [mode[0] for mode in poles]
+        if theory_los == 'local':
+            local_coefficients = _get_local_theory_coefficients(list(poles), swap=swap)
+            ellsin = [0, 2]
+        else:
+            poles = {ell if isinstance(ell, tuple) else (ell, 0): pole for ell, pole in poles.items()} # wide-angle = 0 as a default
+            ellsin = [mode[0] for mode in poles]
 
         if swap: meshes = meshes[::-1]
 
@@ -1845,15 +1884,13 @@ def compute_mesh2_spectrum_mean(*meshes: RealMeshField | ComplexMeshField | Mesh
                             Q += (4. * np.pi) / (2 * ell1 + 1) * xi * _2r(_2c(rmesh1 * xnorm**(-wain) * Ylm(*xhat) * Yl1m1(*xhat)).conj() * A0)
 
                 elif theory_los == 'local':
-                    coeff2 = {(0, 0): [(0, 1), (4, -7. / 18.)],
-                              (0, 2): [(2, 1. / 2.), (4, -5. / 18.)],
-                              (2, 2): [(4, 35. / 18.)]}
-                    coeff2[2, 0] = coeff2[0, 2]
-                    for ell1, ell2 in itertools.product((0, 2), (0, 2)):
+                    keys = list(poles)
+                    for (ell1, ell2), coefficients in local_coefficients.items():
+                        if not coefficients: continue
                         if is_callable:
-                            kernel_ell2 = sum(coeff * get_theory((ell, 0)) for ell, coeff in coeff2[ell1, ell2])
+                            kernel_ell2 = sum(coeff * get_theory(keys[illin]) for illin, coeff in coefficients)
                         else:
-                            pole = sum(coeff * poles[ell, 0] for ell, coeff in coeff2[ell1, ell2])
+                            pole = sum(coeff * poles[keys[illin]] for illin, coeff in coefficients)
                             kernel_ell2 = get_theory(pole=pole)
                         kernel_ell2 = kernel_ell2 * rnorm
                         for Yl1m1, Yl2m2 in itertools.product(Ylms[ell1], Ylms[ell2]):
