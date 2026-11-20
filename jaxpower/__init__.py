@@ -12,6 +12,8 @@ from .cov2 import compute_fkp2_covariance_window, compute_mesh2_covariance_windo
 # cov2's exported one above, and `compute_fkp3_covariance_window` is only useful together with it,
 # so both stay behind `from jaxpower.cov3 import ...`.
 from .cov3 import compute_spectrum3_covariance
+# Only the entry points: the templates and models stay behind `from jaxpower.ic import ...`.
+from .ic import IC2Model, compute_smooth2_ic_window, compute_smooth2_modulation_window, compute_smooth3_ic_window, compute_smooth3_closure_window
 from .oqe import (SeparableWeighting, separable_inverse_weight, compute_oqe2_normalization, compute_oqe2_shotnoise, covariance_weight)
 from .rotation import WindowRotationSpectrum2
 from .mock import generate_gaussian_mesh, generate_spectrum2_mesh, generate_anisotropic_gaussian_mesh, generate_spectrum2_alm, generate_spectrum3_alm, generate_spectrum3_mesh, generate_uniform_particles
