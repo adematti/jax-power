@@ -50,7 +50,7 @@ def generate_gaussian_mesh(mattrs: MeshAttrs, power: Callable=lambda kvec: 1., s
 
 
 def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Callable], seed: int=42, los: str='x', unitary_amplitude: bool=False, **kwargs):
-    """
+    r"""
     Generate a Gaussian random field mesh with input power spectrum multipoles.
 
     Parameters
@@ -59,6 +59,11 @@ def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Call
         Mesh attributes (box size, mesh size, etc.).
     poles : dict or Mesh2SpectrumPoles or list
         Dictionary of multipole order to power spectrum function, or :class:`Mesh2SpectrumPoles`, or list of power spectra.
+        With ``los='local'``, multipole orders can instead be pairs :math:`(\ell_1, \ell_2)`, ``(0, 0), (0, 2), (2, 0), (2, 2)``,
+        for the cross power spectrum of two meshes
+        :math:`\sum_{\ell_1 \ell_2} A_{\ell_1 \ell_2}(k) \mathcal{L}_{\ell_1}(\hat{k} \cdot \hat{x}_1) \mathcal{L}_{\ell_2}(\hat{k} \cdot \hat{x}_2)`,
+        :math:`x_1` (resp. :math:`x_2`) the position in the first (resp. second) mesh;
+        the plane-parallel multipoles only fix :math:`A_{00}, A_{22}` and :math:`A_{02} + A_{20}`, see :func:`compute_mesh2_spectrum_window`.
     seed : int, tuple, optional
         Random seed for mesh generation.
         Provide (seed, ids) to ensure reproducibility when changing the number of devices; see :func:`create_sharded_random` for details.
@@ -73,16 +78,29 @@ def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Call
     -------
     mesh : RealMeshField
         Generated mesh field with the specified multipole power spectra.
+        For pairs :math:`(\ell_1, \ell_2)`, a tuple of two meshes, whose cross power spectrum is the input one; their auto power spectra are not physical.
+
+    Notes
+    -----
+    For pairs :math:`(\ell_1, \ell_2)`, each mesh is painted as :math:`\sum_\ell c^i_\ell(\mathbf{k}) \mathcal{L}_\ell(\hat{k} \cdot \hat{x})`, with
+    :math:`c^1_\ell = s\, n_\ell`, :math:`c^2_\ell = \sum_{\ell'} A_{\ell' \ell} n_{\ell'} / s`, :math:`n_0, n_2` independent white noises,
+    so that :math:`\langle c^1_{\ell_1} c^{2 \star}_{\ell_2} \rangle = A_{\ell_1 \ell_2}`. :math:`s = \sqrt{|A_{00}|}` only balances the amplitude
+    of both meshes; its gradient is stopped, so that for a fixed seed the meshes are linear in :math:`A_{\ell_1 \ell_2}`.
     """
     ells = (0, 2, 4)
     kin = None
     if isinstance(poles, ObservableTree):
         edges = next(iter(poles)).edges('k')
         kin = jnp.append(edges[..., 0], edges[-1, 1])
-        poles = {ell: poles.get(ell).value() for ell in poles.ells}
+        poles = {tuple(ell) if isinstance(ell, (tuple, list)) else ell: leaf.value() for ell, leaf in zip(poles.ells, poles)}
     if isinstance(poles, list):
         poles = {ell: pole for ell, pole in zip(ells, poles)}
     ells = list(poles)
+    # local line of sight, pairs (ell1, ell2): two meshes, for a cross-correlation with A02 != A20
+    local_pairs = [(0, 0), (0, 2), (2, 0), (2, 2)]
+    is_cross = any(isinstance(ell, tuple) for ell in ells)
+    if is_cross and (los != 'local' or sorted(ells) != local_pairs):
+        raise ValueError(f'pairs (ell1, ell2) require los = "local" and ells = {local_pairs}, found los = {los} and ells = {ells}')
 
     key, ids = _process_seed(seed)
     assert key is not None, 'provide random key for mesh generation'
@@ -100,7 +118,7 @@ def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Call
     is_callable = all(callable(pole) for pole in poles.values())
     if not is_callable:
         from .utils import Interpolator1D
-        interp = Interpolator1D(kin, knorm, edges=len(kin) == len(poles[0]) + 1, **kwargs)
+        interp = Interpolator1D(kin, knorm, edges=len(kin) == len(next(iter(poles.values()))) + 1, **kwargs)
 
     def get_theory(ell=None, pole=None):
         if pole is None:
@@ -111,6 +129,45 @@ def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Call
             return interp(pole)
 
     if los == 'local':
+
+        def _interp(pole):
+            if is_callable:
+                return pole.reshape(kshape)
+            else:
+                return get_theory(pole=pole).reshape(kshape)
+
+        def paint(mesh, mesh2):
+            # total mesh, mesh0 + mesh2 * L2(mu), with mesh = mesh0 already in configuration space
+            xvec = mesh.coords(sparse=True)
+            ell = 2
+            Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
+
+            @jax.checkpoint
+            def f(carry, im):
+                carry += 4. * jnp.pi / (2 * ell + 1) * (mesh2 * jax.lax.switch(im, Ylms, *kvec)).c2r() * jax.lax.switch(im, Ylms, *xvec)
+                return carry, im
+
+            return jax.lax.scan(f, init=mesh, xs=np.arange(len(Ylms)))[0]
+
+        if is_cross:
+
+            @jax.checkpoint
+            def get_meshs_cross(keys):
+                if is_callable:
+                    local = {pair: get_theory(pair) / mattrs.cellsize.prod() for pair in local_pairs}
+                else:
+                    local = {pair: poles[pair] / mattrs.cellsize.prod() for pair in local_pairs}
+                scale = jax.lax.stop_gradient(jnp.sqrt(jnp.abs(local[0, 0])))
+                scale = jnp.where(scale == 0., 1., scale)
+                normals = dict(zip((0, 2), (generate_normal(key) for key in keys)))
+                # c^1_ell = s n_ell, c^2_ell = sum_ell' A_{ell' ell} n_ell' / s
+                toret = [(normals[0] * _interp(scale)).c2r(), normals[2] * _interp(scale)]
+                toret += [(normals[0] * _interp(local[0, 0] / scale) + normals[2] * _interp(local[2, 0] / scale)).c2r(),
+                          normals[0] * _interp(local[0, 2] / scale) + normals[2] * _interp(local[2, 2] / scale)]
+                return toret
+
+            mesh1, mesh12, mesh2, mesh22 = get_meshs_cross(random.split(key))
+            return paint(mesh1, mesh12), paint(mesh2, mesh22)
 
         @jax.checkpoint
         def get_meshs(keys):
@@ -131,12 +188,6 @@ def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Call
             l10 = jnp.where(l00 == 0., 0., a10 / l00)
             del a10
 
-            def _interp(pole):
-                if is_callable:
-                    return pole.reshape(kshape)
-                else:
-                    return get_theory(pole=pole).reshape(kshape)
-
             # The mesh for ell = 0
             normal = generate_normal(keys[0])
             mesh = (normal * _interp(l00)).c2r()
@@ -149,20 +200,7 @@ def generate_spectrum2_mesh(mattrs: MeshAttrs, poles: ObservableTree | dict[Call
             return mesh, mesh2
 
         mesh, mesh2 = get_meshs(random.split(key))
-        xvec = mesh.coords(sparse=True)
-        ell = 2
-        Ylms = [get_Ylm(ell, m, real=True) for m in range(-ell, ell + 1)]
-
-        @jax.checkpoint
-        def f(carry, im):
-            carry += 4. * jnp.pi / (2 * ell + 1) * (mesh2 * jax.lax.switch(im, Ylms, *kvec)).c2r() * jax.lax.switch(im, Ylms, *xvec)
-            return carry, im
-
-        mesh = jax.lax.scan(f, init=mesh, xs=np.arange(len(Ylms)))[0]
-        #mesh += 4. * jnp.pi / (2 * ell + 1) * sum((mesh2 * Ylm(*kvec)).c2r() * Ylm(*xvec) for Ylm in Ylms)  # total mesh, mesh0 + mesh2 * L2(mu)
-
-        del mesh2
-        return mesh
+        return paint(mesh, mesh2)
 
     else:
         vlos = _get_los_vector(los, ndim=mattrs.ndim)
