@@ -316,8 +316,13 @@ def create_sharded_random(func, seed, shape=(), out_specs=None, sharding_mesh=No
                 if start is None:
                     start, stop = 0, shape[axis]
                 indices.append(np.arange(start, stop))
-            intmax = np.iinfo(indices[0].dtype).max
-            assert np.prod(shape, dtype='i8') < intmax, f'array size is larger than int maximum = {intmax:d}'
+            # ids take jax's integer type: int32 unless jax_enable_x64 (not numpy's int64 of ``indices``).
+            # Beyond its range, ids would wrap and repeat (cells n and n + 2**32 share the same random numbers).
+            idtype = jax.dtypes.canonicalize_dtype(np.int64)
+            intmax = np.iinfo(idtype).max
+            if np.prod(shape, dtype='i8') - 1 > intmax:
+                raise ValueError(f'array size {np.prod(shape, dtype="i8"):d} is larger than {idtype} maximum = {intmax:d}; '
+                                 "enable jax_enable_x64 to use seed=(key, 'index')")
             return jnp.ravel_multi_index(np.meshgrid(*indices, indexing='ij'), dims=shape)
 
         if sharding_mesh.axis_names:
