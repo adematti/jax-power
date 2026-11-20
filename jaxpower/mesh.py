@@ -1429,7 +1429,12 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
     elif any(fn.endswith(ext) for ext in ['h5', 'hdf5']):  # h5py
         shapes = {}
         import h5py
-        with h5py.File(fn, 'r', **kwargs) as file:
+        kw = {}
+        if h5py.get_config().mpi and mpicomm is not None:
+            kw.update(driver='mpio', comm=mpicomm)
+        # Open with MPI-IO here too (collective, all processes call _load): with the default driver, multi-node runs on Lustre
+        # read a stale, short size for large files just written with MPI-IO ("truncated file: eof = ..."), even minutes after the write.
+        with h5py.File(fn, 'r', **kw, **kwargs) as file:
             state['attrs'] = dict(file.attrs)
             if names is None:
                 names = [name for name in file.keys()]
@@ -1437,11 +1442,7 @@ def _load(fn, names, sharding_mesh=None, mpicomm=None, **kwargs):
             for name in specs:
                 shapes[name] = file[name].shape
 
-        def callback(name, index, mpicomm=mpicomm):
-            kw = {}
-            if h5py.get_config().mpi:
-                kw.update(driver='mpio', comm=mpicomm)
-
+        def callback(name, index):
             with h5py.File(fn, 'r', **kw, **kwargs) as file:
                 dset = file[name]
                 return np.asarray(dset[index])
